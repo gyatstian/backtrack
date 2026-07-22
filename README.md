@@ -1,8 +1,3 @@
-
-# backtrack
-clipping software that works with both nvidia (nvenc) and amd (amf). on nvidia works without shadowplay
-=======
-i'll publish the source  code later when im sure i can<br>
 <img src="logo.png" alt="Screenshot" width="200">
 ## backtrack
 clipping software that works with both nvidia (nvenc) and amd (amf). on nvidia works without shadowplay.<br>

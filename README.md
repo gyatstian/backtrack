@@ -1,10 +1,14 @@
-<img src="logo.png" alt="Screenshot" width="200">
+<div align="center">
+  <img src="logo.png" alt="Screenshot" width="200">
+</div>
 
 # backtrack
 clipping software that works with both nvidia (nvenc) and amd (amf). on nvidia works without shadowplay.<br>
 the goal was to create as lightweight clipping software as possible and i did some stuff but idk if i optimized the video encoding enough (~13% video encode with gtx 1060, 1080p60 and almost lowest gpu settings)
 
-<img src="capture.png" alt="Screenshot" width="500">
+<div align="center">
+  <img src="capture.png" alt="Screenshot" width="500">
+</div>
 
 ## why
 i use nvidia and hate the bloat that comes with shadowplay, idk if works on a completely clean install but i used nvcleanstall with almost no dependencies and works purrfectly

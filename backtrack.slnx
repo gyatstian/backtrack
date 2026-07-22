@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="backtrack/backtrack.vcxproj" Id="6cc1af18-85af-41a9-af5e-2e199f5357b9" />
+</Solution>

@@ -106,7 +106,7 @@ Optional at compile time:
 Visual Studio solution:
 
 ```powershell
-& 'C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe' Backtrack.slnx /p:Configuration=Release /p:Platform=x64 /m
+MSBuild.exe Backtrack.slnx /p:Configuration=Release /p:Platform=x64 /m
 ```
 
 CMake:

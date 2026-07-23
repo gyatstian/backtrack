@@ -121,6 +121,7 @@ void MainWindow::rebindPageControlPointers() {
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
     startWithWindowsCheck_ = nullptr;
+    pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
@@ -141,7 +142,7 @@ void MainWindow::rebindPageControlPointers() {
     gpuAdaptiveCombo_ = nullptr;
     gpuFrameQueueLimitEdit_ = nullptr;
     idleFrameCoalescingCheck_ = nullptr;
-    wgcZeroCopyCheck_ = nullptr;
+    captureMethodCombo_ = nullptr;
     stableMultimonitorFramesCheck_ = nullptr;
     soundSeparationEnabledCheck_ = nullptr;
     soundSeparationAppCombo_ = nullptr;
@@ -180,6 +181,7 @@ void MainWindow::rebindPageControlPointers() {
     outputVolumeEdit_ = child(kOutputVolumeEditId);
     inputVolumeEdit_ = child(kInputVolumeEditId);
     startWithWindowsCheck_ = child(kStartWithWindowsCheckId);
+    pruneStaleMicrophoneConsentEntriesCheck_ = child(kPruneStaleMicrophoneConsentEntriesCheckId);
     exitToTrayCheck_ = child(kExitToTrayCheckId);
     notificationSoundVolumeEdit_ = child(kNotificationSoundVolumeEditId);
     encoderPresetCombo_ = child(kEncoderPresetComboId);
@@ -200,7 +202,7 @@ void MainWindow::rebindPageControlPointers() {
     gpuAdaptiveCombo_ = child(kGpuAdaptiveComboId);
     gpuFrameQueueLimitEdit_ = child(kGpuFrameQueueLimitEditId);
     idleFrameCoalescingCheck_ = child(kIdleFrameCoalescingCheckId);
-    wgcZeroCopyCheck_ = child(kWgcZeroCopyCheckId);
+    captureMethodCombo_ = child(kCaptureMethodComboId);
     stableMultimonitorFramesCheck_ = child(kStableMultimonitorFramesCheckId);
     soundSeparationEnabledCheck_ = child(kSoundSeparationEnabledCheckId);
     soundSeparationAppCombo_ = child(kSoundSeparationAppComboId);
@@ -344,11 +346,15 @@ void MainWindow::switchPage(Page page) {
     if (settingsDirty_ && (previousPage == Page::Capture || previousPage == Page::Settings)) {
         stashVisibleSettings();
     }
+    if (previousPage == Page::Library) {
+        // Do not keep processing Shell thumbnails after leaving the library. Results already
+        // in thumbnailCache_ remain available when the page is rebuilt.
+        clearClipThumbnails();
+    }
 
-    // Capture/Settings hold editable values — destroy on leave so rebuild matches settings_.
-    // Library/Diagnostics keep HWND trees for snappy return (thumbnails, stats layout).
-    const bool previousCacheable =
-        previousPage == Page::Library || previousPage == Page::Diagnostics;
+    // Diagnostics has no asynchronous UI work. Library thumbnail callbacks can arrive after
+    // a tab switch, so rebuild its HWND tree rather than keeping hidden controls alive.
+    const bool previousCacheable = previousPage == Page::Diagnostics;
     if (previousCacheable && pageCaches_[static_cast<size_t>(previousPage)].built) {
         storeCurrentPageCache();
     } else if (previousHost) {
@@ -377,7 +383,7 @@ void MainWindow::switchPage(Page page) {
     auto& cache = pageCaches_[static_cast<size_t>(page_)];
     const bool canReuse =
         cache.built &&
-        (page_ == Page::Library || page_ == Page::Diagnostics);
+        page_ == Page::Diagnostics;
     if (!canReuse) {
         pageScrollY_ = 0;
         pageWheelRemainder_ = 0;
@@ -407,13 +413,6 @@ void MainWindow::switchPage(Page page) {
         storeCurrentPageCache();
         if (pageHost_) {
             SendMessageW(pageHost_, WM_SETREDRAW, TRUE, 0);
-        }
-    } else if (page_ == Page::Library) {
-        // Capture/Settings teardown clears page controls only; library HWNDs stay cached.
-        // Rehydrate gallery slots from thumbnailCache_ so previews survive tab switches.
-        loadClipThumbnails();
-        if (clipList_) {
-            InvalidateRect(clipList_, nullptr, FALSE);
         }
     }
 
@@ -497,6 +496,7 @@ void MainWindow::clearPageControls() {
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
     startWithWindowsCheck_ = nullptr;
+    pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
@@ -517,7 +517,7 @@ void MainWindow::clearPageControls() {
     gpuAdaptiveCombo_ = nullptr;
     gpuFrameQueueLimitEdit_ = nullptr;
     idleFrameCoalescingCheck_ = nullptr;
-    wgcZeroCopyCheck_ = nullptr;
+    captureMethodCombo_ = nullptr;
     stableMultimonitorFramesCheck_ = nullptr;
     soundSeparationEnabledCheck_ = nullptr;
     soundSeparationAppCombo_ = nullptr;
@@ -590,6 +590,7 @@ void MainWindow::clearSettingsBodyControls() {
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
     startWithWindowsCheck_ = nullptr;
+    pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
@@ -610,7 +611,7 @@ void MainWindow::clearSettingsBodyControls() {
     gpuAdaptiveCombo_ = nullptr;
     gpuFrameQueueLimitEdit_ = nullptr;
     idleFrameCoalescingCheck_ = nullptr;
-    wgcZeroCopyCheck_ = nullptr;
+    captureMethodCombo_ = nullptr;
     stableMultimonitorFramesCheck_ = nullptr;
     soundSeparationEnabledCheck_ = nullptr;
     soundSeparationAppCombo_ = nullptr;
@@ -770,6 +771,28 @@ void MainWindow::buildSettingsGeneralPage() {
     startWithWindowsCheck_ = addControl(L"BUTTON", L"Start minimized with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kStartWithWindowsCheckId);
     SendMessageW(startWithWindowsCheck_, BM_SETCHECK, settings_.startWithWindowsMinimized ? BST_CHECKED : BST_UNCHECKED, 0);
     addSettingHelp(startWithWindowsCheck_, 0, 0, L"Adds Backtrack to the current user startup list and starts it minimized after Windows sign-in.");
+    y += kRowHeight;
+
+    addRowLabel(L"Microphone privacy");
+    pruneStaleMicrophoneConsentEntriesCheck_ = addControl(
+        L"BUTTON",
+        L"Clean old Backtrack entries on startup",
+        BS_AUTOCHECKBOX | WS_TABSTOP,
+        kControlX,
+        y,
+        kControlWidth,
+        24,
+        kPruneStaleMicrophoneConsentEntriesCheckId);
+    SendMessageW(
+        pruneStaleMicrophoneConsentEntriesCheck_,
+        BM_SETCHECK,
+        settings_.pruneStaleMicrophoneConsentEntries ? BST_CHECKED : BST_UNCHECKED,
+        0);
+    addSettingHelp(
+        pruneStaleMicrophoneConsentEntriesCheck_,
+        0,
+        0,
+        L"On primary Backtrack startup, removes Windows microphone privacy entries for other backtrack.exe paths. The running executable is never removed.");
     y += kRowHeight;
 
     addRowLabel(L"Close button");
@@ -1037,10 +1060,16 @@ void MainWindow::buildSettingsAdvancedPage() {
     addSettingHelp(idleFrameCoalescingCheck_, 0, 0, L"Preserves the full 60 FPS timeline by extending unchanged samples instead of re-encoding the same captured texture. Periodic IDR heartbeats keep recordings and replays seekable.");
     y += kRowHeight;
 
-    addRowLabel(L"WGC capture");
-    wgcZeroCopyCheck_ = addControl(L"BUTTON", L"Zero-copy textures", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kWgcZeroCopyCheckId);
-    SendMessageW(wgcZeroCopyCheck_, BM_SETCHECK, settings_.gpu.wgcZeroCopy ? BST_CHECKED : BST_UNCHECKED, 0);
-    addSettingHelp(wgcZeroCopyCheck_, 0, 0, L"Uses the Windows Graphics Capture frame-pool texture directly when its native BGRA format can be submitted without conversion. Scaling or experimental format conversion may use a separate pooled output texture.");
+    addRowLabel(L"Capture method");
+    captureMethodCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kCaptureMethodComboId);
+    SendMessageW(captureMethodCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"WGC"));
+    SendMessageW(captureMethodCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"DXGI"));
+    SendMessageW(
+        captureMethodCombo_,
+        CB_SETCURSEL,
+        settings_.preferredCaptureBackend == CaptureBackend::DesktopDuplication ? 1 : 0,
+        0);
+    addSettingHelp(captureMethodCombo_, 0, 0, L"WGC uses Windows Graphics Capture. DXGI uses Desktop Duplication. WGC automatically falls back to DXGI when unavailable.");
     y += kRowHeight;
 
     addRowLabel(L"Monitor switches");
@@ -1185,7 +1214,7 @@ void MainWindow::buildCapturePage() {
     y += kRowHeight;
 
     addRowLabel(L"Action");
-    startStopButton_ = addControl(L"BUTTON", controller_.stats().recording ? L"Stop Recording" : L"Start Recording", BS_PUSHBUTTON | WS_TABSTOP, kControlX, y - 4, 170, 34, kStartStopButtonId);
+    startStopButton_ = addControl(L"BUTTON", controller_.isRecording() ? L"Stop Recording" : L"Start Recording", BS_PUSHBUTTON | WS_TABSTOP, kControlX, y - 4, 170, 34, kStartStopButtonId);
     addControl(L"BUTTON", L"Recover Failed", BS_PUSHBUTTON | WS_TABSTOP, kControlX + 188, y - 4, 170, 34, kRecoverFailedRecordingButtonId);
     y += kRowHeight;
     finishSection();
@@ -1218,7 +1247,13 @@ void MainWindow::buildStatsPage() {
     addSectionLabel(L"Encoder", 464, 78, 220);
     capsLabel_ = addControl(L"STATIC", L"", SS_LEFT, 464, 112, 350, 330, kCapsLabelId);
     addSectionLabel(L"Recent Log", 44, 484, 220);
-    addControl(L"BUTTON", L"Save Log", BS_PUSHBUTTON | WS_TABSTOP, 712, 480, 112, 30, kSaveLogButtonId);
+    HWND logLevel = addControl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 416, 480, 132, 160, kLogLevelComboId);
+    for (const wchar_t* level : {L"Trace", L"Debug", L"Info", L"Warn", L"Error"}) {
+        SendMessageW(logLevel, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(level));
+    }
+    SendMessageW(logLevel, CB_SETCURSEL, static_cast<int>(settings_.logLevel), 0);
+    addControl(L"BUTTON", L"Open Folder", BS_PUSHBUTTON | WS_TABSTOP, 560, 480, 132, 30, kOpenLogFolderButtonId);
+    addControl(L"BUTTON", L"Save Log", BS_PUSHBUTTON | WS_TABSTOP, 704, 480, 120, 30, kSaveLogButtonId);
     diagnosticLogLabel_ = addControl(L"STATIC", L"", SS_LEFT, 44, 518, 780, 150, kDiagnosticLogLabelId);
     updateStats();
 }

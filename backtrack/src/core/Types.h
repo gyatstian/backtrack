@@ -17,6 +17,14 @@ namespace backtrack {
 using Microsoft::WRL::ComPtr;
 using SteadyClock = std::chrono::steady_clock;
 
+enum class LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warning,
+    Error,
+};
+
 enum class VideoCodec {
     H264,
     Hevc,
@@ -174,6 +182,7 @@ struct AppSettings {
     };
     std::vector<SoundSeparationApp> soundSeparationApps;
     bool startWithWindowsMinimized = false;
+    bool pruneStaleMicrophoneConsentEntries = false;
     bool exitToTray = false;
     uint32_t notificationSoundVolumePercent = 100;
     bool libraryGalleryView = false;
@@ -181,6 +190,7 @@ struct AppSettings {
     bool followFocusedMonitor = false;
     bool followMouseMonitor = false;
     bool captureCursor = true;
+    LogLevel logLevel = LogLevel::Debug;
 };
 
 struct CaptureTarget {

@@ -87,6 +87,10 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (startWithWindowsCheck_) {
         target.startWithWindowsMinimized = SendMessageW(startWithWindowsCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
+    if (pruneStaleMicrophoneConsentEntriesCheck_) {
+        target.pruneStaleMicrophoneConsentEntries =
+            SendMessageW(pruneStaleMicrophoneConsentEntriesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
     if (exitToTrayCheck_) {
         target.exitToTray = SendMessageW(exitToTrayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
@@ -164,8 +168,13 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
         target.gpu.allowIdleFrameSkipping =
             SendMessageW(idleFrameCoalescingCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
-    if (wgcZeroCopyCheck_) {
-        target.gpu.wgcZeroCopy = SendMessageW(wgcZeroCopyCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (captureMethodCombo_) {
+        const auto selected = SendMessageW(captureMethodCombo_, CB_GETCURSEL, 0, 0);
+        if (selected == 0) {
+            target.preferredCaptureBackend = CaptureBackend::WindowsGraphicsCapture;
+        } else if (selected == 1) {
+            target.preferredCaptureBackend = CaptureBackend::DesktopDuplication;
+        }
     }
     if (stableMultimonitorFramesCheck_) {
         target.gpu.stableMultimonitorFrames =
@@ -263,18 +272,25 @@ void MainWindow::updateSaveSettingsButton() {
     if (!saveSettingsButton_) {
         return;
     }
+    bool changed = false;
     if (settingsDirty_) {
         if (!IsWindowEnabled(saveSettingsButton_)) {
             EnableWindow(saveSettingsButton_, TRUE);
+            changed = true;
         }
-        showWindowIfHidden(saveSettingsButton_);
+        changed = showWindowIfHidden(saveSettingsButton_) || changed;
     } else {
         if (IsWindowEnabled(saveSettingsButton_)) {
             EnableWindow(saveSettingsButton_, FALSE);
+            changed = true;
         }
         if (IsWindowVisible(saveSettingsButton_)) {
             ShowWindow(saveSettingsButton_, SW_HIDE);
+            changed = true;
         }
+    }
+    if (changed && pageHost_) {
+        layoutCurrentPage();
     }
 }
 

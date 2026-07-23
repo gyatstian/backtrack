@@ -239,6 +239,9 @@ private:
     void startControllerWorker();
     void stopControllerWorker();
     bool queueControllerAction(ControllerAction action, const std::wstring& busyStatus);
+    void armControllerBusyTimer(ControllerActionKind kind);
+    void clearControllerBusyTimer();
+    void handleControllerBusySoftTimeout();
     void controllerWorkerLoop();
     ControllerActionResult executeControllerAction(const ControllerAction& action);
     void handleControllerActionComplete(const ControllerActionResult& result);
@@ -317,6 +320,7 @@ private:
     HWND outputVolumeEdit_ = nullptr;
     HWND inputVolumeEdit_ = nullptr;
     HWND startWithWindowsCheck_ = nullptr;
+    HWND pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     HWND exitToTrayCheck_ = nullptr;
     HWND notificationSoundVolumeEdit_ = nullptr;
     HWND encoderPresetCombo_ = nullptr;
@@ -337,7 +341,7 @@ private:
     HWND gpuAdaptiveCombo_ = nullptr;
     HWND gpuFrameQueueLimitEdit_ = nullptr;
     HWND idleFrameCoalescingCheck_ = nullptr;
-    HWND wgcZeroCopyCheck_ = nullptr;
+    HWND captureMethodCombo_ = nullptr;
     HWND stableMultimonitorFramesCheck_ = nullptr;
     HWND soundSeparationEnabledCheck_ = nullptr;
     HWND soundSeparationAppCombo_ = nullptr;
@@ -382,6 +386,8 @@ private:
     std::deque<ControllerAction> controllerQueue_;
     std::atomic<bool> controllerActionPending_{false};
     bool controllerWorkerStopping_ = false;
+    bool controllerBusyTimerActive_ = false;
+    std::wstring controllerBusyStatus_;
     std::thread thumbnailWorker_;
     std::mutex thumbnailQueueMutex_;
     std::condition_variable thumbnailQueueCv_;

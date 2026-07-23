@@ -117,7 +117,7 @@ HBITMAP createScaledBitmapFromRgb32(const BYTE* pixels, LONG stride, UINT source
 HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int width, int height) {
     ScopedMfStartup mf;
     if (!mf.started) {
-        Logger::instance().warning(
+        Logger::instance().warning(L"ui",
             L"Media Foundation startup failed for clip thumbnail: " + path.wstring() + L" (" + hresultToString(mf.result) + L")");
         return nullptr;
     }
@@ -133,7 +133,7 @@ HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int widt
     ComPtr<IMFSourceReader> reader;
     hr = MFCreateSourceReaderFromURL(path.c_str(), attributes.Get(), &reader);
     if (FAILED(hr) || !reader) {
-        Logger::instance().warning(
+        Logger::instance().warning(L"ui",
             L"Could not open clip for Media Foundation thumbnail: " + path.wstring() + L" (" + hresultToString(hr) + L")");
         return nullptr;
     }
@@ -150,7 +150,7 @@ HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int widt
     outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
     hr = reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, outputType.Get());
     if (FAILED(hr)) {
-        Logger::instance().warning(
+        Logger::instance().warning(L"ui",
             L"Could not configure RGB32 decode for clip thumbnail: " + path.wstring() + L" (" + hresultToString(hr) + L")");
         return nullptr;
     }
@@ -182,7 +182,7 @@ HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int widt
             &timestamp,
             &nextSample);
         if (FAILED(hr)) {
-            Logger::instance().warning(
+            Logger::instance().warning(L"ui",
                 L"Could not decode clip frame for thumbnail: " + path.wstring() + L" (" + hresultToString(hr) + L")");
             return nullptr;
         }
@@ -203,7 +203,7 @@ HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int widt
     }
 
     if (!sample || sourceWidth == 0 || sourceHeight == 0) {
-        Logger::instance().warning(L"No video frame available for clip thumbnail: " + path.wstring());
+        Logger::instance().warning(L"ui", L"No video frame available for clip thumbnail: " + path.wstring());
         return nullptr;
     }
 
@@ -240,7 +240,7 @@ HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int widt
     }
 
     if (!bitmap) {
-        Logger::instance().warning(L"Could not create bitmap for clip thumbnail: " + path.wstring());
+        Logger::instance().warning(L"ui", L"Could not create bitmap for clip thumbnail: " + path.wstring());
     }
     return bitmap;
 }
@@ -410,6 +410,7 @@ bool isSettingsControlId(int controlId) {
     case kOutputVolumeEditId:
     case kInputVolumeEditId:
     case kStartWithWindowsCheckId:
+    case kPruneStaleMicrophoneConsentEntriesCheckId:
     case kExitToTrayCheckId:
     case kNotificationSoundVolumeEditId:
     case kEncoderPresetComboId:
@@ -434,7 +435,7 @@ bool isSettingsControlId(int controlId) {
     case kGpuAdaptiveComboId:
     case kGpuFrameQueueLimitEditId:
     case kIdleFrameCoalescingCheckId:
-    case kWgcZeroCopyCheckId:
+    case kCaptureMethodComboId:
     case kFollowMouseMonitorCheckId:
     case kFollowFocusedMonitorCheckId:
     case kCaptureCursorCheckId:
@@ -819,7 +820,7 @@ HBITMAP loadShellThumbnail(const std::filesystem::path& path, int width, int hei
         return bitmap;
     }
 
-    Logger::instance().warning(
+    Logger::instance().warning(L"ui",
         L"Could not load clip thumbnail: " + path.wstring() +
         (FAILED(hr) ? L" (shell " + hresultToString(hr) + L")" : L""));
     return nullptr;

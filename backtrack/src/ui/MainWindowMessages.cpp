@@ -272,6 +272,31 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kSaveLogButtonId:
             saveLog();
             return 0;
+        case kOpenLogFolderButtonId: {
+            const auto logPath = Logger::instance().currentPath();
+            if (logPath.empty()) {
+                setStatus(L"No log folder available");
+                return 0;
+            }
+            const auto result = reinterpret_cast<INT_PTR>(ShellExecuteW(
+                window_, L"open", logPath.parent_path().c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+            if (result <= 32) {
+                setStatus(L"Could not open log folder");
+            }
+            return 0;
+        }
+        case kLogLevelComboId:
+            if (notification == CBN_SELCHANGE) {
+                const LRESULT selection = SendMessageW(reinterpret_cast<HWND>(lParam), CB_GETCURSEL, 0, 0);
+                if (selection >= static_cast<LRESULT>(LogLevel::Trace) && selection <= static_cast<LRESULT>(LogLevel::Error)) {
+                    settings_.logLevel = static_cast<LogLevel>(selection);
+                    Logger::instance().setMinLevel(settings_.logLevel);
+                    settingsStore_.save(settings_);
+                    Logger::instance().info(L"ui", std::wstring(L"Log level changed to ") + logLevelName(settings_.logLevel));
+                    setStatus(std::wstring(L"Log level: ") + logLevelName(settings_.logLevel));
+                }
+            }
+            return 0;
         case kRecoverFailedRecordingButtonId: {
             ControllerAction action;
             action.kind = ControllerActionKind::RecoverFailedRecording;
@@ -405,6 +430,10 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (wParam == kControllerBusyTimerId) {
+            handleControllerBusySoftTimeout();
+            return 0;
+        }
         break;
     case WM_MEASUREITEM:
         if (wParam == kClipListId) {
@@ -468,6 +497,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         KillTimer(window_, kDiagnosticsTimerId);
         diagnosticsTimerActive_ = false;
+        clearControllerBusyTimer();
         removeTrayIcon();
         hotkeys_.unregisterHotkeys(window_);
         stopGameIntegrations();

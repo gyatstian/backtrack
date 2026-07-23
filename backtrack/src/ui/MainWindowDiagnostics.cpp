@@ -146,18 +146,17 @@ void MainWindow::updateStats() {
     }
 
     if (diagnosticLogLabel_) {
-        const auto lines = Logger::instance().recentLines(7);
+        const auto lines = Logger::instance().recentLines(12);
         std::wstringstream stream;
         if (lines.empty()) {
             stream << L"No log lines available";
         } else {
             // Collapse runs of identical consecutive lines into "line (Nx)".
-            // Compare the message portion after the "[timestamp] [LEVEL] "
-            // prefix so repeats logged at different times still collapse.
+            // Compare message after structured timestamp/level/thread/tag fields.
             auto messageKey = [](const std::wstring& line) -> std::wstring {
                 size_t pos = 0;
-                for (int bracket = 0; bracket < 2; ++bracket) {
-                    const size_t close = line.find(L']', pos);
+                while (pos < line.size() && line[pos] == L'[') {
+                    const size_t close = line.find(L']', pos + 1);
                     if (close == std::wstring::npos) {
                         return line;
                     }

@@ -454,7 +454,7 @@ struct NvencEncoder::Impl {
             availableBitstreams.push_back(createBuffer.bitstreamBuffer);
         }
 
-        Logger::instance().info(
+        Logger::instance().info(L"encoder",
             L"NVENC initialized in zero-copy D3D11 mode at " +
             std::to_wstring(settings.width) + L"x" + std::to_wstring(settings.height) +
             L" with " + std::to_wstring(bitstreamBufferCount) + L" output buffers");
@@ -497,9 +497,9 @@ struct NvencEncoder::Impl {
         if (status != NV_ENC_SUCCESS) {
             ++consecutiveRegisterFailures;
             if (consecutiveRegisterFailures == 1) {
-                Logger::instance().error(L"nvEncRegisterResource failed: " + nvStatusName(status));
+                Logger::instance().error(L"encoder", L"nvEncRegisterResource failed: " + nvStatusName(status));
             } else if ((consecutiveRegisterFailures % 300) == 0) {
-                Logger::instance().warning(
+                Logger::instance().warning(L"encoder",
                     L"Still suppressing repeated nvEncRegisterResource failures; count=" +
                     std::to_wstring(consecutiveRegisterFailures));
             }
@@ -542,16 +542,16 @@ struct NvencEncoder::Impl {
     void noteMapFailure(NVENCSTATUS status) {
         ++consecutiveMapFailures;
         if (consecutiveMapFailures == 1) {
-            Logger::instance().error(L"nvEncMapInputResource failed: " + nvStatusName(status));
+            Logger::instance().error(L"encoder", L"nvEncMapInputResource failed: " + nvStatusName(status));
         } else if (consecutiveMapFailures == 30) {
             inputMappingFaulted = true;
             caps.available = false;
             caps.detail = L"NVENC input mapping failed repeatedly; capture pipeline disabled encoder until restart";
             encoderStats.encoderAvailable = false;
-            Logger::instance().error(caps.detail);
+            Logger::instance().error(L"encoder", caps.detail);
             shutdownEncoder();
         } else if ((consecutiveMapFailures % 300) == 0) {
-            Logger::instance().warning(
+            Logger::instance().warning(L"encoder",
                 L"Still suppressing repeated nvEncMapInputResource failures; count=" +
                 std::to_wstring(consecutiveMapFailures));
         }
@@ -561,9 +561,9 @@ struct NvencEncoder::Impl {
         if (availableBitstreams.empty()) {
             ++consecutiveOutputBufferStarvation;
             if (consecutiveOutputBufferStarvation == 1) {
-                Logger::instance().warning(L"NVENC output buffer pool is full; dropping frame until delayed output drains");
+                Logger::instance().warning(L"encoder", L"NVENC output buffer pool is full; dropping frame until delayed output drains");
             } else if ((consecutiveOutputBufferStarvation % 120) == 0) {
-                Logger::instance().warning(
+                Logger::instance().warning(L"encoder",
                     L"Still waiting for NVENC output buffers; count=" +
                     std::to_wstring(consecutiveOutputBufferStarvation));
             }
@@ -587,7 +587,7 @@ struct NvencEncoder::Impl {
         caps.available = false;
         caps.detail = detail;
         encoderStats.encoderAvailable = false;
-        Logger::instance().error(detail);
+        Logger::instance().error(L"encoder", detail);
         shutdownEncoder();
         return false;
     }
@@ -609,6 +609,9 @@ struct NvencEncoder::Impl {
             NV_ENC_LOCK_BITSTREAM lock{};
             lock.version = NV_ENC_LOCK_BITSTREAM_VER;
             lock.outputBitstream = pending.bitstream;
+            // This is a synchronous NVENC session. The driver completes the
+            // encode before this lock returns; polling can report unsupported
+            // errors on older NVIDIA drivers instead of NV_ENC_ERR_LOCK_BUSY.
             lock.doNotWait = 0;
             const NVENCSTATUS status = api.nvEncLockBitstream(session, &lock);
             if (status == NV_ENC_ERR_LOCK_BUSY && !waitForCompletion) {
@@ -673,7 +676,7 @@ struct NvencEncoder::Impl {
             return popReadyPacket(packet);
         }
         if (frame.width != settings.width || frame.height != settings.height) {
-            Logger::instance().warning(L"Frame size changed; dropping frame until capture pipeline is recreated");
+            Logger::instance().warning(L"encoder", L"Frame size changed; dropping frame until capture pipeline is recreated");
             ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
         }
@@ -687,7 +690,7 @@ struct NvencEncoder::Impl {
             expectedBufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
             break;
         default:
-            Logger::instance().warning(L"Unsupported D3D11 encoder input format; dropping frame");
+            Logger::instance().warning(L"encoder", L"Unsupported D3D11 encoder input format; dropping frame");
             ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
         }
@@ -764,16 +767,16 @@ struct NvencEncoder::Impl {
             pendingOutputs.push_back(std::move(pending));
             ++consecutiveNeedMoreInput;
             if (consecutiveNeedMoreInput == 1) {
-                Logger::instance().info(L"NVENC delayed output until more input is available");
+                Logger::instance().info(L"encoder", L"NVENC delayed output until more input is available");
             } else if ((consecutiveNeedMoreInput % 300) == 0) {
-                Logger::instance().warning(
+                Logger::instance().warning(L"encoder",
                     L"NVENC is still delaying output for reordering/lookahead; count=" +
                     std::to_wstring(consecutiveNeedMoreInput));
             }
             return popReadyPacket(packet);
         }
         if (status != NV_ENC_SUCCESS) {
-            Logger::instance().error(L"nvEncEncodePicture failed: " + nvStatusName(status));
+            Logger::instance().error(L"encoder", L"nvEncEncodePicture failed: " + nvStatusName(status));
             if (requestedKeyFrame) {
                 forceKeyFrame = true;
             }
@@ -806,7 +809,7 @@ struct NvencEncoder::Impl {
         pic.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
         const NVENCSTATUS status = api.nvEncEncodePicture(session, &pic);
         if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
-            Logger::instance().error(L"nvEncEncodePicture(EOS) failed: " + nvStatusName(status));
+            Logger::instance().error(L"encoder", L"nvEncEncodePicture(EOS) failed: " + nvStatusName(status));
         }
 
         if (status == NV_ENC_SUCCESS) {
@@ -894,7 +897,7 @@ bool NvencEncoder::initialize(D3DDevice& device, const VideoSettings& settings) 
     impl_->caps.adapterName = device.adapterName();
     impl_->caps.detail = L"Built without nvEncodeAPI.h. Install NVIDIA Video Codec SDK and rebuild to enable NVENC.";
     impl_->encoderStats.encoderAvailable = false;
-    Logger::instance().error(impl_->caps.detail);
+    Logger::instance().error(L"encoder", impl_->caps.detail);
     return false;
 #endif
 }

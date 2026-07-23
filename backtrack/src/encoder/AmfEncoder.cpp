@@ -511,7 +511,7 @@ struct AmfEncoder::Impl {
                       L" Direct3D 11 session active";
         encoderStats.encoderAvailable = true;
 
-        Logger::instance().info(
+        Logger::instance().info(L"encoder",
             std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
             L" encoder initialized in zero-copy D3D11 mode at " +
             std::to_wstring(settings.width) + L"x" + std::to_wstring(settings.height));
@@ -550,7 +550,7 @@ struct AmfEncoder::Impl {
         caps.available = false;
         caps.detail = detail;
         encoderStats.encoderAvailable = false;
-        Logger::instance().error(detail);
+        Logger::instance().error(L"encoder", detail);
         shutdownEncoder();
         return false;
     }
@@ -650,7 +650,7 @@ struct AmfEncoder::Impl {
             return popReadyPacket(packet);
         }
         if (frame.width != settings.width || frame.height != settings.height) {
-            Logger::instance().warning(L"Frame size changed; dropping frame until capture pipeline is recreated");
+            Logger::instance().warning(L"encoder", L"Frame size changed; dropping frame until capture pipeline is recreated");
             ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
         }
@@ -752,7 +752,7 @@ struct AmfEncoder::Impl {
 
         const AMF_RESULT result = encoder->Drain();
         if (result != AMF_OK && result != AMF_EOF) {
-            Logger::instance().error(L"AMF Drain failed: " + amfResultName(result));
+            Logger::instance().error(L"encoder", L"AMF Drain failed: " + amfResultName(result));
         } else {
             harvestOutputs(true);
         }
@@ -823,7 +823,7 @@ bool AmfEncoder::initialize(D3DDevice& device, const VideoSettings& settings) {
     impl_->caps.available = false;
     impl_->caps.detail = L"Built without AMF headers. Bundle the AMF SDK headers and rebuild to enable AMD encoding.";
     impl_->encoderStats.encoderAvailable = false;
-    Logger::instance().error(impl_->caps.detail);
+    Logger::instance().error(L"encoder", impl_->caps.detail);
     return false;
 #endif
 }

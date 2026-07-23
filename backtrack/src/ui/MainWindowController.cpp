@@ -38,7 +38,7 @@ void MainWindow::handleHotkey(int id) {
         ControllerAction action;
         action.kind = ControllerActionKind::ToggleRecording;
         if (queueControllerAction(std::move(action), L"Recorder is busy; hotkey ignored")) {
-            setStatus(controller_.stats().recording ? L"Stopping recording..." : L"Starting recording...");
+            setStatus(controller_.isRecording() ? L"Stopping recording..." : L"Starting recording...");
         }
     } else if (id == HotkeyService::kSaveReplayId) {
         ControllerAction action;
@@ -84,7 +84,7 @@ void MainWindow::handleLeagueKillDetected() {
     }
 
     killClipTagDeadline_ = SteadyClock::now() + std::chrono::seconds(6);
-    Logger::instance().info(L"League of Legends kill reminder triggered; replay saves are taggable for 6 seconds");
+    Logger::instance().info(L"ui", L"League of Legends kill reminder triggered; replay saves are taggable for 6 seconds");
     playActionIndicator(MB_ICONASTERISK, settings_.notificationSoundVolumePercent);
     setStatus(L"Kill detected; press replay hotkey within 6 seconds to tag it");
 }

@@ -36,6 +36,7 @@ public:
     void shutdown();
 
     RecordingStats stats() const;
+    bool isRecording() const noexcept { return recording_.load(std::memory_order_acquire); }
     EncoderCapabilities encoderCapabilities() const;
     AppSettings settings() const;
     std::wstring captureBackendStatus() const;
@@ -44,8 +45,9 @@ public:
 private:
     bool ensurePipeline();
     void stopPipeline();
-    bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason);
+    bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason, uint32_t adapterIndex);
     bool createCaptureSource(const CaptureTarget& target);
+    uint32_t pipelineAdapterForTarget(const CaptureTarget& target) const;
     uint32_t activeFrameQueueLimit(const GpuOptimizationSettings& gpuSettings) const;
     bool shouldDropForGpuProtection(bool duplicateFrame, const GpuOptimizationSettings& gpuSettings) const;
     void captureLoop();

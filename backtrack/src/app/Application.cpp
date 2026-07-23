@@ -67,28 +67,45 @@ Application::Application()
 }
 
 int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
-    Logger::instance().initialize(localAppDataPath() / L"logs" / L"backtrack.log");
-    Logger::instance().info(L"Backtrack starting");
-
     auto settings = settingsStore_.load();
     settingsStore_.save(settings);
-    updateWindowsStartupRegistration(settings.startWithWindowsMinimized);
 
     HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, kBacktrackSingleInstanceMutexName);
-    if (!instanceMutex) {
-        Logger::instance().warning(L"Single-instance mutex could not be created; continuing without duplicate launch protection");
-    } else if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        Logger::instance().info(L"Backtrack is already running; activating the existing instance");
-        if (!requestExistingInstanceActivation()) {
-            Logger::instance().warning(L"Existing Backtrack instance did not expose a main window to activate");
-        }
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        requestExistingInstanceActivation();
         CloseHandle(instanceMutex);
         return 0;
+    }
+
+    Logger::instance().initialize(localAppDataPath() / L"logs" / L"backtrack.log");
+    Logger::instance().setMinLevel(settings.logLevel);
+    Logger::instance().info(L"Backtrack starting");
+    if (!instanceMutex) {
+        Logger::instance().warning(L"Single-instance mutex could not be created; continuing without duplicate launch protection");
+    }
+    Logger::instance().info(L"app", std::wstring(L"Session config: logLevel=") + logLevelName(settings.logLevel) +
+                                     L", captureBackend=" + captureBackendName(settings.preferredCaptureBackend) +
+                                     L", replay=" + (settings.replay.enabled ? L"enabled" : L"disabled") +
+                                     L", resolution=" + std::to_wstring(settings.video.width) + L"x" +
+                                     std::to_wstring(settings.video.height) + L"@" + std::to_wstring(settings.video.fps));
+    updateWindowsStartupRegistration(settings.startWithWindowsMinimized);
+
+    if (settings.pruneStaleMicrophoneConsentEntries) {
+        pruneStaleMicrophoneConsentEntries();
     }
 
     const HRESULT com = OleInitialize(nullptr);
 
     controller_.initialize(settings);
+    const auto capabilities = controller_.encoderCapabilities();
+    Logger::instance().info(
+        L"app",
+        L"Environment: Windows=" + std::to_wstring(GetVersion()) +
+            L", adapter=" + (capabilities.adapterName.empty() ? L"unknown" : capabilities.adapterName) +
+            L", encoder=" + (capabilities.backendName.empty() ? L"unknown" : capabilities.backendName) +
+            L", encoderAvailable=" + (capabilities.available ? L"yes" : L"no") +
+            L", H264=" + (capabilities.h264 ? L"yes" : L"no") +
+            L", HEVC=" + (capabilities.hevc ? L"yes" : L"no"));
 
     MainWindow window(controller_, settingsStore_);
     const bool startMinimized = settings.startWithWindowsMinimized &&

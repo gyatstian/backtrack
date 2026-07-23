@@ -85,7 +85,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
        <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -102,7 +102,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
        <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -117,7 +117,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
        <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
@@ -134,7 +134,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;dxguid.lib;mfplat.lib;mfreadwrite.lib;mfuuid.lib;windowsapp.lib;dwmapi.lib;uxtheme.lib;ole32.lib;advapi32.lib;avrt.lib;mmdevapi.lib;winmm.lib;winhttp.lib;comctl32.lib;shell32.lib;shlwapi.lib;propsys.lib;user32.lib;gdi32.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
        <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>

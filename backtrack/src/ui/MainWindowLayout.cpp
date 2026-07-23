@@ -211,6 +211,7 @@ bool MainWindow::layoutCurrentPage() {
     };
     std::vector<Placement> placements;
     int contentBottom = kLayoutPadding;
+    std::vector<const LayoutItem*> footers;
 
     auto scaleValue = [](int value, int target, int source) {
         return source > 0 ? MulDiv(value, target, source) : value;
@@ -258,6 +259,10 @@ bool MainWindow::layoutCurrentPage() {
             if (!item.control || isSettingsCategoryTab(item.control)) {
                 continue;
             }
+            if (item.kind == LayoutItem::Kind::Footer) {
+                footers.push_back(&item);
+                continue;
+            }
             const int group = item.kind == LayoutItem::Kind::Footer ? 0 : groupFor(item.design);
             placeInColumn(
                 item,
@@ -300,20 +305,22 @@ bool MainWindow::layoutCurrentPage() {
             contentBottom = std::max(contentBottom, groupBottom);
         }
 
-        const int footerTop = contentBottom + 16;
         for (const auto& item : layoutItems_) {
             if (!item.control || isSettingsCategoryTab(item.control) || item.kind != LayoutItem::Kind::Footer) {
                 continue;
             }
-            const int itemWidth = static_cast<int>(item.design.right - item.design.left);
-            const int itemHeight = static_cast<int>(item.design.bottom - item.design.top);
-            const int width = std::min(std::max(120, itemWidth), columnWidth);
-            const int height = std::max(1, itemHeight);
-            addPlacement(item, kLayoutPadding, footerTop, width, height);
+            footers.push_back(&item);
         }
     }
 
-    pageContentHeight_ = contentBottom + kLayoutPadding;
+    int footerHeight = 0;
+    for (const auto* footer : footers) {
+        footerHeight = std::max(footerHeight, footer->windowHeight > 0
+            ? footer->windowHeight
+            : static_cast<int>(footer->design.bottom - footer->design.top));
+    }
+    // Reserve scroll space so controls do not disappear behind sticky footer.
+    pageContentHeight_ = contentBottom + kLayoutPadding + (footerHeight > 0 ? footerHeight + kLayoutPadding : 0);
     const int maxScroll = std::max(0, pageContentHeight_ - viewportHeight);
     pageScrollY_ = std::clamp(pageScrollY_, 0, maxScroll);
 
@@ -335,6 +342,15 @@ bool MainWindow::layoutCurrentPage() {
             placement.rect.top - pageScrollY_,
             placement.rect.right - placement.rect.left,
             placement.windowHeight) || changed;
+    }
+    for (const auto* footer : footers) {
+        const int designWidth = static_cast<int>(footer->design.right - footer->design.left);
+        const int height = std::max(1, footer->windowHeight > 0
+            ? footer->windowHeight
+            : static_cast<int>(footer->design.bottom - footer->design.top));
+        const int width = std::min(std::max(120, designWidth), std::max(1, viewportWidth - kLayoutPadding * 2));
+        const int y = std::max(kLayoutPadding, viewportHeight - kLayoutPadding - height);
+        changed = moveWindowIfChanged(footer->control, kLayoutPadding, y, width, height) || changed;
     }
     if (changed) {
         InvalidateRect(pageHost_, nullptr, FALSE);

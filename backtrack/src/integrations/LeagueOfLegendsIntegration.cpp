@@ -494,7 +494,7 @@ bool LeagueOfLegendsIntegration::running() const {
 void LeagueOfLegendsIntegration::workerLoop() {
     setThreadDescriptionSafe(L"Backtrack League integration");
     running_ = true;
-    Logger::instance().info(L"League of Legends integration started");
+    Logger::instance().info(L"league", L"League of Legends integration started");
 
     bool gameAvailable = false;
     bool baselineReady = false;
@@ -506,7 +506,7 @@ void LeagueOfLegendsIntegration::workerLoop() {
         auto eventData = httpGet(L"/liveclientdata/eventdata");
         if (!activePlayer || !eventData) {
             if (gameAvailable) {
-                Logger::instance().info(L"League of Legends live client data is no longer available");
+                Logger::instance().info(L"league", L"League of Legends live client data is no longer available");
             }
             gameAvailable = false;
             baselineReady = false;
@@ -526,7 +526,7 @@ void LeagueOfLegendsIntegration::workerLoop() {
         }
 
         if (!gameAvailable) {
-            Logger::instance().info(L"League of Legends live client data detected");
+            Logger::instance().info(L"league", L"League of Legends live client data detected");
         }
         gameAvailable = true;
 
@@ -543,7 +543,7 @@ void LeagueOfLegendsIntegration::workerLoop() {
                 continue;
             }
             if (isActivePlayerKill(event, names)) {
-                Logger::instance().info(L"League of Legends kill detected for clip reminder");
+                Logger::instance().info(L"league", L"League of Legends kill detected for clip reminder");
                 if (killCallback_) {
                     killCallback_();
                 }
@@ -555,7 +555,7 @@ void LeagueOfLegendsIntegration::workerLoop() {
         sleepUntilNextPoll(stopRequested_, kPollInterval);
     }
 
-    Logger::instance().info(L"League of Legends integration stopped");
+    Logger::instance().info(L"league", L"League of Legends integration stopped");
     running_ = false;
 }
 

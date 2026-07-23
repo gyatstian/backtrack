@@ -248,6 +248,7 @@ void MainWindow::startControllerWorker() {
 }
 
 void MainWindow::stopControllerWorker() {
+    clearControllerBusyTimer();
     {
         std::scoped_lock lock(controllerQueueMutex_);
         controllerWorkerStopping_ = true;
@@ -267,6 +268,7 @@ bool MainWindow::queueControllerAction(ControllerAction action, const std::wstri
         return false;
     }
 
+    const ControllerActionKind kind = action.kind;
     {
         std::scoped_lock lock(controllerQueueMutex_);
         if (controllerWorkerStopping_) {
@@ -276,7 +278,52 @@ bool MainWindow::queueControllerAction(ControllerAction action, const std::wstri
         controllerQueue_.push_back(std::move(action));
     }
     controllerQueueCv_.notify_one();
+    armControllerBusyTimer(kind);
     return true;
+}
+
+void MainWindow::armControllerBusyTimer(ControllerActionKind kind) {
+    clearControllerBusyTimer();
+    switch (kind) {
+    case ControllerActionKind::Startup:
+        controllerBusyStatus_ = L"Recorder is starting";
+        break;
+    case ControllerActionKind::ApplySettings:
+        controllerBusyStatus_ = L"Settings saved; applying capture changes";
+        break;
+    case ControllerActionKind::ToggleRecording:
+        controllerBusyStatus_ = L"Recording action in progress";
+        break;
+    case ControllerActionKind::SaveReplay:
+        controllerBusyStatus_ = L"Saving replay";
+        break;
+    case ControllerActionKind::RecoverFailedRecording:
+        controllerBusyStatus_ = L"Recovering failed recording";
+        break;
+    }
+    if (window_ && IsWindow(window_)) {
+        controllerBusyTimerActive_ =
+            SetTimer(window_, kControllerBusyTimerId, kControllerBusySoftTimeoutMs, nullptr) != 0;
+    }
+}
+
+void MainWindow::clearControllerBusyTimer() {
+    if (controllerBusyTimerActive_ && window_ && IsWindow(window_)) {
+        KillTimer(window_, kControllerBusyTimerId);
+    }
+    controllerBusyTimerActive_ = false;
+}
+
+void MainWindow::handleControllerBusySoftTimeout() {
+    if (!controllerActionPending_.load()) {
+        clearControllerBusyTimer();
+        return;
+    }
+    // Soft status only — do not clear pending (would allow double-complete races).
+    const std::wstring base =
+        controllerBusyStatus_.empty() ? L"Recorder is busy" : controllerBusyStatus_;
+    setStatus(base + L" (still working...)");
+    clearControllerBusyTimer();
 }
 
 void MainWindow::controllerWorkerLoop() {
@@ -368,7 +415,7 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         if (result.savedReplay && !action.replayTag.empty()) {
             ClipManager manager(controller_.settings().clipDirectory);
             if (!manager.addTag(result.clipPath, action.replayTag)) {
-                Logger::instance().warning(L"Could not tag saved replay: " + result.clipPath.wstring());
+                Logger::instance().warning(L"ui", L"Could not tag saved replay: " + result.clipPath.wstring());
             }
         }
         result.ok = result.savedReplay;
@@ -408,6 +455,7 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
 }
 
 void MainWindow::handleControllerActionComplete(const ControllerActionResult& result) {
+    clearControllerBusyTimer();
     controllerActionPending_ = false;
     if (result.kind == ControllerActionKind::Startup || result.kind == ControllerActionKind::ApplySettings) {
         updateGameIntegrations();
@@ -417,7 +465,7 @@ void MainWindow::handleControllerActionComplete(const ControllerActionResult& re
     }
     if (result.kind == ControllerActionKind::ToggleRecording && page_ == Page::Capture) {
         HWND button = startStopButton_ ? startStopButton_ : GetDlgItem(pageHost_, kStartStopButtonId);
-        setText(button, controller_.stats().recording ? L"Stop Recording" : L"Start Recording");
+        setText(button, controller_.isRecording() ? L"Stop Recording" : L"Start Recording");
         InvalidateRect(button, nullptr, FALSE);
     }
     if (result.refreshLibrary && page_ == Page::Library) {

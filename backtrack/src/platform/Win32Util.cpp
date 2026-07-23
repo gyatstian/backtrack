@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace backtrack {
 
@@ -20,6 +21,9 @@ namespace {
 constexpr wchar_t kRunPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kStartupApprovedRunPath[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 constexpr wchar_t kStartupValueName[] = L"Backtrack";
+constexpr wchar_t kMicrophoneConsentStorePath[] =
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\CapabilityAccessManager\\ConsentStore\\microphone\\NonPackaged";
+constexpr wchar_t kBacktrackExecutableName[] = L"backtrack.exe";
 constexpr uint8_t kStartupApprovedEnabled[] = {
     0x02, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00,
@@ -66,7 +70,7 @@ bool setRegistryString(HKEY key, const wchar_t* valueName, const std::wstring& v
         reinterpret_cast<const BYTE*>(value.c_str()),
         static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
     if (status != ERROR_SUCCESS) {
-        Logger::instance().warning(
+        Logger::instance().warning(L"platform",
             std::wstring(L"Could not write Windows startup registry value: ") + win32StatusText(status));
         return false;
     }
@@ -77,7 +81,7 @@ bool setStartupApprovedEnabled() {
     HKEY key = nullptr;
     const LSTATUS createStatus = createCurrentUserKey(kStartupApprovedRunPath, KEY_SET_VALUE, key);
     if (createStatus != ERROR_SUCCESS) {
-        Logger::instance().warning(
+        Logger::instance().warning(L"platform",
             std::wstring(L"Could not open Windows StartupApproved registry key: ") + win32StatusText(createStatus));
         return false;
     }
@@ -91,7 +95,7 @@ bool setStartupApprovedEnabled() {
         static_cast<DWORD>(sizeof(kStartupApprovedEnabled)));
     RegCloseKey(key);
     if (status != ERROR_SUCCESS) {
-        Logger::instance().warning(
+        Logger::instance().warning(L"platform",
             std::wstring(L"Could not enable Backtrack in Windows Startup Apps: ") + win32StatusText(status));
         return false;
     }
@@ -102,14 +106,14 @@ bool deleteRegistryValue(const wchar_t* keyPath, const wchar_t* valueName, const
     HKEY key = nullptr;
     const LSTATUS createStatus = createCurrentUserKey(keyPath, KEY_SET_VALUE, key);
     if (createStatus != ERROR_SUCCESS) {
-        Logger::instance().warning(std::wstring(warningPrefix) + L": " + win32StatusText(createStatus));
+        Logger::instance().warning(L"platform", std::wstring(warningPrefix) + L": " + win32StatusText(createStatus));
         return false;
     }
 
     const LSTATUS status = RegDeleteValueW(key, valueName);
     RegCloseKey(key);
     if (status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND) {
-        Logger::instance().warning(std::wstring(warningPrefix) + L": " + win32StatusText(status));
+        Logger::instance().warning(L"platform", std::wstring(warningPrefix) + L": " + win32StatusText(status));
         return false;
     }
     return true;
@@ -121,6 +125,18 @@ std::wstring quotedStartupCommand() {
         return {};
     }
     return L"\"" + path + L"\" " + kBacktrackStartupArgument;
+}
+
+std::wstring microphoneConsentKeyName(const std::wstring& executablePath) {
+    std::wstring keyName = executablePath;
+    std::replace(keyName.begin(), keyName.end(), L'\\', L'#');
+    return keyName;
+}
+
+bool isBacktrackMicrophoneConsentKey(const std::wstring& keyName) {
+    const size_t separator = keyName.rfind(L'#');
+    const wchar_t* executableName = separator == std::wstring::npos ? keyName.c_str() : keyName.c_str() + separator + 1;
+    return CompareStringOrdinal(executableName, -1, kBacktrackExecutableName, -1, TRUE) == CSTR_EQUAL;
 }
 
 std::wstring processImagePath(DWORD processId) {
@@ -279,14 +295,14 @@ bool updateWindowsStartupRegistration(bool enabled) {
     if (enabled) {
         const std::wstring command = quotedStartupCommand();
         if (command.empty()) {
-            Logger::instance().warning(L"Could not register Backtrack for Windows startup because the module path is unavailable");
+            Logger::instance().warning(L"platform", L"Could not register Backtrack for Windows startup because the module path is unavailable");
             return false;
         }
 
         HKEY key = nullptr;
         const LSTATUS createStatus = createCurrentUserKey(kRunPath, KEY_SET_VALUE, key);
         if (createStatus != ERROR_SUCCESS) {
-            Logger::instance().warning(
+            Logger::instance().warning(L"platform",
                 std::wstring(L"Could not open current-user startup registry key: ") + win32StatusText(createStatus));
             return false;
         }
@@ -295,7 +311,7 @@ bool updateWindowsStartupRegistration(bool enabled) {
         RegCloseKey(key);
         const bool startupApproved = setStartupApprovedEnabled();
         if (runValueSet && startupApproved) {
-            Logger::instance().info(L"Backtrack registered for Windows startup: " + command);
+            Logger::instance().info(L"platform", L"Backtrack registered for Windows startup: " + command);
         }
         return runValueSet && startupApproved;
     }
@@ -305,9 +321,89 @@ bool updateWindowsStartupRegistration(bool enabled) {
     const bool startupApprovedDeleted =
         deleteRegistryValue(kStartupApprovedRunPath, kStartupValueName, L"Could not remove Backtrack from Windows Startup Apps");
     if (runValueDeleted && startupApprovedDeleted) {
-        Logger::instance().info(L"Backtrack removed from Windows startup");
+        Logger::instance().info(L"platform", L"Backtrack removed from Windows startup");
     }
     return runValueDeleted && startupApprovedDeleted;
+}
+
+void pruneStaleMicrophoneConsentEntries() {
+    const std::wstring currentPath = moduleFilePath();
+    if (currentPath.empty()) {
+        Logger::instance().warning(L"platform", L"Could not clean old microphone privacy entries because the module path is unavailable");
+        return;
+    }
+
+    HKEY store = nullptr;
+    LSTATUS status = RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        kMicrophoneConsentStorePath,
+        0,
+        KEY_READ | KEY_WRITE | KEY_WOW64_64KEY,
+        &store);
+    if (status == ERROR_INVALID_PARAMETER) {
+        status = RegOpenKeyExW(HKEY_CURRENT_USER, kMicrophoneConsentStorePath, 0, KEY_READ | KEY_WRITE, &store);
+    }
+    if (status == ERROR_FILE_NOT_FOUND) {
+        return;
+    }
+    if (status != ERROR_SUCCESS) {
+        Logger::instance().warning(L"platform",
+            std::wstring(L"Could not open microphone privacy entries for cleanup: ") + win32StatusText(status));
+        return;
+    }
+
+    DWORD subkeyCount = 0;
+    DWORD maximumSubkeyLength = 0;
+    status = RegQueryInfoKeyW(
+        store,
+        nullptr,
+        nullptr,
+        nullptr,
+        &subkeyCount,
+        &maximumSubkeyLength,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr);
+    if (status != ERROR_SUCCESS) {
+        Logger::instance().warning(L"platform",
+            std::wstring(L"Could not enumerate microphone privacy entries for cleanup: ") + win32StatusText(status));
+        RegCloseKey(store);
+        return;
+    }
+
+    std::vector<std::wstring> staleKeys;
+    std::wstring keyName(maximumSubkeyLength + 1, L'\0');
+    const std::wstring currentKeyName = microphoneConsentKeyName(currentPath);
+    for (DWORD index = 0; index < subkeyCount; ++index) {
+        DWORD length = static_cast<DWORD>(keyName.size());
+        status = RegEnumKeyExW(store, index, keyName.data(), &length, nullptr, nullptr, nullptr, nullptr);
+        if (status != ERROR_SUCCESS) {
+            Logger::instance().warning(L"platform",
+                std::wstring(L"Could not read a microphone privacy entry during cleanup: ") + win32StatusText(status));
+            continue;
+        }
+
+        keyName.resize(length);
+        if (isBacktrackMicrophoneConsentKey(keyName) &&
+            CompareStringOrdinal(keyName.c_str(), -1, currentKeyName.c_str(), -1, TRUE) != CSTR_EQUAL) {
+            staleKeys.push_back(keyName);
+        }
+        keyName.resize(maximumSubkeyLength + 1);
+    }
+
+    for (const auto& staleKey : staleKeys) {
+        status = RegDeleteTreeW(store, staleKey.c_str());
+        if (status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND) {
+            Logger::instance().info(L"platform", L"Removed stale Backtrack microphone privacy entry: " + staleKey);
+        } else {
+            Logger::instance().warning(L"platform",
+                std::wstring(L"Could not remove stale Backtrack microphone privacy entry: ") + win32StatusText(status));
+        }
+    }
+    RegCloseKey(store);
 }
 
 HMONITOR monitorFromIndex(uint32_t index) {
@@ -365,6 +461,74 @@ uint32_t dxgiOutputIndexForMonitor(IDXGIAdapter* adapter, HMONITOR monitor) {
         }
     }
     return UINT32_MAX;
+}
+
+DxgiOutputLocation dxgiOutputForMonitor(HMONITOR monitor) {
+    if (!monitor) {
+        return {};
+    }
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return {};
+    }
+
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        ComPtr<IDXGIAdapter1> adapter;
+        const HRESULT adapterHr = factory->EnumAdapters1(adapterIndex, &adapter);
+        if (adapterHr == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(adapterHr) || !adapter) {
+            continue;
+        }
+
+        const uint32_t outputIndex = dxgiOutputIndexForMonitor(adapter.Get(), monitor);
+        if (outputIndex != UINT32_MAX) {
+            return {adapterIndex, outputIndex};
+        }
+    }
+    return {};
+}
+
+bool dxgiAdapterSupportsHardwareEncode(uint32_t adapterIndex) {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+
+    ComPtr<IDXGIAdapter1> adapter;
+    if (FAILED(factory->EnumAdapters1(adapterIndex, &adapter)) || !adapter) {
+        return false;
+    }
+
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(adapter->GetDesc1(&desc))) {
+        return false;
+    }
+    return desc.VendorId == 0x10DE || desc.VendorId == 0x1002;
+}
+
+uint32_t dxgiHardwareEncoderAdapterOr(uint32_t preferredAdapterIndex) {
+    if (dxgiAdapterSupportsHardwareEncode(preferredAdapterIndex)) {
+        return preferredAdapterIndex;
+    }
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return preferredAdapterIndex;
+    }
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        ComPtr<IDXGIAdapter1> adapter;
+        const HRESULT hr = factory->EnumAdapters1(adapterIndex, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (SUCCEEDED(hr) && dxgiAdapterSupportsHardwareEncode(adapterIndex)) {
+            return adapterIndex;
+        }
+    }
+    return preferredAdapterIndex;
 }
 
 HMONITOR focusedMonitorOrFallback(uint32_t fallbackIndex) {

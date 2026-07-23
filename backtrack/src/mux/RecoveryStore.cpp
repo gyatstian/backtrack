@@ -156,7 +156,7 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
 bool writeManifest(const MuxedInputs& inputs, const std::filesystem::path& tempDirectory) {
     std::ofstream stream(manifestPathFor(tempDirectory), std::ios::out | std::ios::trunc);
     if (!stream.is_open()) {
-        Logger::instance().warning(L"Could not write recording recovery manifest: " + manifestPathFor(tempDirectory).wstring());
+        Logger::instance().warning(L"mux", L"Could not write recording recovery manifest: " + manifestPathFor(tempDirectory).wstring());
         return false;
     }
 
@@ -219,7 +219,7 @@ bool muxToMp4WithRetry(const MuxedInputs& inputs, const std::filesystem::path& o
         return true;
     }
 
-    Logger::instance().warning(L"Native MP4 mux failed; retrying once after a short delay: " + outputPath.wstring());
+    Logger::instance().warning(L"mux", L"Native MP4 mux failed; retrying once after a short delay: " + outputPath.wstring());
     std::this_thread::sleep_for(std::chrono::milliseconds(350));
     return Mp4Muxer::muxToMp4(inputs, outputPath);
 }
@@ -288,11 +288,11 @@ std::filesystem::path recoverLatestFailedRecording(
     std::error_code cleanupError;
     std::filesystem::remove_all(selected->tempDirectory, cleanupError);
     if (cleanupError) {
-        Logger::instance().warning(L"Recovered recording but could not remove recovery directory: " + selected->tempDirectory.wstring());
+        Logger::instance().warning(L"mux", L"Recovered recording but could not remove recovery directory: " + selected->tempDirectory.wstring());
     }
 
     detail = L"Recovered failed recording to " + outputPath.filename().wstring();
-    Logger::instance().info(L"Recovered failed recording: " + outputPath.wstring());
+    Logger::instance().info(L"mux", L"Recovered failed recording: " + outputPath.wstring());
     return outputPath;
 }
 

@@ -743,7 +743,7 @@ bool WasapiCapture::start(CaptureOptions options, AudioPacketCallback callback) 
 
     wakeEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!wakeEvent_) {
-        Logger::instance().error(L"CreateEvent for WASAPI capture failed");
+        Logger::instance().error(L"audio", L"CreateEvent for WASAPI capture failed");
         return false;
     }
 
@@ -819,7 +819,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
     if (options.processLoopback) {
         hr = activateProcessLoopbackAudioClient(options.processId, options.processLoopbackMode, &audioClient);
         if (FAILED(hr)) {
-            Logger::instance().warning(L"Process loopback capture could not start for PID " +
+            Logger::instance().warning(L"audio", L"Process loopback capture could not start for PID " +
                                        std::to_wstring(options.processId) + L": " + hresultToString(hr));
             running_ = false;
             return;
@@ -828,7 +828,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
         if (FAILED(hr)) {
-            Logger::instance().error(L"CoCreateInstance(MMDeviceEnumerator) failed: " + hresultToString(hr));
+            Logger::instance().error(L"audio", L"CoCreateInstance(MMDeviceEnumerator) failed: " + hresultToString(hr));
             running_ = false;
             return;
         }
@@ -837,21 +837,21 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         if (!options.deviceId.empty()) {
             hr = enumerator->GetDevice(options.deviceId.c_str(), &endpoint);
             if (FAILED(hr)) {
-                Logger::instance().warning(std::wstring(L"Configured audio device was not found for ") + trackName(track) + L"; falling back to default");
+                Logger::instance().warning(L"audio", std::wstring(L"Configured audio device was not found for ") + trackName(track) + L"; falling back to default");
             }
         }
         if (!endpoint) {
             hr = enumerator->GetDefaultAudioEndpoint(dataFlowFor(track), eConsole, &endpoint);
         }
         if (FAILED(hr)) {
-            Logger::instance().error(std::wstring(L"GetDefaultAudioEndpoint failed for ") + trackName(track) + L": " + hresultToString(hr));
+            Logger::instance().error(L"audio", std::wstring(L"GetDefaultAudioEndpoint failed for ") + trackName(track) + L": " + hresultToString(hr));
             running_ = false;
             return;
         }
 
         hr = endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &audioClient);
         if (FAILED(hr)) {
-            Logger::instance().error(L"IMMDevice::Activate(IAudioClient) failed: " + hresultToString(hr));
+            Logger::instance().error(L"audio", L"IMMDevice::Activate(IAudioClient) failed: " + hresultToString(hr));
             running_ = false;
             return;
         }
@@ -861,7 +861,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
     hr = audioClient->GetMixFormat(&rawMixFormat);
     std::unique_ptr<WAVEFORMATEX, WaveFormatDeleter> mixFormat(rawMixFormat);
     if (FAILED(hr) || !mixFormat) {
-        Logger::instance().error(L"IAudioClient::GetMixFormat failed: " + hresultToString(hr));
+        Logger::instance().error(L"audio", L"IAudioClient::GetMixFormat failed: " + hresultToString(hr));
         running_ = false;
         return;
     }
@@ -886,32 +886,32 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         mixFormat.get(),
         nullptr);
     if (FAILED(hr)) {
-        Logger::instance().error(std::wstring(L"IAudioClient::Initialize failed for ") + trackName(track) + L": " + hresultToString(hr));
+        Logger::instance().error(L"audio", std::wstring(L"IAudioClient::Initialize failed for ") + trackName(track) + L": " + hresultToString(hr));
         running_ = false;
         return;
     }
 
     hr = audioClient->SetEventHandle(wakeEvent_);
     if (FAILED(hr)) {
-        Logger::instance().warning(L"IAudioClient::SetEventHandle failed; capture will use timed polling: " + hresultToString(hr));
+        Logger::instance().warning(L"audio", L"IAudioClient::SetEventHandle failed; capture will use timed polling: " + hresultToString(hr));
     }
 
     Microsoft::WRL::ComPtr<IAudioCaptureClient> captureClient;
     hr = audioClient->GetService(IID_PPV_ARGS(&captureClient));
     if (FAILED(hr)) {
-        Logger::instance().error(L"IAudioClient::GetService(IAudioCaptureClient) failed: " + hresultToString(hr));
+        Logger::instance().error(L"audio", L"IAudioClient::GetService(IAudioCaptureClient) failed: " + hresultToString(hr));
         running_ = false;
         return;
     }
 
     hr = audioClient->Start();
     if (FAILED(hr)) {
-        Logger::instance().error(L"IAudioClient::Start failed: " + hresultToString(hr));
+        Logger::instance().error(L"audio", L"IAudioClient::Start failed: " + hresultToString(hr));
         running_ = false;
         return;
     }
 
-    Logger::instance().info(std::wstring(L"WASAPI capture started for ") + trackName(track));
+    Logger::instance().info(L"audio", std::wstring(L"WASAPI capture started for ") + trackName(track));
     running_ = true;
     signalStarted(true);
 
@@ -928,7 +928,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         UINT32 packetFrames = 0;
         hr = captureClient->GetNextPacketSize(&packetFrames);
         if (FAILED(hr)) {
-            Logger::instance().warning(L"GetNextPacketSize failed: " + hresultToString(hr));
+            Logger::instance().warning(L"audio", L"GetNextPacketSize failed: " + hresultToString(hr));
             break;
         }
 
@@ -941,7 +941,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
 
             hr = captureClient->GetBuffer(&data, &framesAvailable, &flags, &devicePosition, &qpcPosition);
             if (FAILED(hr)) {
-                Logger::instance().warning(L"IAudioCaptureClient::GetBuffer failed: " + hresultToString(hr));
+                Logger::instance().warning(L"audio", L"IAudioCaptureClient::GetBuffer failed: " + hresultToString(hr));
                 break;
             }
 
@@ -980,7 +980,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
 
             hr = captureClient->ReleaseBuffer(framesAvailable);
             if (FAILED(hr)) {
-                Logger::instance().warning(L"IAudioCaptureClient::ReleaseBuffer failed: " + hresultToString(hr));
+                Logger::instance().warning(L"audio", L"IAudioCaptureClient::ReleaseBuffer failed: " + hresultToString(hr));
                 packetFrames = 0;
                 callback(std::move(packet));
                 break;
@@ -990,7 +990,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
 
             hr = captureClient->GetNextPacketSize(&packetFrames);
             if (FAILED(hr)) {
-                Logger::instance().warning(L"GetNextPacketSize failed after ReleaseBuffer: " + hresultToString(hr));
+                Logger::instance().warning(L"audio", L"GetNextPacketSize failed after ReleaseBuffer: " + hresultToString(hr));
                 packetFrames = 0;
             }
         }
@@ -998,7 +998,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
 
     audioClient->Stop();
     running_ = false;
-    Logger::instance().info(std::wstring(L"WASAPI capture stopped for ") + trackName(track));
+    Logger::instance().info(L"audio", std::wstring(L"WASAPI capture stopped for ") + trackName(track));
 
 }
 

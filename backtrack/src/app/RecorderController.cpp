@@ -59,6 +59,10 @@ CaptureTarget captureTargetForSettings(const AppSettings& settings) {
     return target;
 }
 
+HMONITOR monitorForCaptureTarget(const CaptureTarget& target) {
+    return target.monitor ? target.monitor : monitorFromIndex(target.monitorIndex);
+}
+
 size_t frameQueueCapacityFor(const GpuOptimizationSettings& settings) {
     return static_cast<size_t>(std::clamp<uint32_t>(settings.frameQueueLimit, 1, 16));
 }
@@ -74,9 +78,7 @@ const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
 }
 
 CaptureBackend selectedBackendForSettings(const AppSettings& settings) {
-    return settings.followFocusedMonitor
-        ? CaptureBackend::WindowsGraphicsCapture
-        : settings.preferredCaptureBackend;
+    return settings.preferredCaptureBackend;
 }
 
 VideoSettings activeVideoSettingsFor(const AppSettings& settings, uint32_t sourceWidth, uint32_t sourceHeight) {
@@ -334,7 +336,7 @@ bool RecorderController::initialize(AppSettings settings) {
         replay_.clear();
         replay_.configure(settings_.replay);
     }
-    Logger::instance().info(std::wstring(L"Recorder initialized: clips=") + settings_.clipDirectory.wstring() +
+    Logger::instance().info(L"recorder", std::wstring(L"Recorder initialized: clips=") + settings_.clipDirectory.wstring() +
                             L", replay=" + (settings_.replay.enabled ? L"enabled" : L"disabled") +
                             L", fps=" + std::to_wstring(settings_.video.fps) +
                             L", bitrateKbps=" + std::to_wstring(settings_.video.bitrateKbps));
@@ -345,7 +347,7 @@ bool RecorderController::updateSettings(AppSettings settings) {
     settings = sanitizeSettings(std::move(settings));
     const bool wasRunning = pipelineRunning_.load();
     const bool wasRecording = recording_.load();
-    Logger::instance().info(std::wstring(L"Applying recorder settings: pipelineRunning=") + (wasRunning ? L"yes" : L"no") +
+    Logger::instance().info(L"recorder", std::wstring(L"Applying recorder settings: pipelineRunning=") + (wasRunning ? L"yes" : L"no") +
                             L", recording=" + (wasRecording ? L"yes" : L"no"));
     if (wasRecording) {
         stopRecording();
@@ -367,11 +369,11 @@ bool RecorderController::updateSettings(AppSettings settings) {
     if (settings_.replay.enabled) {
         const bool started = ensurePipeline();
         if (!started) {
-            Logger::instance().error(L"Could not restart capture pipeline after applying settings");
+            Logger::instance().error(L"recorder", L"Could not restart capture pipeline after applying settings");
         }
         return started;
     }
-    Logger::instance().info(wasRecording
+    Logger::instance().info(L"recorder", wasRecording
                                 ? L"Recorder settings applied; recording was stopped and replay is disabled, so the pipeline remains stopped"
                                 : L"Recorder settings applied without starting pipeline because replay is disabled and no recording is active");
     return true;
@@ -379,13 +381,13 @@ bool RecorderController::updateSettings(AppSettings settings) {
 
 bool RecorderController::startRecording() {
     if (recording_) {
-        Logger::instance().info(L"Start recording requested while already recording");
+        Logger::instance().info(L"recorder", L"Start recording requested while already recording");
         return true;
     }
-    Logger::instance().info(L"Start recording requested");
+    Logger::instance().info(L"recorder", L"Start recording requested");
     setLastRecordingError({});
     if (!ensurePipeline()) {
-        Logger::instance().error(L"Recording could not start because the capture pipeline failed to start");
+        Logger::instance().error(L"recorder", L"Recording could not start because the capture pipeline failed to start");
         return false;
     }
 
@@ -396,7 +398,7 @@ bool RecorderController::startRecording() {
         videoSettings = activeVideoSettings_;
     }
     if (!muxer_.startRecording(output, videoSettings)) {
-        Logger::instance().error(L"Recording muxer could not start for output: " + output.wstring());
+        Logger::instance().error(L"recorder", L"Recording muxer could not start for output: " + output.wstring());
         if (!settings().replay.enabled) {
             stopPipeline();
         }
@@ -413,16 +415,16 @@ bool RecorderController::startRecording() {
             encoder_->requestKeyFrame();
         }
     }
-    Logger::instance().info(L"Recording started");
+    Logger::instance().info(L"recorder", L"Recording started");
     return true;
 }
 
 std::filesystem::path RecorderController::stopRecording() {
     if (!recording_) {
-        Logger::instance().info(L"Stop recording requested while no recording is active");
+        Logger::instance().info(L"recorder", L"Stop recording requested while no recording is active");
         return {};
     }
-    Logger::instance().info(L"Stop recording requested");
+    Logger::instance().info(L"recorder", L"Stop recording requested");
 
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (muxer_.videoPacketCount() == 0 && std::chrono::steady_clock::now() < deadline) {
@@ -446,7 +448,7 @@ std::filesystem::path RecorderController::stopRecording() {
     waitingForRecordingKeyFrame_ = false;
     auto output = muxer_.finalize();
     setLastRecordingError(output.empty() ? muxer_.lastError() : std::wstring());
-    Logger::instance().info(output.empty()
+    Logger::instance().info(L"recorder", output.empty()
                                 ? std::wstring(L"Recording stopped without a finalized clip")
                                 : std::wstring(L"Recording stopped and saved: ") + output.wstring());
 
@@ -457,11 +459,11 @@ std::filesystem::path RecorderController::stopRecording() {
 }
 
 std::filesystem::path RecorderController::recoverFailedRecording() {
-    Logger::instance().info(L"Recover failed recording requested");
+    Logger::instance().info(L"recorder", L"Recover failed recording requested");
     if (recording_) {
         const std::wstring detail = L"Stop the active recording before recovering a failed recording";
         setLastRecordingError(detail);
-        Logger::instance().warning(detail);
+        Logger::instance().warning(L"recorder", detail);
         return {};
     }
 
@@ -469,19 +471,21 @@ std::filesystem::path RecorderController::recoverFailedRecording() {
     const auto output = Mp4Muxer::recoverLatestFailedRecording(settings().clipDirectory, detail);
     setLastRecordingError(detail);
     if (output.empty()) {
-        Logger::instance().warning(detail.empty() ? L"Failed recording recovery did not produce a clip" : detail);
+        Logger::instance().warning(L"recorder", detail.empty() ? L"Failed recording recovery did not produce a clip" : detail);
     }
     return output;
 }
 
 std::filesystem::path RecorderController::saveReplay() {
-    Logger::instance().info(L"Save replay requested");
-    if (!ensurePipeline()) {
-        Logger::instance().error(L"Replay could not be saved because the capture pipeline failed to start");
-        return {};
-    }
+    Logger::instance().info(L"recorder", L"Save replay requested");
+    // Buffer already has keyframes: mux without restarting capture (avoids WGC
+    // recreate hangs and is unnecessary work when pipeline is already warm).
     if (replay_.videoKeyFrameCount() == 0) {
-        Logger::instance().info(L"Replay save requested before a buffered keyframe; requesting an IDR frame");
+        Logger::instance().info(L"recorder", L"Replay save has no buffered keyframe; ensuring pipeline and requesting IDR");
+        if (!ensurePipeline()) {
+            Logger::instance().error(L"recorder", L"Replay could not be saved because the capture pipeline failed to start");
+            return {};
+        }
         forceVideoHeartbeat_ = true;
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
@@ -493,6 +497,12 @@ std::filesystem::path RecorderController::saveReplay() {
         while (replay_.videoKeyFrameCount() == 0 && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
+        if (replay_.videoKeyFrameCount() == 0) {
+            Logger::instance().warning(L"recorder", L"Replay save aborted: no keyframe arrived within 3s");
+            return {};
+        }
+    } else {
+        Logger::instance().debug(L"recorder", L"Replay save using existing buffer; pipeline ensure skipped");
     }
     const std::wstring gameName = foregroundApplicationName();
     const auto output = nextClipPath(gameName.empty() ? L"replay" : gameName.c_str());
@@ -501,9 +511,10 @@ std::filesystem::path RecorderController::saveReplay() {
         std::scoped_lock lock(stateMutex_);
         videoSettings = activeVideoSettings_;
     }
+    Logger::instance().info(L"recorder", L"Replay saveTo begin: " + output.wstring());
     const bool saved = replay_.saveTo(output, videoSettings);
     if (!saved) {
-        Logger::instance().warning(std::wstring(L"Replay save failed: ") + output.wstring());
+        Logger::instance().warning(L"recorder", std::wstring(L"Replay save failed: ") + output.wstring());
     }
     return saved ? output : std::filesystem::path();
 }
@@ -544,8 +555,10 @@ RecordingStats RecorderController::stats() const {
     stats.encodeWidth = encodeWidth_.load();
     stats.encodeHeight = encodeHeight_.load();
     {
-        std::scoped_lock gpuLock(pipelineGpuMutex_);
-        if (encoder_) {
+        // Diagnostics refreshes on the UI thread. GPU recovery can hold this lock
+        // while WGC waits for outstanding frame leases, so never block UI for it.
+        std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
+        if (gpuLock.owns_lock() && encoder_) {
             stats.encoder = encoder_->stats();
         }
     }
@@ -554,8 +567,9 @@ RecordingStats RecorderController::stats() const {
 }
 
 EncoderCapabilities RecorderController::encoderCapabilities() const {
-    std::scoped_lock gpuLock(pipelineGpuMutex_);
-    if (encoder_) {
+    // See stats(): reporting must not wait for GPU teardown or recreation.
+    std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
+    if (gpuLock.owns_lock() && encoder_) {
         return encoder_->capabilities();
     }
     return {};
@@ -582,7 +596,7 @@ bool RecorderController::ensurePipeline() {
     }
 
     AppSettings snapshot = settings();
-    Logger::instance().info(std::wstring(L"Starting capture pipeline: clips=") + snapshot.clipDirectory.wstring() +
+    Logger::instance().info(L"recorder", std::wstring(L"Starting capture pipeline: clips=") + snapshot.clipDirectory.wstring() +
                             L", captureBackend=" +
                             (snapshot.preferredCaptureBackend == CaptureBackend::WindowsGraphicsCapture ? L"WGC" : L"Desktop Duplication") +
                             L", followFocusedMonitor=" + (snapshot.followFocusedMonitor ? L"yes" : L"no") +
@@ -592,7 +606,7 @@ bool RecorderController::ensurePipeline() {
     std::error_code directoryError;
     std::filesystem::create_directories(snapshot.clipDirectory, directoryError);
     if (directoryError) {
-        Logger::instance().error(std::wstring(L"Could not create clip directory: ") + snapshot.clipDirectory.wstring() +
+        Logger::instance().error(L"recorder", std::wstring(L"Could not create clip directory: ") + snapshot.clipDirectory.wstring() +
                                  L" (" + utf8ToWide(directoryError.message()) + L")");
         std::scoped_lock lock(captureStatusMutex_);
         captureBackendActive_ = false;
@@ -603,8 +617,8 @@ bool RecorderController::ensurePipeline() {
     frameQueue_.resetCapacity(frameQueueCapacityFor(snapshot.gpu));
 
     const CaptureTarget target = captureTargetForSettings(snapshot);
-    if (!recreateGpuPipeline(target, L"pipeline start")) {
-        Logger::instance().error(L"Capture pipeline start failed during GPU/capture initialization");
+    if (!recreateGpuPipeline(target, L"pipeline start", pipelineAdapterForTarget(target))) {
+        Logger::instance().error(L"recorder", L"Capture pipeline start failed during GPU/capture initialization");
         return false;
     }
 
@@ -639,7 +653,7 @@ bool RecorderController::ensurePipeline() {
     }
     if (snapshot.captureMicrophone) {
         if (!microphoneAudio_.start(AudioTrack::Microphone, snapshot.audioInputDeviceId, [this](AudioPacket&& packet) { handleAudioPacket(std::move(packet)); })) {
-            Logger::instance().warning(L"Microphone capture did not start");
+            Logger::instance().warning(L"recorder", L"Microphone capture did not start");
         }
     }
 
@@ -652,7 +666,7 @@ bool RecorderController::ensurePipeline() {
         std::scoped_lock lock(stateMutex_);
         videoSettings = activeVideoSettings_;
     }
-    Logger::instance().info(std::wstring(L"Capture/encode pipeline started: capture=") + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
+    Logger::instance().info(L"recorder", std::wstring(L"Capture/encode pipeline started: capture=") + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
                             L", encode=" + std::to_wstring(videoSettings.width) + L"x" + std::to_wstring(videoSettings.height));
     return true;
 }
@@ -662,18 +676,28 @@ void RecorderController::stopPipeline() {
         return;
     }
 
+    Logger::instance().info(L"recorder", L"Capture/encode pipeline stop requested");
     stopRequested_ = true;
+    // Do not drain stale GPU work during a settings/backend switch. This lets
+    // encodeLoop release frame leases and exit instead of submitting old input.
+    discardQueuedFrames_.store(true, std::memory_order_release);
     systemAudio_.stop();
     microphoneAudio_.stop();
+    Logger::instance().info(L"recorder", L"Capture/encode pipeline audio stopped; joining video workers");
     if (frameEvent_) {
         SetEvent(frameEvent_);
     }
     if (captureThread_.joinable()) {
+        Logger::instance().info(L"recorder", L"Waiting for capture worker to stop");
         captureThread_.join();
+        Logger::instance().info(L"recorder", L"Capture worker stopped");
     }
     if (encodeThread_.joinable()) {
+        Logger::instance().info(L"recorder", L"Waiting for encode worker to stop");
         encodeThread_.join();
+        Logger::instance().info(L"recorder", L"Encode worker stopped");
     }
+    Logger::instance().debug(L"recorder", L"Capture/encode threads joined");
 
     if (audioEvent_) {
         SetEvent(audioEvent_);
@@ -687,12 +711,14 @@ void RecorderController::stopPipeline() {
         systemAudioMutedExecutableKeys_.clear();
         systemAudioSessionMutesActive_ = false;
     }
+    // Drop any remaining GpuFrame leases before capture shutdown so WGC
+    // Direct3D11CaptureFrame refs are released first.
     frameQueue_.clear();
     systemAudioQueue_.clear();
     microphoneAudioQueue_.clear();
 
     const RecordingStats finalStats = stats();
-    Logger::instance().info(
+    Logger::instance().info(L"recorder",
         L"Capture/encode summary: timeline intervals=" +
         std::to_wstring(finalStats.capturedFrames) +
         L", source frames=" + std::to_wstring(finalStats.sourceFrames) +
@@ -723,10 +749,12 @@ void RecorderController::stopPipeline() {
         }
         scaler_.reset();
     }
+    Logger::instance().debug(L"recorder", L"Capture source shutdown begin");
     if (capture_) {
         capture_->shutdown();
         capture_.reset();
     }
+    Logger::instance().debug(L"recorder", L"Capture source shutdown done; D3D shutdown begin");
     d3d_.shutdown();
     {
         std::scoped_lock lock(captureStatusMutex_);
@@ -739,11 +767,23 @@ void RecorderController::stopPipeline() {
     }
 
     pipelineRunning_ = false;
-    Logger::instance().info(L"Capture/encode pipeline stopped");
+    Logger::instance().info(L"recorder", L"Capture/encode pipeline stopped");
 }
 
-bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason) {
-    Logger::instance().info(std::wstring(L"Recreating GPU pipeline: ") + (reason ? reason : L"unspecified"));
+uint32_t RecorderController::pipelineAdapterForTarget(const CaptureTarget& target) const {
+    const DxgiOutputLocation location = dxgiOutputForMonitor(monitorForCaptureTarget(target));
+    if (location.valid() && dxgiAdapterSupportsHardwareEncode(location.adapterIndex)) {
+        return location.adapterIndex;
+    }
+    // WGC bridges capture adapters, so select an adapter with a supported encoder.
+    return dxgiHardwareEncoderAdapterOr(d3d_.adapterIndex());
+}
+
+bool RecorderController::recreateGpuPipeline(
+    const CaptureTarget& target,
+    const wchar_t* reason,
+    uint32_t adapterIndex) {
+    Logger::instance().info(L"recorder", std::wstring(L"Recreating GPU pipeline: ") + (reason ? reason : L"unspecified"));
 
     const uint64_t discardGeneration =
         discardRequestGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -754,10 +794,16 @@ bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const 
 
     // Only encodeLoop consumes frameQueue_. Drain old-device frames before D3D teardown.
     if (encodeThread_.joinable()) {
+        Logger::instance().debug(L"recorder", L"GPU recreate waiting for encode-loop frame discard");
         std::unique_lock discardLock(frameDiscardMutex_);
         frameDiscardComplete_.wait(discardLock, [this, discardGeneration] {
             return discardCompletedGeneration_.load(std::memory_order_acquire) >= discardGeneration;
         });
+        Logger::instance().debug(L"recorder", L"GPU recreate encode-loop discard complete");
+    } else {
+        // Settings/stop path already joined encodeThread_; drop any leftover frames.
+        frameQueue_.clear();
+        Logger::instance().debug(L"recorder", L"GPU recreate skipped discard wait (encode thread not running)");
     }
 
     std::scoped_lock gpuLock(pipelineGpuMutex_);
@@ -768,20 +814,23 @@ bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const 
     }
     scaler_.reset();
     if (capture_) {
+        Logger::instance().debug(L"recorder", L"GPU recreate capture shutdown begin");
         capture_->shutdown();
         capture_.reset();
+        Logger::instance().debug(L"recorder", L"GPU recreate capture shutdown done");
     }
 
-    if (!d3d_.initialize(d3d_.adapterIndex())) {
-        Logger::instance().error(L"GPU pipeline recreate failed during D3D initialization");
+    if (!d3d_.initialize(adapterIndex)) {
+        Logger::instance().error(L"recorder", L"GPU pipeline recreate failed during D3D initialization");
         std::scoped_lock lock(captureStatusMutex_);
         captureBackendActive_ = false;
         captureBackendStatus_ = L"Capture pipeline failed: Direct3D initialization failed";
         return false;
     }
+    Logger::instance().debug(L"recorder", L"GPU recreate D3D initialized; creating capture source");
 
     if (!createCaptureSource(target)) {
-        Logger::instance().error(L"GPU pipeline recreate failed because no capture source could initialize");
+        Logger::instance().error(L"recorder", L"GPU pipeline recreate failed because no capture source could initialize");
         return false;
     }
 
@@ -804,7 +853,7 @@ bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const 
 
     encoder_ = createEncoderForDevice(d3d_);
     if (!encoder_ || !encoder_->initialize(d3d_, videoSettings)) {
-        Logger::instance().error(L"GPU pipeline recreate failed during encoder initialization");
+        Logger::instance().error(L"recorder", L"GPU pipeline recreate failed during encoder initialization");
         {
             std::scoped_lock lock(captureStatusMutex_);
             captureBackendActive_ = false;
@@ -819,7 +868,7 @@ bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const 
 
     forceVideoHeartbeat_ = true;
     encoder_->requestKeyFrame();
-    Logger::instance().info(
+    Logger::instance().info(L"recorder",
         L"GPU pipeline ready: capture=" + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
         L", encode=" + std::to_wstring(videoSettings.width) + L"x" + std::to_wstring(videoSettings.height) +
         L", adapter=" + d3d_.adapterName());
@@ -842,26 +891,51 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
     }
 
     auto tryInitialize = [&](std::unique_ptr<ICaptureSource> source, const wchar_t* name) -> std::unique_ptr<ICaptureSource> {
-        Logger::instance().debug(std::wstring(L"Initializing capture source: ") + name);
+        Logger::instance().info(L"recorder", std::wstring(L"Initializing capture source: ") + name);
         if (source->initialize(d3d_, snapshot, target)) {
-            Logger::instance().debug(std::wstring(L"Capture source initialized: ") + name);
+            Logger::instance().info(L"recorder", std::wstring(L"Capture source initialized: ") + name);
             return std::move(source);
         }
-        Logger::instance().warning(std::wstring(L"Capture source initialization failed: ") + name);
+        Logger::instance().warning(L"recorder", std::wstring(L"Capture source initialization failed: ") + name);
         source->shutdown();
         return {};
     };
 
+    const HMONITOR monitor = monitorForCaptureTarget(target);
+    const DxgiOutputLocation location = dxgiOutputForMonitor(monitor);
+    const bool dxgiTargetEncodable = location.valid() &&
+        dxgiAdapterSupportsHardwareEncode(location.adapterIndex);
+    const bool dxgiTargetOnActiveAdapter = dxgiTargetEncodable &&
+        location.adapterIndex == d3d_.adapterIndex();
+    bool dxgiSkippedForTarget = false;
+
     std::unique_ptr<ICaptureSource> initialized;
-    if (snapshot.followFocusedMonitor || snapshot.preferredCaptureBackend == CaptureBackend::WindowsGraphicsCapture) {
+    if (selectedBackend == CaptureBackend::WindowsGraphicsCapture) {
         wgcAttempted = true;
         initialized = tryInitialize(std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture");
         wgcFailed = !initialized;
     }
 
-    // Always allow Desktop Duplication fallback, including follow-monitor mode
-    // (monitor is resolved via HMONITOR → DXGI output mapping).
-    if (!initialized) {
+    if (!initialized && selectedBackend == CaptureBackend::DesktopDuplication && !dxgiTargetOnActiveAdapter) {
+        const wchar_t* detail = !location.valid()
+            ? L"monitor has no DXGI output"
+            : !dxgiTargetEncodable
+                ? L"monitor adapter has no supported hardware encoder"
+                : L"target adapter differs from active D3D adapter";
+        Logger::instance().warning(L"recorder",
+            std::wstring(L"Desktop Duplication unavailable for target; using WGC: ") + detail);
+        dxgiSkippedForTarget = true;
+        wgcAttempted = true;
+        initialized = tryInitialize(std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture");
+        wgcFailed = !initialized;
+    }
+
+    // WGC fallback may use Desktop Duplication only when output and active D3D
+    // device share an encoder-capable adapter.
+    if (!initialized && dxgiTargetOnActiveAdapter) {
+        if (wgcAttempted && wgcFailed) {
+            Logger::instance().info(L"recorder", L"WGC failed; attempting Desktop Duplication fallback");
+        }
         initialized = tryInitialize(std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication");
     }
 
@@ -886,7 +960,9 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
         captureBackendStatus_ = std::wstring(L"Selected backend: ") + captureBackendDisplayName(selectedBackend) +
             L"; active backend: " + captureBackendDisplayName(activeBackend);
         if (fallbackUsed) {
-            captureBackendStatus_ += L" (fallback after WGC failed)";
+            captureBackendStatus_ += dxgiSkippedForTarget
+                ? L" (DXGI unavailable for target adapter)"
+                : L" (fallback after WGC failed)";
         }
     }
 
@@ -1090,6 +1166,10 @@ void RecorderController::captureLoop() {
     };
 
     auto switchCaptureTarget = [&](const CaptureTarget& target, const wchar_t* reason) -> bool {
+        const uint32_t targetAdapter = pipelineAdapterForTarget(target);
+        if (targetAdapter != d3d_.adapterIndex()) {
+            return recreateGpuPipeline(target, reason, targetAdapter);
+        }
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
             if (!createCaptureSource(target) || !capture_) {
@@ -1117,7 +1197,7 @@ void RecorderController::captureLoop() {
             SetEvent(frameEvent_);
         }
         refreshCaptureDimensions();
-        Logger::instance().info(std::wstring(L"Capture source switched: ") + reason);
+        Logger::instance().info(L"recorder", std::wstring(L"Capture source switched: ") + reason);
         return true;
     };
 
@@ -1171,7 +1251,7 @@ void RecorderController::captureLoop() {
             }
         }
 
-        const bool acquired = capture_ && capture_->acquireNextFrame(frame, timeoutMs);
+            const bool acquired = capture_ && capture_->acquireNextFrame(frame, timeoutMs);
         if (acquired) {
             ++sourceFrames_;
             if (frame.pts100ns <= lastFrame.pts100ns) {
@@ -1190,6 +1270,13 @@ void RecorderController::captureLoop() {
             bool scaled = false;
             {
                 std::scoped_lock gpuLock(pipelineGpuMutex_);
+                // Keep encoder/lastFrame input independent from either capture
+                // backend's pool while settings teardown destroys the source.
+                const bool forceOwnedTexture =
+                    (capture_ &&
+                     (capture_->backend() == CaptureBackend::WindowsGraphicsCapture ||
+                      capture_->backend() == CaptureBackend::DesktopDuplication)) ||
+                    (captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
                 scaled = scaler_.scale(
                     d3d_,
                     frame,
@@ -1197,7 +1284,7 @@ void RecorderController::captureLoop() {
                     videoSettings.height,
                     encodeFrame,
                     captureSettings.followFocusedMonitor,
-                    captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames,
+                    forceOwnedTexture,
                     encoderInputFormat);
             }
             if (!scaled) {
@@ -1240,12 +1327,14 @@ void RecorderController::captureLoop() {
                 ? captureTargetForSettings(captureSettings)
                 : activeCaptureTarget_;
             if (deviceRemoved || encoderFaulted) {
-                Logger::instance().warning(
+                Logger::instance().warning(L"recorder",
                     deviceRemoved
                         ? L"D3D device removed; recreating full GPU pipeline"
                         : L"Hardware encoder faulted; recreating full GPU pipeline");
                 if (recreateGpuPipeline(
-                        target, deviceRemoved ? L"device removed" : L"encoder fault")) {
+                        target,
+                        deviceRemoved ? L"device removed" : L"encoder fault",
+                        pipelineAdapterForTarget(target))) {
                     // Full recreate waits for encode-loop discard before refreshing both settings.
                     {
                         std::scoped_lock stateLock(stateMutex_);
@@ -1269,7 +1358,7 @@ void RecorderController::captureLoop() {
                     }
                 }
             } else {
-                Logger::instance().warning(L"Capture access lost; recreating capture source");
+                Logger::instance().warning(L"recorder", L"Capture access lost; recreating capture source");
                 if (switchCaptureTarget(target, L"device/access loss")) {
                     // capture-only path
                 }
@@ -1325,7 +1414,7 @@ void RecorderController::encodeLoop() {
         if (pendingDurations.size() >= kMaxPendingDurations &&
             pendingDurations.find(pts100ns) == pendingDurations.end()) {
             pendingDurations.clear();
-            Logger::instance().warning(L"Discarded unmatched pending video durations after reaching limit");
+            Logger::instance().warning(L"recorder", L"Discarded unmatched pending video durations after reaching limit");
         }
         auto [it, inserted] = pendingDurations.try_emplace(pts100ns, duration100ns);
         if (!inserted) {
@@ -1451,7 +1540,7 @@ void RecorderController::handleAudioPacket(AudioPacket&& packet) {
             : microphoneAudioQueueDrops_;
         const uint64_t dropped = drops.fetch_add(1, std::memory_order_relaxed) + 1;
         if (dropped == 1 || dropped % 256 == 0) {
-            Logger::instance().warning(
+            Logger::instance().warning(L"recorder",
                 std::wstring(L"Audio queue full; dropped ") +
                 (track == AudioTrack::System ? L"system" : L"microphone") +
                 L" packet(s): " + std::to_wstring(dropped));
@@ -1522,7 +1611,7 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) 
     } else {
         const uint32_t mutedCount = WasapiCapture::applySessionMutesForExecutables(mutedKeys);
         systemAudioSessionMutesActive_ = mutedCount > 0;
-        Logger::instance().info(
+        Logger::instance().info(L"recorder",
             L"Sound separation muting " + std::to_wstring(mutedCount) +
             L" audio session(s) across " + std::to_wstring(mutedKeys.size()) + L" executable(s)");
     }
@@ -1535,7 +1624,7 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) 
         [this](AudioPacket&& packet) { handleAudioPacket(std::move(packet)); });
 
     if (!started) {
-        Logger::instance().warning(L"System audio capture did not start");
+        Logger::instance().warning(L"recorder", L"System audio capture did not start");
         WasapiCapture::clearSessionMutes();
         systemAudioSessionMutesActive_ = false;
         systemAudioMutedExecutableKeys_.clear();

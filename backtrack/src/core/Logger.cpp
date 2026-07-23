@@ -3,21 +3,21 @@
 #include <Windows.h>
 
 #include <chrono>
-#include <deque>
+#include <cwctype>
 #include <fstream>
 #include <iomanip>
-#include <iterator>
 #include <sstream>
 
 namespace backtrack {
 
 namespace {
 
-constexpr uintmax_t kMaxLogBytes = 8ull * 1024ull * 1024ull;
-constexpr uintmax_t kRecentLogReadBytes = 256ull * 1024ull;
+constexpr size_t kRecentLineCapacity = 200;
 
 const wchar_t* levelName(LogLevel level) {
     switch (level) {
+    case LogLevel::Trace:
+        return L"TRACE";
     case LogLevel::Debug:
         return L"DEBUG";
     case LogLevel::Info:
@@ -41,13 +41,9 @@ std::wstring timestamp() {
     return stream.str();
 }
 
-void rotateLogIfNeeded(const std::filesystem::path& logPath) {
+void archivePreviousLog(const std::filesystem::path& logPath) {
     std::error_code error;
     if (!std::filesystem::exists(logPath, error) || error) {
-        return;
-    }
-    const auto bytes = std::filesystem::file_size(logPath, error);
-    if (error || bytes < kMaxLogBytes) {
         return;
     }
 
@@ -56,33 +52,8 @@ void rotateLogIfNeeded(const std::filesystem::path& logPath) {
     error = {};
     std::filesystem::rename(logPath, archivedPath, error);
     if (error) {
-        OutputDebugStringW((L"Could not rotate Backtrack log file: " + logPath.wstring() + L"\n").c_str());
+        OutputDebugStringW((L"Could not archive previous Backtrack log file: " + logPath.wstring() + L"\n").c_str());
     }
-}
-
-std::wstring logBytesToWide(const std::string& value) {
-    if (value.empty()) {
-        return {};
-    }
-    const int size = MultiByteToWideChar(
-        CP_UTF8,
-        MB_ERR_INVALID_CHARS,
-        value.data(),
-        static_cast<int>(value.size()),
-        nullptr,
-        0);
-    if (size > 0) {
-        std::wstring result(static_cast<size_t>(size), L'\0');
-        MultiByteToWideChar(
-            CP_UTF8,
-            MB_ERR_INVALID_CHARS,
-            value.data(),
-            static_cast<int>(value.size()),
-            result.data(),
-            size);
-        return result;
-    }
-    return {value.begin(), value.end()};
 }
 
 } // namespace
@@ -105,13 +76,14 @@ void Logger::initialize(const std::filesystem::path& logPath) {
             return;
         }
     }
-    rotateLogIfNeeded(logPath);
+    archivePreviousLog(logPath);
     logPath_ = logPath;
-    stream_.open(logPath, std::ios::out | std::ios::binary | std::ios::app);
+    stream_.open(logPath, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!stream_.is_open()) {
         OutputDebugStringW((L"Could not open Backtrack log file: " + logPath.wstring() + L"\n").c_str());
     }
     rateStates_.clear();
+    recentLines_.clear();
 }
 
 void Logger::setMinLevel(LogLevel level) {
@@ -126,6 +98,14 @@ LogLevel Logger::minLevel() const {
 
 void Logger::writeLine(const std::wstring& text) {
     // Caller holds mutex_.
+    std::wstring line = text;
+    while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) {
+        line.pop_back();
+    }
+    recentLines_.push_back(std::move(line));
+    while (recentLines_.size() > kRecentLineCapacity) {
+        recentLines_.pop_front();
+    }
     if (stream_.is_open()) {
         stream_ << wideToUtf8(text);
         stream_.flush();
@@ -134,6 +114,10 @@ void Logger::writeLine(const std::wstring& text) {
 }
 
 void Logger::write(LogLevel level, const std::wstring& message) {
+    write(level, nullptr, message);
+}
+
+void Logger::write(LogLevel level, const wchar_t* subsystem, const std::wstring& message) {
     std::scoped_lock lock(mutex_);
 
     if (level < minLevel_) {
@@ -150,7 +134,7 @@ void Logger::write(LogLevel level, const std::wstring& message) {
     constexpr size_t kMaxPerWindow = 3;
 
     const auto now = std::chrono::steady_clock::now();
-    const bool throttleable = level != LogLevel::Error;
+    const bool throttleable = level != LogLevel::Error && minLevel_ > LogLevel::Debug;
 
     if (throttleable) {
         // Bound memory: messages with embedded values (PIDs, dimensions) create
@@ -168,13 +152,19 @@ void Logger::write(LogLevel level, const std::wstring& message) {
 
         auto& state = rateStates_[message];
         state.level = level;
+        state.threadId = GetCurrentThreadId();
+        state.subsystem = subsystem ? subsystem : L"";
         if (state.windowStart == std::chrono::steady_clock::time_point{} ||
             now - state.windowStart >= kWindow) {
             // Window rolled over: report anything suppressed in the prior window.
             if (state.suppressed > 0) {
                 std::wstringstream summary;
-                summary << L"[" << timestamp() << L"] [" << levelName(state.level) << L"] "
-                        << message << L" (rate limited " << state.suppressed
+                summary << L"[" << timestamp() << L"] [" << levelName(state.level) << L"] [tid="
+                        << state.threadId << L"]";
+                if (!state.subsystem.empty()) {
+                    summary << L" [" << state.subsystem << L"]";
+                }
+                summary << L" " << message << L" (rate limited " << state.suppressed
                         << L" occurrence" << (state.suppressed == 1 ? L"" : L"s")
                         << L" in previous " << std::chrono::duration_cast<std::chrono::seconds>(kWindow).count()
                         << L"s)\n";
@@ -193,8 +183,20 @@ void Logger::write(LogLevel level, const std::wstring& message) {
     }
 
     std::wstringstream line;
-    line << L"[" << timestamp() << L"] [" << levelName(level) << L"] " << message << L"\n";
+    line << L"[" << timestamp() << L"] [" << levelName(level) << L"] [tid="
+         << GetCurrentThreadId() << L"]";
+    if (subsystem && *subsystem) {
+        line << L" [" << subsystem << L"]";
+    }
+    line << L" " << message << L"\n";
     writeLine(line.str());
+}
+
+void Logger::flush() {
+    std::scoped_lock lock(mutex_);
+    if (stream_.is_open()) {
+        stream_.flush();
+    }
 }
 
 std::filesystem::path Logger::currentPath() const {
@@ -203,51 +205,12 @@ std::filesystem::path Logger::currentPath() const {
 }
 
 std::vector<std::wstring> Logger::recentLines(size_t maxLines) const {
-    std::filesystem::path path;
-    {
-        std::scoped_lock lock(mutex_);
-        path = logPath_;
-    }
-    if (path.empty() || maxLines == 0) {
+    std::scoped_lock lock(mutex_);
+    if (maxLines == 0 || recentLines_.empty()) {
         return {};
     }
-
-    std::error_code error;
-    const auto bytes = std::filesystem::file_size(path, error);
-    if (error) {
-        return {};
-    }
-
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream.is_open()) {
-        return {};
-    }
-
-    const bool truncated = bytes > kRecentLogReadBytes;
-    if (truncated) {
-        stream.seekg(static_cast<std::streamoff>(bytes - kRecentLogReadBytes), std::ios::beg);
-    }
-    std::string data((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
-    if (truncated) {
-        const auto firstNewline = data.find('\n');
-        if (firstNewline != std::string::npos) {
-            data.erase(0, firstNewline + 1);
-        }
-    }
-
-    std::deque<std::wstring> lines;
-    std::istringstream input(data);
-    std::string line;
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        lines.push_back(logBytesToWide(line));
-        while (lines.size() > maxLines) {
-            lines.pop_front();
-        }
-    }
-    return {lines.begin(), lines.end()};
+    const size_t count = std::min(maxLines, recentLines_.size());
+    return {recentLines_.end() - static_cast<std::ptrdiff_t>(count), recentLines_.end()};
 }
 
 std::wstring hresultToString(HRESULT hr) {
@@ -303,6 +266,24 @@ std::string wideToUtf8(const std::wstring& value) {
     std::string result(static_cast<size_t>(size), '\0');
     WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
     return result;
+}
+
+const wchar_t* logLevelName(LogLevel level) {
+    return levelName(level);
+}
+
+LogLevel logLevelFromName(const std::wstring& value, LogLevel fallback) {
+    std::wstring normalized;
+    normalized.reserve(value.size());
+    for (const wchar_t ch : value) {
+        normalized.push_back(static_cast<wchar_t>(std::towlower(ch)));
+    }
+    if (normalized == L"trace") return LogLevel::Trace;
+    if (normalized == L"debug") return LogLevel::Debug;
+    if (normalized == L"info") return LogLevel::Info;
+    if (normalized == L"warn" || normalized == L"warning") return LogLevel::Warning;
+    if (normalized == L"error") return LogLevel::Error;
+    return fallback;
 }
 
 } // namespace backtrack

@@ -34,7 +34,7 @@ public:
         std::error_code error;
         std::filesystem::remove_all(path_, error);
         if (error) {
-            Logger::instance().warning(L"Could not remove replay temporary directory: " + path_.wstring());
+            Logger::instance().warning(L"replay", L"Could not remove replay temporary directory: " + path_.wstring());
         }
         path_.clear();
     }
@@ -225,7 +225,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
     }
 
     if (video.empty()) {
-        Logger::instance().warning(L"Replay requested but video buffer is empty");
+        Logger::instance().warning(L"replay", L"Replay requested but video buffer is empty");
         return false;
     }
 
@@ -266,7 +266,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
     }
 
     if (firstKeyFrame == video.end()) {
-        Logger::instance().warning(L"Replay requested but buffer does not contain a keyframe yet");
+        Logger::instance().warning(L"replay", L"Replay requested but buffer does not contain a keyframe yet");
         return false;
     }
 
@@ -277,7 +277,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
         std::error_code error;
         std::filesystem::create_directories(outputPath.parent_path(), error);
         if (error) {
-            Logger::instance().error(L"Could not create replay output directory: " + outputPath.parent_path().wstring());
+            Logger::instance().error(L"replay", L"Could not create replay output directory: " + outputPath.parent_path().wstring());
             return false;
         }
     }
@@ -286,7 +286,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
     std::error_code tempError;
     std::filesystem::create_directories(tempDirectory, tempError);
     if (tempError) {
-        Logger::instance().error(L"Could not create replay temporary directory: " + tempDirectory.wstring());
+        Logger::instance().error(L"replay", L"Could not create replay temporary directory: " + tempDirectory.wstring());
         return false;
     }
     ScopedDirectoryCleanup cleanup(tempDirectory);
@@ -295,7 +295,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
 
     std::ofstream videoStream(videoPath, std::ios::binary | std::ios::out | std::ios::trunc);
     if (!videoStream.is_open()) {
-        Logger::instance().error(L"Could not open replay video stream: " + videoPath.wstring());
+        Logger::instance().error(L"replay", L"Could not open replay video stream: " + videoPath.wstring());
         return false;
     }
     std::vector<MuxedInputs::VideoSample> videoSamples;
@@ -312,7 +312,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
     }
     videoStream.close();
     if (!videoStream) {
-        Logger::instance().error(L"Could not write replay video stream: " + videoPath.wstring());
+        Logger::instance().error(L"replay", L"Could not write replay video stream: " + videoPath.wstring());
         return false;
     }
 
@@ -326,7 +326,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
         writeTimelineAudio(systemWriter, systemAudio, systemPath, replayStartPts, replayEndPts);
         if (systemWriter.dataBytes() == 0) {
             systemPath.clear();
-            Logger::instance().warning(L"Replay system audio stream had no samples on the saved timeline");
+            Logger::instance().warning(L"replay", L"Replay system audio stream had no samples on the saved timeline");
         }
     }
 
@@ -335,7 +335,7 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
         writeTimelineAudio(microphoneWriter, microphoneAudio, microphonePath, replayStartPts, replayEndPts);
         if (microphoneWriter.dataBytes() == 0) {
             microphonePath.clear();
-            Logger::instance().warning(L"Replay microphone audio stream had no samples on the saved timeline");
+            Logger::instance().warning(L"replay", L"Replay microphone audio stream had no samples on the saved timeline");
         }
     }
 
@@ -355,11 +355,11 @@ bool ReplayBuffer::saveTo(const std::filesystem::path& outputPath, const VideoSe
     if (ok) {
         std::scoped_lock lock(mutex_);
         lastSaveEndPts100ns_ = newestVideoEndPts;
-        Logger::instance().info(L"Replay saved: " + outputPath.wstring());
+        Logger::instance().info(L"replay", L"Replay saved: " + outputPath.wstring());
     } else {
         std::error_code removeError;
         std::filesystem::remove(outputPath, removeError);
-        Logger::instance().warning(L"Replay mux failed; removed temporary replay files for " + outputPath.wstring());
+        Logger::instance().warning(L"replay", L"Replay mux failed; removed temporary replay files for " + outputPath.wstring());
     }
     return ok;
 }

@@ -43,7 +43,7 @@ void MainWindow::setLibraryViewMode(LibraryViewMode mode) {
     settings_ = controller_.settings();
     settings_.libraryGalleryView = mode == LibraryViewMode::Gallery;
     settingsStore_.save(settings_);
-    Logger::instance().info(std::wstring(L"Library view changed to ") + (mode == LibraryViewMode::Gallery ? L"gallery" : L"list"));
+    Logger::instance().info(L"ui", std::wstring(L"Library view changed to ") + (mode == LibraryViewMode::Gallery ? L"gallery" : L"list"));
     if (clipList_) {
         setListItemHeightIfChanged(clipList_, clipListItemHeight_, mode == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);
         refreshClips();
@@ -379,7 +379,7 @@ void MainWindow::beginClipDrag() {
         setStatus(L"Clip is no longer available to drag");
         return;
     }
-    Logger::instance().info(L"Starting Shell drag for clip: " + path.wstring());
+    Logger::instance().info(L"ui", L"Starting Shell drag for clip: " + path.wstring());
 
     PIDLIST_ABSOLUTE absolutePidl = nullptr;
     HRESULT result = SHParseDisplayName(path.c_str(), nullptr, &absolutePidl, 0, nullptr);
@@ -403,7 +403,7 @@ void MainWindow::beginClipDrag() {
         CoTaskMemFree(absolutePidl);
     }
     if (FAILED(result) || !dataObject) {
-        Logger::instance().warning(L"Could not create Shell drag data for clip: " + path.wstring());
+        Logger::instance().warning(L"ui", L"Could not create Shell drag data for clip: " + path.wstring());
         setStatus(L"Could not start file drag");
         return;
     }
@@ -415,7 +415,7 @@ void MainWindow::beginClipDrag() {
     if (result == DRAGDROP_S_DROP && effect != DROPEFFECT_NONE) {
         setStatus(L"Dropped " + path.filename().wstring());
     } else if (FAILED(result)) {
-        Logger::instance().warning(L"Shell file drag failed for " + path.wstring() + L"; HRESULT=" + std::to_wstring(result));
+        Logger::instance().warning(L"ui", L"Shell file drag failed for " + path.wstring() + L"; HRESULT=" + std::to_wstring(result));
         setStatus(L"Could not start file drag");
     }
 }
@@ -476,7 +476,7 @@ void MainWindow::refreshClips() {
             }
         }
     }
-    Logger::instance().info(L"Library refreshed: " + std::to_wstring(clips_.size()) + L" clips in " + controller_.settings().clipDirectory.wstring());
+    Logger::instance().info(L"ui", L"Library refreshed: " + std::to_wstring(clips_.size()) + L" clips in " + controller_.settings().clipDirectory.wstring());
     std::wstring status = std::to_wstring(clips_.size()) + (clips_.size() == 1 ? L" clip found" : L" clips found");
     const bool loadingPreviews = std::any_of(clipThumbnails_.begin(), clipThumbnails_.end(), [](const ClipThumbnail& thumbnail) {
         return thumbnail.loading;
@@ -515,10 +515,10 @@ void MainWindow::openSelectedClip() {
     }
 
     if (shellExecuteSucceeded(ShellExecuteW(window_, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL))) {
-        Logger::instance().info(std::wstring(L"Opened clip from library: ") + path.wstring());
+        Logger::instance().info(L"ui", std::wstring(L"Opened clip from library: ") + path.wstring());
         setStatus(L"Opened " + path.filename().wstring());
     } else {
-        Logger::instance().warning(std::wstring(L"Shell could not open clip from library: ") + path.wstring());
+        Logger::instance().warning(L"ui", std::wstring(L"Shell could not open clip from library: ") + path.wstring());
         setStatus(L"Clip could not be opened");
     }
 }
@@ -538,11 +538,11 @@ void MainWindow::deleteSelectedClip() {
     }
 
     if (clipManager_.removeClip(path)) {
-        Logger::instance().info(std::wstring(L"Deleted clip from library: ") + path.wstring());
+        Logger::instance().info(L"ui", std::wstring(L"Deleted clip from library: ") + path.wstring());
         refreshClips();
         setStatus(L"Clip deleted");
     } else {
-        Logger::instance().warning(std::wstring(L"Clip delete failed from library: ") + path.wstring());
+        Logger::instance().warning(L"ui", std::wstring(L"Clip delete failed from library: ") + path.wstring());
         setStatus(L"Clip could not be deleted");
     }
 }
@@ -560,11 +560,11 @@ void MainWindow::renameSelectedClip() {
     }
 
     if (clipManager_.renameClip(path, newName)) {
-        Logger::instance().info(std::wstring(L"Renamed clip from library: ") + path.wstring() + L" -> " + newName);
+        Logger::instance().info(L"ui", std::wstring(L"Renamed clip from library: ") + path.wstring() + L" -> " + newName);
         refreshClips();
         setStatus(L"Clip renamed");
     } else {
-        Logger::instance().warning(std::wstring(L"Clip rename failed from library: ") + path.wstring() + L" -> " + newName);
+        Logger::instance().warning(L"ui", std::wstring(L"Clip rename failed from library: ") + path.wstring() + L" -> " + newName);
         setStatus(L"Clip could not be renamed");
     }
 }
@@ -577,11 +577,11 @@ void MainWindow::toggleSelectedFavorite() {
     }
     const bool currentlyFavorite = std::filesystem::exists(path.parent_path() / (path.filename().wstring() + L".favorite"));
     if (clipManager_.setFavorite(path, !currentlyFavorite)) {
-        Logger::instance().info(std::wstring(currentlyFavorite ? L"Removed favorite marker from clip: " : L"Marked clip as favorite: ") + path.wstring());
+        Logger::instance().info(L"ui", std::wstring(currentlyFavorite ? L"Removed favorite marker from clip: " : L"Marked clip as favorite: ") + path.wstring());
         refreshClips();
         setStatus(currentlyFavorite ? L"Favorite removed" : L"Clip favorited");
     } else {
-        Logger::instance().warning(std::wstring(L"Favorite update failed for clip: ") + path.wstring());
+        Logger::instance().warning(L"ui", std::wstring(L"Favorite update failed for clip: ") + path.wstring());
         setStatus(L"Favorite could not be updated");
     }
 }

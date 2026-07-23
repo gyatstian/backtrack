@@ -105,7 +105,7 @@ bool HotkeyService::registerHotkeys(HWND window, const HotkeySettings& settings)
             if (activeService_ == this) {
                 activeService_ = nullptr;
             }
-            Logger::instance().warning(keyboardHookFailureMessage(hookError));
+            Logger::instance().warning(L"hotkeys", keyboardHookFailureMessage(hookError));
         }
     }
 
@@ -135,14 +135,14 @@ bool HotkeyService::registerHotkeys(HWND window, const HotkeySettings& settings)
 
     if (!startStop) {
         const std::wstring message = hotkeyFailureMessage(L"start/stop", settings.startStopModifiers, settings.startStopVirtualKey, startStopError);
-        Logger::instance().warning(hookOk ? message + L"; fullscreen hook remains active" : message);
+        Logger::instance().warning(L"hotkeys", hookOk ? message + L"; fullscreen hook remains active" : message);
         if (!hookOk) {
             lastErrorMessage_ = message;
         }
     }
     if (!saveReplay) {
         const std::wstring message = hotkeyFailureMessage(L"save replay", settings.saveReplayModifiers, settings.saveReplayVirtualKey, saveReplayError);
-        Logger::instance().warning(hookOk ? message + L"; fullscreen hook remains active" : message);
+        Logger::instance().warning(L"hotkeys", hookOk ? message + L"; fullscreen hook remains active" : message);
         if (!hookOk) {
             if (!lastErrorMessage_.empty()) {
                 lastErrorMessage_ += L"; ";

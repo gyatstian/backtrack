@@ -20,6 +20,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace backtrack {
@@ -76,22 +77,23 @@ struct WgcCaptureSource::Impl {
         framePoolSize = std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 2, 3, 8);
         frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!frameEvent) {
-            Logger::instance().error(L"CreateEvent for WGC failed");
+            Logger::instance().error(L"capture", L"CreateEvent for WGC failed");
             return false;
         }
 
         if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
-            Logger::instance().warning(L"Windows Graphics Capture is not supported by this OS/session");
+            Logger::instance().warning(L"capture", L"Windows Graphics Capture is not supported by this OS/session");
             return false;
         }
 
         HMONITOR monitor = target.monitor ? target.monitor : monitorFromIndex(target.monitorIndex);
         if (!monitor) {
-            Logger::instance().warning(L"No monitor handle available for Windows Graphics Capture");
+            Logger::instance().warning(L"capture", L"No monitor handle available for Windows Graphics Capture");
             return false;
         }
 
         try {
+            Logger::instance().debug(L"capture", L"WGC CreateForMonitor");
             auto factory = winrt::get_activation_factory<
                 winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
                 IGraphicsCaptureItemInterop>();
@@ -103,7 +105,7 @@ struct WgcCaptureSource::Impl {
             ComPtr<IDXGIDevice> dxgiDevice;
             HRESULT hr = d3d.device()->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
             if (FAILED(hr)) {
-                Logger::instance().error(L"WGC could not query IDXGIDevice: " + hresultToString(hr));
+                Logger::instance().error(L"capture", L"WGC could not query IDXGIDevice: " + hresultToString(hr));
                 return false;
             }
 
@@ -117,6 +119,8 @@ struct WgcCaptureSource::Impl {
             if (!zeroCopy && !createTexturePool(width, height)) {
                 return false;
             }
+            Logger::instance().debug(L"capture",
+                L"WGC item ready: " + std::to_wstring(width) + L"x" + std::to_wstring(height));
 
             framePool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
                 winrtDevice,
@@ -152,27 +156,30 @@ struct WgcCaptureSource::Impl {
                                     AppCapabilityAccessStatus::Allowed) {
                                 capturedSession.IsBorderRequired(false);
                             } else {
-                                Logger::instance().warning(
+                                Logger::instance().warning(L"capture",
                                     L"Borderless capture access was not granted; Windows may show a capture border");
                             }
                         } catch (const winrt::hresult_error& error) {
-                            Logger::instance().warning(
+                            Logger::instance().warning(L"capture",
                                 L"Could not disable Windows Graphics Capture border: " +
                                 std::wstring(error.message().c_str()));
                         }
                     });
             } catch (const winrt::hresult_error& error) {
-                Logger::instance().warning(
+                Logger::instance().warning(L"capture",
                     L"Could not request borderless Windows Graphics Capture: " +
                     std::wstring(error.message().c_str()));
             }
+            Logger::instance().debug(L"capture", L"WGC StartCapture");
             session.StartCapture();
         } catch (const winrt::hresult_error& error) {
-            Logger::instance().warning(L"Windows Graphics Capture initialization failed: " + std::wstring(error.message().c_str()));
+            Logger::instance().warning(L"capture", L"Windows Graphics Capture initialization failed: " + std::wstring(error.message().c_str()));
             return false;
         }
 
-        Logger::instance().debug(L"Windows Graphics Capture initialized at " + std::to_wstring(width) + L"x" + std::to_wstring(height));
+        Logger::instance().info(L"capture",
+            L"Windows Graphics Capture initialized at " + std::to_wstring(width) + L"x" +
+            std::to_wstring(height) + L", zeroCopy=" + (zeroCopy ? L"yes" : L"no"));
         return true;
     }
 
@@ -215,7 +222,7 @@ struct WgcCaptureSource::Impl {
             ComPtr<ID3D11Texture2D> capturedTexture;
             HRESULT hr = access->GetInterface(IID_PPV_ARGS(&capturedTexture));
             if (FAILED(hr)) {
-                Logger::instance().warning(L"WGC surface did not expose ID3D11Texture2D: " + hresultToString(hr));
+                Logger::instance().warning(L"capture", L"WGC surface did not expose ID3D11Texture2D: " + hresultToString(hr));
                 return false;
             }
 
@@ -229,7 +236,7 @@ struct WgcCaptureSource::Impl {
                 if (outstanding >= maxLeases) {
                     ++zeroCopyLeaseDrops;
                     if (zeroCopyLeaseDrops == 1 || (zeroCopyLeaseDrops % 300) == 0) {
-                        Logger::instance().warning(
+                        Logger::instance().warning(L"capture",
                             L"WGC zero-copy lease limit reached; falling back to copy path count=" +
                             std::to_wstring(zeroCopyLeaseDrops) +
                             L" outstanding=" + std::to_wstring(outstanding) +
@@ -243,7 +250,7 @@ struct WgcCaptureSource::Impl {
                     if (!slot) {
                         ++poolExhaustionDrops;
                         if (poolExhaustionDrops == 1 || (poolExhaustionDrops % 300) == 0) {
-                            Logger::instance().warning(
+                            Logger::instance().warning(L"capture",
                                 L"WGC capture texture pool exhausted; dropping frame count=" +
                                 std::to_wstring(poolExhaustionDrops));
                         }
@@ -293,7 +300,7 @@ struct WgcCaptureSource::Impl {
             if (!slot) {
                 ++poolExhaustionDrops;
                 if (poolExhaustionDrops == 1 || (poolExhaustionDrops % 300) == 0) {
-                    Logger::instance().warning(
+                    Logger::instance().warning(L"capture",
                         L"WGC capture texture pool exhausted; dropping frame count=" +
                         std::to_wstring(poolExhaustionDrops));
                 }
@@ -317,25 +324,64 @@ struct WgcCaptureSource::Impl {
             output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
             return true;
         } catch (const winrt::hresult_error& error) {
-            Logger::instance().warning(L"Windows Graphics Capture frame acquisition failed: " + std::wstring(error.message().c_str()));
+            Logger::instance().warning(L"capture", L"Windows Graphics Capture frame acquisition failed: " + std::wstring(error.message().c_str()));
             deviceLost.store(true);
             return false;
         }
     }
 
     void shutdown() {
-        if (framePool && frameArrivedToken.value) {
-            framePool.FrameArrived(frameArrivedToken);
+        // Revoke callbacks first so free-threaded FrameArrived cannot re-enter
+        // while session/framePool are closing (known WinRT hang class).
+        try {
+            if (framePool && frameArrivedToken.value) {
+                framePool.FrameArrived(frameArrivedToken);
+                frameArrivedToken = {};
+            }
+            if (item && closedToken.value) {
+                item.Closed(closedToken);
+                closedToken = {};
+            }
+        } catch (const winrt::hresult_error& error) {
+            Logger::instance().warning(L"capture",
+                L"WGC event revoke failed during shutdown: " + std::wstring(error.message().c_str()));
         }
-        if (item && closedToken.value) {
-            item.Closed(closedToken);
+
+        // Best-effort drain of zero-copy Direct3D11CaptureFrame leases. Closing
+        // the session while frames are still leased can hang indefinitely.
+        if (outstandingZeroCopyLeases) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (outstandingZeroCopyLeases->load(std::memory_order_acquire) > 0 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            const uint32_t remaining =
+                outstandingZeroCopyLeases->load(std::memory_order_acquire);
+            if (remaining > 0) {
+                Logger::instance().warning(L"capture",
+                    L"WGC shutdown proceeding with outstanding zero-copy leases=" +
+                    std::to_wstring(remaining));
+            }
         }
-        if (session) {
-            session.Close();
+
+        try {
+            if (session) {
+                session.Close();
+                session = nullptr;
+            }
+        } catch (const winrt::hresult_error& error) {
+            Logger::instance().warning(L"capture",
+                L"WGC session.Close failed: " + std::wstring(error.message().c_str()));
             session = nullptr;
         }
-        if (framePool) {
-            framePool.Close();
+        try {
+            if (framePool) {
+                framePool.Close();
+                framePool = nullptr;
+            }
+        } catch (const winrt::hresult_error& error) {
+            Logger::instance().warning(L"capture",
+                L"WGC framePool.Close failed: " + std::wstring(error.message().c_str()));
             framePool = nullptr;
         }
         item = nullptr;
@@ -349,6 +395,7 @@ struct WgcCaptureSource::Impl {
             }
         }
         device = nullptr;
+        deviceLost.store(true);
     }
 
     void signalFrameEvent() {
@@ -385,7 +432,7 @@ struct WgcCaptureSource::Impl {
             auto slot = std::make_shared<TextureSlot>();
             HRESULT hr = device->device()->CreateTexture2D(&desc, nullptr, &slot->texture);
             if (FAILED(hr)) {
-                Logger::instance().error(L"CreateTexture2D for WGC pool failed: " + hresultToString(hr));
+                Logger::instance().error(L"capture", L"CreateTexture2D for WGC pool failed: " + hresultToString(hr));
                 pool.clear();
                 return false;
             }

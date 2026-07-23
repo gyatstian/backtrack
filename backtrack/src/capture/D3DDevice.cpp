@@ -31,13 +31,13 @@ bool D3DDevice::initialize(uint32_t adapterIndex) {
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
     if (FAILED(hr)) {
-        Logger::instance().error(L"CreateDXGIFactory1 failed: " + hresultToString(hr));
+        Logger::instance().error(L"capture", L"CreateDXGIFactory1 failed: " + hresultToString(hr));
         return false;
     }
 
     hr = factory->EnumAdapters1(adapterIndex, &adapter_);
     if (FAILED(hr)) {
-        Logger::instance().warning(L"Requested adapter not found; using default hardware adapter");
+        Logger::instance().warning(L"capture", L"Requested adapter not found; using default hardware adapter");
         adapter_.Reset();
     }
 
@@ -84,8 +84,18 @@ bool D3DDevice::initialize(uint32_t adapterIndex) {
 #endif
 
     if (FAILED(hr)) {
-        Logger::instance().error(L"D3D11CreateDevice failed: " + hresultToString(hr));
+        Logger::instance().error(L"capture", L"D3D11CreateDevice failed: " + hresultToString(hr));
         return false;
+    }
+
+    // Capture, video processing, and hardware encoding use this device from
+    // separate worker threads. The app-level context mutex does not cover all
+    // driver work performed by DXGI/NVENC, so enable D3D11 runtime protection.
+    ComPtr<ID3D11Multithread> multithread;
+    if (SUCCEEDED(context_.As(&multithread)) && multithread) {
+        multithread->SetMultithreadProtected(TRUE);
+    } else {
+        Logger::instance().warning(L"capture", L"ID3D11Multithread unavailable; shared D3D11 access is not runtime-protected");
     }
 
     if (!adapter_) {
@@ -119,7 +129,7 @@ bool D3DDevice::initialize(uint32_t adapterIndex) {
         }
     }
 
-    Logger::instance().info(L"D3D11 device initialized on adapter: " + adapterName_);
+    Logger::instance().info(L"capture", L"D3D11 device initialized on adapter: " + adapterName_);
     return true;
 }
 

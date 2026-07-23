@@ -204,7 +204,7 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
         if (openAudioSource(path, kMuxAudioSampleRate, source)) {
             sources.push_back(std::move(source));
         } else {
-            Logger::instance().warning(L"Skipping unsupported audio stream for native MP4 mux: " + path.wstring());
+            Logger::instance().warning(L"audio", L"Skipping unsupported audio stream for native MP4 mux: " + path.wstring());
         }
     }
     if (sources.empty()) {
@@ -228,7 +228,7 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
 
     WavWriter writer;
     if (!writer.open(mixedPath, pcm16StereoFormat(kMuxAudioSampleRate))) {
-        Logger::instance().warning(L"Could not create mixed audio stream for MP4 mux: " + mixedPath.wstring());
+        Logger::instance().warning(L"audio", L"Could not create mixed audio stream for MP4 mux: " + mixedPath.wstring());
         mixedPath.clear();
         return true;
     }

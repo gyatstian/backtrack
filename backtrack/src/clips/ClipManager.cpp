@@ -140,7 +140,7 @@ std::vector<ClipInfo> ClipManager::listClips() const {
     std::error_code error;
     if (directory_.empty() || !std::filesystem::exists(directory_, error)) {
         if (error) {
-            Logger::instance().warning(L"Could not access clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not access clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
         }
         return clips;
     }
@@ -148,7 +148,7 @@ std::vector<ClipInfo> ClipManager::listClips() const {
     std::filesystem::directory_iterator iterator(directory_, error);
     const std::filesystem::directory_iterator end;
     if (error) {
-        Logger::instance().warning(L"Could not enumerate clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
         return clips;
     }
     for (; iterator != end; iterator.increment(error)) {
@@ -165,13 +165,13 @@ std::vector<ClipInfo> ClipManager::listClips() const {
         info.path = entry.path();
         info.bytes = entry.file_size(error);
         if (error) {
-            Logger::instance().warning(L"Could not read clip file size: " + entry.path().wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not read clip file size: " + entry.path().wstring() + L" (" + utf8ToWide(error.message()) + L")");
             error = {};
             continue;
         }
         info.modifiedTime = entry.last_write_time(error);
         if (error) {
-            Logger::instance().warning(L"Could not read clip modified time: " + entry.path().wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not read clip modified time: " + entry.path().wstring() + L" (" + utf8ToWide(error.message()) + L")");
             error = {};
             continue;
         }
@@ -182,7 +182,7 @@ std::vector<ClipInfo> ClipManager::listClips() const {
         clips.push_back(std::move(info));
     }
     if (error) {
-        Logger::instance().warning(L"Could not finish enumerating clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        Logger::instance().warning(L"clips", L"Could not finish enumerating clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
     }
 
     std::sort(clips.begin(), clips.end(), [](const ClipInfo& left, const ClipInfo& right) {
@@ -196,7 +196,7 @@ std::vector<ClipInfo> ClipManager::listClips() const {
 
 bool ClipManager::removeClip(const std::filesystem::path& path) const {
     if (!isManagedClipPath(path)) {
-        Logger::instance().warning(L"Rejected delete outside the clip directory: " + path.wstring());
+        Logger::instance().warning(L"clips", L"Rejected delete outside the clip directory: " + path.wstring());
         return false;
     }
 
@@ -207,14 +207,14 @@ bool ClipManager::removeClip(const std::filesystem::path& path) const {
     error = {};
     const bool removed = std::filesystem::remove(path, error);
     if (!removed || error) {
-        Logger::instance().warning(L"Could not delete clip: " + path.wstring() + (error ? L" (" + utf8ToWide(error.message()) + L")" : L""));
+        Logger::instance().warning(L"clips", L"Could not delete clip: " + path.wstring() + (error ? L" (" + utf8ToWide(error.message()) + L")" : L""));
     }
     return removed && !error;
 }
 
 bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstring& newStem) const {
     if (!isManagedClipPath(path)) {
-        Logger::instance().warning(L"Rejected rename outside the clip directory: " + path.wstring());
+        Logger::instance().warning(L"clips", L"Rejected rename outside the clip directory: " + path.wstring());
         return false;
     }
 
@@ -225,12 +225,12 @@ bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstri
     auto target = path.parent_path() / (trimmedStem + path.extension().wstring());
     std::error_code error;
     if (std::filesystem::exists(target, error)) {
-        Logger::instance().warning(L"Could not rename clip because the target already exists: " + target.wstring());
+        Logger::instance().warning(L"clips", L"Could not rename clip because the target already exists: " + target.wstring());
         return false;
     }
     std::filesystem::rename(path, target, error);
     if (error) {
-        Logger::instance().warning(L"Could not rename clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        Logger::instance().warning(L"clips", L"Could not rename clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
         return false;
     }
 
@@ -238,7 +238,7 @@ bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstri
     if (std::filesystem::exists(oldMarker)) {
         std::filesystem::rename(oldMarker, favoriteMarker(target), error);
         if (error) {
-            Logger::instance().warning(L"Could not rename favorite marker for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not rename favorite marker for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
         }
     }
     error = {};
@@ -246,7 +246,7 @@ bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstri
     if (std::filesystem::exists(oldTags)) {
         std::filesystem::rename(oldTags, tagFile(target), error);
         if (error) {
-            Logger::instance().warning(L"Could not rename tag file for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not rename tag file for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
         }
     }
     return true;
@@ -254,7 +254,7 @@ bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstri
 
 bool ClipManager::setFavorite(const std::filesystem::path& path, bool favorite) const {
     if (!isManagedClipPath(path)) {
-        Logger::instance().warning(L"Rejected favorite marker outside the clip directory: " + path.wstring());
+        Logger::instance().warning(L"clips", L"Rejected favorite marker outside the clip directory: " + path.wstring());
         return false;
     }
 
@@ -263,20 +263,20 @@ bool ClipManager::setFavorite(const std::filesystem::path& path, bool favorite) 
     if (favorite) {
         std::ofstream stream(marker, std::ios::out | std::ios::trunc);
         if (!stream.is_open()) {
-            Logger::instance().warning(L"Could not create favorite marker: " + marker.wstring());
+            Logger::instance().warning(L"clips", L"Could not create favorite marker: " + marker.wstring());
         }
         return stream.is_open();
     }
     std::filesystem::remove(marker, error);
     if (error) {
-        Logger::instance().warning(L"Could not remove favorite marker: " + marker.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        Logger::instance().warning(L"clips", L"Could not remove favorite marker: " + marker.wstring() + L" (" + utf8ToWide(error.message()) + L")");
     }
     return !error;
 }
 
 bool ClipManager::addTag(const std::filesystem::path& path, const std::wstring& tag) const {
     if (!isManagedClipPath(path)) {
-        Logger::instance().warning(L"Rejected tag update outside the clip directory: " + path.wstring());
+        Logger::instance().warning(L"clips", L"Rejected tag update outside the clip directory: " + path.wstring());
         return false;
     }
 
@@ -293,14 +293,14 @@ bool ClipManager::addTag(const std::filesystem::path& path, const std::wstring& 
     const auto filePath = tagFile(path);
     std::ofstream stream(filePath, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!stream.is_open()) {
-        Logger::instance().warning(L"Could not write clip tags: " + filePath.wstring());
+        Logger::instance().warning(L"clips", L"Could not write clip tags: " + filePath.wstring());
         return false;
     }
     for (const auto& existing : tags) {
         stream << wideToUtf8(existing) << "\n";
     }
     if (!stream) {
-        Logger::instance().warning(L"Could not finish writing clip tags: " + filePath.wstring());
+        Logger::instance().warning(L"clips", L"Could not finish writing clip tags: " + filePath.wstring());
         return false;
     }
     return true;

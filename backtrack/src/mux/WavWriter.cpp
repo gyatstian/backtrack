@@ -58,14 +58,14 @@ bool WavWriter::open(const std::filesystem::path& path, const WaveFormatBlob& fo
     sizeLimitLogged_ = false;
     const WaveFormatBlob effectiveFormat = format.bytes.empty() ? fallbackPcmFormat() : format;
     if (effectiveFormat.bytes.size() < sizeof(WAVEFORMATEX)) {
-        Logger::instance().warning(L"Rejected WAV stream with invalid format metadata: " + path_.wstring());
+        Logger::instance().warning(L"mux", L"Rejected WAV stream with invalid format metadata: " + path_.wstring());
         return false;
     }
     const auto* waveFormat = reinterpret_cast<const WAVEFORMATEX*>(effectiveFormat.bytes.data());
     blockAlign_ = waveFormat->nBlockAlign;
     samplesPerSec_ = waveFormat->nSamplesPerSec;
     if (blockAlign_ == 0 || samplesPerSec_ == 0) {
-        Logger::instance().warning(L"Rejected WAV stream with unusable format metadata: " + path_.wstring());
+        Logger::instance().warning(L"mux", L"Rejected WAV stream with unusable format metadata: " + path_.wstring());
         return false;
     }
     if (!path_.parent_path().empty()) {
@@ -91,7 +91,7 @@ void WavWriter::write(const uint8_t* data, size_t size) {
     if (maxDataBytes_ > 0) {
         if (dataBytes_ >= maxDataBytes_) {
             if (!sizeLimitLogged_) {
-                Logger::instance().warning(L"WAV stream reached the RIFF size limit; dropping additional audio: " + path_.wstring());
+                Logger::instance().warning(L"mux", L"WAV stream reached the RIFF size limit; dropping additional audio: " + path_.wstring());
                 sizeLimitLogged_ = true;
             }
             return;
@@ -102,7 +102,7 @@ void WavWriter::write(const uint8_t* data, size_t size) {
         }
         bytesToWrite = std::min<uint64_t>(bytesToWrite, remaining);
         if (bytesToWrite < size && !sizeLimitLogged_) {
-            Logger::instance().warning(L"WAV stream reached the RIFF size limit; truncating audio: " + path_.wstring());
+            Logger::instance().warning(L"mux", L"WAV stream reached the RIFF size limit; truncating audio: " + path_.wstring());
             sizeLimitLogged_ = true;
         }
     }
@@ -111,7 +111,7 @@ void WavWriter::write(const uint8_t* data, size_t size) {
     }
     stream_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytesToWrite));
     if (!stream_) {
-        Logger::instance().warning(L"Could not write WAV audio data: " + path_.wstring());
+        Logger::instance().warning(L"mux", L"Could not write WAV audio data: " + path_.wstring());
         return;
     }
     dataBytes_ += bytesToWrite;

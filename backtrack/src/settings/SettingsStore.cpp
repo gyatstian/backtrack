@@ -249,7 +249,10 @@ AppSettings SettingsStore::load() const {
         settings.soundSeparationApps.push_back(std::move(app));
     }
     settings.startWithWindowsMinimized = readBool(values, L"general.startWithWindowsMinimized", settings.startWithWindowsMinimized);
+    settings.pruneStaleMicrophoneConsentEntries =
+        readBool(values, L"general.pruneStaleMicrophoneConsentEntries", settings.pruneStaleMicrophoneConsentEntries);
     settings.exitToTray = readBool(values, L"general.exitToTray", settings.exitToTray);
+    settings.logLevel = logLevelFromName(readString(values, L"diagnostics.logLevel", logLevelName(settings.logLevel)), settings.logLevel);
     settings.notificationSoundVolumePercent =
         readUInt(values, L"general.notificationSoundVolumePercent", settings.notificationSoundVolumePercent);
     settings.monitorIndex = readUInt(values, L"capture.monitorIndex", settings.monitorIndex);
@@ -274,7 +277,7 @@ void SettingsStore::save(const AppSettings& settings) const {
         std::error_code error;
         std::filesystem::create_directories(path_.parent_path(), error);
         if (error) {
-            Logger::instance().error(L"Could not create settings directory: " + path_.parent_path().wstring());
+            Logger::instance().error(L"settings", L"Could not create settings directory: " + path_.parent_path().wstring());
             return;
         }
     }
@@ -326,7 +329,9 @@ void SettingsStore::save(const AppSettings& settings) const {
         output << prefix << L"muted=" << (app.muted ? 1 : 0) << L"\n";
     }
     output << L"general.startWithWindowsMinimized=" << (normalized.startWithWindowsMinimized ? 1 : 0) << L"\n";
+    output << L"general.pruneStaleMicrophoneConsentEntries=" << (normalized.pruneStaleMicrophoneConsentEntries ? 1 : 0) << L"\n";
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
+    output << L"diagnostics.logLevel=" << logLevelName(normalized.logLevel) << L"\n";
     output << L"general.notificationSoundVolumePercent=" << normalized.notificationSoundVolumePercent << L"\n";
     output << L"capture.monitorIndex=" << normalized.monitorIndex << L"\n";
     output << L"capture.followFocusedMonitor=" << (normalized.followFocusedMonitor ? 1 : 0) << L"\n";
@@ -342,12 +347,12 @@ void SettingsStore::save(const AppSettings& settings) const {
 
     std::ofstream file(path_, std::ios::out | std::ios::binary | std::ios::trunc);
     if (!file.is_open()) {
-        Logger::instance().error(L"Could not open settings file for writing: " + path_.wstring());
+        Logger::instance().error(L"settings", L"Could not open settings file for writing: " + path_.wstring());
         return;
     }
     file << wideToUtf8(output.str());
     if (!file) {
-        Logger::instance().error(L"Could not write settings file: " + path_.wstring());
+        Logger::instance().error(L"settings", L"Could not write settings file: " + path_.wstring());
     }
 }
 

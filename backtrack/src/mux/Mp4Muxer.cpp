@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <vector>
@@ -75,12 +76,12 @@ bool configureVideoStream(IMFSinkWriter* writer, const MuxedInputs& inputs, DWOR
 
     hr = writer->AddStream(mediaType.Get(), &streamIndex);
     if (FAILED(hr)) {
-        Logger::instance().error(L"Native MP4 mux could not add video stream: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not add video stream: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
         return false;
     }
     hr = writer->SetInputMediaType(streamIndex, mediaType.Get(), nullptr);
     if (FAILED(hr)) {
-        Logger::instance().error(L"Native MP4 mux could not set video input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not set video input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
         return false;
     }
     return true;
@@ -102,7 +103,7 @@ bool configureAudioStream(IMFSinkWriter* writer, const WavInfo& wav, DWORD& stre
 
     hr = writer->AddStream(outputType.Get(), &streamIndex);
     if (FAILED(hr)) {
-        Logger::instance().error(L"Native MP4 mux could not add audio stream: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not add audio stream: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
         return false;
     }
 
@@ -136,13 +137,13 @@ bool configureAudioStream(IMFSinkWriter* writer, const WavInfo& wav, DWORD& stre
     }
 
     if (FAILED(hr)) {
-        Logger::instance().error(L"Native MP4 mux could not create audio input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not create audio input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
         return false;
     }
 
     hr = writer->SetInputMediaType(streamIndex, inputType.Get(), nullptr);
     if (FAILED(hr)) {
-        Logger::instance().error(L"Native MP4 mux could not set audio input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not set audio input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
         return false;
     }
     return true;
@@ -151,11 +152,11 @@ bool configureAudioStream(IMFSinkWriter* writer, const WavInfo& wav, DWORD& stre
 bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInputs& inputs) {
     std::ifstream stream(inputs.videoPath, std::ios::binary);
     if (!stream.is_open()) {
-        Logger::instance().error(L"Native MP4 mux could not read video stream: " + inputs.videoPath.wstring());
+        Logger::instance().error(L"mux", L"Native MP4 mux could not read video stream: " + inputs.videoPath.wstring());
         return false;
     }
     if (inputs.videoSamples.empty()) {
-        Logger::instance().error(L"Native MP4 mux has no video sample timing data");
+        Logger::instance().error(L"mux", L"Native MP4 mux has no video sample timing data");
         return false;
     }
 
@@ -183,7 +184,7 @@ bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInpu
         const bool readOk = stream.gcount() == videoSample.size;
         buffer->Unlock();
         if (!readOk) {
-            Logger::instance().error(L"Native MP4 mux could not read a complete video sample");
+            Logger::instance().error(L"mux", L"Native MP4 mux could not read a complete video sample");
             return false;
         }
         buffer->SetCurrentLength(videoSample.size);
@@ -202,7 +203,7 @@ bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInpu
 
         hr = writer->WriteSample(streamIndex, sample.Get());
         if (FAILED(hr)) {
-            Logger::instance().error(L"Native MP4 mux could not write video sample: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+            Logger::instance().error(L"mux", L"Native MP4 mux could not write video sample: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
             return false;
         }
     }
@@ -255,7 +256,7 @@ bool writeAudioSamples(IMFSinkWriter* writer, DWORD streamIndex, const WavInfo& 
 
         hr = writer->WriteSample(streamIndex, sample.Get());
         if (FAILED(hr)) {
-            Logger::instance().error(L"Native MP4 mux could not write audio sample: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+            Logger::instance().error(L"mux", L"Native MP4 mux could not write audio sample: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
             return false;
         }
         framesWritten += framesThisChunk;
@@ -282,14 +283,14 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     std::error_code directoryError;
     std::filesystem::create_directories(tempDirectory_, directoryError);
     if (directoryError) {
-        Logger::instance().error(L"Could not create recording temporary directory: " + tempDirectory_.wstring());
+        Logger::instance().error(L"mux", L"Could not create recording temporary directory: " + tempDirectory_.wstring());
         return false;
     }
 
     videoPath_ = tempDirectory_ / (settings.codec == VideoCodec::H264 ? L"video.h264" : L"video.hevc");
     videoStream_.open(videoPath_, std::ios::binary | std::ios::out | std::ios::trunc);
     if (!videoStream_.is_open()) {
-        Logger::instance().error(L"Could not open temporary video stream: " + videoPath_.wstring());
+        Logger::instance().error(L"mux", L"Could not open temporary video stream: " + videoPath_.wstring());
         std::error_code cleanupError;
         std::filesystem::remove_all(tempDirectory_, cleanupError);
         return false;
@@ -302,7 +303,7 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     videoSamples_.clear();
     pendingAudio_.clear();
     active_ = true;
-    Logger::instance().info(L"Recording muxer started: " + outputPath_.wstring());
+    Logger::instance().info(L"mux", L"Recording muxer started: " + outputPath_.wstring());
     return true;
 }
 
@@ -313,7 +314,7 @@ void Mp4Muxer::writeVideoPacket(const EncodedPacket& packet) {
     }
     if (packet.bytes.size() > static_cast<size_t>((std::numeric_limits<std::streamsize>::max)())) {
         writeFailed_ = true;
-        Logger::instance().error(L"Encoded video packet is too large for the temporary recording stream: " + videoPath_.wstring());
+        Logger::instance().error(L"mux", L"Encoded video packet is too large for the temporary recording stream: " + videoPath_.wstring());
         return;
     }
 
@@ -321,7 +322,7 @@ void Mp4Muxer::writeVideoPacket(const EncodedPacket& packet) {
     videoStream_.write(reinterpret_cast<const char*>(packet.bytes.data()), static_cast<std::streamsize>(packet.bytes.size()));
     if (!videoStream_) {
         writeFailed_ = true;
-        Logger::instance().error(L"Could not write temporary video stream: " + videoPath_.wstring());
+        Logger::instance().error(L"mux", L"Could not write temporary video stream: " + videoPath_.wstring());
         return;
     }
     if (!firstVideoPts100ns_) {
@@ -435,7 +436,7 @@ std::filesystem::path Mp4Muxer::finalize() {
             std::scoped_lock lock(mutex_);
             lastError_ = detail;
         }
-        Logger::instance().warning(detail);
+        Logger::instance().warning(L"mux", detail);
         return {};
     }
 
@@ -447,7 +448,7 @@ std::filesystem::path Mp4Muxer::finalize() {
             std::scoped_lock lock(mutex_);
             lastError_ = detail;
         }
-        Logger::instance().warning(detail);
+        Logger::instance().warning(L"mux", detail);
         return {};
     }
 
@@ -462,17 +463,17 @@ std::filesystem::path Mp4Muxer::finalize() {
             std::scoped_lock lock(mutex_);
             lastError_ = detail;
         }
-        Logger::instance().warning(detail);
+        Logger::instance().warning(L"mux", detail);
         return {};
     }
 
     std::error_code cleanupError;
     std::filesystem::remove_all(tempDirectory, cleanupError);
     if (cleanupError) {
-        Logger::instance().warning(L"Could not remove recording temporary directory: " + tempDirectory.wstring());
+        Logger::instance().warning(L"mux", L"Could not remove recording temporary directory: " + tempDirectory.wstring());
     }
 
-    Logger::instance().info(L"MP4 finalized: " + outputPath.wstring());
+    Logger::instance().info(L"mux", L"MP4 finalized: " + outputPath.wstring());
     return outputPath;
 }
 
@@ -522,7 +523,7 @@ void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPa
     }
     if (!state.writer.isOpen()) {
         if (!packet.format || !state.writer.open(tempDirectory_ / fileName, *packet.format)) {
-            Logger::instance().warning(std::wstring(L"Could not open temporary audio stream: ") + fileName);
+            Logger::instance().warning(L"mux", std::wstring(L"Could not open temporary audio stream: ") + fileName);
             return;
         }
         state.nextPts100ns = *firstVideoPts100ns_;
@@ -571,27 +572,32 @@ void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPa
 }
 
 bool Mp4Muxer::muxToMp4(const MuxedInputs& inputs, const std::filesystem::path& outputPath) {
+    const auto muxStart = std::chrono::steady_clock::now();
+    Logger::instance().info(L"mux",
+        L"Native MP4 mux begin: samples=" + std::to_wstring(inputs.videoSamples.size()) +
+        L", output=" + outputPath.wstring());
+
     if (inputs.videoPath.empty() || !std::filesystem::exists(inputs.videoPath)) {
-        Logger::instance().warning(L"No video elementary stream to mux");
+        Logger::instance().warning(L"mux", L"No video elementary stream to mux");
         return false;
     }
     if (!outputPath.parent_path().empty()) {
         std::error_code directoryError;
         std::filesystem::create_directories(outputPath.parent_path(), directoryError);
         if (directoryError) {
-            Logger::instance().error(L"Could not create MP4 output directory: " + outputPath.parent_path().wstring());
+            Logger::instance().error(L"mux", L"Could not create MP4 output directory: " + outputPath.parent_path().wstring());
             return false;
         }
     }
 
     ScopedComInitialization com;
     if (!com.usable()) {
-        Logger::instance().error(L"COM initialization failed for native MP4 mux");
+        Logger::instance().error(L"mux", L"COM initialization failed for native MP4 mux");
         return false;
     }
     ScopedMfStartup mf;
     if (!mf.started) {
-        Logger::instance().error(L"Media Foundation startup failed for native MP4 mux: 0x" + std::to_wstring(static_cast<uint32_t>(mf.result)));
+        Logger::instance().error(L"mux", L"Media Foundation startup failed for native MP4 mux: 0x" + std::to_wstring(static_cast<uint32_t>(mf.result)));
         return false;
     }
 
@@ -599,6 +605,7 @@ bool Mp4Muxer::muxToMp4(const MuxedInputs& inputs, const std::filesystem::path& 
     if (!buildMixedPcmAudio(inputs, outputPath, mixedAudioPath)) {
         return false;
     }
+    Logger::instance().debug(L"mux", L"Native MP4 mux audio mix complete");
     WavInfo mixedAudio;
     bool hasAudio = !mixedAudioPath.empty() && parseWav(mixedAudioPath, mixedAudio);
 
@@ -606,18 +613,20 @@ bool Mp4Muxer::muxToMp4(const MuxedInputs& inputs, const std::filesystem::path& 
     std::filesystem::remove(outputPath, removeError);
 
     ComPtr<IMFAttributes> attributes;
-    HRESULT hr = MFCreateAttributes(&attributes, 2);
+    HRESULT hr = MFCreateAttributes(&attributes, 3);
     if (FAILED(hr)) {
         return false;
     }
     attributes->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-    attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+    // Offline remux of already-compressed elementary streams. Hardware MFT
+    // enablement has stalled WriteSample/Finalize on some driver stacks.
+    attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, FALSE);
     attributes->SetUINT32(MF_MPEG4SINK_SPSPPS_PASSTHROUGH, TRUE);
 
     ComPtr<IMFSinkWriter> writer;
     hr = MFCreateSinkWriterFromURL(outputPath.wstring().c_str(), nullptr, attributes.Get(), &writer);
     if (FAILED(hr)) {
-        Logger::instance().error(L"Could not create native MP4 writer: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Could not create native MP4 writer: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
         return false;
     }
 
@@ -628,7 +637,7 @@ bool Mp4Muxer::muxToMp4(const MuxedInputs& inputs, const std::filesystem::path& 
 
     DWORD audioStreamIndex = 0;
     if (hasAudio && !configureAudioStream(writer.Get(), mixedAudio, audioStreamIndex)) {
-        Logger::instance().warning(L"Audio stream could not be configured for MP4 mux; saving video without audio");
+        Logger::instance().warning(L"mux", L"Audio stream could not be configured for MP4 mux; saving video without audio");
         hasAudio = false;
         writer.Reset();
         removeError = {};
@@ -636,7 +645,7 @@ bool Mp4Muxer::muxToMp4(const MuxedInputs& inputs, const std::filesystem::path& 
 
         hr = MFCreateSinkWriterFromURL(outputPath.wstring().c_str(), nullptr, attributes.Get(), &writer);
         if (FAILED(hr)) {
-            Logger::instance().error(L"Could not create native MP4 writer for video-only fallback: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+            Logger::instance().error(L"mux", L"Could not create native MP4 writer for video-only fallback: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
             return false;
         }
 
@@ -648,22 +657,33 @@ bool Mp4Muxer::muxToMp4(const MuxedInputs& inputs, const std::filesystem::path& 
 
     hr = writer->BeginWriting();
     if (FAILED(hr)) {
-        Logger::instance().error(L"Native MP4 writer could not begin writing: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 writer could not begin writing: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
         return false;
     }
 
     if (!writeVideoSamples(writer.Get(), videoStreamIndex, inputs)) {
         return false;
     }
+    Logger::instance().debug(L"mux", L"Native MP4 mux video samples written");
     if (hasAudio && !writeAudioSamples(writer.Get(), audioStreamIndex, mixedAudio)) {
         return false;
     }
+    if (hasAudio) {
+        Logger::instance().debug(L"mux", L"Native MP4 mux audio samples written");
+    }
 
     hr = writer->Finalize();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - muxStart)
+                               .count();
     if (FAILED(hr)) {
-        Logger::instance().error(L"Native MP4 writer finalize failed: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux",
+            L"Native MP4 writer finalize failed: 0x" + std::to_wstring(static_cast<uint32_t>(hr)) +
+            L" after " + std::to_wstring(elapsedMs) + L"ms");
         return false;
     }
+    Logger::instance().info(L"mux",
+        L"Native MP4 mux complete: " + outputPath.wstring() + L" in " + std::to_wstring(elapsedMs) + L"ms");
     return true;
 }
 

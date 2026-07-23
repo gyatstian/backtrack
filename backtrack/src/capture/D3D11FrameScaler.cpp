@@ -57,7 +57,7 @@ bool D3D11FrameScaler::scale(
             auto slot = acquireSlot();
             if (!slot) {
                 if (shouldLogRepeatedDrop(poolExhaustionDrops_)) {
-                    Logger::instance().warning(
+                    Logger::instance().warning(L"capture",
                         L"D3D11 scaler texture pool exhausted; dropping frame count=" +
                         std::to_wstring(poolExhaustionDrops_));
                 }
@@ -163,7 +163,7 @@ bool D3D11FrameScaler::scale(
                 const HRESULT hr = videoContext_->VideoProcessorBlt(
                     processor_.Get(), slot->outputView.Get(), 0, 1, &stream);
                 if (FAILED(hr)) {
-                    Logger::instance().warning(
+                    Logger::instance().warning(L"capture",
                         L"D3D11 VideoProcessorBlt failed: " + hresultToString(hr));
                     conversionFailed = true;
                 } else {
@@ -183,7 +183,7 @@ bool D3D11FrameScaler::scale(
         }
 
         nv12Unavailable_ = true;
-        Logger::instance().warning(
+        Logger::instance().warning(L"capture",
             L"Preferred NV12 encoder input failed at runtime; falling back to BGRA for this capture session");
         releaseResources();
         outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -246,12 +246,12 @@ bool D3D11FrameScaler::ensureInitialized(
 
     HRESULT hr = device.device()->QueryInterface(IID_PPV_ARGS(&videoDevice_));
     if (FAILED(hr)) {
-        Logger::instance().warning(L"D3D11 video device is unavailable for scaling: " + hresultToString(hr));
+        Logger::instance().warning(L"capture", L"D3D11 video device is unavailable for scaling: " + hresultToString(hr));
         return false;
     }
     hr = device.context()->QueryInterface(IID_PPV_ARGS(&videoContext_));
     if (FAILED(hr)) {
-        Logger::instance().warning(L"D3D11 video context is unavailable for scaling: " + hresultToString(hr));
+        Logger::instance().warning(L"capture", L"D3D11 video context is unavailable for scaling: " + hresultToString(hr));
         return false;
     }
     device.context()->QueryInterface(IID_PPV_ARGS(&videoContext1_));
@@ -266,7 +266,7 @@ bool D3D11FrameScaler::ensureInitialized(
 
     hr = videoDevice_->CreateVideoProcessorEnumerator(&content, &enumerator_);
     if (FAILED(hr)) {
-        Logger::instance().warning(L"CreateVideoProcessorEnumerator failed: " + hresultToString(hr));
+        Logger::instance().warning(L"capture", L"CreateVideoProcessorEnumerator failed: " + hresultToString(hr));
         releaseResources();
         return false;
     }
@@ -274,7 +274,7 @@ bool D3D11FrameScaler::ensureInitialized(
     UINT formatSupport = 0;
     hr = enumerator_->CheckVideoProcessorFormat(outputFormat, &formatSupport);
     if (FAILED(hr) || (formatSupport & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) == 0) {
-        Logger::instance().warning(
+        Logger::instance().warning(L"capture",
             L"D3D11 video processor does not support the requested output format: " +
             hresultToString(hr));
         releaseResources();
@@ -283,7 +283,7 @@ bool D3D11FrameScaler::ensureInitialized(
 
     hr = videoDevice_->CreateVideoProcessor(enumerator_.Get(), 0, &processor_);
     if (FAILED(hr)) {
-        Logger::instance().warning(L"CreateVideoProcessor failed: " + hresultToString(hr));
+        Logger::instance().warning(L"capture", L"CreateVideoProcessor failed: " + hresultToString(hr));
         releaseResources();
         return false;
     }
@@ -309,21 +309,21 @@ bool D3D11FrameScaler::ensureInitialized(
         auto slot = std::make_shared<TextureSlot>();
         hr = device.device()->CreateTexture2D(&desc, nullptr, &slot->texture);
         if (FAILED(hr)) {
-            Logger::instance().warning(L"CreateTexture2D for D3D11 scaler failed: " + hresultToString(hr));
+            Logger::instance().warning(L"capture", L"CreateTexture2D for D3D11 scaler failed: " + hresultToString(hr));
             releaseResources();
             return false;
         }
         if (outputFormat == DXGI_FORMAT_B8G8R8A8_UNORM) {
             hr = device.device()->CreateRenderTargetView(slot->texture.Get(), nullptr, &slot->renderTargetView);
             if (FAILED(hr)) {
-                Logger::instance().warning(L"CreateRenderTargetView for D3D11 scaler failed: " + hresultToString(hr));
+                Logger::instance().warning(L"capture", L"CreateRenderTargetView for D3D11 scaler failed: " + hresultToString(hr));
                 releaseResources();
                 return false;
             }
         }
         hr = videoDevice_->CreateVideoProcessorOutputView(slot->texture.Get(), enumerator_.Get(), &outputViewDesc, &slot->outputView);
         if (FAILED(hr)) {
-            Logger::instance().warning(L"CreateVideoProcessorOutputView failed: " + hresultToString(hr));
+            Logger::instance().warning(L"capture", L"CreateVideoProcessorOutputView failed: " + hresultToString(hr));
             releaseResources();
             return false;
         }
@@ -335,7 +335,7 @@ bool D3D11FrameScaler::ensureInitialized(
     outputWidth_ = outputWidth;
     outputHeight_ = outputHeight;
     outputFormat_ = outputFormat;
-    Logger::instance().debug(
+    Logger::instance().debug(L"capture",
         L"D3D11 scaler initialized " +
         std::to_wstring(inputWidth) + L"x" + std::to_wstring(inputHeight) +
         L" -> " + std::to_wstring(outputWidth) + L"x" + std::to_wstring(outputHeight) +
@@ -384,7 +384,7 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::inputViewFor(
 
     useCopiedInput_ = true;
     inputViews_.clear();
-    Logger::instance().warning(
+    Logger::instance().warning(L"capture",
         L"Capture texture is not directly compatible with the D3D11 video processor (" +
         hresultToString(hr) + L"); using a pooled BGRA input copy");
     return copiedInputViewFor(device, texture);
@@ -413,7 +413,7 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::copiedInputViewFor(
         HRESULT hr = device.device()->CreateTexture2D(
             &copyDesc, nullptr, &copiedInputTexture_);
         if (FAILED(hr)) {
-            Logger::instance().warning(
+            Logger::instance().warning(L"capture",
                 L"CreateTexture2D for video-processor input copy failed: " +
                 hresultToString(hr));
             return nullptr;
@@ -430,7 +430,7 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::copiedInputViewFor(
             &inputViewDesc,
             &copiedInputView_);
         if (FAILED(hr)) {
-            Logger::instance().warning(
+            Logger::instance().warning(L"capture",
                 L"CreateVideoProcessorInputView for copied texture failed: " +
                 hresultToString(hr));
             copiedInputTexture_.Reset();

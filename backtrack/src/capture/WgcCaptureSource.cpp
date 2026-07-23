@@ -44,12 +44,18 @@ struct WgcCaptureSource::Impl {
     std::mutex frameEventMutex;
     std::vector<std::shared_ptr<TextureSlot>> pool;
     uint64_t poolExhaustionDrops = 0;
+    uint64_t zeroCopyLeaseDrops = 0;
     uint64_t frameIndex = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     bool zeroCopy = true;
+    bool captureCursor = true;
     uint32_t texturePoolSize = 6;
     uint32_t framePoolSize = 5;
+    // Live Direct3D11CaptureFrame leases held by in-flight GpuFrames (zero-copy).
+    // shared_ptr so lease deleters stay valid if Impl is destroyed first.
+    std::shared_ptr<std::atomic<uint32_t>> outstandingZeroCopyLeases =
+        std::make_shared<std::atomic<uint32_t>>(0);
     std::atomic<bool> deviceLost{false};
 
     ~Impl() {
@@ -59,8 +65,14 @@ struct WgcCaptureSource::Impl {
     bool initialize(D3DDevice& d3d, const AppSettings& settings, const CaptureTarget& target) {
         device = &d3d;
         deviceLost.store(false);
+        outstandingZeroCopyLeases = std::make_shared<std::atomic<uint32_t>>(0);
+        zeroCopyLeaseDrops = 0;
         zeroCopy = settings.gpu.wgcZeroCopy;
-        texturePoolSize = std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 3, 4, 16);
+        captureCursor = settings.captureCursor;
+        // +1 for lastFrame pin in captureLoop (keeps one copy-path pool slot in use).
+        texturePoolSize = std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 4, 5, 16);
+        // Bound WGC pool so in-flight zero-copy leases cannot exhaust it.
+        // Keep at least one free slot for the next FrameArrived.
         framePoolSize = std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 2, 3, 8);
         frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!frameEvent) {
@@ -120,7 +132,7 @@ struct WgcCaptureSource::Impl {
             });
 
             session = framePool.CreateCaptureSession(item);
-            session.IsCursorCaptureEnabled(true);
+            session.IsCursorCaptureEnabled(captureCursor);
             // Disabling the capture border is a best-effort cosmetic step. Keep it asynchronous so
             // capture startup does not depend on a WinRT permission operation completing inline.
             try {
@@ -208,11 +220,65 @@ struct WgcCaptureSource::Impl {
             }
 
             if (zeroCopy) {
-                auto lease = std::make_shared<DirectFrameLease>();
+                // Keep at least one WGC pool slot free so TryGetNextFrame keeps working.
+                // Each zero-copy lease holds a Direct3D11CaptureFrame until encode finishes.
+                const uint32_t outstanding =
+                    outstandingZeroCopyLeases->load(std::memory_order_acquire);
+                // Keep ≥1 WGC pool slot free so FrameArrived / TryGetNextFrame keep working.
+                const uint32_t maxLeases = framePoolSize > 1 ? framePoolSize - 1 : 1;
+                if (outstanding >= maxLeases) {
+                    ++zeroCopyLeaseDrops;
+                    if (zeroCopyLeaseDrops == 1 || (zeroCopyLeaseDrops % 300) == 0) {
+                        Logger::instance().warning(
+                            L"WGC zero-copy lease limit reached; falling back to copy path count=" +
+                            std::to_wstring(zeroCopyLeaseDrops) +
+                            L" outstanding=" + std::to_wstring(outstanding) +
+                            L" pool=" + std::to_wstring(framePoolSize));
+                    }
+                    // Force a copy so the Direct3D11CaptureFrame is released immediately.
+                    if (pool.empty() && !createTexturePool(width, height)) {
+                        return false;
+                    }
+                    auto slot = acquireSlot();
+                    if (!slot) {
+                        ++poolExhaustionDrops;
+                        if (poolExhaustionDrops == 1 || (poolExhaustionDrops % 300) == 0) {
+                            Logger::instance().warning(
+                                L"WGC capture texture pool exhausted; dropping frame count=" +
+                                std::to_wstring(poolExhaustionDrops));
+                        }
+                        return false;
+                    }
+                    poolExhaustionDrops = 0;
+                    {
+                        std::scoped_lock lock(device->immediateContextMutex());
+                        device->context()->CopyResource(slot->texture.Get(), capturedTexture.Get());
+                    }
+                    // frame goes out of scope after this block → WGC pool slot freed.
+                    output.texture = slot->texture;
+                    output.lease = slot;
+                    output.frameIndex = frameIndex++;
+                    output.pts100ns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
+                                          std::chrono::steady_clock::now().time_since_epoch())
+                                          .count();
+                    output.width = width;
+                    output.height = height;
+                    output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    return true;
+                }
+
+                auto counter = outstandingZeroCopyLeases;
+                auto lease = std::shared_ptr<DirectFrameLease>(
+                    new DirectFrameLease{},
+                    [counter](DirectFrameLease* ptr) {
+                        delete ptr;
+                        counter->fetch_sub(1, std::memory_order_acq_rel);
+                    });
                 lease->frame = frame;
+                counter->fetch_add(1, std::memory_order_acq_rel);
 
                 output.texture = capturedTexture;
-                output.lease = lease;
+                output.lease = std::move(lease);
                 output.frameIndex = frameIndex++;
                 output.pts100ns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
                                       std::chrono::steady_clock::now().time_since_epoch())

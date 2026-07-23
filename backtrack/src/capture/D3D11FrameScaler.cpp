@@ -217,7 +217,8 @@ void D3D11FrameScaler::reset() {
 }
 
 void D3D11FrameScaler::setPoolSize(uint32_t poolSize) {
-    const uint32_t normalized = std::clamp<uint32_t>(poolSize, 4, 16);
+    // Min 5: captureLoop keeps one slot pinned via lastFrame (effective free = size−1).
+    const uint32_t normalized = std::clamp<uint32_t>(poolSize, 5, 16);
     if (poolSize_ == normalized) {
         return;
     }

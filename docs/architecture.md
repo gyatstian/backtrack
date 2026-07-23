@@ -47,6 +47,7 @@ The hot path uses bounded queues and drops frames when the encoder falls behind 
 - The capture loop recreates the capture source after access loss, and the full GPU pipeline after D3D device removal or hardware encoder fault.
 - Monitor size changes recreate the WGC frame pool and texture pool.
 - Shutdown stops recording, joins workers, stops WASAPI, drains the hardware encoder, and closes muxing files.
+- Recording stop waits up to two seconds for an initial video packet and five seconds for video timeline drain. Stop runs on the controller worker, so UI stays responsive, but hotkeys and settings actions remain unavailable until finalization completes.
 
 ## Hardware Encoders
 

@@ -10,7 +10,8 @@ namespace backtrack {
 namespace {
 
 uint32_t captureTexturePoolSize(const AppSettings& settings) {
-    return std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 3, 4, 16);
+    // +1 for lastFrame pin in captureLoop (keeps one pool slot in use).
+    return std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 4, 5, 16);
 }
 
 } // namespace
@@ -20,6 +21,7 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     deviceLost_ = false;
     frameIndex_ = 0;
     poolExhaustionDrops_ = 0;
+    haveContent_ = false;
 
     ComPtr<IDXGIDevice> dxgiDevice;
     HRESULT hr = device.device()->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
@@ -121,6 +123,13 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         return false;
     }
 
+    // frameInfo.TotalMetadataBufferSize == 0 → no dirty/move rects (idle or pointer-only).
+    // Cadence path reuses lastFrame, so skip the full-frame CopyResource on idle desktops.
+    if (haveContent_ && frameInfo.TotalMetadataBufferSize == 0) {
+        duplication_->ReleaseFrame();
+        return false;
+    }
+
     auto slot = acquireSlot();
     if (!slot) {
         duplication_->ReleaseFrame();
@@ -140,6 +149,7 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
     }
 
     duplication_->ReleaseFrame();
+    haveContent_ = true;
 
     frame.texture = slot->texture;
     frame.lease = slot;
@@ -160,6 +170,7 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
 
 void DesktopDuplicationCapture::shutdown() {
     duplication_.Reset();
+    haveContent_ = false;
     pool_.clear();
     device_ = nullptr;
 }
@@ -175,8 +186,9 @@ std::shared_ptr<DesktopDuplicationCapture::TextureSlot> DesktopDuplicationCaptur
 
 bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t height, DXGI_FORMAT format, uint32_t poolSize) {
     pool_.clear();
+    haveContent_ = false;
     poolExhaustionDrops_ = 0;
-    poolSize = std::clamp<uint32_t>(poolSize, 4, 16);
+    poolSize = std::clamp<uint32_t>(poolSize, 5, 16);
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = width;

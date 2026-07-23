@@ -113,6 +113,7 @@ void MainWindow::rebindPageControlPointers() {
     heightEdit_ = nullptr;
     followFocusedMonitorCheck_ = nullptr;
     followMouseMonitorCheck_ = nullptr;
+    captureCursorCheck_ = nullptr;
     systemAudioCheck_ = nullptr;
     microphoneCheck_ = nullptr;
     outputDeviceCombo_ = nullptr;
@@ -121,6 +122,7 @@ void MainWindow::rebindPageControlPointers() {
     inputVolumeEdit_ = nullptr;
     startWithWindowsCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
+    notificationSoundVolumeEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
     encoderModeCombo_ = nullptr;
     encoderProfileCombo_ = nullptr;
@@ -170,6 +172,7 @@ void MainWindow::rebindPageControlPointers() {
     heightEdit_ = child(kHeightEditId);
     followFocusedMonitorCheck_ = child(kFollowFocusedMonitorCheckId);
     followMouseMonitorCheck_ = child(kFollowMouseMonitorCheckId);
+    captureCursorCheck_ = child(kCaptureCursorCheckId);
     systemAudioCheck_ = child(kSystemAudioCheckId);
     microphoneCheck_ = child(kMicrophoneCheckId);
     outputDeviceCombo_ = child(kOutputDeviceComboId);
@@ -178,6 +181,7 @@ void MainWindow::rebindPageControlPointers() {
     inputVolumeEdit_ = child(kInputVolumeEditId);
     startWithWindowsCheck_ = child(kStartWithWindowsCheckId);
     exitToTrayCheck_ = child(kExitToTrayCheckId);
+    notificationSoundVolumeEdit_ = child(kNotificationSoundVolumeEditId);
     encoderPresetCombo_ = child(kEncoderPresetComboId);
     encoderModeCombo_ = child(kEncoderModeComboId);
     encoderProfileCombo_ = child(kEncoderProfileComboId);
@@ -485,6 +489,7 @@ void MainWindow::clearPageControls() {
     heightEdit_ = nullptr;
     followFocusedMonitorCheck_ = nullptr;
     followMouseMonitorCheck_ = nullptr;
+    captureCursorCheck_ = nullptr;
     systemAudioCheck_ = nullptr;
     microphoneCheck_ = nullptr;
     outputDeviceCombo_ = nullptr;
@@ -493,6 +498,7 @@ void MainWindow::clearPageControls() {
     inputVolumeEdit_ = nullptr;
     startWithWindowsCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
+    notificationSoundVolumeEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
     encoderModeCombo_ = nullptr;
     encoderProfileCombo_ = nullptr;
@@ -576,6 +582,7 @@ void MainWindow::clearSettingsBodyControls() {
     heightEdit_ = nullptr;
     followFocusedMonitorCheck_ = nullptr;
     followMouseMonitorCheck_ = nullptr;
+    captureCursorCheck_ = nullptr;
     systemAudioCheck_ = nullptr;
     microphoneCheck_ = nullptr;
     outputDeviceCombo_ = nullptr;
@@ -584,6 +591,7 @@ void MainWindow::clearSettingsBodyControls() {
     inputVolumeEdit_ = nullptr;
     startWithWindowsCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
+    notificationSoundVolumeEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
     encoderModeCombo_ = nullptr;
     encoderProfileCombo_ = nullptr;
@@ -649,6 +657,7 @@ HWND MainWindow::addControl(const wchar_t* className, const wchar_t* text, DWORD
     }
     if (comboBox) {
         SendMessageW(control, CB_SETMINVISIBLE, kComboVisibleItems, 0);
+        SetWindowSubclass(control, comboBoxSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
     }
     pageControls_.push_back(control);
     layoutItems_.push_back(LayoutItem{control, design, windowHeight, LayoutItem::Kind::Content});
@@ -768,6 +777,23 @@ void MainWindow::buildSettingsGeneralPage() {
     SendMessageW(exitToTrayCheck_, BM_SETCHECK, settings_.exitToTray ? BST_CHECKED : BST_UNCHECKED, 0);
     addSettingHelp(exitToTrayCheck_, 0, 0, L"Closing the window hides Backtrack in the tray instead of shutting down recording and replay services.");
     y += kRowHeight;
+
+    addRowLabel(L"Notification volume");
+    notificationSoundVolumeEdit_ = addControl(
+        L"EDIT",
+        std::to_wstring(settings_.notificationSoundVolumePercent).c_str(),
+        WS_BORDER | ES_NUMBER | WS_TABSTOP,
+        kControlX,
+        y,
+        kNumericWidth,
+        24,
+        kNotificationSoundVolumeEditId);
+    addSettingHelp(
+        notificationSoundVolumeEdit_,
+        0,
+        0,
+        L"Volume of UI notification tones (record start/stop, replay save, errors). 0 mutes; 100 is full level.");
+    y += kRowHeight;
     finishSection();
 
     addSection(L"Output");
@@ -821,6 +847,11 @@ void MainWindow::buildSettingsGeneralPage() {
     followMouseMonitorCheck_ = addControl(L"BUTTON", L"Follow mouse", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kFollowMouseMonitorCheckId);
     SendMessageW(followMouseMonitorCheck_, BM_SETCHECK, settings_.followMouseMonitor ? BST_CHECKED : BST_UNCHECKED, 0);
     addSettingHelp(followMouseMonitorCheck_, 0, 0, L"Uses the mouse cursor instead of the foreground window to choose the recorded monitor when monitor following is enabled.");
+    y += kRowHeight;
+
+    captureCursorCheck_ = addControl(L"BUTTON", L"Capture cursor", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kCaptureCursorCheckId);
+    SendMessageW(captureCursorCheck_, BM_SETCHECK, settings_.captureCursor ? BST_CHECKED : BST_UNCHECKED, 0);
+    addSettingHelp(captureCursorCheck_, 0, 0, L"Includes the mouse cursor in Windows Graphics Capture. Desktop Duplication always composites the system cursor separately when drawn by the desktop.");
     y += kRowHeight;
 
     addRowLabel(L"Clip folder");

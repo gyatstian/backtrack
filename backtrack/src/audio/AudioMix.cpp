@@ -125,44 +125,45 @@ bool ensureSourceFrameLoaded(AudioSource& source, uint64_t sourceFrame) {
            sourceFrame < source.loadedStartFrame + source.loadedFrames;
 }
 
-float sourceFrameChannelAt(AudioSource& source, uint64_t sourceFrame, uint16_t outputChannel) {
-    const uint16_t sourceChannel = source.info.channels == 1
-        ? 0
-        : std::min<uint16_t>(outputChannel, static_cast<uint16_t>(source.info.channels - 1));
-    const uint16_t bytesPerSample = source.info.bitsPerSample / 8;
-    if (bytesPerSample == 0) {
-        return 0.0f;
-    }
-    if (!ensureSourceFrameLoaded(source, sourceFrame)) {
-        return 0.0f;
-    }
-
-    const size_t offset =
-        static_cast<size_t>(sourceFrame - source.loadedStartFrame) * source.info.blockAlign +
-        static_cast<size_t>(sourceChannel) * bytesPerSample;
-    if (offset + bytesPerSample > source.chunk.size()) {
-        return 0.0f;
-    }
-    return readSourceSample(source.chunk.data() + offset, source.info);
-}
-
 float sourceChannelAt(AudioSource& source, uint64_t outputFrame, uint16_t outputChannel, uint32_t targetSamplesPerSec) {
     if (outputFrame >= source.outputFrames || source.frames == 0 || targetSamplesPerSec == 0) {
         return 0.0f;
     }
 
-    const long double sourcePosition = std::min<long double>(
-        static_cast<long double>(source.frames - 1),
-        (static_cast<long double>(outputFrame) * source.info.samplesPerSec) / targetSamplesPerSec);
+    const double sourcePosition = std::min<double>(
+        static_cast<double>(source.frames - 1),
+        (static_cast<double>(outputFrame) * source.info.samplesPerSec) / targetSamplesPerSec);
     const uint64_t sourceFrame0 = static_cast<uint64_t>(sourcePosition);
     const uint64_t sourceFrame1 = std::min<uint64_t>(source.frames - 1, sourceFrame0 + 1);
-    const float sample0 = sourceFrameChannelAt(source, sourceFrame0, outputChannel);
+    if (!ensureSourceFrameLoaded(source, sourceFrame0)) {
+        return 0.0f;
+    }
+    const uint16_t sourceChannel = source.info.channels == 1
+        ? 0
+        : std::min<uint16_t>(outputChannel, static_cast<uint16_t>(source.info.channels - 1));
+    const uint16_t bytesPerSample = source.info.bitsPerSample / 8;
+    const size_t frameOffset =
+        static_cast<size_t>(sourceFrame0 - source.loadedStartFrame) * source.info.blockAlign +
+        static_cast<size_t>(sourceChannel) * bytesPerSample;
+    if (bytesPerSample == 0 || frameOffset + bytesPerSample > source.chunk.size()) {
+        return 0.0f;
+    }
+    const float sample0 = readSourceSample(source.chunk.data() + frameOffset, source.info);
     if (sourceFrame1 == sourceFrame0) {
         return sample0;
     }
 
-    const float sample1 = sourceFrameChannelAt(source, sourceFrame1, outputChannel);
-    const float fraction = static_cast<float>(sourcePosition - static_cast<long double>(sourceFrame0));
+    if (!ensureSourceFrameLoaded(source, sourceFrame1)) {
+        return sample0;
+    }
+    const size_t nextFrameOffset =
+        static_cast<size_t>(sourceFrame1 - source.loadedStartFrame) * source.info.blockAlign +
+        static_cast<size_t>(sourceChannel) * bytesPerSample;
+    if (nextFrameOffset + bytesPerSample > source.chunk.size()) {
+        return sample0;
+    }
+    const float sample1 = readSourceSample(source.chunk.data() + nextFrameOffset, source.info);
+    const float fraction = static_cast<float>(sourcePosition - static_cast<double>(sourceFrame0));
     return sample0 + (sample1 - sample0) * fraction;
 }
 

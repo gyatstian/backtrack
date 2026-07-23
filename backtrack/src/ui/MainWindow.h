@@ -142,6 +142,7 @@ private:
     static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK pageHostProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK clipListSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
+    static LRESULT CALLBACK comboBoxSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
     LRESULT handleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
     void buildTabs();
@@ -308,6 +309,7 @@ private:
     HWND heightEdit_ = nullptr;
     HWND followFocusedMonitorCheck_ = nullptr;
     HWND followMouseMonitorCheck_ = nullptr;
+    HWND captureCursorCheck_ = nullptr;
     HWND systemAudioCheck_ = nullptr;
     HWND microphoneCheck_ = nullptr;
     HWND outputDeviceCombo_ = nullptr;
@@ -316,6 +318,7 @@ private:
     HWND inputVolumeEdit_ = nullptr;
     HWND startWithWindowsCheck_ = nullptr;
     HWND exitToTrayCheck_ = nullptr;
+    HWND notificationSoundVolumeEdit_ = nullptr;
     HWND encoderPresetCombo_ = nullptr;
     HWND encoderModeCombo_ = nullptr;
     HWND encoderProfileCombo_ = nullptr;

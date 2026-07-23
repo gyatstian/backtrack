@@ -162,6 +162,10 @@ bool MainWindow::layoutCurrentPage() {
     };
 
     Bounds groups[2];
+    auto isSettingsCategoryTab = [this](HWND control) {
+        return page_ == Page::Settings &&
+               std::find(settingsCategoryButtons_.begin(), settingsCategoryButtons_.end(), control) != settingsCategoryButtons_.end();
+    };
     auto groupFor = [this, designPageWidth](const RECT& rect) {
         if (page_ == Page::Capture || page_ == Page::Settings) {
             return 0;
@@ -182,6 +186,14 @@ bool MainWindow::layoutCurrentPage() {
 
     for (const auto& item : layoutItems_) {
         if (!item.control || item.kind == LayoutItem::Kind::Footer) {
+            continue;
+        }
+        if (isSettingsCategoryTab(item.control)) {
+            // Tabs reserve their design-space height but never determine content scaling.
+            Bounds& bounds = groups[0];
+            bounds.present = true;
+            bounds.top = std::min(bounds.top, static_cast<int>(item.design.top));
+            bounds.bottom = std::max(bounds.bottom, static_cast<int>(item.design.bottom));
             continue;
         }
         include(groups[groupFor(item.design)], item.design);
@@ -223,10 +235,27 @@ bool MainWindow::layoutCurrentPage() {
         addPlacement(item, x, y, width, height);
     };
 
+    if (page_ == Page::Settings && !settingsCategoryButtons_.empty()) {
+        constexpr int kSettingsCategoryTabGap = 8;
+        constexpr int kSettingsCategoryTabHeight = 30;
+        const int tabCount = static_cast<int>(settingsCategoryButtons_.size());
+        const int totalGap = kSettingsCategoryTabGap * (tabCount - 1);
+        const int tabWidth = std::max(1, (viewportWidth - kLayoutPadding * 2 - totalGap) / tabCount);
+        int x = kLayoutPadding;
+        for (HWND button : settingsCategoryButtons_) {
+            if (button) {
+                RECT rect{x, kLayoutPadding, x + tabWidth, kLayoutPadding + kSettingsCategoryTabHeight};
+                placements.push_back(Placement{button, rect, kSettingsCategoryTabHeight});
+                contentBottom = std::max(contentBottom, static_cast<int>(rect.bottom));
+            }
+            x += tabWidth + kSettingsCategoryTabGap;
+        }
+    }
+
     if (twoColumns) {
         const int columnWidth = std::max(80, (viewportWidth - kLayoutPadding * 2 - kLayoutColumnGap) / 2);
         for (const auto& item : layoutItems_) {
-            if (!item.control) {
+            if (!item.control || isSettingsCategoryTab(item.control)) {
                 continue;
             }
             const int group = item.kind == LayoutItem::Kind::Footer ? 0 : groupFor(item.design);
@@ -250,7 +279,10 @@ bool MainWindow::layoutCurrentPage() {
             int groupBottom = nextTop;
 
             for (const auto& item : layoutItems_) {
-                if (!item.control || item.kind == LayoutItem::Kind::Footer || groupFor(item.design) != group) {
+                if (!item.control ||
+                    item.kind == LayoutItem::Kind::Footer ||
+                    isSettingsCategoryTab(item.control) ||
+                    groupFor(item.design) != group) {
                     continue;
                 }
                 const int itemLeft = static_cast<int>(item.design.left);
@@ -270,7 +302,7 @@ bool MainWindow::layoutCurrentPage() {
 
         const int footerTop = contentBottom + 16;
         for (const auto& item : layoutItems_) {
-            if (!item.control || item.kind != LayoutItem::Kind::Footer) {
+            if (!item.control || isSettingsCategoryTab(item.control) || item.kind != LayoutItem::Kind::Footer) {
                 continue;
             }
             const int itemWidth = static_cast<int>(item.design.right - item.design.left);

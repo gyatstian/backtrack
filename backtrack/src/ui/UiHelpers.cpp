@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cwctype>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -410,6 +411,7 @@ bool isSettingsControlId(int controlId) {
     case kInputVolumeEditId:
     case kStartWithWindowsCheckId:
     case kExitToTrayCheckId:
+    case kNotificationSoundVolumeEditId:
     case kEncoderPresetComboId:
     case kEncoderModeComboId:
     case kEncoderProfileComboId:
@@ -435,6 +437,7 @@ bool isSettingsControlId(int controlId) {
     case kWgcZeroCopyCheckId:
     case kFollowMouseMonitorCheckId:
     case kFollowFocusedMonitorCheckId:
+    case kCaptureCursorCheckId:
     case kStableMultimonitorFramesCheckId:
     case kReplayEnabledId:
     case kReplaySecondsEditId:
@@ -722,10 +725,37 @@ const std::vector<uint8_t>& actionIndicatorWav(UINT type) {
     return attention;
 }
 
-void playActionIndicator(UINT type) {
+void playActionIndicator(UINT type, uint32_t volumePercent) {
+    volumePercent = std::min<uint32_t>(volumePercent, 100);
+    if (volumePercent == 0) {
+        return;
+    }
+
+    // Serialize playback so SND_ASYNC memory buffers stay valid until replaced.
+    static std::mutex playMutex;
+    static std::vector<uint8_t> scaled;
+    std::lock_guard<std::mutex> lock(playMutex);
+    PlaySoundW(nullptr, nullptr, 0);
+
     const auto& wav = actionIndicatorWav(type);
-    if (!PlaySoundW(reinterpret_cast<LPCWSTR>(wav.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {
-        MessageBeep(type);
+    const std::vector<uint8_t>* playback = &wav;
+    if (volumePercent < 100 && wav.size() > 44) {
+        scaled = wav;
+        const double gain = static_cast<double>(volumePercent) / 100.0;
+        for (size_t offset = 44; offset + 1 < scaled.size(); offset += 2) {
+            const auto sample = static_cast<int16_t>(
+                static_cast<uint16_t>(scaled[offset]) | (static_cast<uint16_t>(scaled[offset + 1]) << 8));
+            const auto adjusted = static_cast<int16_t>(std::lround(static_cast<double>(sample) * gain));
+            scaled[offset] = static_cast<uint8_t>(static_cast<uint16_t>(adjusted) & 0xff);
+            scaled[offset + 1] = static_cast<uint8_t>((static_cast<uint16_t>(adjusted) >> 8) & 0xff);
+        }
+        playback = &scaled;
+    }
+
+    if (!PlaySoundW(reinterpret_cast<LPCWSTR>(playback->data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {
+        if (volumePercent >= 100) {
+            MessageBeep(type);
+        }
     }
 }
 

@@ -78,8 +78,13 @@ LRESULT CALLBACK MainWindow::pageHostProc(HWND window, UINT message, WPARAM wPar
         }
         break;
     case WM_MOUSEMOVE:
-        self->updateStatusHelp(nullptr);
-        self->clearButtonHover();
+        {
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            const HWND underCursor = WindowFromPoint(cursor);
+            self->updateStatusHelp(underCursor);
+            self->updateButtonHover(underCursor);
+        }
         break;
     case WM_MOUSELEAVE:
         self->clearButtonHover();
@@ -172,6 +177,24 @@ LRESULT CALLBACK MainWindow::clipListSubclassProc(HWND window, UINT message, WPA
         break;
     case WM_NCDESTROY:
         RemoveWindowSubclass(window, clipListSubclassProc, subclassId);
+        break;
+    default:
+        break;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK MainWindow::comboBoxSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
+    auto* self = reinterpret_cast<MainWindow*>(refData);
+    switch (message) {
+    case WM_MOUSEWHEEL:
+        if (self && SendMessageW(window, CB_GETDROPPEDSTATE, 0, 0) == FALSE) {
+            self->scrollPageWheel(wParam);
+            return 0;
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, comboBoxSubclassProc, subclassId);
         break;
     default:
         break;
@@ -362,8 +385,13 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_MOUSEMOVE:
-        updateStatusHelp(nullptr);
-        clearButtonHover();
+        {
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            const HWND underCursor = WindowFromPoint(cursor);
+            updateStatusHelp(underCursor);
+            updateButtonHover(underCursor);
+        }
         break;
     case WM_MOUSELEAVE:
         clearButtonHover();

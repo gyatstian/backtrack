@@ -135,7 +135,7 @@ struct ReplaySettings {
 
 struct GpuOptimizationSettings {
     GpuAdaptiveMode adaptiveMode = GpuAdaptiveMode::Conservative;
-    bool wgcZeroCopy = false;
+    bool wgcZeroCopy = true;
     uint32_t frameQueueLimit = 4;
     bool allowIdleFrameSkipping = true;
     bool stableMultimonitorFrames = true;
@@ -175,10 +175,12 @@ struct AppSettings {
     std::vector<SoundSeparationApp> soundSeparationApps;
     bool startWithWindowsMinimized = false;
     bool exitToTray = false;
+    uint32_t notificationSoundVolumePercent = 100;
     bool libraryGalleryView = false;
     uint32_t monitorIndex = 0;
     bool followFocusedMonitor = false;
     bool followMouseMonitor = false;
+    bool captureCursor = true;
 };
 
 struct CaptureTarget {
@@ -228,7 +230,7 @@ struct AudioPacket {
     std::vector<uint8_t> bytes;
     uint32_t frameCount = 0;
     int64_t pts100ns = 0;
-    WaveFormatBlob format;
+    std::shared_ptr<const WaveFormatBlob> format;
 };
 
 struct EncoderCapabilities {
@@ -274,6 +276,8 @@ struct RecordingStats {
     uint64_t droppedFrames = 0;
     uint64_t gpuProtectionDrops = 0;
     uint64_t idleFrameSkips = 0;
+    uint64_t systemAudioQueueDrops = 0;
+    uint64_t microphoneAudioQueueDrops = 0;
     uint64_t replayVideoPackets = 0;
     uint64_t replayKeyFrames = 0;
     uint32_t captureWidth = 0;

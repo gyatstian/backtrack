@@ -35,6 +35,7 @@ private:
     uint32_t height_ = 0;
     DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
     bool deviceLost_ = false;
+    bool haveContent_ = false;
 };
 
 } // namespace backtrack

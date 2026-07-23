@@ -42,7 +42,8 @@ uint32_t evenEncodeDimension(uint32_t value) {
 }
 
 uint32_t captureTexturePoolSize(const GpuOptimizationSettings& settings) {
-    return std::clamp<uint32_t>(settings.frameQueueLimit + 3, 4, 16);
+    // +1 for lastFrame pin in captureLoop (keeps one scaler/capture slot in use).
+    return std::clamp<uint32_t>(settings.frameQueueLimit + 4, 5, 16);
 }
 
 CaptureTarget captureTargetForSettings(const AppSettings& settings) {
@@ -282,7 +283,10 @@ void applyAudioVolume(AudioPacket& packet, uint32_t volumePercent) {
         return;
     }
 
-    const AudioFormatInfo format = audioFormatInfo(packet.format);
+    if (!packet.format) {
+        return;
+    }
+    const AudioFormatInfo format = audioFormatInfo(*packet.format);
     const float gain = static_cast<float>(std::clamp<uint32_t>(volumePercent, 0, 200)) / 100.0f;
     switch (format.encoding) {
     case AudioSampleEncoding::Pcm:
@@ -299,8 +303,11 @@ void applyAudioVolume(AudioPacket& packet, uint32_t volumePercent) {
 } // namespace
 
 RecorderController::RecorderController()
-    : frameQueue_(8) {
+    : frameQueue_(8),
+      systemAudioQueue_(256),
+      microphoneAudioQueue_(256) {
     frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    audioEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
 
 RecorderController::~RecorderController() {
@@ -308,6 +315,10 @@ RecorderController::~RecorderController() {
     if (frameEvent_) {
         CloseHandle(frameEvent_);
         frameEvent_ = nullptr;
+    }
+    if (audioEvent_) {
+        CloseHandle(audioEvent_);
+        audioEvent_ = nullptr;
     }
 }
 
@@ -318,6 +329,8 @@ bool RecorderController::initialize(AppSettings settings) {
         settings_ = std::move(settings);
         activeVideoSettings_ = settings_.video;
         activeGpuSettings_ = settings_.gpu;
+        audioOutputVolumePercent_.store(settings_.audioOutputVolumePercent, std::memory_order_relaxed);
+        audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
         replay_.clear();
         replay_.configure(settings_.replay);
     }
@@ -346,6 +359,8 @@ bool RecorderController::updateSettings(AppSettings settings) {
         settings_ = std::move(settings);
         activeVideoSettings_ = settings_.video;
         activeGpuSettings_ = settings_.gpu;
+        audioOutputVolumePercent_.store(settings_.audioOutputVolumePercent, std::memory_order_relaxed);
+        audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
         replay_.configure(settings_.replay);
     }
 
@@ -375,7 +390,12 @@ bool RecorderController::startRecording() {
     }
 
     const auto output = nextClipPath(L"recording");
-    if (!muxer_.startRecording(output, activeVideoSettings_)) {
+    VideoSettings videoSettings;
+    {
+        std::scoped_lock lock(stateMutex_);
+        videoSettings = activeVideoSettings_;
+    }
+    if (!muxer_.startRecording(output, videoSettings)) {
         Logger::instance().error(L"Recording muxer could not start for output: " + output.wstring());
         if (!settings().replay.enabled) {
             stopPipeline();
@@ -387,8 +407,11 @@ bool RecorderController::startRecording() {
     waitingForRecordingKeyFrame_ = true;
     recording_ = true;
     forceVideoHeartbeat_ = true;
-    if (encoder_) {
-        encoder_->requestKeyFrame();
+    {
+        std::scoped_lock gpuLock(pipelineGpuMutex_);
+        if (encoder_) {
+            encoder_->requestKeyFrame();
+        }
     }
     Logger::instance().info(L"Recording started");
     return true;
@@ -460,8 +483,11 @@ std::filesystem::path RecorderController::saveReplay() {
     if (replay_.videoKeyFrameCount() == 0) {
         Logger::instance().info(L"Replay save requested before a buffered keyframe; requesting an IDR frame");
         forceVideoHeartbeat_ = true;
-        if (encoder_) {
-            encoder_->requestKeyFrame();
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            if (encoder_) {
+                encoder_->requestKeyFrame();
+            }
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (replay_.videoKeyFrameCount() == 0 && std::chrono::steady_clock::now() < deadline) {
@@ -470,7 +496,12 @@ std::filesystem::path RecorderController::saveReplay() {
     }
     const std::wstring gameName = foregroundApplicationName();
     const auto output = nextClipPath(gameName.empty() ? L"replay" : gameName.c_str());
-    const bool saved = replay_.saveTo(output, activeVideoSettings_);
+    VideoSettings videoSettings;
+    {
+        std::scoped_lock lock(stateMutex_);
+        videoSettings = activeVideoSettings_;
+    }
+    const bool saved = replay_.saveTo(output, videoSettings);
     if (!saved) {
         Logger::instance().warning(std::wstring(L"Replay save failed: ") + output.wstring());
     }
@@ -504,20 +535,26 @@ RecordingStats RecorderController::stats() const {
     stats.droppedFrames = droppedFrames_.load();
     stats.gpuProtectionDrops = gpuProtectionDrops_.load();
     stats.idleFrameSkips = idleFrameSkips_.load();
+    stats.systemAudioQueueDrops = systemAudioQueueDrops_.load();
+    stats.microphoneAudioQueueDrops = microphoneAudioQueueDrops_.load();
     stats.replayVideoPackets = replay_.videoPacketCount();
     stats.replayKeyFrames = replay_.videoKeyFrameCount();
     stats.captureWidth = captureWidth_.load();
     stats.captureHeight = captureHeight_.load();
     stats.encodeWidth = encodeWidth_.load();
     stats.encodeHeight = encodeHeight_.load();
-    if (encoder_) {
-        stats.encoder = encoder_->stats();
+    {
+        std::scoped_lock gpuLock(pipelineGpuMutex_);
+        if (encoder_) {
+            stats.encoder = encoder_->stats();
+        }
     }
     stats.encoder.queueDepth = static_cast<uint32_t>(frameQueue_.size());
     return stats;
 }
 
 EncoderCapabilities RecorderController::encoderCapabilities() const {
+    std::scoped_lock gpuLock(pipelineGpuMutex_);
     if (encoder_) {
         return encoder_->capabilities();
     }
@@ -563,8 +600,7 @@ bool RecorderController::ensurePipeline() {
         return false;
     }
 
-    activeGpuSettings_ = snapshot.gpu;
-    frameQueue_.resetCapacity(frameQueueCapacityFor(activeGpuSettings_));
+    frameQueue_.resetCapacity(frameQueueCapacityFor(snapshot.gpu));
 
     const CaptureTarget target = captureTargetForSettings(snapshot);
     if (!recreateGpuPipeline(target, L"pipeline start")) {
@@ -593,6 +629,8 @@ bool RecorderController::ensurePipeline() {
     droppedFrames_ = 0;
     gpuProtectionDrops_ = 0;
     idleFrameSkips_ = 0;
+    systemAudioQueueDrops_ = 0;
+    microphoneAudioQueueDrops_ = 0;
     lastEncodedVideoPts100ns_ = 0;
     videoTimelineEndPts100ns_ = 0;
 
@@ -608,8 +646,14 @@ bool RecorderController::ensurePipeline() {
     pipelineRunning_ = true;
     captureThread_ = std::thread(&RecorderController::captureLoop, this);
     encodeThread_ = std::thread(&RecorderController::encodeLoop, this);
+    audioThread_ = std::thread(&RecorderController::audioLoop, this);
+    VideoSettings videoSettings;
+    {
+        std::scoped_lock lock(stateMutex_);
+        videoSettings = activeVideoSettings_;
+    }
     Logger::instance().info(std::wstring(L"Capture/encode pipeline started: capture=") + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
-                            L", encode=" + std::to_wstring(activeVideoSettings_.width) + L"x" + std::to_wstring(activeVideoSettings_.height));
+                            L", encode=" + std::to_wstring(videoSettings.width) + L"x" + std::to_wstring(videoSettings.height));
     return true;
 }
 
@@ -619,6 +663,8 @@ void RecorderController::stopPipeline() {
     }
 
     stopRequested_ = true;
+    systemAudio_.stop();
+    microphoneAudio_.stop();
     if (frameEvent_) {
         SetEvent(frameEvent_);
     }
@@ -629,8 +675,12 @@ void RecorderController::stopPipeline() {
         encodeThread_.join();
     }
 
-    systemAudio_.stop();
-    microphoneAudio_.stop();
+    if (audioEvent_) {
+        SetEvent(audioEvent_);
+    }
+    if (audioThread_.joinable()) {
+        audioThread_.join();
+    }
     WasapiCapture::clearSessionMutes();
     {
         std::scoped_lock lock(systemAudioCaptureMutex_);
@@ -638,6 +688,8 @@ void RecorderController::stopPipeline() {
         systemAudioSessionMutesActive_ = false;
     }
     frameQueue_.clear();
+    systemAudioQueue_.clear();
+    microphoneAudioQueue_.clear();
 
     const RecordingStats finalStats = stats();
     Logger::instance().info(
@@ -663,11 +715,14 @@ void RecorderController::stopPipeline() {
         L", encoded bytes=" +
         std::to_wstring(finalStats.encoder.encodedBytes));
 
-    if (encoder_) {
-        encoder_->shutdown();
-        encoder_.reset();
+    {
+        std::scoped_lock gpuLock(pipelineGpuMutex_);
+        if (encoder_) {
+            encoder_->shutdown();
+            encoder_.reset();
+        }
+        scaler_.reset();
     }
-    scaler_.reset();
     if (capture_) {
         capture_->shutdown();
         capture_.reset();
@@ -690,9 +745,19 @@ void RecorderController::stopPipeline() {
 bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason) {
     Logger::instance().info(std::wstring(L"Recreating GPU pipeline: ") + (reason ? reason : L"unspecified"));
 
+    const uint64_t discardGeneration =
+        discardRequestGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
     discardQueuedFrames_.store(true, std::memory_order_release);
     if (frameEvent_) {
         SetEvent(frameEvent_);
+    }
+
+    // Only encodeLoop consumes frameQueue_. Drain old-device frames before D3D teardown.
+    if (encodeThread_.joinable()) {
+        std::unique_lock discardLock(frameDiscardMutex_);
+        frameDiscardComplete_.wait(discardLock, [this, discardGeneration] {
+            return discardCompletedGeneration_.load(std::memory_order_acquire) >= discardGeneration;
+        });
     }
 
     std::scoped_lock gpuLock(pipelineGpuMutex_);
@@ -706,7 +771,6 @@ bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const 
         capture_->shutdown();
         capture_.reset();
     }
-    frameQueue_.clear();
 
     if (!d3d_.initialize(d3d_.adapterIndex())) {
         Logger::instance().error(L"GPU pipeline recreate failed during D3D initialization");
@@ -727,14 +791,19 @@ bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const 
     captureHeight_ = sourceHeight;
 
     AppSettings snapshot = settings();
-    activeGpuSettings_ = snapshot.gpu;
-    activeVideoSettings_ = activeVideoSettingsFor(snapshot, sourceWidth, sourceHeight);
-    encodeWidth_ = activeVideoSettings_.width;
-    encodeHeight_ = activeVideoSettings_.height;
-    scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
+    const VideoSettings videoSettings = activeVideoSettingsFor(snapshot, sourceWidth, sourceHeight);
+    const GpuOptimizationSettings gpuSettings = snapshot.gpu;
+    {
+        std::scoped_lock stateLock(stateMutex_);
+        activeVideoSettings_ = videoSettings;
+        activeGpuSettings_ = gpuSettings;
+    }
+    encodeWidth_ = videoSettings.width;
+    encodeHeight_ = videoSettings.height;
+    scaler_.setPoolSize(captureTexturePoolSize(gpuSettings));
 
     encoder_ = createEncoderForDevice(d3d_);
-    if (!encoder_ || !encoder_->initialize(d3d_, activeVideoSettings_)) {
+    if (!encoder_ || !encoder_->initialize(d3d_, videoSettings)) {
         Logger::instance().error(L"GPU pipeline recreate failed during encoder initialization");
         {
             std::scoped_lock lock(captureStatusMutex_);
@@ -752,7 +821,7 @@ bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const 
     encoder_->requestKeyFrame();
     Logger::instance().info(
         L"GPU pipeline ready: capture=" + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
-        L", encode=" + std::to_wstring(activeVideoSettings_.width) + L"x" + std::to_wstring(activeVideoSettings_.height) +
+        L", encode=" + std::to_wstring(videoSettings.width) + L"x" + std::to_wstring(videoSettings.height) +
         L", adapter=" + d3d_.adapterName());
     return true;
 }
@@ -830,13 +899,13 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
     return true;
 }
 
-uint32_t RecorderController::activeFrameQueueLimit() const {
+uint32_t RecorderController::activeFrameQueueLimit(const GpuOptimizationSettings& gpuSettings) const {
     const uint32_t configured = std::clamp<uint32_t>(
-        activeGpuSettings_.frameQueueLimit,
+        gpuSettings.frameQueueLimit,
         1,
         static_cast<uint32_t>(frameQueue_.capacity()));
 
-    switch (activeGpuSettings_.adaptiveMode) {
+    switch (gpuSettings.adaptiveMode) {
     case GpuAdaptiveMode::Aggressive:
         return std::min<uint32_t>(configured, 2);
     case GpuAdaptiveMode::Conservative:
@@ -847,14 +916,16 @@ uint32_t RecorderController::activeFrameQueueLimit() const {
     return configured;
 }
 
-bool RecorderController::shouldDropForGpuProtection(bool duplicateFrame) const {
+bool RecorderController::shouldDropForGpuProtection(
+    bool duplicateFrame,
+    const GpuOptimizationSettings& gpuSettings) const {
     const uint32_t queueDepth = static_cast<uint32_t>(frameQueue_.size());
-    const uint32_t queueLimit = activeFrameQueueLimit();
+    const uint32_t queueLimit = activeFrameQueueLimit(gpuSettings);
     if (queueDepth >= queueLimit) {
         return true;
     }
 
-    switch (activeGpuSettings_.adaptiveMode) {
+    switch (gpuSettings.adaptiveMode) {
     case GpuAdaptiveMode::Disabled:
         return false;
     case GpuAdaptiveMode::Conservative:
@@ -873,6 +944,13 @@ void RecorderController::captureLoop() {
     const HANDLE mmcssHandle = enableMmcssForCaptureThread();
 
     AppSettings captureSettings = settings();
+    VideoSettings videoSettings;
+    GpuOptimizationSettings gpuSettings;
+    {
+        std::scoped_lock stateLock(stateMutex_);
+        videoSettings = activeVideoSettings_;
+        gpuSettings = activeGpuSettings_;
+    }
     GpuFrame lastFrame;
     auto nextEmit = std::chrono::steady_clock::now();
     auto nextMonitorPoll = std::chrono::steady_clock::now();
@@ -882,17 +960,22 @@ void RecorderController::captureLoop() {
     HMONITOR pendingMonitor = nullptr;
     bool emitClockStarted = false;
     bool requestKeyFrameAfterAcceptedFrame = false;
-    DXGI_FORMAT encoderInputFormat =
-        encoder_ ? encoder_->preferredInputFormat() : DXGI_FORMAT_B8G8R8A8_UNORM;
-    const auto fps = std::max<uint32_t>(1, activeVideoSettings_.fps);
+    DXGI_FORMAT encoderInputFormat;
+    {
+        std::scoped_lock gpuLock(pipelineGpuMutex_);
+        encoderInputFormat = encoder_
+            ? encoder_->preferredInputFormat()
+            : DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+    const auto fps = std::max<uint32_t>(1, videoSettings.fps);
     const auto frameInterval = std::chrono::nanoseconds(1'000'000'000 / fps);
     const int64_t nominalFrameDuration100ns = kHundredNanosecondsPerSecond / fps;
     VideoTimelineScheduler timelineScheduler(nominalFrameDuration100ns);
     const auto keyFrameHeartbeatInterval =
-        std::chrono::seconds(std::max<uint32_t>(1, activeVideoSettings_.gopSeconds));
+        std::chrono::seconds(std::max<uint32_t>(1, videoSettings.gopSeconds));
     auto idleCoalescingAllowed = [&]() {
         std::scoped_lock gpuLock(pipelineGpuMutex_);
-        return activeGpuSettings_.allowIdleFrameSkipping &&
+        return gpuSettings.allowIdleFrameSkipping &&
                encoder_ && encoder_->capabilities().effective.zeroReorderDelay;
     };
     const auto monitorPollInterval = std::chrono::milliseconds(250);
@@ -955,7 +1038,7 @@ void RecorderController::captureLoop() {
                 encoder_->requestKeyFrame();
             }
         }
-        if (shouldDropForGpuProtection(emission.duplicateFrame) ||
+        if (shouldDropForGpuProtection(emission.duplicateFrame, gpuSettings) ||
             !frameQueue_.tryPush(std::move(frame))) {
             if (forcedHeartbeat) {
                 forceVideoHeartbeat_ = true;
@@ -996,7 +1079,7 @@ void RecorderController::captureLoop() {
             }
             if (capture_) {
                 scaler_.reset();
-                scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
+                scaler_.setPoolSize(captureTexturePoolSize(gpuSettings));
             }
         }
         lastFrame = {};
@@ -1016,7 +1099,7 @@ void RecorderController::captureLoop() {
                 encoder_->resetInputResources();
             }
             scaler_.reset();
-            scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
+            scaler_.setPoolSize(captureTexturePoolSize(gpuSettings));
         }
         discardQueuedFrames_.store(true, std::memory_order_release);
         durationUpdatePending_.store(false, std::memory_order_release);
@@ -1088,13 +1171,7 @@ void RecorderController::captureLoop() {
             }
         }
 
-        bool acquired = false;
-        {
-            std::scoped_lock gpuLock(pipelineGpuMutex_);
-            if (capture_ && capture_->acquireNextFrame(frame, timeoutMs)) {
-                acquired = true;
-            }
-        }
+        const bool acquired = capture_ && capture_->acquireNextFrame(frame, timeoutMs);
         if (acquired) {
             ++sourceFrames_;
             if (frame.pts100ns <= lastFrame.pts100ns) {
@@ -1103,27 +1180,29 @@ void RecorderController::captureLoop() {
             captureWidth_ = frame.width;
             captureHeight_ = frame.height;
 
-            if (shouldDropForGpuProtection(false)) {
+            if (shouldDropForGpuProtection(false, gpuSettings)) {
                 ++droppedFrames_;
                 ++gpuProtectionDrops_;
                 continue;
             }
 
             GpuFrame encodeFrame;
+            bool scaled = false;
             {
                 std::scoped_lock gpuLock(pipelineGpuMutex_);
-                if (!scaler_.scale(
-                        d3d_,
-                        frame,
-                        activeVideoSettings_.width,
-                        activeVideoSettings_.height,
-                        encodeFrame,
-                        captureSettings.followFocusedMonitor,
-                        captureSettings.followFocusedMonitor && activeGpuSettings_.stableMultimonitorFrames,
-                        encoderInputFormat)) {
-                    ++droppedFrames_;
-                    continue;
-                }
+                scaled = scaler_.scale(
+                    d3d_,
+                    frame,
+                    videoSettings.width,
+                    videoSettings.height,
+                    encodeFrame,
+                    captureSettings.followFocusedMonitor,
+                    captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames,
+                    encoderInputFormat);
+            }
+            if (!scaled) {
+                ++droppedFrames_;
+                continue;
             }
 
             lastFrame = encodeFrame;
@@ -1167,12 +1246,23 @@ void RecorderController::captureLoop() {
                         : L"Hardware encoder faulted; recreating full GPU pipeline");
                 if (recreateGpuPipeline(
                         target, deviceRemoved ? L"device removed" : L"encoder fault")) {
+                    // Full recreate waits for encode-loop discard before refreshing both settings.
+                    {
+                        std::scoped_lock stateLock(stateMutex_);
+                        videoSettings = activeVideoSettings_;
+                        gpuSettings = activeGpuSettings_;
+                    }
                     resetVideoHandoff();
-                    encoderInputFormat =
-                        encoder_ ? encoder_->preferredInputFormat() : DXGI_FORMAT_B8G8R8A8_UNORM;
+                    {
+                        std::scoped_lock gpuLock(pipelineGpuMutex_);
+                        encoderInputFormat = encoder_
+                            ? encoder_->preferredInputFormat()
+                            : DXGI_FORMAT_B8G8R8A8_UNORM;
+                    }
                     if (recording_) {
                         waitingForRecordingKeyFrame_ = true;
                         forceVideoHeartbeat_ = true;
+                        std::scoped_lock gpuLock(pipelineGpuMutex_);
                         if (encoder_) {
                             encoder_->requestKeyFrame();
                         }
@@ -1208,6 +1298,7 @@ void RecorderController::captureLoop() {
 void RecorderController::encodeLoop() {
     setThreadDescriptionSafe(L"Backtrack encode");
 
+    constexpr size_t kMaxPendingDurations = 512;
     std::unordered_map<int64_t, int64_t> pendingDurations;
 
     auto discardQueuedFrames = [&]() {
@@ -1221,11 +1312,20 @@ void RecorderController::encodeLoop() {
             durationUpdatePending_.store(false, std::memory_order_release);
         }
         pendingDurations.clear();
+        discardCompletedGeneration_.store(
+            discardRequestGeneration_.load(std::memory_order_acquire),
+            std::memory_order_release);
+        frameDiscardComplete_.notify_all();
     };
 
     auto extendVideoDuration = [&](int64_t pts100ns, int64_t duration100ns) {
         if (pts100ns <= 0 || duration100ns <= 0) {
             return;
+        }
+        if (pendingDurations.size() >= kMaxPendingDurations &&
+            pendingDurations.find(pts100ns) == pendingDurations.end()) {
+            pendingDurations.clear();
+            Logger::instance().warning(L"Discarded unmatched pending video durations after reaching limit");
         }
         auto [it, inserted] = pendingDurations.try_emplace(pts100ns, duration100ns);
         if (!inserted) {
@@ -1341,20 +1441,58 @@ void RecorderController::handleAudioPacket(AudioPacket&& packet) {
         return;
     }
 
-    writeAudioPacket(std::move(packet));
+    const AudioTrack track = packet.track;
+    SpscQueue<AudioPacket>& queue = track == AudioTrack::System
+        ? systemAudioQueue_
+        : microphoneAudioQueue_;
+    if (!queue.tryPush(std::move(packet))) {
+        std::atomic<uint64_t>& drops = track == AudioTrack::System
+            ? systemAudioQueueDrops_
+            : microphoneAudioQueueDrops_;
+        const uint64_t dropped = drops.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (dropped == 1 || dropped % 256 == 0) {
+            Logger::instance().warning(
+                std::wstring(L"Audio queue full; dropped ") +
+                (track == AudioTrack::System ? L"system" : L"microphone") +
+                L" packet(s): " + std::to_wstring(dropped));
+        }
+        return;
+    }
+    if (audioEvent_) {
+        SetEvent(audioEvent_);
+    }
 }
 
 void RecorderController::writeAudioPacket(AudioPacket&& packet) {
-    AppSettings snapshot = settings();
     const uint32_t volumePercent = packet.track == AudioTrack::System
-        ? snapshot.audioOutputVolumePercent
-        : snapshot.audioInputVolumePercent;
+        ? audioOutputVolumePercent_.load(std::memory_order_relaxed)
+        : audioInputVolumePercent_.load(std::memory_order_relaxed);
     applyAudioVolume(packet, volumePercent);
 
     if (recording_ && muxer_.active()) {
         muxer_.writeAudioPacket(packet);
     }
     replay_.pushAudio(std::move(packet));
+}
+
+void RecorderController::audioLoop() {
+    setThreadDescriptionSafe(L"Backtrack audio writer");
+
+    while (!stopRequested_ || systemAudioQueue_.size() > 0 || microphoneAudioQueue_.size() > 0) {
+        AudioPacket packet;
+        bool wrotePacket = false;
+        while (systemAudioQueue_.tryPop(packet)) {
+            writeAudioPacket(std::move(packet));
+            wrotePacket = true;
+        }
+        while (microphoneAudioQueue_.tryPop(packet)) {
+            writeAudioPacket(std::move(packet));
+            wrotePacket = true;
+        }
+        if (!wrotePacket && audioEvent_) {
+            WaitForSingleObject(audioEvent_, 16);
+        }
+    }
 }
 
 void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) {

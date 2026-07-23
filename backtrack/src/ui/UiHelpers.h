@@ -44,7 +44,7 @@ const wchar_t* yesNo(bool value);
 const wchar_t* captureBackendDisplayName(CaptureBackend backend);
 std::wstring actionFailureStatus(const wchar_t* summary, const EncoderCapabilities& caps, const RecordingStats& stats);
 std::wstring withHotkeyWarning(std::wstring status, bool hotkeysOk, const std::wstring& hotkeyError);
-void playActionIndicator(UINT type);
+void playActionIndicator(UINT type, uint32_t volumePercent = 100);
 std::wstring thumbnailCacheKey(const std::filesystem::path& path);
 std::wstring executableKey(const std::filesystem::path& path);
 std::wstring appNameFromPath(const std::filesystem::path& path);

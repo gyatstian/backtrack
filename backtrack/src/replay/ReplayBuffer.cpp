@@ -54,9 +54,9 @@ void writeTimelineAudio(
     }
 
     const auto formatPacket = std::find_if(audio.begin(), audio.end(), [](const auto& packet) {
-        return packet->frameCount > 0 && !packet->bytes.empty();
+        return packet->format && packet->frameCount > 0 && !packet->bytes.empty();
     });
-    if (formatPacket == audio.end() || !writer.open(path, (*formatPacket)->format)) {
+    if (formatPacket == audio.end() || !writer.open(path, *(*formatPacket)->format)) {
         return;
     }
 
@@ -139,11 +139,11 @@ void writeTimelineAudio(
 }
 
 int64_t audioPacketEndPts100ns(const AudioPacket& packet) {
-    if (packet.frameCount == 0 || packet.format.bytes.size() < sizeof(WAVEFORMATEX)) {
+    if (!packet.format || packet.frameCount == 0 || packet.format->bytes.size() < sizeof(WAVEFORMATEX)) {
         return packet.pts100ns;
     }
 
-    const auto* format = reinterpret_cast<const WAVEFORMATEX*>(packet.format.bytes.data());
+    const auto* format = reinterpret_cast<const WAVEFORMATEX*>(packet.format->bytes.data());
     if (format->nSamplesPerSec == 0) {
         return packet.pts100ns;
     }

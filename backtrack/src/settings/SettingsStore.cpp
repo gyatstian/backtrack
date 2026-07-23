@@ -250,9 +250,12 @@ AppSettings SettingsStore::load() const {
     }
     settings.startWithWindowsMinimized = readBool(values, L"general.startWithWindowsMinimized", settings.startWithWindowsMinimized);
     settings.exitToTray = readBool(values, L"general.exitToTray", settings.exitToTray);
+    settings.notificationSoundVolumePercent =
+        readUInt(values, L"general.notificationSoundVolumePercent", settings.notificationSoundVolumePercent);
     settings.monitorIndex = readUInt(values, L"capture.monitorIndex", settings.monitorIndex);
     settings.followFocusedMonitor = readBool(values, L"capture.followFocusedMonitor", settings.followFocusedMonitor);
     settings.followMouseMonitor = readBool(values, L"capture.followMouseMonitor", settings.followMouseMonitor);
+    settings.captureCursor = readBool(values, L"capture.cursor", settings.captureCursor);
     settings.preferredCaptureBackend = captureBackendFromName(
         readString(values, L"capture.backend", captureBackendName(settings.preferredCaptureBackend)));
     settings.clipDirectory = readString(values, L"clips.directory", settings.clipDirectory.wstring());
@@ -324,9 +327,11 @@ void SettingsStore::save(const AppSettings& settings) const {
     }
     output << L"general.startWithWindowsMinimized=" << (normalized.startWithWindowsMinimized ? 1 : 0) << L"\n";
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
+    output << L"general.notificationSoundVolumePercent=" << normalized.notificationSoundVolumePercent << L"\n";
     output << L"capture.monitorIndex=" << normalized.monitorIndex << L"\n";
     output << L"capture.followFocusedMonitor=" << (normalized.followFocusedMonitor ? 1 : 0) << L"\n";
     output << L"capture.followMouseMonitor=" << (normalized.followMouseMonitor ? 1 : 0) << L"\n";
+    output << L"capture.cursor=" << (normalized.captureCursor ? 1 : 0) << L"\n";
     output << L"capture.backend=" << captureBackendName(normalized.preferredCaptureBackend) << L"\n";
     output << L"clips.directory=" << normalized.clipDirectory.wstring() << L"\n";
     output << L"library.viewMode=" << (normalized.libraryGalleryView ? L"gallery" : L"list") << L"\n";
@@ -365,6 +370,7 @@ AppSettings sanitizeSettings(AppSettings settings) {
     settings.gpu.frameQueueLimit = std::clamp<uint32_t>(settings.gpu.frameQueueLimit, 1, 8);
     settings.audioInputVolumePercent = std::clamp<uint32_t>(settings.audioInputVolumePercent, 0, 200);
     settings.audioOutputVolumePercent = std::clamp<uint32_t>(settings.audioOutputVolumePercent, 0, 200);
+    settings.notificationSoundVolumePercent = std::clamp<uint32_t>(settings.notificationSoundVolumePercent, 0, 100);
     std::vector<AppSettings::SoundSeparationApp> soundSeparationApps;
     soundSeparationApps.reserve(settings.soundSeparationApps.size());
     std::unordered_set<std::wstring> seenSoundSeparationPaths;

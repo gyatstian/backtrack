@@ -210,6 +210,7 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     }
     ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : initialShowCommand);
     UpdateWindow(window_);
+    addTrayIcon();
     if (settings_.replay.enabled) {
         setStatus(L"Starting replay buffer...");
     }
@@ -262,7 +263,7 @@ void MainWindow::stopControllerWorker() {
 bool MainWindow::queueControllerAction(ControllerAction action, const std::wstring& busyStatus) {
     if (controllerActionPending_.exchange(true)) {
         setStatus(busyStatus);
-        playActionIndicator(MB_ICONHAND);
+        playActionIndicator(MB_ICONHAND, settings_.notificationSoundVolumePercent);
         return false;
     }
 
@@ -340,13 +341,13 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         result.status = withHotkeyWarning(std::move(result.status), action.hotkeysOk, action.hotkeyError);
         break;
     case ControllerActionKind::ToggleRecording:
-        playActionIndicator(MB_ICONASTERISK);
+        playActionIndicator(MB_ICONASTERISK, controller_.settings().notificationSoundVolumePercent);
         if (controller_.stats().recording) {
             result.clipPath = controller_.stopRecording();
             result.stoppedRecording = true;
             result.ok = !result.clipPath.empty();
             result.refreshLibrary = result.ok;
-            playActionIndicator(result.ok ? MB_OK : MB_ICONHAND);
+            playActionIndicator(result.ok ? MB_OK : MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
             const std::wstring detail = trimText(controller_.lastRecordingError());
             result.status = result.ok
                 ? L"Saved " + result.clipPath.filename().wstring()
@@ -354,14 +355,14 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         } else {
             result.ok = controller_.startRecording();
             result.startedRecording = result.ok;
-            playActionIndicator(result.ok ? MB_OK : MB_ICONHAND);
+            playActionIndicator(result.ok ? MB_OK : MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
             result.status = result.ok
                 ? L"Recording started"
                 : actionFailureStatus(L"Recording could not start", controller_.encoderCapabilities(), controller_.stats());
         }
         break;
     case ControllerActionKind::SaveReplay:
-        playActionIndicator(MB_ICONASTERISK);
+        playActionIndicator(MB_ICONASTERISK, controller_.settings().notificationSoundVolumePercent);
         result.clipPath = controller_.saveReplay();
         result.savedReplay = !result.clipPath.empty();
         if (result.savedReplay && !action.replayTag.empty()) {
@@ -372,7 +373,7 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         }
         result.ok = result.savedReplay;
         result.refreshLibrary = result.savedReplay;
-        playActionIndicator(result.savedReplay ? MB_OK : MB_ICONHAND);
+        playActionIndicator(result.savedReplay ? MB_OK : MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
         if (result.savedReplay) {
             result.status = action.replayTag.empty()
                 ? L"Replay saved"
@@ -388,12 +389,12 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         }
         break;
     case ControllerActionKind::RecoverFailedRecording:
-        playActionIndicator(MB_ICONASTERISK);
+        playActionIndicator(MB_ICONASTERISK, controller_.settings().notificationSoundVolumePercent);
         result.clipPath = controller_.recoverFailedRecording();
         result.recoveredRecording = !result.clipPath.empty();
         result.ok = result.recoveredRecording;
         result.refreshLibrary = result.recoveredRecording;
-        playActionIndicator(result.recoveredRecording ? MB_OK : MB_ICONHAND);
+        playActionIndicator(result.recoveredRecording ? MB_OK : MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
         {
             const std::wstring detail = trimText(controller_.lastRecordingError());
             result.status = result.recoveredRecording

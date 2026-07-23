@@ -12,6 +12,7 @@
 #include "replay/ReplayBuffer.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -45,10 +46,11 @@ private:
     void stopPipeline();
     bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason);
     bool createCaptureSource(const CaptureTarget& target);
-    uint32_t activeFrameQueueLimit() const;
-    bool shouldDropForGpuProtection(bool duplicateFrame) const;
+    uint32_t activeFrameQueueLimit(const GpuOptimizationSettings& gpuSettings) const;
+    bool shouldDropForGpuProtection(bool duplicateFrame, const GpuOptimizationSettings& gpuSettings) const;
     void captureLoop();
     void encodeLoop();
+    void audioLoop();
     void handleAudioPacket(AudioPacket&& packet);
     void writeAudioPacket(AudioPacket&& packet);
     void refreshSystemAudioCapture(const AppSettings& settings);
@@ -62,8 +64,8 @@ private:
     CaptureTarget activeCaptureTarget_;
 
     D3DDevice d3d_;
-    // Serializes capture/encode access while D3D device, capture source, scaler,
-    // or encoder are torn down and recreated after device loss.
+    // Serializes GPU resource teardown/recreation. Per-operation D3D access is
+    // synchronized by D3DDevice's immediate-context mutex.
     mutable std::mutex pipelineGpuMutex_;
     std::unique_ptr<ICaptureSource> capture_;
     mutable std::mutex captureStatusMutex_;
@@ -86,20 +88,30 @@ private:
     std::wstring lastRecordingError_;
 
     SpscQueue<GpuFrame> frameQueue_;
+    SpscQueue<AudioPacket> systemAudioQueue_;
+    SpscQueue<AudioPacket> microphoneAudioQueue_;
     mutable std::mutex durationUpdateMutex_;
+    std::mutex frameDiscardMutex_;
+    std::condition_variable frameDiscardComplete_;
     int64_t pendingDurationPts100ns_ = 0;
     int64_t pendingDuration100ns_ = 0;
     std::thread captureThread_;
     std::thread encodeThread_;
+    std::thread audioThread_;
     HANDLE frameEvent_ = nullptr;
+    HANDLE audioEvent_ = nullptr;
 
     std::atomic<bool> pipelineRunning_{false};
     std::atomic<bool> stopRequested_{false};
     std::atomic<bool> recording_{false};
     std::atomic<bool> waitingForRecordingKeyFrame_{false};
     std::atomic<bool> discardQueuedFrames_{false};
+    std::atomic<uint64_t> discardRequestGeneration_{0};
+    std::atomic<uint64_t> discardCompletedGeneration_{0};
     std::atomic<bool> durationUpdatePending_{false};
     std::atomic<bool> forceVideoHeartbeat_{false};
+    std::atomic<uint32_t> audioOutputVolumePercent_{100};
+    std::atomic<uint32_t> audioInputVolumePercent_{100};
     std::atomic<uint64_t> capturedFrames_{0};
     std::atomic<uint64_t> sourceFrames_{0};
     std::atomic<uint64_t> cadenceDuplicateFrames_{0};
@@ -108,6 +120,8 @@ private:
     std::atomic<uint64_t> droppedFrames_{0};
     std::atomic<uint64_t> gpuProtectionDrops_{0};
     std::atomic<uint64_t> idleFrameSkips_{0};
+    std::atomic<uint64_t> systemAudioQueueDrops_{0};
+    std::atomic<uint64_t> microphoneAudioQueueDrops_{0};
     std::atomic<int64_t> lastEncodedVideoPts100ns_{0};
     std::atomic<int64_t> videoTimelineEndPts100ns_{0};
     std::atomic<uint32_t> captureWidth_{0};

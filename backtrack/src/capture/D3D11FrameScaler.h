@@ -61,7 +61,7 @@ private:
     uint32_t outputWidth_ = 0;
     uint32_t outputHeight_ = 0;
     DXGI_FORMAT outputFormat_ = DXGI_FORMAT_UNKNOWN;
-    uint32_t poolSize_ = 6;
+    uint32_t poolSize_ = 8;
 };
 
 } // namespace backtrack

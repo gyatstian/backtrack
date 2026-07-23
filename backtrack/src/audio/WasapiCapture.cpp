@@ -866,9 +866,10 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         return;
     }
 
+    const auto streamFormat = std::make_shared<const WaveFormatBlob>(copyWaveFormat(mixFormat.get()));
     {
         std::scoped_lock lock(formatMutex_);
-        format_ = copyWaveFormat(mixFormat.get());
+        format_ = *streamFormat;
     }
 
     constexpr REFERENCE_TIME bufferDuration = 10'000'000;
@@ -920,7 +921,6 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         ? steadyNow100ns() - qpcCalibration100ns
         : 0;
 
-    std::vector<uint8_t> silence;
     int64_t nextPacketPts100ns = -1;
     while (!stopRequested_) {
         WaitForSingleObject(wakeEvent_, 20);
@@ -959,7 +959,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
             const int64_t capturedPts100ns = !timestampError && hasQpcCalibration && qpcPosition != 0
                 ? std::max<int64_t>(0, static_cast<int64_t>(qpcPosition) + qpcToSteadyOffset100ns)
                 : std::max<int64_t>(0, steadyNow100ns() - packetDuration100ns);
-            packet.format = format();
+            packet.format = streamFormat;
 
             const bool hasTimeline = nextPacketPts100ns >= 0;
             const bool discontinuity = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
@@ -973,8 +973,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
             nextPacketPts100ns = packet.pts100ns + packetDuration100ns;
 
             if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data) {
-                silence.assign(byteCount, 0);
-                packet.bytes = silence;
+                packet.bytes.assign(byteCount, 0);
             } else {
                 packet.bytes.assign(data, data + byteCount);
             }

@@ -59,6 +59,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
         target.followMouseMonitor = target.followFocusedMonitor &&
             SendMessageW(followMouseMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
+    if (captureCursorCheck_) {
+        target.captureCursor = SendMessageW(captureCursorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
     if (codecCombo_) {
         const auto selected = SendMessageW(codecCombo_, CB_GETCURSEL, 0, 0);
         target.video.codec = selected == 1 ? VideoCodec::Hevc : VideoCodec::H264;
@@ -86,6 +89,10 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
     }
     if (exitToTrayCheck_) {
         target.exitToTray = SendMessageW(exitToTrayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
+    if (notificationSoundVolumeEdit_) {
+        target.notificationSoundVolumePercent =
+            readUIntControl(notificationSoundVolumeEdit_, target.notificationSoundVolumePercent);
     }
     if (encoderPresetCombo_) {
         const auto selected = SendMessageW(encoderPresetCombo_, CB_GETCURSEL, 0, 0);
@@ -224,7 +231,7 @@ void MainWindow::applyVisibleSettings() {
     settings_ = sanitizeSettings(settings_);
     if (controllerActionPending_.load()) {
         setStatus(L"Recorder is busy; try saving settings again after the current action finishes");
-        playActionIndicator(MB_ICONHAND);
+        playActionIndicator(MB_ICONHAND, settings_.notificationSoundVolumePercent);
         return;
     }
     updateStartupRegistration();

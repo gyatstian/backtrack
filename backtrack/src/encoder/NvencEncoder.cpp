@@ -218,9 +218,15 @@ struct NvencEncoder::Impl {
     mutable std::mutex mutex;
 
     struct RegisteredResource {
+        // Hold a strong ref so a freed+reallocated texture cannot reuse this address
+        // while the registration is still cached.
         ComPtr<ID3D11Texture2D> texture;
         NV_ENC_REGISTERED_PTR registered = nullptr;
+        uint64_t generation = 0;
     };
+
+    // Bumped on full invalidation (pool recreation / resetInputResources).
+    uint64_t registrationGeneration = 1;
 
     struct PendingOutput {
         NV_ENC_OUTPUT_PTR bitstream = nullptr;
@@ -464,7 +470,17 @@ struct NvencEncoder::Impl {
     NV_ENC_REGISTERED_PTR registeredResourceFor(ID3D11Texture2D* texture, NV_ENC_BUFFER_FORMAT bufferFormat) {
         const auto existing = registeredResources.find(texture);
         if (existing != registeredResources.end()) {
-            return existing->second.registered;
+            // Reject stale entries: generation mismatch or pointer identity no longer matches
+            // the held ComPtr (defensive against address reuse after partial invalidation).
+            if (existing->second.generation == registrationGeneration &&
+                existing->second.texture.Get() == texture &&
+                existing->second.registered) {
+                return existing->second.registered;
+            }
+            if (existing->second.registered && session) {
+                api.nvEncUnregisterResource(session, existing->second.registered);
+            }
+            registeredResources.erase(existing);
         }
 
         NV_ENC_REGISTER_RESOURCE resource{};
@@ -494,6 +510,7 @@ struct NvencEncoder::Impl {
         RegisteredResource cached;
         cached.texture = texture;
         cached.registered = resource.registeredResource;
+        cached.generation = registrationGeneration;
         registeredResources.emplace(texture, std::move(cached));
         return resource.registeredResource;
     }
@@ -512,6 +529,12 @@ struct NvencEncoder::Impl {
             }
         }
         registeredResources.clear();
+        // Invalidate any concurrent lookups that might still hold raw NV_ENC_REGISTERED_PTR
+        // from a previous pool epoch (pool recreation path).
+        ++registrationGeneration;
+        if (registrationGeneration == 0) {
+            registrationGeneration = 1;
+        }
         consecutiveRegisterFailures = 0;
         consecutiveMapFailures = 0;
     }

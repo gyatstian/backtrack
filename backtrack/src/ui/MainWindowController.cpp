@@ -85,7 +85,7 @@ void MainWindow::handleLeagueKillDetected() {
 
     killClipTagDeadline_ = SteadyClock::now() + std::chrono::seconds(6);
     Logger::instance().info(L"League of Legends kill reminder triggered; replay saves are taggable for 6 seconds");
-    playActionIndicator(MB_ICONASTERISK);
+    playActionIndicator(MB_ICONASTERISK, settings_.notificationSoundVolumePercent);
     setStatus(L"Kill detected; press replay hotkey within 6 seconds to tag it");
 }
 
@@ -193,7 +193,6 @@ void MainWindow::removeTrayIcon() {
 }
 
 void MainWindow::restoreFromTray() {
-    removeTrayIcon();
     ShowWindow(window_, IsIconic(window_) ? SW_RESTORE : SW_SHOWNORMAL);
     BringWindowToTop(window_);
     SetForegroundWindow(window_);

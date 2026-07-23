@@ -521,7 +521,7 @@ void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPa
         return;
     }
     if (!state.writer.isOpen()) {
-        if (!state.writer.open(tempDirectory_ / fileName, packet.format)) {
+        if (!packet.format || !state.writer.open(tempDirectory_ / fileName, *packet.format)) {
             Logger::instance().warning(std::wstring(L"Could not open temporary audio stream: ") + fileName);
             return;
         }

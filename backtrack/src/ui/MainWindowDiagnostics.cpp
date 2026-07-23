@@ -105,6 +105,8 @@ void MainWindow::updateStats() {
         stream << L"Coalesced idle intervals: " << stats.coalescedIdleIntervals << L"\r\n";
         stream << L"Dropped frames: " << stats.droppedFrames + stats.encoder.droppedFrames << L"\r\n";
         stream << L"GPU protection drops: " << stats.gpuProtectionDrops << L"\r\n";
+        stream << L"System audio queue drops: " << stats.systemAudioQueueDrops << L"\r\n";
+        stream << L"Microphone audio queue drops: " << stats.microphoneAudioQueueDrops << L"\r\n";
         stream << L"Frame queue depth: " << stats.encoder.queueDepth << L"\r\n";
         stream << L"Encoder submissions: " << stats.encoder.submittedFrames << L"\r\n";
         stream << L"Encoded frames: " << stats.encoder.encodedFrames << L"\r\n";

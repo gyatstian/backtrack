@@ -8,6 +8,7 @@
 
 #include <Windows.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -127,6 +128,17 @@ private:
         HICON icon = nullptr;
     };
 
+    struct PageCache {
+        HWND host = nullptr;
+        bool built = false;
+        std::vector<HWND> controls;
+        std::vector<LayoutItem> layoutItems;
+        std::unordered_map<HWND, std::wstring> statusHelpTexts;
+        int scrollY = 0;
+        int contentHeight = 0;
+        int wheelRemainder = 0;
+    };
+
     static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK pageHostProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK clipListSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
@@ -135,12 +147,23 @@ private:
     void buildTabs();
     void switchPage(Page page);
     void clearPageControls();
+    void clearSettingsBodyControls();
+    void storeCurrentPageCache();
+    void loadPageCache(Page page);
+    void rebindPageControlPointers();
+    void invalidatePageCache(Page page);
+    void updateTabChrome();
+    void updateSettingsCategoryChrome();
+    void updateButtonHover(HWND control);
+    void clearButtonHover();
     HWND addControl(const wchar_t* className, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id);
     HWND addSectionLabel(const wchar_t* text, int x, int y, int width);
     void setDefaultFont(HWND control);
 
     void buildSettingsPage();
     void buildSettingsCategoryTabs(int y);
+    void buildSettingsCategoryBody();
+    void rebuildSettingsCategoryBody();
     void buildSettingsGeneralPage();
     void buildSettingsAdvancedPage();
     void buildSettingsSoundSeparationPage();
@@ -150,10 +173,14 @@ private:
     void buildClipsPage();
     void switchSettingsCategory(SettingsCategory category);
 
+    bool readVisibleSettingsInto(AppSettings& target);
+    void stashVisibleSettings();
     void applyVisibleSettings();
     void addDirtySaveButton();
+    void updateSaveSettingsButton();
     void markSettingsDirty();
     void clearSettingsDirty();
+    bool promptSaveSettingsIfDirty(bool allowCancel);
     void addSettingHelp(HWND control, int x, int y, const std::wstring& text);
     void addStatusHelp(HWND control, const std::wstring& text);
     void updateStatusHelp(HWND hoveredControl);
@@ -248,10 +275,15 @@ private:
     HBRUSH editBrush_ = nullptr;
     HBRUSH selectionBrush_ = nullptr;
     HBRUSH favoriteBrush_ = nullptr;
+    HBRUSH tabActiveBrush_ = nullptr;
+    HBRUSH buttonHoverBrush_ = nullptr;
+    HBRUSH buttonPressedBrush_ = nullptr;
     HPEN outlinePen_ = nullptr;
     HPEN selectedOutlinePen_ = nullptr;
+    HPEN tabActiveOutlinePen_ = nullptr;
     Page page_ = Page::Capture;
     SettingsCategory settingsCategory_ = SettingsCategory::General;
+    std::array<PageCache, 4> pageCaches_{};
     std::vector<HWND> pageControls_;
     std::vector<ClipInfo> clips_;
 
@@ -326,6 +358,8 @@ private:
     std::wstring statusText_ = L"Ready";
     std::wstring displayedStatusText_;
     HWND hoveredHelpControl_ = nullptr;
+    HWND hoveredButton_ = nullptr;
+    bool buttonHoverTracking_ = false;
     std::unordered_map<HWND, std::wstring> statusHelpTexts_;
     std::vector<LayoutItem> layoutItems_;
     std::vector<AudioDeviceInfo> outputDevices_;

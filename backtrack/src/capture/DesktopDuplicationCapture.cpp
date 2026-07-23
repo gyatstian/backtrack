@@ -1,6 +1,7 @@
 #include "capture/DesktopDuplicationCapture.h"
 
 #include "core/Logger.h"
+#include "platform/Win32Util.h"
 
 #include <algorithm>
 
@@ -34,8 +35,27 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
         return false;
     }
 
+    // Prefer HMONITOR match so EnumDisplayMonitors order and DXGI EnumOutputs
+    // order never disagree on multi-monitor setups.
+    uint32_t outputIndex = target.monitorIndex;
+    if (target.monitor) {
+        const uint32_t matched = dxgiOutputIndexForMonitor(adapter.Get(), target.monitor);
+        if (matched != UINT32_MAX) {
+            outputIndex = matched;
+        } else {
+            Logger::instance().warning(
+                L"Desktop Duplication could not map HMONITOR to DXGI output; using monitorIndex fallback");
+        }
+    } else {
+        const HMONITOR monitor = monitorFromIndex(target.monitorIndex);
+        const uint32_t matched = dxgiOutputIndexForMonitor(adapter.Get(), monitor);
+        if (matched != UINT32_MAX) {
+            outputIndex = matched;
+        }
+    }
+
     ComPtr<IDXGIOutput> output;
-    hr = adapter->EnumOutputs(target.monitorIndex, &output);
+    hr = adapter->EnumOutputs(outputIndex, &output);
     if (FAILED(hr)) {
         Logger::instance().warning(L"Requested monitor output not found; falling back to output 0");
         hr = adapter->EnumOutputs(0, &output);

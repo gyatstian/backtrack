@@ -72,11 +72,17 @@ LRESULT CALLBACK MainWindow::pageHostProc(HWND window, UINT message, WPARAM wPar
         return SendMessageW(self->window_, message, wParam, lParam);
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
-            self->updateStatusHelp(reinterpret_cast<HWND>(wParam));
+            const HWND underCursor = reinterpret_cast<HWND>(wParam);
+            self->updateStatusHelp(underCursor);
+            self->updateButtonHover(underCursor);
         }
         break;
     case WM_MOUSEMOVE:
         self->updateStatusHelp(nullptr);
+        self->clearButtonHover();
+        break;
+    case WM_MOUSELEAVE:
+        self->clearButtonHover();
         break;
     case WM_MOUSEWHEEL:
         self->scrollPageWheel(wParam);
@@ -350,11 +356,17 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case WM_SETCURSOR:
         if (LOWORD(lParam) == HTCLIENT) {
-            updateStatusHelp(reinterpret_cast<HWND>(wParam));
+            const HWND underCursor = reinterpret_cast<HWND>(wParam);
+            updateStatusHelp(underCursor);
+            updateButtonHover(underCursor);
         }
         break;
     case WM_MOUSEMOVE:
         updateStatusHelp(nullptr);
+        clearButtonHover();
+        break;
+    case WM_MOUSELEAVE:
+        clearButtonHover();
         break;
     case WM_TIMER:
         if (wParam == kDiagnosticsTimerId) {
@@ -415,6 +427,9 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_ERASEBKGND:
         return TRUE;
     case WM_CLOSE:
+        if (settingsDirty_ && !promptSaveSettingsIfDirty(true)) {
+            return 0;
+        }
         if (settings_.exitToTray && !exitFromTray_) {
             addTrayIcon();
             ShowWindow(window_, SW_HIDE);
@@ -502,14 +517,31 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool selected = selectedTab || selectedLibraryView || selectedSettingsCategory;
-    const COLORREF textColor = selected ? kText : (disabled ? kMutedText : kText);
+    const bool hovered = !pressed && !disabled && item.hwndItem == hoveredButton_;
+    const COLORREF textColor = disabled ? kMutedText : kText;
 
-    HBRUSH brush = selected || pressed ? selectionBrush_ : controlBrush_;
+    HBRUSH brush = controlBrush_;
+    if (pressed) {
+        brush = buttonPressedBrush_ ? buttonPressedBrush_ : selectionBrush_;
+    } else if (selected) {
+        brush = tabActiveBrush_ ? tabActiveBrush_ : selectionBrush_;
+    } else if (hovered) {
+        brush = buttonHoverBrush_ ? buttonHoverBrush_ : controlBrush_;
+    }
     FillRect(item.hDC, &item.rcItem, brush);
 
-    HGDIOBJ oldPen = SelectObject(item.hDC, outlinePen_);
+    HPEN outline = selected
+        ? (tabActiveOutlinePen_ ? tabActiveOutlinePen_ : selectedOutlinePen_)
+        : outlinePen_;
+    HGDIOBJ oldPen = SelectObject(item.hDC, outline);
     HGDIOBJ oldBrush = SelectObject(item.hDC, GetStockObject(NULL_BRUSH));
     Rectangle(item.hDC, item.rcItem.left, item.rcItem.top, item.rcItem.right, item.rcItem.bottom);
+    if (selectedTab) {
+        const int underlineTop = item.rcItem.bottom - 3;
+        HBRUSH underline = selectionBrush_;
+        RECT bar{item.rcItem.left + 2, underlineTop, item.rcItem.right - 2, item.rcItem.bottom - 1};
+        FillRect(item.hDC, &bar, underline);
+    }
     SelectObject(item.hDC, oldBrush);
     SelectObject(item.hDC, oldPen);
 
@@ -524,10 +556,69 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
     }
     SetBkMode(item.hDC, TRANSPARENT);
     SetTextColor(item.hDC, textColor);
+    const HFONT font = selected && headingFont_ ? headingFont_ : font_;
+    HGDIOBJ oldFont = font ? SelectObject(item.hDC, font) : nullptr;
     DrawTextW(item.hDC, textBuffer, -1, &textRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+    if (oldFont) {
+        SelectObject(item.hDC, oldFont);
+    }
 
     if ((item.itemState & ODS_FOCUS) != 0) {
         DrawFocusRect(item.hDC, &item.rcItem);
+    }
+}
+
+void MainWindow::updateButtonHover(HWND control) {
+    HWND button = control;
+    while (button && button != window_ && button != pageHost_) {
+        wchar_t className[32]{};
+        if (GetClassNameW(button, className, static_cast<int>(_countof(className))) > 0 &&
+            lstrcmpW(className, L"Button") == 0) {
+            break;
+        }
+        button = GetParent(button);
+    }
+    if (!button || button == window_ || button == pageHost_) {
+        clearButtonHover();
+        return;
+    }
+
+    if (hoveredButton_ == button) {
+        if (!buttonHoverTracking_) {
+            TRACKMOUSEEVENT track{};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window_;
+            TrackMouseEvent(&track);
+            buttonHoverTracking_ = true;
+        }
+        return;
+    }
+
+    HWND previous = hoveredButton_;
+    hoveredButton_ = button;
+    if (previous) {
+        InvalidateRect(previous, nullptr, FALSE);
+    }
+    InvalidateRect(hoveredButton_, nullptr, FALSE);
+
+    TRACKMOUSEEVENT track{};
+    track.cbSize = sizeof(track);
+    track.dwFlags = TME_LEAVE;
+    track.hwndTrack = window_;
+    TrackMouseEvent(&track);
+    buttonHoverTracking_ = true;
+}
+
+void MainWindow::clearButtonHover() {
+    buttonHoverTracking_ = false;
+    if (!hoveredButton_) {
+        return;
+    }
+    HWND previous = hoveredButton_;
+    hoveredButton_ = nullptr;
+    if (previous && IsWindow(previous)) {
+        InvalidateRect(previous, nullptr, FALSE);
     }
 }
 

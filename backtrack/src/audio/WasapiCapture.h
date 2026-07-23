@@ -27,6 +27,10 @@ public:
     static std::vector<AudioDeviceInfo> enumerateDevices(AudioTrack track);
     static std::vector<AudioSessionAppInfo> enumerateAudioSessionApps();
     static std::vector<AudioSessionAppInfo> enumerateOpenApps();
+    // Mutes active render sessions whose image path is in mutedExecutableKeys (lowercase paths).
+    // Restores any previously applied mutes that are no longer requested. Returns muted process count.
+    static uint32_t applySessionMutesForExecutables(const std::vector<std::wstring>& mutedExecutableKeys);
+    static void clearSessionMutes();
 
     bool start(AudioTrack track, const std::wstring& deviceId, AudioPacketCallback callback);
     bool startProcessLoopback(uint32_t processId, AudioPacketCallback callback);

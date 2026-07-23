@@ -52,8 +52,14 @@ CaptureTarget captureTargetForSettings(const AppSettings& settings) {
         target.monitor = settings.followMouseMonitor
             ? cursorMonitorOrFallback(settings.monitorIndex)
             : focusedMonitorOrFallback(settings.monitorIndex);
+    } else {
+        target.monitor = monitorFromIndex(settings.monitorIndex);
     }
     return target;
+}
+
+size_t frameQueueCapacityFor(const GpuOptimizationSettings& settings) {
+    return static_cast<size_t>(std::clamp<uint32_t>(settings.frameQueueLimit, 1, 16));
 }
 
 const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
@@ -74,7 +80,10 @@ CaptureBackend selectedBackendForSettings(const AppSettings& settings) {
 
 VideoSettings activeVideoSettingsFor(const AppSettings& settings, uint32_t sourceWidth, uint32_t sourceHeight) {
     VideoSettings active = settings.video;
-    if (settings.video.resolutionMode == ResolutionMode::Native && !settings.followFocusedMonitor && sourceWidth > 0 && sourceHeight > 0) {
+    if (settings.video.resolutionMode == ResolutionMode::Native && sourceWidth > 0 && sourceHeight > 0) {
+        // Keep native source size even when follow-monitor is enabled so the
+        // first monitor's resolution is encoded 1:1; later switches letterbox
+        // into this canvas via the scaler fit-with-bars path.
         active.width = evenEncodeDimension(sourceWidth);
         active.height = evenEncodeDimension(sourceHeight);
     } else {
@@ -155,6 +164,25 @@ std::wstring normalizedExecutableKey(const std::filesystem::path& path) {
     return value;
 }
 
+std::vector<std::wstring> mutedSoundSeparationExecutableKeys(const AppSettings& settings) {
+    std::vector<std::wstring> keys;
+    if (!settings.soundSeparationEnabled || !settings.captureSystemAudio) {
+        return keys;
+    }
+    for (const auto& app : settings.soundSeparationApps) {
+        if (!app.muted || app.executablePath.empty()) {
+            continue;
+        }
+        const std::wstring key = normalizedExecutableKey(app.executablePath);
+        if (!key.empty()) {
+            keys.push_back(key);
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    return keys;
+}
+
 bool hasMutedSoundSeparationApps(const AppSettings& settings) {
     if (!settings.soundSeparationEnabled) {
         return false;
@@ -165,41 +193,6 @@ bool hasMutedSoundSeparationApps(const AppSettings& settings) {
         [](const AppSettings::SoundSeparationApp& app) {
             return app.muted && !app.executablePath.empty();
         });
-}
-
-uint32_t mutedSoundSeparationProcessId(const AppSettings& settings) {
-    if (!settings.captureSystemAudio || !hasMutedSoundSeparationApps(settings)) {
-        return 0;
-    }
-
-    std::unordered_set<std::wstring> mutedExecutableKeys;
-    for (const auto& app : settings.soundSeparationApps) {
-        if (!app.muted || app.executablePath.empty()) {
-            continue;
-        }
-        const std::wstring key = normalizedExecutableKey(app.executablePath);
-        if (!key.empty()) {
-            mutedExecutableKeys.insert(key);
-        }
-    }
-    if (mutedExecutableKeys.empty()) {
-        return 0;
-    }
-
-    std::vector<uint32_t> targetProcessIds;
-    for (const auto& sessionApp : WasapiCapture::enumerateAudioSessionApps()) {
-        const std::wstring key = normalizedExecutableKey(sessionApp.executablePath);
-        if (!key.empty() && mutedExecutableKeys.contains(key) && sessionApp.processId != 0) {
-            targetProcessIds.push_back(sessionApp.processId);
-        }
-    }
-    if (targetProcessIds.empty()) {
-        return 0;
-    }
-
-    std::sort(targetProcessIds.begin(), targetProcessIds.end());
-    targetProcessIds.erase(std::unique(targetProcessIds.begin(), targetProcessIds.end()), targetProcessIds.end());
-    return targetProcessIds.front();
 }
 
 int32_t readSigned24(const uint8_t* sample) {
@@ -570,44 +563,17 @@ bool RecorderController::ensurePipeline() {
         return false;
     }
 
-    if (!d3d_.device() && !d3d_.initialize(0)) {
-        Logger::instance().error(L"Capture pipeline start failed during D3D initialization");
-        std::scoped_lock lock(captureStatusMutex_);
-        captureBackendActive_ = false;
-        captureBackendStatus_ = L"Capture pipeline failed before capture backend start: Direct3D initialization failed";
-        return false;
-    }
+    activeGpuSettings_ = snapshot.gpu;
+    frameQueue_.resetCapacity(frameQueueCapacityFor(activeGpuSettings_));
 
     const CaptureTarget target = captureTargetForSettings(snapshot);
-    if (!createCaptureSource(target)) {
-        Logger::instance().error(L"Capture pipeline start failed because no capture source could initialize");
+    if (!recreateGpuPipeline(target, L"pipeline start")) {
+        Logger::instance().error(L"Capture pipeline start failed during GPU/capture initialization");
         return false;
     }
 
-    const uint32_t sourceWidth = capture_->width();
-    const uint32_t sourceHeight = capture_->height();
-    captureWidth_ = sourceWidth;
-    captureHeight_ = sourceHeight;
-
-    activeGpuSettings_ = snapshot.gpu;
-    activeVideoSettings_ = activeVideoSettingsFor(snapshot, sourceWidth, sourceHeight);
-    encodeWidth_ = activeVideoSettings_.width;
-    encodeHeight_ = activeVideoSettings_.height;
-    scaler_.reset();
-    scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
-
-    encoder_ = createEncoderForDevice(d3d_);
-    if (!encoder_ || !encoder_->initialize(d3d_, activeVideoSettings_)) {
-        Logger::instance().error(L"Capture pipeline start failed during encoder initialization");
-        {
-            std::scoped_lock lock(captureStatusMutex_);
-            captureBackendActive_ = false;
-            captureBackendStatus_ += L"; encoder initialization failed";
-        }
-        capture_->shutdown();
-        capture_.reset();
-        return false;
-    }
+    const uint32_t sourceWidth = captureWidth_.load();
+    const uint32_t sourceHeight = captureHeight_.load();
 
     replay_.configure(snapshot.replay);
     stopRequested_ = false;
@@ -618,7 +584,7 @@ bool RecorderController::ensurePipeline() {
         pendingDurationPts100ns_ = 0;
         pendingDuration100ns_ = 0;
     }
-    forceVideoHeartbeat_ = false;
+    // recreateGpuPipeline may have requested a keyframe; keep that flag.
     capturedFrames_ = 0;
     sourceFrames_ = 0;
     cadenceDuplicateFrames_ = 0;
@@ -665,9 +631,11 @@ void RecorderController::stopPipeline() {
 
     systemAudio_.stop();
     microphoneAudio_.stop();
+    WasapiCapture::clearSessionMutes();
     {
         std::scoped_lock lock(systemAudioCaptureMutex_);
-        systemAudioExcludedProcessId_ = UINT32_MAX;
+        systemAudioMutedExecutableKeys_.clear();
+        systemAudioSessionMutesActive_ = false;
     }
     frameQueue_.clear();
 
@@ -697,12 +665,14 @@ void RecorderController::stopPipeline() {
 
     if (encoder_) {
         encoder_->shutdown();
+        encoder_.reset();
     }
     scaler_.reset();
     if (capture_) {
         capture_->shutdown();
         capture_.reset();
     }
+    d3d_.shutdown();
     {
         std::scoped_lock lock(captureStatusMutex_);
         captureBackendActive_ = false;
@@ -715,6 +685,76 @@ void RecorderController::stopPipeline() {
 
     pipelineRunning_ = false;
     Logger::instance().info(L"Capture/encode pipeline stopped");
+}
+
+bool RecorderController::recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason) {
+    Logger::instance().info(std::wstring(L"Recreating GPU pipeline: ") + (reason ? reason : L"unspecified"));
+
+    discardQueuedFrames_.store(true, std::memory_order_release);
+    if (frameEvent_) {
+        SetEvent(frameEvent_);
+    }
+
+    std::scoped_lock gpuLock(pipelineGpuMutex_);
+
+    if (encoder_) {
+        encoder_->shutdown();
+        encoder_.reset();
+    }
+    scaler_.reset();
+    if (capture_) {
+        capture_->shutdown();
+        capture_.reset();
+    }
+    frameQueue_.clear();
+
+    if (!d3d_.initialize(d3d_.adapterIndex())) {
+        Logger::instance().error(L"GPU pipeline recreate failed during D3D initialization");
+        std::scoped_lock lock(captureStatusMutex_);
+        captureBackendActive_ = false;
+        captureBackendStatus_ = L"Capture pipeline failed: Direct3D initialization failed";
+        return false;
+    }
+
+    if (!createCaptureSource(target)) {
+        Logger::instance().error(L"GPU pipeline recreate failed because no capture source could initialize");
+        return false;
+    }
+
+    const uint32_t sourceWidth = capture_->width();
+    const uint32_t sourceHeight = capture_->height();
+    captureWidth_ = sourceWidth;
+    captureHeight_ = sourceHeight;
+
+    AppSettings snapshot = settings();
+    activeGpuSettings_ = snapshot.gpu;
+    activeVideoSettings_ = activeVideoSettingsFor(snapshot, sourceWidth, sourceHeight);
+    encodeWidth_ = activeVideoSettings_.width;
+    encodeHeight_ = activeVideoSettings_.height;
+    scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
+
+    encoder_ = createEncoderForDevice(d3d_);
+    if (!encoder_ || !encoder_->initialize(d3d_, activeVideoSettings_)) {
+        Logger::instance().error(L"GPU pipeline recreate failed during encoder initialization");
+        {
+            std::scoped_lock lock(captureStatusMutex_);
+            captureBackendActive_ = false;
+            captureBackendStatus_ += L"; encoder initialization failed";
+        }
+        if (capture_) {
+            capture_->shutdown();
+            capture_.reset();
+        }
+        return false;
+    }
+
+    forceVideoHeartbeat_ = true;
+    encoder_->requestKeyFrame();
+    Logger::instance().info(
+        L"GPU pipeline ready: capture=" + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
+        L", encode=" + std::to_wstring(activeVideoSettings_.width) + L"x" + std::to_wstring(activeVideoSettings_.height) +
+        L", adapter=" + d3d_.adapterName());
+    return true;
 }
 
 bool RecorderController::createCaptureSource(const CaptureTarget& target) {
@@ -750,7 +790,9 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
         wgcFailed = !initialized;
     }
 
-    if (!initialized && !snapshot.followFocusedMonitor) {
+    // Always allow Desktop Duplication fallback, including follow-monitor mode
+    // (monitor is resolved via HMONITOR → DXGI output mapping).
+    if (!initialized) {
         initialized = tryInitialize(std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication");
     }
 
@@ -759,7 +801,7 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
         captureBackendActive_ = false;
         captureBackendFallbackUsed_ = false;
         captureBackendStatus_ = wgcAttempted && wgcFailed
-            ? L"Selected backend: Windows Graphics Capture; WGC failed and no fallback is available for the current capture mode"
+            ? L"Selected backend: Windows Graphics Capture; WGC failed and Desktop Duplication fallback also failed"
             : std::wstring(L"Selected backend: ") + captureBackendDisplayName(selectedBackend) + L"; initialization failed";
         return false;
     }
@@ -840,7 +882,7 @@ void RecorderController::captureLoop() {
     HMONITOR pendingMonitor = nullptr;
     bool emitClockStarted = false;
     bool requestKeyFrameAfterAcceptedFrame = false;
-    const DXGI_FORMAT encoderInputFormat =
+    DXGI_FORMAT encoderInputFormat =
         encoder_ ? encoder_->preferredInputFormat() : DXGI_FORMAT_B8G8R8A8_UNORM;
     const auto fps = std::max<uint32_t>(1, activeVideoSettings_.fps);
     const auto frameInterval = std::chrono::nanoseconds(1'000'000'000 / fps);
@@ -848,9 +890,11 @@ void RecorderController::captureLoop() {
     VideoTimelineScheduler timelineScheduler(nominalFrameDuration100ns);
     const auto keyFrameHeartbeatInterval =
         std::chrono::seconds(std::max<uint32_t>(1, activeVideoSettings_.gopSeconds));
-    const bool allowIdleCoalescing =
-        activeGpuSettings_.allowIdleFrameSkipping &&
-        encoder_ && encoder_->capabilities().effective.zeroReorderDelay;
+    auto idleCoalescingAllowed = [&]() {
+        std::scoped_lock gpuLock(pipelineGpuMutex_);
+        return activeGpuSettings_.allowIdleFrameSkipping &&
+               encoder_ && encoder_->capabilities().effective.zeroReorderDelay;
+    };
     const auto monitorPollInterval = std::chrono::milliseconds(250);
     const auto soundSeparationPollInterval = std::chrono::seconds(2);
     const auto monitorSwitchStableInterval = std::chrono::milliseconds(1500);
@@ -866,7 +910,7 @@ void RecorderController::captureLoop() {
             source.frameIndex,
             steadyTimePoint100ns(emitTime),
             intervalCount,
-            allowIdleCoalescing,
+            idleCoalescingAllowed(),
             forcedHeartbeat,
             periodicHeartbeat);
 
@@ -905,8 +949,11 @@ void RecorderController::captureLoop() {
         frame.duration100ns = emission.duration100ns;
         frame.previousFramePts100ns = emission.previousFramePts100ns;
         frame.previousFrameDuration100ns = emission.previousFrameDuration100ns;
-        if (emission.requestKeyFrame && encoder_) {
-            encoder_->requestKeyFrame();
+        if (emission.requestKeyFrame) {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            if (encoder_) {
+                encoder_->requestKeyFrame();
+            }
         }
         if (shouldDropForGpuProtection(emission.duplicateFrame) ||
             !frameQueue_.tryPush(std::move(frame))) {
@@ -942,12 +989,15 @@ void RecorderController::captureLoop() {
         if (frameEvent_) {
             SetEvent(frameEvent_);
         }
-        if (encoder_) {
-            encoder_->resetInputResources();
-        }
-        if (capture_) {
-            scaler_.reset();
-            scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            if (encoder_) {
+                encoder_->resetInputResources();
+            }
+            if (capture_) {
+                scaler_.reset();
+                scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
+            }
         }
         lastFrame = {};
         emitClockStarted = false;
@@ -957,10 +1007,32 @@ void RecorderController::captureLoop() {
     };
 
     auto switchCaptureTarget = [&](const CaptureTarget& target, const wchar_t* reason) -> bool {
-        if (!createCaptureSource(target) || !capture_) {
-            return false;
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            if (!createCaptureSource(target) || !capture_) {
+                return false;
+            }
+            if (encoder_) {
+                encoder_->resetInputResources();
+            }
+            scaler_.reset();
+            scaler_.setPoolSize(captureTexturePoolSize(activeGpuSettings_));
         }
-        resetVideoHandoff();
+        discardQueuedFrames_.store(true, std::memory_order_release);
+        durationUpdatePending_.store(false, std::memory_order_release);
+        {
+            std::scoped_lock lock(durationUpdateMutex_);
+            pendingDurationPts100ns_ = 0;
+            pendingDuration100ns_ = 0;
+        }
+        lastFrame = {};
+        emitClockStarted = false;
+        timelineScheduler.reset();
+        lastVideoSubmission = SteadyClock::time_point::min();
+        requestKeyFrameAfterAcceptedFrame = true;
+        if (frameEvent_) {
+            SetEvent(frameEvent_);
+        }
         refreshCaptureDimensions();
         Logger::instance().info(std::wstring(L"Capture source switched: ") + reason);
         return true;
@@ -1016,7 +1088,14 @@ void RecorderController::captureLoop() {
             }
         }
 
-        if (capture_ && capture_->acquireNextFrame(frame, timeoutMs)) {
+        bool acquired = false;
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            if (capture_ && capture_->acquireNextFrame(frame, timeoutMs)) {
+                acquired = true;
+            }
+        }
+        if (acquired) {
             ++sourceFrames_;
             if (frame.pts100ns <= lastFrame.pts100ns) {
                 frame.pts100ns = steadyNow100ns();
@@ -1031,24 +1110,30 @@ void RecorderController::captureLoop() {
             }
 
             GpuFrame encodeFrame;
-            if (!scaler_.scale(
-                    d3d_,
-                    frame,
-                    activeVideoSettings_.width,
-                    activeVideoSettings_.height,
-                    encodeFrame,
-                    captureSettings.followFocusedMonitor,
-                    captureSettings.followFocusedMonitor && activeGpuSettings_.stableMultimonitorFrames,
-                    encoderInputFormat)) {
-                ++droppedFrames_;
-                continue;
+            {
+                std::scoped_lock gpuLock(pipelineGpuMutex_);
+                if (!scaler_.scale(
+                        d3d_,
+                        frame,
+                        activeVideoSettings_.width,
+                        activeVideoSettings_.height,
+                        encodeFrame,
+                        captureSettings.followFocusedMonitor,
+                        captureSettings.followFocusedMonitor && activeGpuSettings_.stableMultimonitorFrames,
+                        encoderInputFormat)) {
+                    ++droppedFrames_;
+                    continue;
+                }
             }
 
             lastFrame = encodeFrame;
             if (requestKeyFrameAfterAcceptedFrame) {
                 discardQueuedFrames_ = true;
-                if (encoder_) {
-                    encoder_->requestKeyFrame();
+                {
+                    std::scoped_lock gpuLock(pipelineGpuMutex_);
+                    if (encoder_) {
+                        encoder_->requestKeyFrame();
+                    }
                 }
                 requestKeyFrameAfterAcceptedFrame = false;
                 if (frameEvent_) {
@@ -1061,15 +1146,44 @@ void RecorderController::captureLoop() {
             }
         }
 
-        if (capture_ && capture_->isDeviceLost()) {
-            Logger::instance().warning(L"Capture device lost; attempting to recreate capture source");
-            capture_->shutdown();
-            capture_.reset();
+        bool captureLost = false;
+        bool deviceRemoved = false;
+        bool encoderFaulted = false;
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            captureLost = capture_ && capture_->isDeviceLost();
+            deviceRemoved = d3d_.isDeviceRemoved();
+            encoderFaulted = encoder_ && !encoder_->stats().encoderAvailable;
+        }
+        if (captureLost || deviceRemoved || encoderFaulted) {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
             CaptureTarget target = captureSettings.followFocusedMonitor
                 ? captureTargetForSettings(captureSettings)
                 : activeCaptureTarget_;
-            switchCaptureTarget(target, L"device/access loss");
+            if (deviceRemoved || encoderFaulted) {
+                Logger::instance().warning(
+                    deviceRemoved
+                        ? L"D3D device removed; recreating full GPU pipeline"
+                        : L"Hardware encoder faulted; recreating full GPU pipeline");
+                if (recreateGpuPipeline(
+                        target, deviceRemoved ? L"device removed" : L"encoder fault")) {
+                    resetVideoHandoff();
+                    encoderInputFormat =
+                        encoder_ ? encoder_->preferredInputFormat() : DXGI_FORMAT_B8G8R8A8_UNORM;
+                    if (recording_) {
+                        waitingForRecordingKeyFrame_ = true;
+                        forceVideoHeartbeat_ = true;
+                        if (encoder_) {
+                            encoder_->requestKeyFrame();
+                        }
+                    }
+                }
+            } else {
+                Logger::instance().warning(L"Capture access lost; recreating capture source");
+                if (switchCaptureTarget(target, L"device/access loss")) {
+                    // capture-only path
+                }
+            }
         }
 
         if (lastFrame.texture && emitClockStarted) {
@@ -1092,7 +1206,7 @@ void RecorderController::captureLoop() {
 }
 
 void RecorderController::encodeLoop() {
-    setThreadDescriptionSafe(L"Backtrack NVENC");
+    setThreadDescriptionSafe(L"Backtrack encode");
 
     std::unordered_map<int64_t, int64_t> pendingDurations;
 
@@ -1197,15 +1311,25 @@ void RecorderController::encodeLoop() {
         extendVideoDuration(frame.previousFramePts100ns, frame.previousFrameDuration100ns);
 
         EncodedPacket packet;
-        if (encoder_ && encoder_->encodeFrame(frame, packet) && !packet.bytes.empty()) {
+        bool encoded = false;
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            if (encoder_ && encoder_->encodeFrame(frame, packet) && !packet.bytes.empty()) {
+                encoded = true;
+            }
+        }
+        if (encoded) {
             publishPacket(std::move(packet));
         }
     }
 
     consumeDurationUpdate();
     std::vector<EncodedPacket> drained;
-    if (encoder_) {
-        encoder_->drain(drained);
+    {
+        std::scoped_lock gpuLock(pipelineGpuMutex_);
+        if (encoder_) {
+            encoder_->drain(drained);
+        }
     }
     for (auto& packet : drained) {
         publishPacket(std::move(packet));
@@ -1238,56 +1362,46 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) 
         return;
     }
 
-    uint32_t excludedProcessId = mutedSoundSeparationProcessId(settings);
+    const std::vector<std::wstring> mutedKeys = mutedSoundSeparationExecutableKeys(settings);
     std::scoped_lock lock(systemAudioCaptureMutex_);
 
-    // If a prior attempt to exclude this PID already failed, don't keep retrying
-    // (and re-logging) the same doomed loopback every poll. Treat it as no
-    // exclusion until the target PID changes.
-    if (excludedProcessId != 0 && excludedProcessId == failedSoundSeparationProcessId_) {
-        excludedProcessId = 0;
-    }
-
-    if (systemAudioExcludedProcessId_ == excludedProcessId && systemAudio_.running()) {
+    const bool keysChanged = mutedKeys != systemAudioMutedExecutableKeys_;
+    if (systemAudio_.running() && !keysChanged) {
+        // Re-apply session mutes so newly started muted apps get silenced.
+        if (!mutedKeys.empty()) {
+            const uint32_t mutedCount = WasapiCapture::applySessionMutesForExecutables(mutedKeys);
+            systemAudioSessionMutesActive_ = mutedCount > 0;
+        }
         return;
     }
 
+    systemAudioMutedExecutableKeys_ = mutedKeys;
     systemAudio_.stop();
 
-    bool started = false;
-    uint32_t activeExcludedProcessId = excludedProcessId;
-    if (excludedProcessId != 0) {
-        started = systemAudio_.startProcessLoopback(
-            AudioTrack::System,
-            excludedProcessId,
-            ProcessLoopbackMode::ExcludeTargetProcessTree,
-            [this](AudioPacket&& packet) { handleAudioPacket(std::move(packet)); });
-        if (started) {
-            failedSoundSeparationProcessId_ = 0;
-            Logger::instance().info(L"Sound seperation excluding audio from process " + std::to_wstring(excludedProcessId));
-        }
+    if (mutedKeys.empty()) {
+        WasapiCapture::clearSessionMutes();
+        systemAudioSessionMutesActive_ = false;
+    } else {
+        const uint32_t mutedCount = WasapiCapture::applySessionMutesForExecutables(mutedKeys);
+        systemAudioSessionMutesActive_ = mutedCount > 0;
+        Logger::instance().info(
+            L"Sound separation muting " + std::to_wstring(mutedCount) +
+            L" audio session(s) across " + std::to_wstring(mutedKeys.size()) + L" executable(s)");
     }
 
-    if (!started) {
-        activeExcludedProcessId = 0;
-        if (excludedProcessId != 0) {
-            // Remember this PID so we stop retrying it until the target changes.
-            failedSoundSeparationProcessId_ = excludedProcessId;
-            Logger::instance().warning(L"Sound seperation exclusion did not start; falling back to normal system audio");
-        }
-        started = systemAudio_.start(
-            AudioTrack::System,
-            settings.audioOutputDeviceId,
-            [this](AudioPacket&& packet) { handleAudioPacket(std::move(packet)); });
-    }
+    // Capture full system mix; muted apps are silenced at the session level so
+    // multiple apps can be excluded (process-loopback exclude only supports one PID).
+    const bool started = systemAudio_.start(
+        AudioTrack::System,
+        settings.audioOutputDeviceId,
+        [this](AudioPacket&& packet) { handleAudioPacket(std::move(packet)); });
 
     if (!started) {
         Logger::instance().warning(L"System audio capture did not start");
-        systemAudioExcludedProcessId_ = UINT32_MAX;
-        return;
+        WasapiCapture::clearSessionMutes();
+        systemAudioSessionMutesActive_ = false;
+        systemAudioMutedExecutableKeys_.clear();
     }
-
-    systemAudioExcludedProcessId_ = activeExcludedProcessId;
 }
 
 std::filesystem::path RecorderController::nextClipPath(const wchar_t* prefix) const {

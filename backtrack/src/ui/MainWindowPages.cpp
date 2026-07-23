@@ -53,63 +53,413 @@ void MainWindow::buildTabs() {
         applyDarkTheme(button);
         tabButtons_.push_back(button);
     }
+    updateTabChrome();
+}
+
+void MainWindow::storeCurrentPageCache() {
+    const size_t index = static_cast<size_t>(page_);
+    if (index >= pageCaches_.size()) {
+        return;
+    }
+    auto& cache = pageCaches_[index];
+    cache.host = pageHost_;
+    cache.controls = pageControls_;
+    cache.layoutItems = layoutItems_;
+    cache.statusHelpTexts = statusHelpTexts_;
+    cache.scrollY = pageScrollY_;
+    cache.contentHeight = pageContentHeight_;
+    cache.wheelRemainder = pageWheelRemainder_;
+    cache.built = true;
+}
+
+void MainWindow::loadPageCache(Page page) {
+    const size_t index = static_cast<size_t>(page);
+    if (index >= pageCaches_.size()) {
+        return;
+    }
+    auto& cache = pageCaches_[index];
+    pageHost_ = cache.host;
+    pageControls_ = cache.controls;
+    layoutItems_ = cache.layoutItems;
+    statusHelpTexts_ = cache.statusHelpTexts;
+    pageScrollY_ = cache.scrollY;
+    pageContentHeight_ = cache.contentHeight;
+    pageWheelRemainder_ = cache.wheelRemainder;
+    rebindPageControlPointers();
+}
+
+void MainWindow::rebindPageControlPointers() {
+    saveSettingsButton_ = nullptr;
+    startStopButton_ = nullptr;
+    bitrateEdit_ = nullptr;
+    codecCombo_ = nullptr;
+    recordHotkey_ = nullptr;
+    clipFolderEdit_ = nullptr;
+    replayEnabledCheck_ = nullptr;
+    replaySecondsEdit_ = nullptr;
+    replayHotkey_ = nullptr;
+    leagueKillReminderCheck_ = nullptr;
+    statsLabel_ = nullptr;
+    capsLabel_ = nullptr;
+    diagnosticLogLabel_ = nullptr;
+    clipList_ = nullptr;
+    listViewButton_ = nullptr;
+    galleryViewButton_ = nullptr;
+    settingsCategoryButtons_.clear();
+    renameEdit_ = nullptr;
+    fpsEdit_ = nullptr;
+    resolutionModeCombo_ = nullptr;
+    widthEdit_ = nullptr;
+    heightEdit_ = nullptr;
+    followFocusedMonitorCheck_ = nullptr;
+    followMouseMonitorCheck_ = nullptr;
+    systemAudioCheck_ = nullptr;
+    microphoneCheck_ = nullptr;
+    outputDeviceCombo_ = nullptr;
+    inputDeviceCombo_ = nullptr;
+    outputVolumeEdit_ = nullptr;
+    inputVolumeEdit_ = nullptr;
+    startWithWindowsCheck_ = nullptr;
+    exitToTrayCheck_ = nullptr;
+    encoderPresetCombo_ = nullptr;
+    encoderModeCombo_ = nullptr;
+    encoderProfileCombo_ = nullptr;
+    encoderLookaheadCheck_ = nullptr;
+    encoderLookaheadDepthEdit_ = nullptr;
+    encoderSpatialAQCheck_ = nullptr;
+    encoderAQStrengthEdit_ = nullptr;
+    encoderTemporalAQCheck_ = nullptr;
+    encoderMultipassCombo_ = nullptr;
+    encoderBFramesCheck_ = nullptr;
+    encoderAdaptiveBFramesCheck_ = nullptr;
+    encoderAdaptiveIFramesCheck_ = nullptr;
+    encoderZeroReorderDelayCheck_ = nullptr;
+    encoderGopSecondsEdit_ = nullptr;
+    encoderReferenceFramesEdit_ = nullptr;
+    gpuAdaptiveCombo_ = nullptr;
+    gpuFrameQueueLimitEdit_ = nullptr;
+    idleFrameCoalescingCheck_ = nullptr;
+    wgcZeroCopyCheck_ = nullptr;
+    stableMultimonitorFramesCheck_ = nullptr;
+    soundSeparationEnabledCheck_ = nullptr;
+    soundSeparationAppCombo_ = nullptr;
+    soundSeparationRefreshButton_ = nullptr;
+    soundSeparationManualButton_ = nullptr;
+    soundSeparationRowsY_ = 0;
+
+    if (!pageHost_) {
+        return;
+    }
+
+    auto child = [this](int id) -> HWND {
+        return GetDlgItem(pageHost_, id);
+    };
+
+    startStopButton_ = child(kStartStopButtonId);
+    recordHotkey_ = child(kRecordHotkeyId);
+    replayEnabledCheck_ = child(kReplayEnabledId);
+    replaySecondsEdit_ = child(kReplaySecondsEditId);
+    replayHotkey_ = child(kReplayHotkeyId);
+    saveSettingsButton_ = child(kSaveSettingsButtonId);
+    bitrateEdit_ = child(kBitrateEditId);
+    codecCombo_ = child(kCodecComboId);
+    clipFolderEdit_ = child(kClipFolderEditId);
+    fpsEdit_ = child(kFpsEditId);
+    resolutionModeCombo_ = child(kResolutionModeComboId);
+    widthEdit_ = child(kWidthEditId);
+    heightEdit_ = child(kHeightEditId);
+    followFocusedMonitorCheck_ = child(kFollowFocusedMonitorCheckId);
+    followMouseMonitorCheck_ = child(kFollowMouseMonitorCheckId);
+    systemAudioCheck_ = child(kSystemAudioCheckId);
+    microphoneCheck_ = child(kMicrophoneCheckId);
+    outputDeviceCombo_ = child(kOutputDeviceComboId);
+    inputDeviceCombo_ = child(kInputDeviceComboId);
+    outputVolumeEdit_ = child(kOutputVolumeEditId);
+    inputVolumeEdit_ = child(kInputVolumeEditId);
+    startWithWindowsCheck_ = child(kStartWithWindowsCheckId);
+    exitToTrayCheck_ = child(kExitToTrayCheckId);
+    encoderPresetCombo_ = child(kEncoderPresetComboId);
+    encoderModeCombo_ = child(kEncoderModeComboId);
+    encoderProfileCombo_ = child(kEncoderProfileComboId);
+    encoderLookaheadCheck_ = child(kEncoderLookaheadCheckId);
+    encoderLookaheadDepthEdit_ = child(kEncoderLookaheadDepthEditId);
+    encoderSpatialAQCheck_ = child(kEncoderSpatialAQCheckId);
+    encoderAQStrengthEdit_ = child(kEncoderAQStrengthEditId);
+    encoderTemporalAQCheck_ = child(kEncoderTemporalAQCheckId);
+    encoderMultipassCombo_ = child(kEncoderMultipassComboId);
+    encoderBFramesCheck_ = child(kEncoderBFramesCheckId);
+    encoderAdaptiveBFramesCheck_ = child(kEncoderAdaptiveBFramesCheckId);
+    encoderAdaptiveIFramesCheck_ = child(kEncoderAdaptiveIFramesCheckId);
+    encoderZeroReorderDelayCheck_ = child(kEncoderZeroReorderDelayCheckId);
+    encoderGopSecondsEdit_ = child(kEncoderGopSecondsEditId);
+    encoderReferenceFramesEdit_ = child(kEncoderReferenceFramesEditId);
+    gpuAdaptiveCombo_ = child(kGpuAdaptiveComboId);
+    gpuFrameQueueLimitEdit_ = child(kGpuFrameQueueLimitEditId);
+    idleFrameCoalescingCheck_ = child(kIdleFrameCoalescingCheckId);
+    wgcZeroCopyCheck_ = child(kWgcZeroCopyCheckId);
+    stableMultimonitorFramesCheck_ = child(kStableMultimonitorFramesCheckId);
+    soundSeparationEnabledCheck_ = child(kSoundSeparationEnabledCheckId);
+    soundSeparationAppCombo_ = child(kSoundSeparationAppComboId);
+    soundSeparationRefreshButton_ = child(kSoundSeparationRefreshButtonId);
+    soundSeparationManualButton_ = child(kSoundSeparationManualButtonId);
+    leagueKillReminderCheck_ = child(kLeagueKillReminderCheckId);
+    statsLabel_ = child(kStatsLabelId);
+    capsLabel_ = child(kCapsLabelId);
+    diagnosticLogLabel_ = child(kDiagnosticLogLabelId);
+    clipList_ = child(kClipListId);
+    listViewButton_ = child(kClipListViewButtonId);
+    galleryViewButton_ = child(kClipGalleryViewButtonId);
+    renameEdit_ = child(kRenameEditId);
+
+    for (int index = 0; index < kSettingsCategoryCount; ++index) {
+        HWND button = child(kSettingsCategoryButtonBaseId + index);
+        if (button) {
+            settingsCategoryButtons_.push_back(button);
+        }
+    }
+
+    if (page_ == Page::Settings && settingsCategory_ == SettingsCategory::SoundSeparation) {
+        // Rows sit under the "Selected apps" section; fall back if layout scan fails.
+        soundSeparationRowsY_ = 250;
+        for (const auto& item : layoutItems_) {
+            if (item.control == soundSeparationAppCombo_) {
+                soundSeparationRowsY_ = static_cast<int>(item.design.bottom) + kPageRect.top + 54;
+                break;
+            }
+        }
+    }
+}
+
+void MainWindow::invalidatePageCache(Page page) {
+    const size_t index = static_cast<size_t>(page);
+    if (index >= pageCaches_.size()) {
+        return;
+    }
+    auto& cache = pageCaches_[index];
+    if (!cache.built && cache.controls.empty()) {
+        return;
+    }
+
+    const bool wasCurrent = page_ == page && pageHost_ == cache.host;
+    if (wasCurrent) {
+        if (pageHost_) {
+            SendMessageW(pageHost_, WM_SETREDRAW, FALSE, 0);
+        }
+        clearPageControls();
+        pageScrollY_ = 0;
+        pageContentHeight_ = 0;
+        pageWheelRemainder_ = 0;
+        cache.controls.clear();
+        cache.layoutItems.clear();
+        cache.statusHelpTexts.clear();
+        cache.scrollY = 0;
+        cache.contentHeight = 0;
+        cache.wheelRemainder = 0;
+        cache.built = false;
+        if (pageHost_) {
+            SendMessageW(pageHost_, WM_SETREDRAW, TRUE, 0);
+        }
+        return;
+    }
+
+    for (HWND control : cache.controls) {
+        if (control && IsWindow(control)) {
+            DestroyWindow(control);
+        }
+    }
+    cache.controls.clear();
+    cache.layoutItems.clear();
+    cache.statusHelpTexts.clear();
+    cache.scrollY = 0;
+    cache.contentHeight = 0;
+    cache.wheelRemainder = 0;
+    cache.built = false;
+}
+
+void MainWindow::updateTabChrome() {
+    for (size_t index = 0; index < tabButtons_.size(); ++index) {
+        HWND button = tabButtons_[index];
+        if (!button) {
+            continue;
+        }
+        const bool selected = index == static_cast<size_t>(page_);
+        const bool dirtySettings = settingsDirty_ && index == static_cast<size_t>(Page::Settings);
+        std::wstring label;
+        switch (static_cast<Page>(index)) {
+        case Page::Capture:
+            label = L"Capture";
+            break;
+        case Page::Library:
+            label = L"Library";
+            break;
+        case Page::Settings:
+            label = dirtySettings ? L"Settings*" : L"Settings";
+            break;
+        case Page::Diagnostics:
+            label = L"Diagnostics";
+            break;
+        }
+        setText(button, label);
+        EnableWindow(button, TRUE);
+        InvalidateRect(button, nullptr, FALSE);
+        (void)selected;
+    }
+}
+
+void MainWindow::updateSettingsCategoryChrome() {
+    for (size_t index = 0; index < settingsCategoryButtons_.size(); ++index) {
+        HWND button = settingsCategoryButtons_[index];
+        if (!button) {
+            continue;
+        }
+        EnableWindow(button, TRUE);
+        InvalidateRect(button, nullptr, FALSE);
+    }
 }
 
 void MainWindow::switchPage(Page page) {
+    const bool alreadyVisible =
+        page == page_ &&
+        pageCaches_[static_cast<size_t>(page)].built &&
+        pageHost_ &&
+        IsWindowVisible(pageHost_);
+    if (alreadyVisible) {
+        updateTabChrome();
+        return;
+    }
+
+    if (page != page_ && settingsDirty_) {
+        if (!promptSaveSettingsIfDirty(true)) {
+            updateTabChrome();
+            return;
+        }
+    }
+
+    HWND previousHost = pageHost_;
+    const Page previousPage = page_;
+    if (settingsDirty_ && (previousPage == Page::Capture || previousPage == Page::Settings)) {
+        stashVisibleSettings();
+    }
+
+    // Capture/Settings hold editable values — destroy on leave so rebuild matches settings_.
+    // Library/Diagnostics keep HWND trees for snappy return (thumbnails, stats layout).
+    const bool previousCacheable =
+        previousPage == Page::Library || previousPage == Page::Diagnostics;
+    if (previousCacheable && pageCaches_[static_cast<size_t>(previousPage)].built) {
+        storeCurrentPageCache();
+    } else if (previousHost) {
+        SendMessageW(previousHost, WM_SETREDRAW, FALSE, 0);
+        clearPageControls();
+        auto& previousCache = pageCaches_[static_cast<size_t>(previousPage)];
+        previousCache.controls.clear();
+        previousCache.layoutItems.clear();
+        previousCache.statusHelpTexts.clear();
+        previousCache.scrollY = 0;
+        previousCache.contentHeight = 0;
+        previousCache.wheelRemainder = 0;
+        previousCache.built = false;
+        SendMessageW(previousHost, WM_SETREDRAW, TRUE, 0);
+    }
+    if (previousHost) {
+        ShowWindow(previousHost, SW_HIDE);
+    }
+
     page_ = page;
-    settingsDirty_ = false;
-    pageScrollY_ = 0;
-    pageWheelRemainder_ = 0;
+    clearButtonHover();
+    hoveredHelpControl_ = nullptr;
     clipListWheelRemainder_ = 0;
+    loadPageCache(page_);
+
+    auto& cache = pageCaches_[static_cast<size_t>(page_)];
+    const bool canReuse =
+        cache.built &&
+        (page_ == Page::Library || page_ == Page::Diagnostics);
+    if (!canReuse) {
+        pageScrollY_ = 0;
+        pageWheelRemainder_ = 0;
+        pageContentHeight_ = 0;
+        pageControls_.clear();
+        layoutItems_.clear();
+        statusHelpTexts_.clear();
+        if (pageHost_) {
+            SendMessageW(pageHost_, WM_SETREDRAW, FALSE, 0);
+        }
+        buildingPage_ = true;
+        switch (page_) {
+        case Page::Capture:
+            buildCapturePage();
+            break;
+        case Page::Library:
+            buildClipsPage();
+            break;
+        case Page::Settings:
+            buildSettingsPage();
+            break;
+        case Page::Diagnostics:
+            buildStatsPage();
+            break;
+        }
+        buildingPage_ = false;
+        storeCurrentPageCache();
+        if (pageHost_) {
+            SendMessageW(pageHost_, WM_SETREDRAW, TRUE, 0);
+        }
+    } else if (page_ == Page::Library) {
+        // Capture/Settings teardown clears page controls only; library HWNDs stay cached.
+        // Rehydrate gallery slots from thumbnailCache_ so previews survive tab switches.
+        loadClipThumbnails();
+        if (clipList_) {
+            InvalidateRect(clipList_, nullptr, FALSE);
+        }
+    }
+
     if (pageHost_) {
-        SendMessageW(pageHost_, WM_SETREDRAW, FALSE, 0);
+        ShowWindow(pageHost_, SW_SHOW);
     }
-    clearPageControls();
-    for (size_t index = 0; index < tabButtons_.size(); ++index) {
-        EnableWindow(tabButtons_[index], index != static_cast<size_t>(page_));
-    }
-    buildingPage_ = true;
-    switch (page_) {
-    case Page::Capture:
-        buildCapturePage();
-        break;
-    case Page::Library:
-        buildClipsPage();
-        break;
-    case Page::Settings:
-        buildSettingsPage();
-        break;
-    case Page::Diagnostics:
-        buildStatsPage();
-        break;
-    }
-    buildingPage_ = false;
-    clearSettingsDirty();
-    applyStatusText(statusText_);
+    updateTabChrome();
+    updateSaveSettingsButton();
+    applyStatusText(currentStatusDisplayText());
     layoutCurrentPage();
     if (pageHost_) {
-        SendMessageW(pageHost_, WM_SETREDRAW, TRUE, 0);
         redrawWindowAndChildren(pageHost_, true);
     }
-    redrawWindowAndChildren(window_);
+    for (HWND button : tabButtons_) {
+        InvalidateRect(button, nullptr, FALSE);
+    }
     updateDiagnosticsTimer();
+    if (page_ == Page::Diagnostics) {
+        updateStats();
+    }
 }
 
 void MainWindow::switchSettingsCategory(SettingsCategory category) {
+    if (page_ != Page::Settings) {
+        settingsCategory_ = category;
+        switchPage(Page::Settings);
+        return;
+    }
+    if (category == settingsCategory_) {
+        updateSettingsCategoryChrome();
+        return;
+    }
+    stashVisibleSettings();
     settingsCategory_ = category;
-    switchPage(Page::Settings);
+    rebuildSettingsCategoryBody();
 }
 
 void MainWindow::clearPageControls() {
     for (HWND control : pageControls_) {
-        DestroyWindow(control);
+        if (control && IsWindow(control)) {
+            DestroyWindow(control);
+        }
     }
     releaseSoundSeparationRowIcons();
+    soundSeparationRows_.clear();
     pageControls_.clear();
     layoutItems_.clear();
     statusHelpTexts_.clear();
     hoveredHelpControl_ = nullptr;
-    applyStatusText(statusText_);
+    clearButtonHover();
     saveSettingsButton_ = nullptr;
     startStopButton_ = nullptr;
     bitrateEdit_ = nullptr;
@@ -129,7 +479,6 @@ void MainWindow::clearPageControls() {
     settingsCategoryButtons_.clear();
     renameEdit_ = nullptr;
     selectedClipIndex_ = static_cast<size_t>(-1);
-    clearClipThumbnails();
     fpsEdit_ = nullptr;
     resolutionModeCombo_ = nullptr;
     widthEdit_ = nullptr;
@@ -171,6 +520,96 @@ void MainWindow::clearPageControls() {
     soundSeparationAvailableApps_.clear();
     soundSeparationRowsY_ = 0;
     clipListItemHeight_ = 0;
+}
+
+void MainWindow::clearSettingsBodyControls() {
+    std::unordered_set<HWND> keep;
+    keep.reserve(settingsCategoryButtons_.size() + 1);
+    for (HWND button : settingsCategoryButtons_) {
+        if (button) {
+            keep.insert(button);
+        }
+    }
+    if (saveSettingsButton_) {
+        keep.insert(saveSettingsButton_);
+    }
+
+    std::vector<HWND> keptControls;
+    std::vector<LayoutItem> keptLayout;
+    std::unordered_map<HWND, std::wstring> keptHelp;
+    keptControls.reserve(keep.size());
+    for (HWND control : pageControls_) {
+        if (keep.contains(control)) {
+            keptControls.push_back(control);
+            continue;
+        }
+        if (control && IsWindow(control)) {
+            DestroyWindow(control);
+        }
+    }
+    for (const auto& item : layoutItems_) {
+        if (item.control && keep.contains(item.control)) {
+            keptLayout.push_back(item);
+        }
+    }
+    for (const auto& [control, text] : statusHelpTexts_) {
+        if (keep.contains(control)) {
+            keptHelp[control] = text;
+        }
+    }
+
+    releaseSoundSeparationRowIcons();
+    soundSeparationRows_.clear();
+    pageControls_ = std::move(keptControls);
+    layoutItems_ = std::move(keptLayout);
+    statusHelpTexts_ = std::move(keptHelp);
+    hoveredHelpControl_ = nullptr;
+    clearButtonHover();
+
+    bitrateEdit_ = nullptr;
+    codecCombo_ = nullptr;
+    clipFolderEdit_ = nullptr;
+    leagueKillReminderCheck_ = nullptr;
+    fpsEdit_ = nullptr;
+    resolutionModeCombo_ = nullptr;
+    widthEdit_ = nullptr;
+    heightEdit_ = nullptr;
+    followFocusedMonitorCheck_ = nullptr;
+    followMouseMonitorCheck_ = nullptr;
+    systemAudioCheck_ = nullptr;
+    microphoneCheck_ = nullptr;
+    outputDeviceCombo_ = nullptr;
+    inputDeviceCombo_ = nullptr;
+    outputVolumeEdit_ = nullptr;
+    inputVolumeEdit_ = nullptr;
+    startWithWindowsCheck_ = nullptr;
+    exitToTrayCheck_ = nullptr;
+    encoderPresetCombo_ = nullptr;
+    encoderModeCombo_ = nullptr;
+    encoderProfileCombo_ = nullptr;
+    encoderLookaheadCheck_ = nullptr;
+    encoderLookaheadDepthEdit_ = nullptr;
+    encoderSpatialAQCheck_ = nullptr;
+    encoderAQStrengthEdit_ = nullptr;
+    encoderTemporalAQCheck_ = nullptr;
+    encoderMultipassCombo_ = nullptr;
+    encoderBFramesCheck_ = nullptr;
+    encoderAdaptiveBFramesCheck_ = nullptr;
+    encoderAdaptiveIFramesCheck_ = nullptr;
+    encoderZeroReorderDelayCheck_ = nullptr;
+    encoderGopSecondsEdit_ = nullptr;
+    encoderReferenceFramesEdit_ = nullptr;
+    gpuAdaptiveCombo_ = nullptr;
+    gpuFrameQueueLimitEdit_ = nullptr;
+    idleFrameCoalescingCheck_ = nullptr;
+    wgcZeroCopyCheck_ = nullptr;
+    stableMultimonitorFramesCheck_ = nullptr;
+    soundSeparationEnabledCheck_ = nullptr;
+    soundSeparationAppCombo_ = nullptr;
+    soundSeparationRefreshButton_ = nullptr;
+    soundSeparationManualButton_ = nullptr;
+    soundSeparationAvailableApps_.clear();
+    soundSeparationRowsY_ = 0;
 }
 
 HWND MainWindow::addControl(const wchar_t* className, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id) {
@@ -232,8 +671,15 @@ HWND MainWindow::addSectionLabel(const wchar_t* text, int x, int y, int width) {
 }
 
 void MainWindow::buildSettingsPage() {
-    settings_ = controller_.settings();
+    if (!settingsDirty_) {
+        settings_ = controller_.settings();
+    }
     buildSettingsCategoryTabs(78);
+    buildSettingsCategoryBody();
+    addDirtySaveButton();
+}
+
+void MainWindow::buildSettingsCategoryBody() {
     if (settingsCategory_ == SettingsCategory::General) {
         buildSettingsGeneralPage();
     } else if (settingsCategory_ == SettingsCategory::Advanced) {
@@ -243,7 +689,25 @@ void MainWindow::buildSettingsPage() {
     } else {
         buildSettingsGameIntegrationsPage();
     }
-    addDirtySaveButton();
+}
+
+void MainWindow::rebuildSettingsCategoryBody() {
+    if (!pageHost_) {
+        return;
+    }
+    SendMessageW(pageHost_, WM_SETREDRAW, FALSE, 0);
+    buildingPage_ = true;
+    clearSettingsBodyControls();
+    pageScrollY_ = 0;
+    pageWheelRemainder_ = 0;
+    buildSettingsCategoryBody();
+    buildingPage_ = false;
+    updateSettingsCategoryChrome();
+    updateSaveSettingsButton();
+    layoutCurrentPage();
+    storeCurrentPageCache();
+    SendMessageW(pageHost_, WM_SETREDRAW, TRUE, 0);
+    redrawWindowAndChildren(pageHost_, true);
 }
 
 void MainWindow::buildSettingsCategoryTabs(int y) {
@@ -251,7 +715,7 @@ void MainWindow::buildSettingsCategoryTabs(int y) {
     constexpr int kTabWidth = 150;
     constexpr int kTabHeight = 30;
     constexpr int kTabGap = 8;
-    const wchar_t* labels[] = {L"General", L"Advanced", L"Sound seperation", L"Game integrations"};
+    const wchar_t* labels[] = {L"General", L"Advanced", L"Sound separation", L"Game integrations"};
 
     settingsCategoryButtons_.clear();
     for (int index = 0; index < kSettingsCategoryCount; ++index) {
@@ -265,8 +729,9 @@ void MainWindow::buildSettingsCategoryTabs(int y) {
             kTabHeight,
             kSettingsCategoryButtonBaseId + index);
         settingsCategoryButtons_.push_back(button);
-        EnableWindow(button, index != static_cast<int>(settingsCategory_));
+        EnableWindow(button, TRUE);
     }
+    updateSettingsCategoryChrome();
 }
 
 void MainWindow::buildSettingsGeneralPage() {
@@ -571,11 +1036,11 @@ void MainWindow::buildSettingsSoundSeparationPage() {
         y += 36;
     };
 
-    addSection(L"Sound seperation");
+    addSection(L"Sound separation");
     addRowLabel(L"Mode");
     soundSeparationEnabledCheck_ = addControl(
         L"BUTTON",
-        L"Enable sound seperation",
+        L"Enable sound separation",
         BS_AUTOCHECKBOX | WS_TABSTOP,
         kControlX,
         y,
@@ -596,7 +1061,7 @@ void MainWindow::buildSettingsSoundSeparationPage() {
         kComboWidth,
         180,
         kSoundSeparationAppComboId);
-    addSettingHelp(soundSeparationAppCombo_, 0, 0, L"Choose a running app to add it to sound seperation. Apps only affect clips while sound seperation is enabled and the app row is muted.");
+    addSettingHelp(soundSeparationAppCombo_, 0, 0, L"Choose a running app to add it to sound separation. Apps only affect clips while sound separation is enabled and the app row is muted.");
     soundSeparationRefreshButton_ = addControl(
         L"BUTTON",
         L"Refresh",
@@ -658,7 +1123,9 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
 }
 
 void MainWindow::buildCapturePage() {
-    settings_ = controller_.settings();
+    if (!settingsDirty_) {
+        settings_ = controller_.settings();
+    }
 
     constexpr int kX = 44;
     constexpr int kLabelWidth = 160;
@@ -721,7 +1188,7 @@ void MainWindow::buildStatsPage() {
     capsLabel_ = addControl(L"STATIC", L"", SS_LEFT, 464, 112, 350, 330, kCapsLabelId);
     addSectionLabel(L"Recent Log", 44, 484, 220);
     addControl(L"BUTTON", L"Save Log", BS_PUSHBUTTON | WS_TABSTOP, 712, 480, 112, 30, kSaveLogButtonId);
-    diagnosticLogLabel_ = addControl(L"STATIC", L"", SS_LEFT, 44, 518, 780, 150, -1);
+    diagnosticLogLabel_ = addControl(L"STATIC", L"", SS_LEFT, 44, 518, 780, 150, kDiagnosticLogLabelId);
     updateStats();
 }
 

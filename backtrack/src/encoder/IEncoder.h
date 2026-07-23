@@ -21,8 +21,8 @@ public:
     virtual EncoderStats stats() const = 0;
 
     // Preferred D3D11 input surface format for this encoder. The capture scaler
-    // converts frames to this format before submission. NVENC accepts BGRA
-    // directly; AMF AVC/HEVC prefer NV12.
+    // converts frames to this format before submission. Both NVENC and AMF use
+    // BGRA; AMF performs color conversion inside the encoder.
     virtual DXGI_FORMAT preferredInputFormat() const = 0;
 };
 

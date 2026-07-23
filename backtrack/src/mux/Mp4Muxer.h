@@ -57,6 +57,7 @@ private:
     };
 
     void writeTimelineAudioPacket(AudioTimelineState& state, const AudioPacket& packet, const wchar_t* fileName);
+    void flushPendingAudioLocked();
 
     mutable std::mutex mutex_;
     bool active_ = false;
@@ -68,6 +69,7 @@ private:
     std::vector<MuxedInputs::VideoSample> videoSamples_;
     AudioTimelineState systemAudio_;
     AudioTimelineState microphoneAudio_;
+    std::vector<AudioPacket> pendingAudio_;
     std::optional<int64_t> firstVideoPts100ns_;
     uint64_t videoPackets_ = 0;
     uint64_t videoBytes_ = 0;

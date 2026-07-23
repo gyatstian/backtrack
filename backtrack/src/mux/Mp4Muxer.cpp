@@ -300,6 +300,7 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     writeFailed_ = false;
     lastError_.clear();
     videoSamples_.clear();
+    pendingAudio_.clear();
     active_ = true;
     Logger::instance().info(L"Recording muxer started: " + outputPath_.wstring());
     return true;
@@ -327,6 +328,7 @@ void Mp4Muxer::writeVideoPacket(const EncodedPacket& packet) {
         firstVideoPts100ns_ = packet.pts100ns;
         systemAudio_.nextPts100ns = packet.pts100ns;
         microphoneAudio_.nextPts100ns = packet.pts100ns;
+        flushPendingAudioLocked();
     }
     videoSamples_.push_back(MuxedInputs::VideoSample{
         offset,
@@ -359,11 +361,34 @@ void Mp4Muxer::writeAudioPacket(const AudioPacket& packet) {
     }
 
     if (!firstVideoPts100ns_) {
+        // Hold audio until the first video sample anchors the timeline so short
+        // recordings and pre-keyframe audio are not silently dropped.
+        constexpr size_t kMaxPendingAudioPackets = 512;
+        if (pendingAudio_.size() >= kMaxPendingAudioPackets) {
+            pendingAudio_.erase(pendingAudio_.begin());
+        }
+        pendingAudio_.push_back(packet);
         return;
     }
 
     auto& state = packet.track == AudioTrack::System ? systemAudio_ : microphoneAudio_;
     writeTimelineAudioPacket(state, packet, packet.track == AudioTrack::System ? L"system.wav" : L"microphone.wav");
+}
+
+void Mp4Muxer::flushPendingAudioLocked() {
+    if (!firstVideoPts100ns_ || pendingAudio_.empty()) {
+        pendingAudio_.clear();
+        return;
+    }
+
+    for (const auto& packet : pendingAudio_) {
+        auto& state = packet.track == AudioTrack::System ? systemAudio_ : microphoneAudio_;
+        writeTimelineAudioPacket(
+            state,
+            packet,
+            packet.track == AudioTrack::System ? L"system.wav" : L"microphone.wav");
+    }
+    pendingAudio_.clear();
 }
 
 std::filesystem::path Mp4Muxer::finalize() {
@@ -380,8 +405,10 @@ std::filesystem::path Mp4Muxer::finalize() {
         }
 
         videoStream_.close();
+        flushPendingAudioLocked();
         systemAudio_.writer.close();
         microphoneAudio_.writer.close();
+        pendingAudio_.clear();
         active_ = false;
 
         inputs.videoPath = videoPath_;
@@ -461,6 +488,7 @@ void Mp4Muxer::abort() {
         }
         systemAudio_.writer.close();
         microphoneAudio_.writer.close();
+        pendingAudio_.clear();
     }
     if (!tempDirectory.empty()) {
         std::error_code cleanupError;

@@ -43,6 +43,7 @@ public:
 private:
     bool ensurePipeline();
     void stopPipeline();
+    bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason);
     bool createCaptureSource(const CaptureTarget& target);
     uint32_t activeFrameQueueLimit() const;
     bool shouldDropForGpuProtection(bool duplicateFrame) const;
@@ -61,6 +62,9 @@ private:
     CaptureTarget activeCaptureTarget_;
 
     D3DDevice d3d_;
+    // Serializes capture/encode access while D3D device, capture source, scaler,
+    // or encoder are torn down and recreated after device loss.
+    mutable std::mutex pipelineGpuMutex_;
     std::unique_ptr<ICaptureSource> capture_;
     mutable std::mutex captureStatusMutex_;
     CaptureBackend selectedCaptureBackend_ = CaptureBackend::WindowsGraphicsCapture;
@@ -76,10 +80,8 @@ private:
     WasapiCapture microphoneAudio_;
 
     mutable std::mutex systemAudioCaptureMutex_;
-    uint32_t systemAudioExcludedProcessId_ = UINT32_MAX;
-    // PID whose loopback exclusion was attempted and failed; suppresses retrying
-    // (and re-logging) the same doomed exclusion every poll cycle.
-    uint32_t failedSoundSeparationProcessId_ = 0;
+    std::vector<std::wstring> systemAudioMutedExecutableKeys_;
+    bool systemAudioSessionMutesActive_ = false;
     mutable std::mutex recordingErrorMutex_;
     std::wstring lastRecordingError_;
 

@@ -65,8 +65,10 @@ void MainWindow::layoutWindow() {
 
     const int pageTop = kTabTop + kTabHeight + kPageGap;
     const int pageBottom = std::max(pageTop + 40, statusTop - kPageGap);
-    if (pageHost_) {
-        changed = moveWindowIfChanged(pageHost_, kOuterMargin, pageTop, contentWidth, pageBottom - pageTop) || changed;
+    for (auto& cache : pageCaches_) {
+        if (cache.host) {
+            changed = moveWindowIfChanged(cache.host, kOuterMargin, pageTop, contentWidth, pageBottom - pageTop) || changed;
+        }
     }
 
     changed = layoutCurrentPage() || changed;

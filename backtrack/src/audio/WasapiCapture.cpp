@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 namespace backtrack {
@@ -474,6 +475,155 @@ std::vector<AudioSessionAppInfo> WasapiCapture::enumerateAudioSessionApps() {
         return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
     });
     return apps;
+}
+
+namespace {
+
+struct SessionMuteEntry {
+    DWORD processId = 0;
+    std::wstring pathKey;
+    bool previousMute = false;
+    Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
+};
+
+std::mutex g_sessionMuteMutex;
+std::vector<SessionMuteEntry> g_sessionMutes;
+
+void restoreSessionMutesLocked() {
+    for (auto& entry : g_sessionMutes) {
+        if (entry.volume) {
+            entry.volume->SetMute(entry.previousMute ? TRUE : FALSE, nullptr);
+        }
+    }
+    g_sessionMutes.clear();
+}
+
+} // namespace
+
+uint32_t WasapiCapture::applySessionMutesForExecutables(const std::vector<std::wstring>& mutedExecutableKeys) {
+    std::scoped_lock lock(g_sessionMuteMutex);
+    if (mutedExecutableKeys.empty()) {
+        restoreSessionMutesLocked();
+        return 0;
+    }
+
+    std::unordered_set<std::wstring> mutedKeys(
+        mutedExecutableKeys.begin(), mutedExecutableKeys.end());
+
+    ScopedComInitialization com(COINIT_MULTITHREADED);
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr) || !enumerator) {
+        return 0;
+    }
+
+    Microsoft::WRL::ComPtr<IMMDeviceCollection> endpoints;
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &endpoints);
+    if (FAILED(hr) || !endpoints) {
+        return 0;
+    }
+
+    // Drop stale mute entries for processes that exited or are no longer requested.
+    for (auto it = g_sessionMutes.begin(); it != g_sessionMutes.end();) {
+        const bool stillWanted = mutedKeys.contains(it->pathKey);
+        HANDLE process = stillWanted ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, it->processId) : nullptr;
+        const bool alive = process != nullptr;
+        if (process) {
+            CloseHandle(process);
+        }
+        if (!stillWanted || !alive || !it->volume) {
+            if (it->volume) {
+                it->volume->SetMute(it->previousMute ? TRUE : FALSE, nullptr);
+            }
+            it = g_sessionMutes.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::unordered_set<DWORD> alreadyMuted;
+    for (const auto& entry : g_sessionMutes) {
+        alreadyMuted.insert(entry.processId);
+    }
+
+    const DWORD currentProcessId = GetCurrentProcessId();
+    UINT endpointCount = 0;
+    endpoints->GetCount(&endpointCount);
+    for (UINT endpointIndex = 0; endpointIndex < endpointCount; ++endpointIndex) {
+        Microsoft::WRL::ComPtr<IMMDevice> endpoint;
+        if (FAILED(endpoints->Item(endpointIndex, &endpoint)) || !endpoint) {
+            continue;
+        }
+
+        Microsoft::WRL::ComPtr<IAudioSessionManager2> sessionManager;
+        hr = endpoint->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &sessionManager);
+        if (FAILED(hr) || !sessionManager) {
+            continue;
+        }
+
+        Microsoft::WRL::ComPtr<IAudioSessionEnumerator> sessions;
+        hr = sessionManager->GetSessionEnumerator(&sessions);
+        if (FAILED(hr) || !sessions) {
+            continue;
+        }
+
+        int sessionCount = 0;
+        sessions->GetCount(&sessionCount);
+        for (int sessionIndex = 0; sessionIndex < sessionCount; ++sessionIndex) {
+            Microsoft::WRL::ComPtr<IAudioSessionControl> session;
+            if (FAILED(sessions->GetSession(sessionIndex, &session)) || !session) {
+                continue;
+            }
+
+            Microsoft::WRL::ComPtr<IAudioSessionControl2> session2;
+            if (FAILED(session.As(&session2)) || !session2) {
+                continue;
+            }
+            if (session2->IsSystemSoundsSession() == S_OK) {
+                continue;
+            }
+
+            DWORD processId = 0;
+            if (FAILED(session2->GetProcessId(&processId)) ||
+                processId == 0 ||
+                processId == currentProcessId ||
+                alreadyMuted.contains(processId)) {
+                continue;
+            }
+
+            const std::filesystem::path imagePath = processImagePath(processId);
+            const std::wstring key = normalizedPathKey(imagePath);
+            if (key.empty() || !mutedKeys.contains(key)) {
+                continue;
+            }
+
+            Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
+            if (FAILED(session.As(&volume)) || !volume) {
+                continue;
+            }
+
+            BOOL previousMute = FALSE;
+            volume->GetMute(&previousMute);
+            if (FAILED(volume->SetMute(TRUE, nullptr))) {
+                continue;
+            }
+
+            SessionMuteEntry entry;
+            entry.processId = processId;
+            entry.pathKey = key;
+            entry.previousMute = previousMute == TRUE;
+            entry.volume = std::move(volume);
+            g_sessionMutes.push_back(std::move(entry));
+            alreadyMuted.insert(processId);
+        }
+    }
+
+    return static_cast<uint32_t>(g_sessionMutes.size());
+}
+
+void WasapiCapture::clearSessionMutes() {
+    std::scoped_lock lock(g_sessionMuteMutex);
+    restoreSessionMutesLocked();
 }
 
 std::vector<AudioSessionAppInfo> WasapiCapture::enumerateOpenApps() {

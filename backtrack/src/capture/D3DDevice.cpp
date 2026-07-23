@@ -6,7 +6,28 @@
 
 namespace backtrack {
 
+void D3DDevice::shutdown() {
+    std::scoped_lock lock(contextMutex_);
+    context_.Reset();
+    device_.Reset();
+    adapter_.Reset();
+    adapterName_.clear();
+    vendor_ = GpuVendor::Unknown;
+    vendorId_ = 0;
+}
+
+bool D3DDevice::isDeviceRemoved() const {
+    if (!device_) {
+        return true;
+    }
+    const HRESULT reason = device_->GetDeviceRemovedReason();
+    return FAILED(reason);
+}
+
 bool D3DDevice::initialize(uint32_t adapterIndex) {
+    shutdown();
+    adapterIndex_ = adapterIndex;
+
     ComPtr<IDXGIFactory1> factory;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
     if (FAILED(hr)) {
@@ -86,8 +107,7 @@ bool D3DDevice::initialize(uint32_t adapterIndex) {
         case 0x10DE:
             vendor_ = GpuVendor::Nvidia;
             break;
-        case 0x1002:
-        case 0x1022:
+        case 0x1002: // AMD GPU (Radeon). 0x1022 is AMD CPU/chipset PCI id — not a GPU.
             vendor_ = GpuVendor::Amd;
             break;
         case 0x8086:

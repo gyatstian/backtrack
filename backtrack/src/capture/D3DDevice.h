@@ -9,6 +9,8 @@ namespace backtrack {
 class D3DDevice {
 public:
     bool initialize(uint32_t adapterIndex = 0);
+    void shutdown();
+    bool isDeviceRemoved() const;
 
     ID3D11Device* device() const { return device_.Get(); }
     ID3D11DeviceContext* context() const { return context_.Get(); }
@@ -16,6 +18,7 @@ public:
     const std::wstring& adapterName() const { return adapterName_; }
     GpuVendor vendor() const { return vendor_; }
     uint32_t vendorId() const { return vendorId_; }
+    uint32_t adapterIndex() const { return adapterIndex_; }
 
     std::mutex& immediateContextMutex() { return contextMutex_; }
 
@@ -26,6 +29,7 @@ private:
     std::wstring adapterName_;
     GpuVendor vendor_ = GpuVendor::Unknown;
     uint32_t vendorId_ = 0;
+    uint32_t adapterIndex_ = 0;
     std::mutex contextMutex_;
 };
 

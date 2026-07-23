@@ -3,19 +3,248 @@
 #include "core/Logger.h"
 #include "core/Types.h"
 
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
 #include <mmsystem.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cwctype>
 #include <limits>
 #include <sstream>
 #include <vector>
 
 namespace backtrack {
+
+namespace {
+
+using Microsoft::WRL::ComPtr;
+
+struct ScopedMfStartup {
+    ScopedMfStartup()
+        : result(MFStartup(MF_VERSION)),
+          started(SUCCEEDED(result)) {
+    }
+
+    ~ScopedMfStartup() {
+        if (started) {
+            MFShutdown();
+        }
+    }
+
+    HRESULT result = E_FAIL;
+    bool started = false;
+};
+
+HBITMAP createScaledBitmapFromRgb32(const BYTE* pixels, LONG stride, UINT sourceWidth, UINT sourceHeight, int width, int height) {
+    if (!pixels || sourceWidth == 0 || sourceHeight == 0 || width <= 0 || height <= 0) {
+        return nullptr;
+    }
+
+    const LONG pitch = stride == 0 ? static_cast<LONG>(sourceWidth) * 4 : stride;
+    const size_t rowBytes = static_cast<size_t>(sourceWidth) * 4;
+    std::vector<BYTE> topDown(rowBytes * sourceHeight);
+    for (UINT y = 0; y < sourceHeight; ++y) {
+        const BYTE* src = pixels + static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(pitch);
+        std::memcpy(topDown.data() + static_cast<size_t>(y) * rowBytes, src, rowBytes);
+    }
+
+    BITMAPINFO sourceInfo{};
+    sourceInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    sourceInfo.bmiHeader.biWidth = static_cast<LONG>(sourceWidth);
+    sourceInfo.bmiHeader.biHeight = -static_cast<LONG>(sourceHeight);
+    sourceInfo.bmiHeader.biPlanes = 1;
+    sourceInfo.bmiHeader.biBitCount = 32;
+    sourceInfo.bmiHeader.biCompression = BI_RGB;
+
+    BITMAPINFO targetInfo{};
+    targetInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    targetInfo.bmiHeader.biWidth = width;
+    targetInfo.bmiHeader.biHeight = -height;
+    targetInfo.bmiHeader.biPlanes = 1;
+    targetInfo.bmiHeader.biBitCount = 32;
+    targetInfo.bmiHeader.biCompression = BI_RGB;
+
+    void* targetBits = nullptr;
+    HBITMAP bitmap = CreateDIBSection(nullptr, &targetInfo, DIB_RGB_COLORS, &targetBits, nullptr, 0);
+    if (!bitmap || !targetBits) {
+        if (bitmap) {
+            DeleteObject(bitmap);
+        }
+        return nullptr;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    HDC targetDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
+    if (!targetDc) {
+        if (screenDc) {
+            ReleaseDC(nullptr, screenDc);
+        }
+        DeleteObject(bitmap);
+        return nullptr;
+    }
+
+    HGDIOBJ oldTarget = SelectObject(targetDc, bitmap);
+    SetStretchBltMode(targetDc, HALFTONE);
+    SetBrushOrgEx(targetDc, 0, 0, nullptr);
+    StretchDIBits(
+        targetDc,
+        0,
+        0,
+        width,
+        height,
+        0,
+        0,
+        static_cast<int>(sourceWidth),
+        static_cast<int>(sourceHeight),
+        topDown.data(),
+        &sourceInfo,
+        DIB_RGB_COLORS,
+        SRCCOPY);
+    SelectObject(targetDc, oldTarget);
+    DeleteDC(targetDc);
+    ReleaseDC(nullptr, screenDc);
+    return bitmap;
+}
+
+HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int width, int height) {
+    ScopedMfStartup mf;
+    if (!mf.started) {
+        Logger::instance().warning(
+            L"Media Foundation startup failed for clip thumbnail: " + path.wstring() + L" (" + hresultToString(mf.result) + L")");
+        return nullptr;
+    }
+
+    ComPtr<IMFAttributes> attributes;
+    HRESULT hr = MFCreateAttributes(&attributes, 2);
+    if (FAILED(hr)) {
+        return nullptr;
+    }
+    attributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+
+    ComPtr<IMFSourceReader> reader;
+    hr = MFCreateSourceReaderFromURL(path.c_str(), attributes.Get(), &reader);
+    if (FAILED(hr) || !reader) {
+        Logger::instance().warning(
+            L"Could not open clip for Media Foundation thumbnail: " + path.wstring() + L" (" + hresultToString(hr) + L")");
+        return nullptr;
+    }
+
+    reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE);
+    reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), TRUE);
+
+    ComPtr<IMFMediaType> outputType;
+    hr = MFCreateMediaType(&outputType);
+    if (FAILED(hr)) {
+        return nullptr;
+    }
+    outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+    hr = reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), nullptr, outputType.Get());
+    if (FAILED(hr)) {
+        Logger::instance().warning(
+            L"Could not configure RGB32 decode for clip thumbnail: " + path.wstring() + L" (" + hresultToString(hr) + L")");
+        return nullptr;
+    }
+
+    ComPtr<IMFMediaType> currentType;
+    hr = reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &currentType);
+    if (FAILED(hr) || !currentType) {
+        return nullptr;
+    }
+
+    UINT32 sourceWidth = 0;
+    UINT32 sourceHeight = 0;
+    hr = MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &sourceWidth, &sourceHeight);
+    if (FAILED(hr) || sourceWidth == 0 || sourceHeight == 0) {
+        return nullptr;
+    }
+
+    ComPtr<IMFSample> sample;
+    for (;;) {
+        DWORD streamIndex = 0;
+        DWORD flags = 0;
+        LONGLONG timestamp = 0;
+        ComPtr<IMFSample> nextSample;
+        hr = reader->ReadSample(
+            static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM),
+            0,
+            &streamIndex,
+            &flags,
+            &timestamp,
+            &nextSample);
+        if (FAILED(hr)) {
+            Logger::instance().warning(
+                L"Could not decode clip frame for thumbnail: " + path.wstring() + L" (" + hresultToString(hr) + L")");
+            return nullptr;
+        }
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+            break;
+        }
+        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
+            currentType.Reset();
+            if (SUCCEEDED(reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), &currentType)) &&
+                currentType) {
+                MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &sourceWidth, &sourceHeight);
+            }
+        }
+        if (nextSample) {
+            sample = nextSample;
+            break;
+        }
+    }
+
+    if (!sample || sourceWidth == 0 || sourceHeight == 0) {
+        Logger::instance().warning(L"No video frame available for clip thumbnail: " + path.wstring());
+        return nullptr;
+    }
+
+    ComPtr<IMFMediaBuffer> buffer;
+    hr = sample->ConvertToContiguousBuffer(&buffer);
+    if (FAILED(hr) || !buffer) {
+        return nullptr;
+    }
+
+    BYTE* data = nullptr;
+    DWORD maxLength = 0;
+    DWORD currentLength = 0;
+    LONG pitch = 0;
+    ComPtr<IMF2DBuffer> buffer2d;
+    if (SUCCEEDED(buffer.As(&buffer2d))) {
+        hr = buffer2d->Lock2D(&data, &pitch);
+        if (FAILED(hr) || !data) {
+            return nullptr;
+        }
+    } else {
+        hr = buffer->Lock(&data, &maxLength, &currentLength);
+        if (FAILED(hr) || !data) {
+            return nullptr;
+        }
+        pitch = static_cast<LONG>(sourceWidth) * 4;
+    }
+
+    HBITMAP bitmap = createScaledBitmapFromRgb32(data, pitch, sourceWidth, sourceHeight, width, height);
+
+    if (buffer2d) {
+        buffer2d->Unlock2D();
+    } else {
+        buffer->Unlock();
+    }
+
+    if (!bitmap) {
+        Logger::instance().warning(L"Could not create bitmap for clip thumbnail: " + path.wstring());
+    }
+    return bitmap;
+}
+
+} // namespace
 
 std::wstring readText(HWND control) {
     if (!control) {
@@ -543,20 +772,27 @@ HICON loadExecutableIcon(const std::filesystem::path& path) {
 HBITMAP loadShellThumbnail(const std::filesystem::path& path, int width, int height) {
     IShellItemImageFactory* factory = nullptr;
     HRESULT hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&factory));
-    if (FAILED(hr) || !factory) {
-        Logger::instance().warning(L"Could not create shell thumbnail factory for clip: " + path.wstring() + L" (" + hresultToString(hr) + L")");
-        return nullptr;
+    if (SUCCEEDED(hr) && factory) {
+        SIZE size{width, height};
+        HBITMAP bitmap = nullptr;
+        hr = factory->GetImage(size, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK, &bitmap);
+        factory->Release();
+        if (SUCCEEDED(hr) && bitmap) {
+            return bitmap;
+        }
+        if (bitmap) {
+            DeleteObject(bitmap);
+        }
     }
 
-    SIZE size{width, height};
-    HBITMAP bitmap = nullptr;
-    hr = factory->GetImage(size, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK, &bitmap);
-    factory->Release();
-    if (FAILED(hr) || !bitmap) {
-        Logger::instance().warning(L"Could not load shell thumbnail for clip: " + path.wstring() + L" (" + hresultToString(hr) + L")");
-        return nullptr;
+    if (HBITMAP bitmap = loadMediaFoundationThumbnail(path, width, height)) {
+        return bitmap;
     }
-    return bitmap;
+
+    Logger::instance().warning(
+        L"Could not load clip thumbnail: " + path.wstring() +
+        (FAILED(hr) ? L" (shell " + hresultToString(hr) + L")" : L""));
+    return nullptr;
 }
 
 void drawBitmapFit(HDC dc, HBITMAP bitmap, const RECT& target) {

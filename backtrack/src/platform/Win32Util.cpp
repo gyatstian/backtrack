@@ -1,9 +1,11 @@
 #include "platform/Win32Util.h"
 
 #include "core/Logger.h"
+#include "core/Types.h"
 
 #include <avrt.h>
 #include <shlobj.h>
+#include <wrl/client.h>
 
 #include <chrono>
 #include <cwctype>
@@ -338,6 +340,31 @@ HMONITOR monitorFromIndex(uint32_t index) {
         return MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
     }
     return state.monitor;
+}
+
+uint32_t dxgiOutputIndexForMonitor(IDXGIAdapter* adapter, HMONITOR monitor) {
+    if (!adapter || !monitor) {
+        return UINT32_MAX;
+    }
+
+    for (UINT index = 0;; ++index) {
+        ComPtr<IDXGIOutput> output;
+        const HRESULT hr = adapter->EnumOutputs(index, &output);
+        if (hr == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(hr) || !output) {
+            continue;
+        }
+        DXGI_OUTPUT_DESC desc{};
+        if (FAILED(output->GetDesc(&desc))) {
+            continue;
+        }
+        if (desc.Monitor == monitor) {
+            return index;
+        }
+    }
+    return UINT32_MAX;
 }
 
 HMONITOR focusedMonitorOrFallback(uint32_t fallbackIndex) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <vector>
@@ -10,7 +11,15 @@ template <typename T>
 class SpscQueue {
 public:
     explicit SpscQueue(size_t capacity)
-        : buffer_(capacity + 1) {
+        : buffer_(std::max<size_t>(capacity, 1) + 1) {
+    }
+
+    // Safe only when producer and consumer are stopped (no concurrent push/pop).
+    void resetCapacity(size_t capacity) {
+        clear();
+        buffer_.assign(std::max<size_t>(capacity, 1) + 1, T{});
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
     }
 
     bool tryPush(T&& item) {

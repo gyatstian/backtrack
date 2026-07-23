@@ -33,164 +33,157 @@
 #include <utility>
 
 namespace backtrack {
-void MainWindow::applyVisibleSettings() {
-    const bool soundSeparationVisible = settingsCategory_ == SettingsCategory::SoundSeparation && soundSeparationAppCombo_;
-    auto visibleSoundSeparationApps = settings_.soundSeparationApps;
-    settings_ = controller_.settings();
-    if (soundSeparationVisible) {
-        settings_.soundSeparationApps = std::move(visibleSoundSeparationApps);
-    }
-
+bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (bitrateEdit_) {
-        settings_.video.bitrateKbps = readUIntControl(bitrateEdit_, settings_.video.bitrateKbps);
+        target.video.bitrateKbps = readUIntControl(bitrateEdit_, target.video.bitrateKbps);
     }
     if (fpsEdit_) {
-        settings_.video.fps = std::max<uint32_t>(1, readUIntControl(fpsEdit_, settings_.video.fps));
+        target.video.fps = std::max<uint32_t>(1, readUIntControl(fpsEdit_, target.video.fps));
     }
     if (resolutionModeCombo_) {
         const auto selected = SendMessageW(resolutionModeCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= static_cast<LRESULT>(ResolutionMode::Custom)) {
-            settings_.video.resolutionMode = static_cast<ResolutionMode>(selected);
+            target.video.resolutionMode = static_cast<ResolutionMode>(selected);
         }
     }
     if (widthEdit_) {
-        settings_.video.width = std::max<uint32_t>(16, readUIntControl(widthEdit_, settings_.video.width));
+        target.video.width = std::max<uint32_t>(16, readUIntControl(widthEdit_, target.video.width));
     }
     if (heightEdit_) {
-        settings_.video.height = std::max<uint32_t>(16, readUIntControl(heightEdit_, settings_.video.height));
+        target.video.height = std::max<uint32_t>(16, readUIntControl(heightEdit_, target.video.height));
     }
     if (followFocusedMonitorCheck_) {
-        settings_.followFocusedMonitor = SendMessageW(followFocusedMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.followFocusedMonitor = SendMessageW(followFocusedMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (followMouseMonitorCheck_) {
-        settings_.followMouseMonitor = settings_.followFocusedMonitor &&
+        target.followMouseMonitor = target.followFocusedMonitor &&
             SendMessageW(followMouseMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (codecCombo_) {
         const auto selected = SendMessageW(codecCombo_, CB_GETCURSEL, 0, 0);
-        settings_.video.codec = selected == 1 ? VideoCodec::Hevc : VideoCodec::H264;
+        target.video.codec = selected == 1 ? VideoCodec::Hevc : VideoCodec::H264;
     }
     if (systemAudioCheck_) {
-        settings_.captureSystemAudio = SendMessageW(systemAudioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.captureSystemAudio = SendMessageW(systemAudioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (microphoneCheck_) {
-        settings_.captureMicrophone = SendMessageW(microphoneCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.captureMicrophone = SendMessageW(microphoneCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (outputDeviceCombo_) {
-        settings_.audioOutputDeviceId = selectedDeviceId(outputDeviceCombo_, outputDevices_);
+        target.audioOutputDeviceId = selectedDeviceId(outputDeviceCombo_, outputDevices_);
     }
     if (inputDeviceCombo_) {
-        settings_.audioInputDeviceId = selectedDeviceId(inputDeviceCombo_, inputDevices_);
+        target.audioInputDeviceId = selectedDeviceId(inputDeviceCombo_, inputDevices_);
     }
     if (outputVolumeEdit_) {
-        settings_.audioOutputVolumePercent = readUIntControl(outputVolumeEdit_, settings_.audioOutputVolumePercent);
+        target.audioOutputVolumePercent = readUIntControl(outputVolumeEdit_, target.audioOutputVolumePercent);
     }
     if (inputVolumeEdit_) {
-        settings_.audioInputVolumePercent = readUIntControl(inputVolumeEdit_, settings_.audioInputVolumePercent);
+        target.audioInputVolumePercent = readUIntControl(inputVolumeEdit_, target.audioInputVolumePercent);
     }
     if (startWithWindowsCheck_) {
-        settings_.startWithWindowsMinimized = SendMessageW(startWithWindowsCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.startWithWindowsMinimized = SendMessageW(startWithWindowsCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (exitToTrayCheck_) {
-        settings_.exitToTray = SendMessageW(exitToTrayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.exitToTray = SendMessageW(exitToTrayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderPresetCombo_) {
         const auto selected = SendMessageW(encoderPresetCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= 6) {
-            settings_.video.encoderPreset = static_cast<EncoderPreset>(selected);
+            target.video.encoderPreset = static_cast<EncoderPreset>(selected);
         }
     }
     if (encoderModeCombo_) {
         const auto selected = SendMessageW(encoderModeCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= 4) {
-            settings_.video.encoderMode = static_cast<EncoderMode>(selected);
+            target.video.encoderMode = static_cast<EncoderMode>(selected);
         }
     }
     if (encoderProfileCombo_) {
         const auto selected = SendMessageW(encoderProfileCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= 2) {
-            settings_.video.encoderProfile = static_cast<EncoderProfile>(selected);
+            target.video.encoderProfile = static_cast<EncoderProfile>(selected);
         }
     }
     if (encoderLookaheadCheck_) {
-        settings_.video.encoderLookahead = SendMessageW(encoderLookaheadCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.video.encoderLookahead = SendMessageW(encoderLookaheadCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderLookaheadDepthEdit_) {
-        settings_.video.encoderLookaheadDepth = std::min<uint32_t>(31, readUIntControl(encoderLookaheadDepthEdit_, settings_.video.encoderLookaheadDepth));
+        target.video.encoderLookaheadDepth = std::min<uint32_t>(31, readUIntControl(encoderLookaheadDepthEdit_, target.video.encoderLookaheadDepth));
     }
     if (encoderSpatialAQCheck_) {
-        settings_.video.encoderSpatialAQ = SendMessageW(encoderSpatialAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.video.encoderSpatialAQ = SendMessageW(encoderSpatialAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderAQStrengthEdit_) {
-        settings_.video.encoderAQStrength = std::clamp<uint32_t>(readUIntControl(encoderAQStrengthEdit_, settings_.video.encoderAQStrength), 1, 15);
+        target.video.encoderAQStrength = std::clamp<uint32_t>(readUIntControl(encoderAQStrengthEdit_, target.video.encoderAQStrength), 1, 15);
     }
     if (encoderTemporalAQCheck_) {
-        settings_.video.encoderTemporalAQ = SendMessageW(encoderTemporalAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.video.encoderTemporalAQ = SendMessageW(encoderTemporalAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderMultipassCombo_) {
         const auto selected = SendMessageW(encoderMultipassCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= 2) {
-            settings_.video.encoderMultipass = static_cast<EncoderMultipass>(selected);
+            target.video.encoderMultipass = static_cast<EncoderMultipass>(selected);
         }
     }
     if (encoderBFramesCheck_) {
-        settings_.video.encoderBFrames = SendMessageW(encoderBFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.video.encoderBFrames = SendMessageW(encoderBFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderAdaptiveBFramesCheck_) {
-        settings_.video.encoderAdaptiveBFrames = SendMessageW(encoderAdaptiveBFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.video.encoderAdaptiveBFrames = SendMessageW(encoderAdaptiveBFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderAdaptiveIFramesCheck_) {
-        settings_.video.encoderAdaptiveIFrames = SendMessageW(encoderAdaptiveIFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.video.encoderAdaptiveIFrames = SendMessageW(encoderAdaptiveIFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderZeroReorderDelayCheck_) {
-        settings_.video.encoderZeroReorderDelay = SendMessageW(encoderZeroReorderDelayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.video.encoderZeroReorderDelay = SendMessageW(encoderZeroReorderDelayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderGopSecondsEdit_) {
-        settings_.video.gopSeconds = readUIntControl(encoderGopSecondsEdit_, settings_.video.gopSeconds);
+        target.video.gopSeconds = readUIntControl(encoderGopSecondsEdit_, target.video.gopSeconds);
     }
     if (encoderReferenceFramesEdit_) {
-        settings_.video.encoderReferenceFrames = readUIntControl(encoderReferenceFramesEdit_, settings_.video.encoderReferenceFrames);
+        target.video.encoderReferenceFrames = readUIntControl(encoderReferenceFramesEdit_, target.video.encoderReferenceFrames);
     }
     if (gpuAdaptiveCombo_) {
         const auto selected = SendMessageW(gpuAdaptiveCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= 2) {
-            settings_.gpu.adaptiveMode = static_cast<GpuAdaptiveMode>(selected);
+            target.gpu.adaptiveMode = static_cast<GpuAdaptiveMode>(selected);
         }
     }
     if (gpuFrameQueueLimitEdit_) {
-        settings_.gpu.frameQueueLimit = readUIntControl(gpuFrameQueueLimitEdit_, settings_.gpu.frameQueueLimit);
+        target.gpu.frameQueueLimit = readUIntControl(gpuFrameQueueLimitEdit_, target.gpu.frameQueueLimit);
     }
     if (idleFrameCoalescingCheck_) {
-        settings_.gpu.allowIdleFrameSkipping =
+        target.gpu.allowIdleFrameSkipping =
             SendMessageW(idleFrameCoalescingCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (wgcZeroCopyCheck_) {
-        settings_.gpu.wgcZeroCopy = SendMessageW(wgcZeroCopyCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.gpu.wgcZeroCopy = SendMessageW(wgcZeroCopyCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (stableMultimonitorFramesCheck_) {
-        settings_.gpu.stableMultimonitorFrames =
+        target.gpu.stableMultimonitorFrames =
             SendMessageW(stableMultimonitorFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (replayEnabledCheck_) {
-        settings_.replay.enabled = SendMessageW(replayEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.replay.enabled = SendMessageW(replayEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (replaySecondsEdit_) {
-        settings_.replay.seconds = readUIntControl(replaySecondsEdit_, settings_.replay.seconds);
+        target.replay.seconds = readUIntControl(replaySecondsEdit_, target.replay.seconds);
     }
     if (leagueKillReminderCheck_) {
-        settings_.gameIntegrations.leagueOfLegendsKillReminder =
+        target.gameIntegrations.leagueOfLegendsKillReminder =
             SendMessageW(leagueKillReminderCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (soundSeparationEnabledCheck_) {
-        settings_.soundSeparationEnabled = SendMessageW(soundSeparationEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        target.soundSeparationEnabled = SendMessageW(soundSeparationEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (recordHotkey_) {
-        settings_.hotkeys.startStopModifiers = recordHotkeyModifiers_;
-        settings_.hotkeys.startStopVirtualKey = recordHotkeyVirtualKey_;
+        target.hotkeys.startStopModifiers = recordHotkeyModifiers_;
+        target.hotkeys.startStopVirtualKey = recordHotkeyVirtualKey_;
     }
     if (replayHotkey_) {
-        settings_.hotkeys.saveReplayModifiers = replayHotkeyModifiers_;
-        settings_.hotkeys.saveReplayVirtualKey = replayHotkeyVirtualKey_;
+        target.hotkeys.saveReplayModifiers = replayHotkeyModifiers_;
+        target.hotkeys.saveReplayVirtualKey = replayHotkeyVirtualKey_;
     }
     if (clipFolderEdit_) {
         const auto folder = trimText(readText(clipFolderEdit_));
@@ -199,22 +192,35 @@ void MainWindow::applyVisibleSettings() {
             const std::filesystem::path folderPath(folder);
             if (std::filesystem::exists(folderPath, folderError) && !std::filesystem::is_directory(folderPath, folderError)) {
                 setStatus(L"Clip folder must be a folder, not a file");
-                return;
+                return false;
             }
             if (folderError) {
                 setStatus(L"Clip folder could not be checked");
-                return;
+                return false;
             }
             std::filesystem::create_directories(folderPath, folderError);
             if (folderError) {
                 setStatus(L"Clip folder could not be created");
-                return;
+                return false;
             }
-            settings_.clipDirectory = folder;
+            target.clipDirectory = folder;
         }
     }
-    settings_.libraryGalleryView = libraryViewMode_ == LibraryViewMode::Gallery;
+    target.libraryGalleryView = libraryViewMode_ == LibraryViewMode::Gallery;
+    return true;
+}
 
+void MainWindow::stashVisibleSettings() {
+    if (!readVisibleSettingsInto(settings_)) {
+        return;
+    }
+    settings_ = sanitizeSettings(settings_);
+}
+
+void MainWindow::applyVisibleSettings() {
+    if (!readVisibleSettingsInto(settings_)) {
+        return;
+    }
     settings_ = sanitizeSettings(settings_);
     if (controllerActionPending_.load()) {
         setStatus(L"Recorder is busy; try saving settings again after the current action finishes");
@@ -243,7 +249,26 @@ void MainWindow::addDirtySaveButton() {
     if (!layoutItems_.empty()) {
         layoutItems_.back().kind = LayoutItem::Kind::Footer;
     }
-    clearSettingsDirty();
+    updateSaveSettingsButton();
+}
+
+void MainWindow::updateSaveSettingsButton() {
+    if (!saveSettingsButton_) {
+        return;
+    }
+    if (settingsDirty_) {
+        if (!IsWindowEnabled(saveSettingsButton_)) {
+            EnableWindow(saveSettingsButton_, TRUE);
+        }
+        showWindowIfHidden(saveSettingsButton_);
+    } else {
+        if (IsWindowEnabled(saveSettingsButton_)) {
+            EnableWindow(saveSettingsButton_, FALSE);
+        }
+        if (IsWindowVisible(saveSettingsButton_)) {
+            ShowWindow(saveSettingsButton_, SW_HIDE);
+        }
+    }
 }
 
 void MainWindow::markSettingsDirty() {
@@ -254,12 +279,8 @@ void MainWindow::markSettingsDirty() {
         return;
     }
     settingsDirty_ = true;
-    if (saveSettingsButton_) {
-        if (!IsWindowEnabled(saveSettingsButton_)) {
-            EnableWindow(saveSettingsButton_, TRUE);
-        }
-        showWindowIfHidden(saveSettingsButton_);
-    }
+    updateSaveSettingsButton();
+    updateTabChrome();
 }
 
 void MainWindow::clearSettingsDirty() {
@@ -267,14 +288,38 @@ void MainWindow::clearSettingsDirty() {
         return;
     }
     settingsDirty_ = false;
-    if (saveSettingsButton_) {
-        if (IsWindowEnabled(saveSettingsButton_)) {
-            EnableWindow(saveSettingsButton_, FALSE);
-        }
-        if (IsWindowVisible(saveSettingsButton_)) {
-            ShowWindow(saveSettingsButton_, SW_HIDE);
-        }
+    updateSaveSettingsButton();
+    updateTabChrome();
+}
+
+bool MainWindow::promptSaveSettingsIfDirty(bool allowCancel) {
+    if (!settingsDirty_) {
+        return true;
     }
+    stashVisibleSettings();
+    const UINT flags = MB_ICONWARNING | (allowCancel ? MB_YESNOCANCEL : MB_YESNO);
+    const int result = MessageBoxW(
+        window_,
+        L"You have unsaved settings. Save them before leaving?",
+        L"Unsaved settings",
+        flags);
+    if (result == IDYES) {
+        applyVisibleSettings();
+        return !settingsDirty_;
+    }
+    if (result == IDNO) {
+        settings_ = controller_.settings();
+        recordHotkeyModifiers_ = settings_.hotkeys.startStopModifiers;
+        recordHotkeyVirtualKey_ = settings_.hotkeys.startStopVirtualKey;
+        replayHotkeyModifiers_ = settings_.hotkeys.saveReplayModifiers;
+        replayHotkeyVirtualKey_ = settings_.hotkeys.saveReplayVirtualKey;
+        clearSettingsDirty();
+        // Cached Capture/Settings HWNDs no longer match discarded values.
+        invalidatePageCache(Page::Capture);
+        invalidatePageCache(Page::Settings);
+        return true;
+    }
+    return false;
 }
 
 void MainWindow::addSettingHelp(HWND control, int x, int y, const std::wstring& text) {
@@ -296,7 +341,7 @@ void MainWindow::updateStatusHelp(HWND hoveredControl) {
         if (help != statusHelpTexts_.end()) {
             if (hoveredHelpControl_ != control) {
                 hoveredHelpControl_ = control;
-                applyStatusText(help->second);
+                applyStatusText(currentStatusDisplayText());
             }
             return;
         }
@@ -305,7 +350,7 @@ void MainWindow::updateStatusHelp(HWND hoveredControl) {
 
     if (hoveredHelpControl_) {
         hoveredHelpControl_ = nullptr;
-        applyStatusText(statusText_);
+        applyStatusText(currentStatusDisplayText());
     }
 }
 
@@ -340,7 +385,13 @@ std::wstring MainWindow::currentStatusDisplayText() const {
     if (hoveredHelpControl_) {
         const auto help = statusHelpTexts_.find(hoveredHelpControl_);
         if (help != statusHelpTexts_.end()) {
-            return help->second;
+            if (statusText_.empty() || statusText_ == L"Ready") {
+                return help->second;
+            }
+            if (statusText_ == help->second) {
+                return statusText_;
+            }
+            return statusText_ + L"  ·  " + help->second;
         }
     }
     return statusText_;
@@ -561,7 +612,7 @@ void MainWindow::addSoundSeparationApp(std::wstring name, std::filesystem::path 
     settings_.soundSeparationApps.push_back(std::move(app));
     rebuildSoundSeparationRows();
     markSettingsDirty();
-    setStatus(L"App added to sound seperation");
+    setStatus(L"App added to sound separation");
 }
 
 void MainWindow::rebuildSoundSeparationRows() {
@@ -647,7 +698,7 @@ void MainWindow::rebuildSoundSeparationRows() {
             kRemoveWidth,
             30,
             kSoundSeparationRemoveButtonBaseId + static_cast<int>(index));
-        addSettingHelp(row.removeButton, 0, 0, L"Remove this app from sound seperation.");
+        addSettingHelp(row.removeButton, 0, 0, L"Remove this app from sound separation.");
 
         soundSeparationRows_.push_back(row);
         y += kRowHeight;
@@ -716,13 +767,18 @@ void MainWindow::removeSoundSeparationApp(size_t index) {
     settings_.soundSeparationApps.erase(settings_.soundSeparationApps.begin() + static_cast<std::ptrdiff_t>(index));
     rebuildSoundSeparationRows();
     markSettingsDirty();
-    setStatus(L"App removed from sound seperation");
+    setStatus(L"App removed from sound separation");
 }
 
 bool MainWindow::isSoundSeparationMutedLabel(HWND control) const {
-    return std::any_of(soundSeparationRows_.begin(), soundSeparationRows_.end(), [control](const SoundSeparationRowControls& row) {
-        return row.mutedLabel == control;
-    });
+    if (!control) {
+        return false;
+    }
+    wchar_t text[16]{};
+    if (GetWindowTextW(control, text, static_cast<int>(_countof(text))) <= 0) {
+        return false;
+    }
+    return lstrcmpW(text, L"MUTED") == 0;
 }
 
 void MainWindow::updateStartupRegistration() {

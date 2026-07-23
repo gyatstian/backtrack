@@ -6,9 +6,9 @@
 
 namespace backtrack {
 
-// AMD Advanced Media Framework (AMF) hardware encoder. Encodes D3D11 NV12
-// textures directly on the GPU through amfrt64.dll, mirroring the zero-copy
-// design of NvencEncoder. Builds as a stub when the AMF headers are absent.
+// AMD Advanced Media Framework (AMF) hardware encoder. Wraps BGRA D3D11
+// textures via CreateSurfaceFromDX11Native (AMF converts to NV12 internally)
+// through amfrt64.dll. Builds as a stub when the AMF headers are absent.
 class AmfEncoder final : public IEncoder {
 public:
     AmfEncoder();

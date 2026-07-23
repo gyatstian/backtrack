@@ -47,7 +47,7 @@ i might fix or i might not fix. but feel free to report anything, i dont murder 
 
 - **GPU-first pipeline** - Direct3D 11 textures stay on the GPU through capture and encode. No CPU-side image conversion or readback in the capture path.
 - **Dual capture backends** - Windows Graphics Capture (WGC) first, Desktop Duplication fallback, with automatic recovery on device/access loss.
-- **Vendor-aware hardware encoding** - NVIDIA NVENC (NVIDIA Video Codec SDK) or AMD AMF (Advanced Media Framework), auto-selected by GPU vendor. NVENC registers BGRA textures directly; AMF consumes NV12 surfaces.
+- **Vendor-aware hardware encoding** - NVIDIA NVENC (NVIDIA Video Codec SDK) or AMD AMF (Advanced Media Framework), auto-selected by GPU vendor. Both take BGRA D3D11 textures; AMF converts to NV12 inside the encoder.
 - **H.264 and HEVC** output, with configurable bitrate, FPS, GOP, and full encoder tuning (preset, mode, lookahead, spatial/temporal AQ, multipass, B-frames, reference frames).
 - **Instant replay** - Encoded packets held in a ring buffer; save the last N seconds on a hotkey.
 - **Audio capture** - WASAPI system loopback plus microphone, per-device selection and volume, with optional per-application sound separation (mute specific apps out of the mix).
@@ -93,7 +93,7 @@ Encoder backend is auto-detected from the active GPU vendor at runtime:
 
 - NVIDIA adapters use NVENC (`nvEncodeAPI64.dll`, shipped with the NVIDIA driver).
 - AMD adapters use AMF (`amfrt64.dll`, shipped with the AMD Adrenalin driver).
-- On other adapters the app tries NVENC first, then AMF.
+- On other adapters the app defaults to NVENC.
 
 Optional at compile time:
 
@@ -147,6 +147,6 @@ The recording and replay hotkeys are configurable in Settings. The clip folder i
 
 ## Notes
 
-The active implementation uses Direct3D 11 because NVENC can directly register D3D11 textures. WGC and Desktop Duplication both output BGRA D3D11 textures, which are copied GPU-to-GPU into a small texture pool (or passed through directly when WGC zero-copy is enabled) before being registered/mapped by the encoder. A GPU scaler converts each frame to the active encoder's preferred format (BGRA for NVENC, NV12 for AMF). Only the compressed H.264/HEVC bitstream is copied back to CPU memory.
+The active implementation uses Direct3D 11 because NVENC can directly register D3D11 textures. WGC and Desktop Duplication both output BGRA D3D11 textures, which are copied GPU-to-GPU into a small texture pool (or passed through directly when WGC zero-copy is enabled) before being registered/mapped by the encoder. A GPU scaler converts each frame to the active encoder's preferred format (BGRA for both NVENC and AMF). Only the compressed H.264/HEVC bitstream is copied back to CPU memory.
 
 See `docs/architecture.md` for the full pipeline diagram, frame lifetime, and threading model.

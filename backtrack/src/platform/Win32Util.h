@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <dxgi.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -25,6 +26,8 @@ bool updateWindowsStartupRegistration(bool enabled);
 HMONITOR monitorFromIndex(uint32_t index);
 HMONITOR focusedMonitorOrFallback(uint32_t fallbackIndex);
 HMONITOR cursorMonitorOrFallback(uint32_t fallbackIndex);
+// Returns DXGI output index on the given adapter for HMONITOR, or UINT32_MAX if none.
+uint32_t dxgiOutputIndexForMonitor(IDXGIAdapter* adapter, HMONITOR monitor);
 UINT backtrackActivationMessage();
 
 } // namespace backtrack

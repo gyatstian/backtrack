@@ -79,6 +79,18 @@ MainWindow::~MainWindow() {
     if (selectedOutlinePen_) {
         DeleteObject(selectedOutlinePen_);
     }
+    if (tabActiveBrush_) {
+        DeleteObject(tabActiveBrush_);
+    }
+    if (buttonHoverBrush_) {
+        DeleteObject(buttonHoverBrush_);
+    }
+    if (buttonPressedBrush_) {
+        DeleteObject(buttonPressedBrush_);
+    }
+    if (tabActiveOutlinePen_) {
+        DeleteObject(tabActiveOutlinePen_);
+    }
 }
 
 bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized) {
@@ -98,8 +110,12 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     editBrush_ = CreateSolidBrush(kEdit);
     selectionBrush_ = CreateSolidBrush(kSelection);
     favoriteBrush_ = CreateSolidBrush(kFavorite);
+    tabActiveBrush_ = CreateSolidBrush(kTabActive);
+    buttonHoverBrush_ = CreateSolidBrush(kButtonHover);
+    buttonPressedBrush_ = CreateSolidBrush(kButtonPressed);
     outlinePen_ = CreatePen(PS_SOLID, 1, kOutline);
     selectedOutlinePen_ = CreatePen(PS_SOLID, 1, kText);
+    tabActiveOutlinePen_ = CreatePen(PS_SOLID, 1, kTabActiveOutline);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = MainWindow::windowProc;
@@ -140,23 +156,26 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     }
     applyDarkTheme(window_);
 
-    pageHost_ = CreateWindowExW(
-        0,
-        pageHostClass.lpszClassName,
-        nullptr,
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
-        0,
-        0,
-        0,
-        0,
-        window_,
-        nullptr,
-        instance,
-        this);
-    if (!pageHost_) {
-        return false;
+    for (size_t index = 0; index < pageCaches_.size(); ++index) {
+        pageCaches_[index].host = CreateWindowExW(
+            0,
+            pageHostClass.lpszClassName,
+            nullptr,
+            WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN,
+            0,
+            0,
+            0,
+            0,
+            window_,
+            nullptr,
+            instance,
+            this);
+        if (!pageCaches_[index].host) {
+            return false;
+        }
+        applyDarkTheme(pageCaches_[index].host);
     }
-    applyDarkTheme(pageHost_);
+    pageHost_ = pageCaches_[static_cast<size_t>(Page::Capture)].host;
 
     buildTabs();
     status_ = CreateWindowExW(
@@ -438,12 +457,12 @@ void MainWindow::applyDarkTheme(HWND control) {
 }
 
 void MainWindow::setStatus(const std::wstring& status) {
-    if (statusText_ == status && (!hoveredHelpControl_ || displayedStatusText_ == status)) {
+    if (statusText_ == status) {
         return;
     }
     statusText_ = status;
-    if (!hoveredHelpControl_ && !buildingPage_) {
-        applyStatusText(statusText_);
+    if (!buildingPage_) {
+        applyStatusText(currentStatusDisplayText());
     }
 }
 

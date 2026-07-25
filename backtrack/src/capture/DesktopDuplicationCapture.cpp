@@ -6,6 +6,7 @@
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace backtrack {
@@ -65,12 +66,58 @@ constexpr char kCursorShaderHlsl[] =
 
 } // namespace
 
+void DesktopDuplicationCapture::releaseHeldFrame() {
+    if (frameHeld_ && duplication_) {
+        duplication_->ReleaseFrame();
+    }
+    frameHeld_ = false;
+}
+
+void DesktopDuplicationCapture::logAcquireFailureOnce(const wchar_t* reason, HRESULT hr) {
+    const auto now = std::chrono::steady_clock::now();
+    constexpr auto kLogCooldown = std::chrono::seconds(2);
+    if (hr == lastLoggedAcquireHr_ &&
+        lastAcquireLogAt_.time_since_epoch().count() != 0 &&
+        now - lastAcquireLogAt_ < kLogCooldown) {
+        ++suppressedAcquireLogs_;
+        return;
+    }
+    std::wstring message = reason ? reason : L"AcquireNextFrame failed";
+    message += L": " + hresultToString(hr);
+    if (suppressedAcquireLogs_ > 0) {
+        message += L" (suppressed " + std::to_wstring(suppressedAcquireLogs_) + L" repeats)";
+        suppressedAcquireLogs_ = 0;
+    }
+    Logger::instance().warning(L"capture", message);
+    lastLoggedAcquireHr_ = hr;
+    lastAcquireLogAt_ = now;
+}
+
+void DesktopDuplicationCapture::markLost(const wchar_t* reason, HRESULT hr) {
+    if (!deviceLost_) {
+        logAcquireFailureOnce(reason, hr);
+    }
+    releaseHeldFrame();
+    deviceLost_ = true;
+    duplication_.Reset();
+    frameHeld_ = false;
+}
+
 bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings& settings, const CaptureTarget& target) {
     device_ = &device;
     deviceLost_ = false;
     frameIndex_ = 0;
+    cursorOnlyFrames_ = 0;
+    cursorOnlyFrameInterval_ = std::chrono::nanoseconds(
+        1'000'000'000 / std::max<uint32_t>(1, settings.video.fps));
+    nextCursorOnlyFrameAt_ = {};
     poolExhaustionDrops_ = 0;
     haveContent_ = false;
+    havePresentedContent_ = false;
+    frameHeld_ = false;
+    lastLoggedAcquireHr_ = S_OK;
+    suppressedAcquireLogs_ = 0;
+    lastAcquireLogAt_ = {};
     captureCursor_ = settings.captureCursor;
     cursorVisible_ = false;
     cursorShapeValid_ = false;
@@ -130,28 +177,30 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
         return false;
     }
 
-    // DuplicateOutput can transiently fail with DXGI_ERROR_NOT_CURRENTLY_AVAILABLE
-    // during display mode changes, fullscreen transitions, or when another process
-    // is briefly holding the duplication. Retry with backoff before giving up.
-    constexpr int kMaxDuplicateAttempts = 5;
-    constexpr DWORD kDuplicateRetryDelayMs = 100;
+    // Non-blocking rebind: a few short attempts only. Outer capture loop owns
+    // WaitStable cooldown so we do not sleep seconds on the capture thread.
+    constexpr int kMaxDuplicateAttempts = 4;
     for (int attempt = 0; attempt < kMaxDuplicateAttempts; ++attempt) {
+        duplication_.Reset();
         hr = output1->DuplicateOutput(device.device(), &duplication_);
         if (SUCCEEDED(hr)) {
             break;
         }
-        if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE) {
+        if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE &&
+            hr != DXGI_ERROR_ACCESS_LOST &&
+            hr != E_ACCESSDENIED) {
             break;
         }
-        Logger::instance().warning(L"capture",
-            L"DuplicateOutput not currently available; retrying attempt " +
-            std::to_wstring(attempt + 1) + L"/" + std::to_wstring(kMaxDuplicateAttempts));
-        Sleep(kDuplicateRetryDelayMs);
+        if (attempt + 1 < kMaxDuplicateAttempts) {
+            Sleep(40);
+        }
     }
     if (FAILED(hr)) {
-        Logger::instance().error(L"capture", L"DuplicateOutput failed: " + hresultToString(hr));
+        Logger::instance().warning(L"capture", L"DuplicateOutput failed: " + hresultToString(hr));
+        duplication_.Reset();
         return false;
     }
+    frameHeld_ = false;
 
     poolSize_ = captureTexturePoolSize(settings);
     if (!createTexturePool(width_, height_, format_, poolSize_)) {
@@ -164,8 +213,13 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
 }
 
 bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeoutMs) {
-    if (!duplication_) {
+    if (deviceLost_ || !duplication_) {
         return false;
+    }
+
+    // DXGI requires ReleaseFrame before the next AcquireNextFrame.
+    if (frameHeld_) {
+        releaseHeldFrame();
     }
 
     DXGI_OUTDUPL_FRAME_INFO frameInfo{};
@@ -174,28 +228,32 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         return false;
     }
-    if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
-        Logger::instance().warning(L"capture", L"Desktop duplication access lost; capture must be recreated");
-        deviceLost_ = true;
+    // ACCESS_LOST / INVALID_CALL / device loss: stop all further acquires.
+    if (hr == DXGI_ERROR_ACCESS_LOST ||
+        hr == DXGI_ERROR_INVALID_CALL ||
+        hr == DXGI_ERROR_DEVICE_REMOVED ||
+        hr == DXGI_ERROR_DEVICE_RESET ||
+        hr == E_INVALIDARG) {
+        markLost(L"Desktop duplication lost", hr);
         return false;
     }
     if (FAILED(hr)) {
-        Logger::instance().warning(L"capture", L"AcquireNextFrame failed: " + hresultToString(hr));
+        logAcquireFailureOnce(L"AcquireNextFrame failed", hr);
+        // Unknown failures often mean the object is unusable under exclusive FS.
+        markLost(L"Desktop duplication unusable", hr);
         return false;
     }
+
+    frameHeld_ = true;
 
     ComPtr<ID3D11Texture2D> acquiredTexture;
     hr = resource.As(&acquiredTexture);
     if (FAILED(hr)) {
-        duplication_->ReleaseFrame();
-        Logger::instance().warning(L"capture", L"Captured resource is not ID3D11Texture2D: " + hresultToString(hr));
+        releaseHeldFrame();
+        logAcquireFailureOnce(L"Captured resource is not ID3D11Texture2D", hr);
         return false;
     }
 
-    // Desktop dimensions/format come from the acquired texture, not the output
-    // desc: rotated displays swap width/height, and HDR outputs deliver 10-bit
-    // or fp16 surfaces (e.g. R16G16B16A16_FLOAT) rather than the default BGRA8.
-    // Recreate the pool whenever the source surface no longer matches.
     D3D11_TEXTURE2D_DESC acquiredDesc{};
     acquiredTexture->GetDesc(&acquiredDesc);
     if (acquiredDesc.Width != width_ || acquiredDesc.Height != height_ || acquiredDesc.Format != format_) {
@@ -206,30 +264,48 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         height_ = acquiredDesc.Height;
         format_ = acquiredDesc.Format;
         if (!createTexturePool(width_, height_, format_, poolSize_)) {
-            duplication_->ReleaseFrame();
-            deviceLost_ = true;
+            markLost(L"Texture pool recreate failed", E_FAIL);
             return false;
         }
     }
 
-    // Track cursor position/visibility and pick up a new shape when DXGI signals
-    // one. The pointer shape is only re-sent when it changes, so it is cached.
-    updateCursorState(frameInfo);
-    if (frameInfo.PointerShapeBufferSize > 0) {
-        refreshCursorShape(frameInfo.PointerShapeBufferSize);
+    const bool cursorUpdated = captureCursor_ && frameInfo.LastMouseUpdateTime.QuadPart != 0;
+    const bool cursorShapeUpdated = captureCursor_ && frameInfo.PointerShapeBufferSize > 0;
+    if (captureCursor_) {
+        updateCursorState(frameInfo);
+        if (cursorShapeUpdated) {
+            refreshCursorShape(frameInfo.PointerShapeBufferSize);
+        }
     }
 
-    // Persist the desktop image. DXGI wakes us for desktop changes and for
-    // pointer-only updates; only refresh the stored copy when the desktop itself
-    // changed (or on the first frame, when we have no copy yet).
     const bool desktopChanged = frameInfo.LastPresentTime.QuadPart != 0 || !haveContent_;
+    // DuplicateOutput can signal without a desktop or cursor update. Returning the
+    // cached texture in that case makes the recorder treat stale desktop content as
+    // a fresh game frame.
+    if (!desktopChanged && !cursorUpdated && !cursorShapeUpdated) {
+        releaseHeldFrame();
+        return false;
+    }
+    if (!desktopChanged) {
+        const auto now = std::chrono::steady_clock::now();
+        if (nextCursorOnlyFrameAt_.time_since_epoch().count() != 0 &&
+            now < nextCursorOnlyFrameAt_) {
+            releaseHeldFrame();
+            return false;
+        }
+        nextCursorOnlyFrameAt_ = now + cursorOnlyFrameInterval_;
+        ++cursorOnlyFrames_;
+    }
     if (desktopChanged) {
         std::scoped_lock lock(device_->immediateContextMutex());
         device_->context()->CopyResource(desktopCopy_.Get(), acquiredTexture.Get());
         haveContent_ = true;
+        if (frameInfo.LastPresentTime.QuadPart != 0) {
+            havePresentedContent_ = true;
+        }
     }
 
-    duplication_->ReleaseFrame();
+    releaseHeldFrame();
 
     if (!haveContent_) {
         return false;
@@ -247,8 +323,6 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
     }
     poolExhaustionDrops_ = 0;
 
-    // Copy the persistent desktop into the slot, then blend the cursor on top so
-    // a moving pointer over a static desktop still yields fresh frames.
     const bool drawCursor = captureCursor_ && cursorVisible_ && cursorShapeValid_ && ensureCompositor();
     {
         std::scoped_lock lock(device_->immediateContextMutex());
@@ -279,8 +353,12 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
 }
 
 void DesktopDuplicationCapture::shutdown() {
+    releaseHeldFrame();
     duplication_.Reset();
     haveContent_ = false;
+    havePresentedContent_ = false;
+    frameHeld_ = false;
+    deviceLost_ = true;
     pool_.clear();
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
@@ -312,6 +390,7 @@ bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t heigh
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
     haveContent_ = false;
+    havePresentedContent_ = false;
     poolExhaustionDrops_ = 0;
     poolSize = std::clamp<uint32_t>(poolSize, kMinPoolSize, kMaxPoolSize);
 

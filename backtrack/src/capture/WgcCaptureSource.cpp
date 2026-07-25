@@ -43,6 +43,10 @@ struct WgcCaptureSource::Impl {
     winrt::event_token closedToken{};
     HANDLE frameEvent = nullptr;
     std::mutex frameEventMutex;
+    // High-resolution cadence timer. Lets acquire() honor sub-15ms timeouts even
+    // if the global timer period was not raised (timeBeginPeriod denied). nullptr
+    // falls back to the coarse WaitForSingleObject path.
+    HANDLE cadenceTimer = nullptr;
     std::vector<std::shared_ptr<TextureSlot>> pool;
     uint64_t poolExhaustionDrops = 0;
     uint64_t zeroCopyLeaseDrops = 0;
@@ -75,11 +79,15 @@ struct WgcCaptureSource::Impl {
         // Bound WGC pool so in-flight zero-copy leases cannot exhaust it.
         // Keep at least one free slot for the next FrameArrived.
         framePoolSize = std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 2, 3, 8);
-        frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        // FrameArrived can fire while capture work is running. Keep notification
+        // asserted until the consumer has drained the frame pool.
+        frameEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!frameEvent) {
             Logger::instance().error(L"capture", L"CreateEvent for WGC failed");
             return false;
         }
+        // Best-effort; nullptr just means acquire() uses the coarse wait path.
+        cadenceTimer = createHighResolutionWaitableTimer();
 
         if (!winrt::Windows::Graphics::Capture::GraphicsCaptureSession::IsSupported()) {
             Logger::instance().warning(L"capture", L"Windows Graphics Capture is not supported by this OS/session");
@@ -87,20 +95,29 @@ struct WgcCaptureSource::Impl {
         }
 
         HMONITOR monitor = target.monitor ? target.monitor : monitorFromIndex(target.monitorIndex);
-        if (!monitor) {
-            Logger::instance().warning(L"capture", L"No monitor handle available for Windows Graphics Capture");
+        const HWND window = (target.window && IsWindow(target.window)) ? target.window : nullptr;
+        if (!window && !monitor) {
+            Logger::instance().warning(L"capture", L"No monitor/window handle available for Windows Graphics Capture");
             return false;
         }
 
         try {
-            Logger::instance().debug(L"capture", L"WGC CreateForMonitor");
             auto factory = winrt::get_activation_factory<
                 winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
                 IGraphicsCaptureItemInterop>();
-            winrt::check_hresult(factory->CreateForMonitor(
-                monitor,
-                winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
-                winrt::put_abi(item)));
+            if (window) {
+                Logger::instance().debug(L"capture", L"WGC CreateForWindow");
+                winrt::check_hresult(factory->CreateForWindow(
+                    window,
+                    winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
+                    winrt::put_abi(item)));
+            } else {
+                Logger::instance().debug(L"capture", L"WGC CreateForMonitor");
+                winrt::check_hresult(factory->CreateForMonitor(
+                    monitor,
+                    winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
+                    winrt::put_abi(item)));
+            }
 
             ComPtr<IDXGIDevice> dxgiDevice;
             HRESULT hr = d3d.device()->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
@@ -188,15 +205,45 @@ struct WgcCaptureSource::Impl {
             return false;
         }
 
-        const DWORD wait = WaitForSingleObject(frameEvent, timeoutMs);
-        if (wait != WAIT_OBJECT_0) {
-            return false;
+        // Wait for the next frame. When a high-res cadence timer is available,
+        // wait on both it and frameEvent so sub-15ms timeouts are honored even if
+        // the global timer period was not raised. Timer expiry == cadence timeout.
+        if (cadenceTimer && timeoutMs > 0) {
+            LARGE_INTEGER due;
+            // Negative = relative, in 100ns units.
+            due.QuadPart = -static_cast<int64_t>(timeoutMs) * 10'000LL;
+            if (SetWaitableTimer(cadenceTimer, &due, 0, nullptr, nullptr, FALSE)) {
+                const HANDLE handles[2] = {frameEvent, cadenceTimer};
+                const DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                CancelWaitableTimer(cadenceTimer);
+                if (wait != WAIT_OBJECT_0) {
+                    return false;
+                }
+            } else {
+                const DWORD wait = WaitForSingleObject(frameEvent, timeoutMs);
+                if (wait != WAIT_OBJECT_0) {
+                    return false;
+                }
+            }
+        } else {
+            const DWORD wait = WaitForSingleObject(frameEvent, timeoutMs);
+            if (wait != WAIT_OBJECT_0) {
+                return false;
+            }
         }
 
         try {
+            ResetEvent(frameEvent);
             auto frame = framePool.TryGetNextFrame();
             if (!frame) {
                 return false;
+            }
+
+            // WGC pools frames while capture/scaling is busy. Consume all ready
+            // frames and retain newest one; encoding stale cursor positions only
+            // adds latency and auto-reset events used to lose these wakeups.
+            while (auto newerFrame = framePool.TryGetNextFrame()) {
+                frame = std::move(newerFrame);
             }
 
             const auto size = frame.ContentSize();
@@ -210,12 +257,29 @@ struct WgcCaptureSource::Impl {
                     deviceLost.store(true);
                     return false;
                 }
+                // Recreate requires every frame from the old pool to be released.
+                // Keeping this frame alive can stall capture across a display-mode change.
+                frame = nullptr;
                 framePool.Recreate(
                     winrtDevice,
                     winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
                     static_cast<int32_t>(framePoolSize),
                     size);
                 return false;
+            }
+
+            // True presentation time (DWM vsync instant), not drain-time now().
+            // SystemRelativeTime is QPC-based 100ns units -- same epoch as MSVC
+            // steady_clock -- so it stays comparable with the emit-grid clock and
+            // gives an evenly-spaced cadence. Drain-time now() carried callback +
+            // scheduling jitter, which is what made the emit grid stutter. Zero
+            // means the frame has no timestamp yet; fall back to now() for it.
+            int64_t presentTime100ns = frame.SystemRelativeTime().count();
+            if (presentTime100ns <= 0) {
+                presentTime100ns = std::chrono::duration_cast<
+                                       std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
             }
 
             auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
@@ -265,9 +329,7 @@ struct WgcCaptureSource::Impl {
                     output.texture = slot->texture;
                     output.lease = slot;
                     output.frameIndex = frameIndex++;
-                    output.pts100ns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
-                                          std::chrono::steady_clock::now().time_since_epoch())
-                                          .count();
+                    output.pts100ns = presentTime100ns;
                     output.width = width;
                     output.height = height;
                     output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -287,9 +349,7 @@ struct WgcCaptureSource::Impl {
                 output.texture = capturedTexture;
                 output.lease = std::move(lease);
                 output.frameIndex = frameIndex++;
-                output.pts100ns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
-                                      std::chrono::steady_clock::now().time_since_epoch())
-                                      .count();
+                output.pts100ns = presentTime100ns;
                 output.width = width;
                 output.height = height;
                 output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -316,9 +376,7 @@ struct WgcCaptureSource::Impl {
             output.texture = slot->texture;
             output.lease = slot;
             output.frameIndex = frameIndex++;
-            output.pts100ns = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
-                                  std::chrono::steady_clock::now().time_since_epoch())
-                                  .count();
+            output.pts100ns = presentTime100ns;
             output.width = width;
             output.height = height;
             output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -393,6 +451,10 @@ struct WgcCaptureSource::Impl {
                 CloseHandle(frameEvent);
                 frameEvent = nullptr;
             }
+        }
+        if (cadenceTimer) {
+            CloseHandle(cadenceTimer);
+            cadenceTimer = nullptr;
         }
         device = nullptr;
         deviceLost.store(true);

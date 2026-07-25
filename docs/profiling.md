@@ -33,8 +33,13 @@ For every run record:
 - Average and peak GPU **Video Encode**, **Video Processing**, **3D**, and copy-engine utilization.
 - Game average FPS, 1% low, representative GPU frame time, and visible stutter.
 - Diagnostics: timeline intervals, source frames, cadence duplicates, catch-up duplicates, coalesced idle intervals, frame-queue depth, NVENC submissions, encoded frames, keyframes, all drop counters, and encoder failures.
+- Diagnostics: source frames/sec and timeline intervals/sec. Active gameplay must keep source frames/sec near configured FPS; a 60 FPS timeline with a much lower source rate means capture starvation, not successful capture.
+- For Desktop Duplication, record cursor-only desktop frames. Cursor-heavy scenes should not cause GPU-protection drops or reduced source frames/sec.
 - Output bytes and average bitrate over the same wall-clock duration.
 - CPU usage and capture/encode thread behavior.
+- Game-capture shared counters: hook install QPC ticks, producer/host copy QPC ticks,
+  producer/host keyed-mutex misses, cadence/contention drops, resize count, and shared-texture recreates.
+  Divide QPC tick fields by `qpcFrequency`; use counter deltas over the measured interval.
 
 Task Manager is useful for a quick indication but is not sufficient for the final decision. Its engine percentages are sampled and cannot be added as if they represented interchangeable hardware. Use PresentMon or an equivalent repeatable frame-time capture for gameplay, and use Windows Performance Recorder/WPA or GPUView to inspect GPU-engine scheduling.
 
@@ -84,6 +89,11 @@ wpr -stop "$env:USERPROFILE\Desktop\backtrack.etl"
 ```
 
 Open the ETL in Windows Performance Analyzer and inspect CPU Usage by Process and Thread, GPU Utilization by engine, Disk Usage, Context Switches, and DPC/ISR activity. Capture and encode threads should show short wakeups around frame boundaries rather than sustained CPU work.
+
+For injected game capture, snapshot shared counters before and after each WPR interval. Correlate
+producer and host copy QPC time with GPUView copy-engine work; correlate keyed-mutex misses and
+contention drops with host/producer overlap. Cadence drops should follow configured capture FPS,
+not GPU contention. Repeated resize or shared-texture recreation invalidates a steady-state run.
 
 ## GPUView and Failure Indicators
 

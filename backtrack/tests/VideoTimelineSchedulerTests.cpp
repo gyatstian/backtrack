@@ -61,8 +61,11 @@ void testCatchUpCollapseAndStop() {
         false,
         4);
     expect(remainder.has_value(), "elapsed cadence remainder was lost");
-    expect(remainder->intervalCount == 2, "elapsed cadence remainder has the wrong interval count");
-    expect(remainder->nextEmit == start + 6 * interval, "elapsed cadence remainder ended at the wrong deadline");
+    // now sits exactly on the next boundary (5*interval): emit that one frame and
+    // stop. Collapsing further would advance nextEmit past now (jitter aliasing),
+    // which the >=1.5-interval overshoot guard now prevents.
+    expect(remainder->intervalCount == 1, "elapsed cadence remainder over-collapsed on the boundary");
+    expect(remainder->nextEmit == start + 5 * interval, "elapsed cadence remainder ended at the wrong deadline");
 
     expect(!backtrack::advanceVideoCadence(start, start, interval, true),
         "stop request allowed a new cadence emission");
@@ -161,6 +164,36 @@ void testResetAndCoalescingGate() {
     expect(afterReset.previousFrameDuration100ns == 0, "reset leaked a preceding sample duration");
 }
 
+void testStallHoldPreferCoalesceOverSlideshow() {
+    // Simulates exclusive-fullscreen capture stall: same source index for a long
+    // gap with forced idle coalescing; only GOP heartbeat should Submit.
+    VideoTimelineScheduler scheduler(kFrameDuration100ns);
+    constexpr int64_t startPts = 200'000'000;
+    constexpr int64_t stallSpan = 180 * kFrameDuration100ns; // ~3s at 60fps
+
+    const auto first = scheduler.plan(40, startPts, 1, true, false, false);
+    scheduler.acceptSubmission(first);
+
+    int coalesceCount = 0;
+    for (int i = 1; i <= 170; ++i) {
+        const auto idle = scheduler.plan(40, startPts + i * kFrameDuration100ns, 1, true, false, false);
+        expect(idle.action == VideoTimelineAction::Coalesce,
+            "stall hold re-submitted frozen texture without heartbeat");
+        ++coalesceCount;
+    }
+    expect(coalesceCount == 170, "stall hold lost idle coalesce samples");
+
+    const auto heartbeat = scheduler.plan(40, startPts + stallSpan, 1, true, false, true);
+    expect(heartbeat.action == VideoTimelineAction::Submit, "stall-hold GOP heartbeat was coalesced");
+    expect(heartbeat.requestKeyFrame, "stall-hold GOP heartbeat missing keyframe request");
+    expect(heartbeat.previousFrameDuration100ns >= stallSpan,
+        "stall-hold heartbeat did not close the full freeze gap");
+    scheduler.acceptSubmission(heartbeat);
+
+    const auto after = scheduler.plan(40, startPts + stallSpan + kFrameDuration100ns, 1, true, false, false);
+    expect(after.action == VideoTimelineAction::Coalesce, "post-heartbeat stall hold did not resume coalesce");
+}
+
 } // namespace
 
 int main() {
@@ -171,6 +204,7 @@ int main() {
         testHeartbeatAndDistinctFrameSubmission();
         testQueueRejectionDoesNotCommitState();
         testResetAndCoalescingGate();
+        testStallHoldPreferCoalesceOverSlideshow();
         std::cout << "VideoTimelineScheduler tests passed\n";
         return 0;
     } catch (const std::exception& error) {

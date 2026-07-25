@@ -39,6 +39,13 @@ private:
         uint32_t outputWidth,
         uint32_t outputHeight,
         DXGI_FORMAT outputFormat);
+    // Allocates the texture pool for the same-size, same-format CopyResource
+    // fast-path, which does not need the video-processor stack.
+    bool ensureCopyPool(
+        D3DDevice& device,
+        uint32_t width,
+        uint32_t height,
+        DXGI_FORMAT format);
     void releaseResources();
     std::shared_ptr<TextureSlot> acquireSlot();
     ID3D11VideoProcessorInputView* inputViewFor(D3DDevice& device, ID3D11Texture2D* texture);

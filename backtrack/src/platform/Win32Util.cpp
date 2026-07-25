@@ -5,8 +5,10 @@
 
 #include <avrt.h>
 #include <shlobj.h>
+#include <timeapi.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cwctype>
 #include <iomanip>
@@ -268,6 +270,54 @@ void disableMmcssForThread(HANDLE handle) {
     if (handle) {
         AvRevertMmThreadCharacteristics(handle);
     }
+}
+
+HighResolutionTimerScope::HighResolutionTimerScope() {
+    // timeBeginPeriod(1) requests the finest legal period (1ms). This is a
+    // process-wide, ref-counted setting; the matching timeEndPeriod runs in the
+    // destructor. Prefer the timer floor the OS reports rather than assuming 1.
+    TIMECAPS caps{};
+    UINT period = 1;
+    if (timeGetDevCaps(&caps, sizeof(caps)) == TIMERR_NOERROR) {
+        period = std::clamp<UINT>(1, caps.wPeriodMin, caps.wPeriodMax);
+    }
+    active_ = timeBeginPeriod(period) == TIMERR_NOERROR;
+    period_ = active_ ? period : 0;
+    if (!active_) {
+        Logger::instance().warning(L"platform",
+            L"Failed to raise system timer resolution; cadence may alias below target fps");
+    }
+}
+
+HighResolutionTimerScope::~HighResolutionTimerScope() {
+    if (active_) {
+        timeEndPeriod(period_);
+    }
+}
+
+HANDLE createHighResolutionWaitableTimer() {
+    // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION requires Windows 10 1803+.
+    HANDLE timer = CreateWaitableTimerExW(
+        nullptr,
+        nullptr,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS);
+    return timer;
+}
+
+bool waitHighResolution(HANDLE timer, uint32_t timeoutMs) {
+    if (!timer || timeoutMs == 0) {
+        return false;
+    }
+    // Negative 100ns units = relative due time. High-resolution timers ignore
+    // the global system timer period, so this fires close to the requested
+    // duration regardless of timeBeginPeriod state.
+    LARGE_INTEGER dueTime{};
+    dueTime.QuadPart = -static_cast<LONGLONG>(timeoutMs) * 10000LL;
+    if (!SetWaitableTimerEx(timer, &dueTime, 0, nullptr, nullptr, nullptr, 0)) {
+        return false;
+    }
+    return WaitForSingleObject(timer, timeoutMs + 1) != WAIT_FAILED;
 }
 
 std::wstring moduleFilePath() {

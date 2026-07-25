@@ -127,13 +127,32 @@ LRESULT CALLBACK MainWindow::pageHostProc(HWND window, UINT message, WPARAM wPar
         HDC dc = BeginPaint(window, &paint);
         RECT rect{};
         GetClientRect(window, &rect);
-        FillRect(dc, &rect, self->controlBrush_);
 
-        HGDIOBJ oldPen = SelectObject(dc, self->outlinePen_);
-        HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, rect.left, rect.top, rect.right, rect.bottom);
-        SelectObject(dc, oldBrush);
-        SelectObject(dc, oldPen);
+        if (!self->sectionPanels_.empty()) {
+            // Settings: dark page host with raised panels behind each section.
+            FillRect(dc, &rect, self->backgroundBrush_);
+
+            HGDIOBJ oldPen = SelectObject(dc, self->outlinePen_);
+            HGDIOBJ oldBrush = SelectObject(dc, self->controlBrush_);
+            for (const RECT& panel : self->sectionPanels_) {
+                const int top = panel.top - self->pageScrollY_;
+                const int bottom = panel.bottom - self->pageScrollY_;
+                if (bottom < rect.top || top > rect.bottom) {
+                    continue;
+                }
+                Rectangle(dc, panel.left, top, panel.right, bottom);
+            }
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+        } else {
+            FillRect(dc, &rect, self->controlBrush_);
+
+            HGDIOBJ oldPen = SelectObject(dc, self->outlinePen_);
+            HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, rect.left, rect.top, rect.right, rect.bottom);
+            SelectObject(dc, oldBrush);
+            SelectObject(dc, oldPen);
+        }
 
         EndPaint(window, &paint);
         return 0;
@@ -213,12 +232,20 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         const int controlId = static_cast<int>(LOWORD(wParam));
         const int notification = static_cast<int>(HIWORD(wParam));
         if (controlId == kResolutionModeComboId && notification == CBN_SELCHANGE) {
-            updateResolutionControls();
+            stashVisibleSettings();
+            rebuildSettingsCategoryBody();
             markSettingsDirty();
             return 0;
         }
-        if (controlId == kFollowFocusedMonitorCheckId && notification == BN_CLICKED) {
-            updateResolutionControls();
+        if (controlId == kMultiMonitorSupportCheckId && notification == BN_CLICKED) {
+            stashVisibleSettings();
+            rebuildSettingsCategoryBody();
+            markSettingsDirty();
+            return 0;
+        }
+        if ((controlId == kGameCaptureModeComboId || controlId == kEncoderProfileComboId) && notification == CBN_SELCHANGE) {
+            stashVisibleSettings();
+            rebuildSettingsCategoryBody();
             markSettingsDirty();
             return 0;
         }
@@ -249,6 +276,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kSettingsCategoryButtonBaseId + 1:
         case kSettingsCategoryButtonBaseId + 2:
         case kSettingsCategoryButtonBaseId + 3:
+        case kSettingsCategoryButtonBaseId + 4:
             switchSettingsCategory(static_cast<SettingsCategory>(controlId - kSettingsCategoryButtonBaseId));
             return 0;
         case kStartStopButtonId:

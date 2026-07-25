@@ -3,6 +3,7 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
+#include "capture/game/AntiCheatGuard.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -77,6 +78,14 @@ void MainWindow::saveLog() {
 }
 
 void MainWindow::updateStats() {
+    // Edge-triggered: fires the failure beep once per transition into the
+    // anti-cheat-blocked state. GameCapture is refused for anti-cheat titles and
+    // WGC takes over; the beep signals that the requested backend was unavailable.
+    if (const AntiCheatKind blockedKind = controller_.consumeAntiCheatBlock();
+        blockedKind != AntiCheatKind::None) {
+        playActionIndicator(MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
+    }
+
     const auto stats = controller_.stats();
     if (statsLabel_) {
         std::wstringstream stream;
@@ -100,11 +109,14 @@ void MainWindow::updateStats() {
         stream << L"Encode size: " << stats.encodeWidth << L"x" << stats.encodeHeight << L"\r\n";
         stream << L"Timeline intervals: " << stats.capturedFrames << L"\r\n";
         stream << L"New source frames: " << stats.sourceFrames << L"\r\n";
+        stream << L"Source frames/sec: " << stats.sourceFramesPerSecond << L"\r\n";
+        stream << L"Timeline intervals/sec: " << stats.timelineIntervalsPerSecond << L"\r\n";
         stream << L"Cadence duplicates: " << stats.cadenceDuplicateFrames << L"\r\n";
         stream << L"Catch-up duplicates: " << stats.catchUpDuplicateFrames << L"\r\n";
         stream << L"Coalesced idle intervals: " << stats.coalescedIdleIntervals << L"\r\n";
         stream << L"Dropped frames: " << stats.droppedFrames + stats.encoder.droppedFrames << L"\r\n";
         stream << L"GPU protection drops: " << stats.gpuProtectionDrops << L"\r\n";
+        stream << L"Cursor-only desktop frames: " << stats.cursorOnlyFrames << L"\r\n";
         stream << L"System audio queue drops: " << stats.systemAudioQueueDrops << L"\r\n";
         stream << L"Microphone audio queue drops: " << stats.microphoneAudioQueueDrops << L"\r\n";
         stream << L"Frame queue depth: " << stats.encoder.queueDepth << L"\r\n";

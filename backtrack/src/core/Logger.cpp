@@ -224,15 +224,20 @@ std::wstring hresultToString(HRESULT hr) {
         0,
         nullptr);
 
-    std::wstringstream fallback;
-    fallback << L"HRESULT 0x" << std::uppercase << std::hex << static_cast<unsigned long>(hr);
-    std::wstring message = fallback.str();
+    std::wstringstream hexStream;
+    hexStream << L"0x" << std::uppercase << std::hex << static_cast<unsigned long>(hr);
+    const std::wstring hex = hexStream.str();
+
+    std::wstring message = hex;
     if (length > 0 && buffer) {
-        message.assign(buffer, buffer + length);
-        while (!message.empty() && (message.back() == L'\r' || message.back() == L'\n')) {
-            message.pop_back();
+        std::wstring text(buffer, buffer + length);
+        while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n')) {
+            text.pop_back();
         }
         LocalFree(buffer);
+        if (!text.empty()) {
+            message = text + L" (" + hex + L")";
+        }
     }
     return message;
 }

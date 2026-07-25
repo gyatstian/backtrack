@@ -153,32 +153,32 @@ std::vector<ClipInfo> ClipManager::listClips() const {
     }
     for (; iterator != end; iterator.increment(error)) {
         const auto& entry = *iterator;
-        if (!entry.is_regular_file(error) || error || !hasMp4Extension(entry.path())) {
+        const auto path = entry.path();
+        if (!entry.is_regular_file(error) || error || !hasMp4Extension(path)) {
             error = {};
             continue;
         }
-        if (!isManagedClipPath(entry.path())) {
-            error = {};
-            continue;
-        }
+
+        // Iterator yields only direct children of configured clip directory. Re-canonicalizing
+        // root and every child here caused synchronous filesystem work for every library item.
         ClipInfo info;
-        info.path = entry.path();
+        info.path = path;
         info.bytes = entry.file_size(error);
         if (error) {
-            Logger::instance().warning(L"clips", L"Could not read clip file size: " + entry.path().wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not read clip file size: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
             error = {};
             continue;
         }
         info.modifiedTime = entry.last_write_time(error);
         if (error) {
-            Logger::instance().warning(L"clips", L"Could not read clip modified time: " + entry.path().wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not read clip modified time: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
             error = {};
             continue;
         }
-        info.duration100ns = readMediaDuration(entry.path());
-        info.favorite = std::filesystem::exists(favoriteMarker(entry.path()), error);
+        info.duration100ns = readMediaDuration(path);
+        info.favorite = std::filesystem::exists(favoriteMarker(path), error);
         error = {};
-        info.tags = readTags(entry.path());
+        info.tags = readTags(path);
         clips.push_back(std::move(info));
     }
     if (error) {

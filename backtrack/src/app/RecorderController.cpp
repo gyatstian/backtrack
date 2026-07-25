@@ -3,6 +3,7 @@
 
 #include "capture/DesktopDuplicationCapture.h"
 #include "capture/WgcCaptureSource.h"
+#include "capture/game/GameCaptureSource.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
@@ -36,6 +37,15 @@ int64_t steadyTimePoint100ns(SteadyClock::time_point time) {
         .count();
 }
 
+// Inverse of steadyTimePoint100ns. WGC SystemRelativeTime and MSVC steady_clock
+// are both QPC-derived (same epoch), so a source present time in 100ns units maps
+// back to a steady_clock instant for emit-grid phase locking.
+SteadyClock::time_point steadyPointFrom100ns(int64_t value100ns) {
+    return SteadyClock::time_point(
+        std::chrono::duration_cast<SteadyClock::duration>(
+            std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>(value100ns)));
+}
+
 uint32_t evenEncodeDimension(uint32_t value) {
     value = std::max<uint32_t>(16, value);
     return value % 2 == 0 ? value : value - 1;
@@ -49,7 +59,7 @@ uint32_t captureTexturePoolSize(const GpuOptimizationSettings& settings) {
 CaptureTarget captureTargetForSettings(const AppSettings& settings) {
     CaptureTarget target;
     target.monitorIndex = settings.monitorIndex;
-    if (settings.followFocusedMonitor) {
+    if (settings.multiMonitorSupport && settings.followFocusedMonitor) {
         target.monitor = settings.followMouseMonitor
             ? cursorMonitorOrFallback(settings.monitorIndex)
             : focusedMonitorOrFallback(settings.monitorIndex);
@@ -63,6 +73,30 @@ HMONITOR monitorForCaptureTarget(const CaptureTarget& target) {
     return target.monitor ? target.monitor : monitorFromIndex(target.monitorIndex);
 }
 
+bool foregroundWindowCoversMonitor(HMONITOR monitor) {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground || !monitor || IsIconic(foreground) || !IsWindowVisible(foreground)) {
+        return false;
+    }
+
+    // A monitor-sized borderless window is only an exclusive candidate. Actual
+    // loss needs a sustained capture stall below; this also excludes desktop,
+    // tool, and child windows that happen to cover a monitor.
+    if (GetWindow(foreground, GW_OWNER) ||
+        (GetWindowLongPtrW(foreground, GWL_STYLE) & WS_CHILD) != 0) {
+        return false;
+    }
+
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    RECT windowRect{};
+    return GetMonitorInfoW(monitor, &monitorInfo) && GetWindowRect(foreground, &windowRect) &&
+           windowRect.left <= monitorInfo.rcMonitor.left &&
+           windowRect.top <= monitorInfo.rcMonitor.top &&
+           windowRect.right >= monitorInfo.rcMonitor.right &&
+           windowRect.bottom >= monitorInfo.rcMonitor.bottom;
+}
+
 size_t frameQueueCapacityFor(const GpuOptimizationSettings& settings) {
     return static_cast<size_t>(std::clamp<uint32_t>(settings.frameQueueLimit, 1, 16));
 }
@@ -73,6 +107,8 @@ const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
         return L"Windows Graphics Capture";
     case CaptureBackend::DesktopDuplication:
         return L"Desktop Duplication";
+    case CaptureBackend::GameCapture:
+        return L"Game Capture";
     }
     return L"Unknown";
 }
@@ -540,12 +576,15 @@ RecordingStats RecorderController::stats() const {
     }
     stats.capturedFrames = capturedFrames_.load();
     stats.sourceFrames = sourceFrames_.load();
+    stats.sourceFramesPerSecond = sourceFramesPerSecond_.load();
+    stats.timelineIntervalsPerSecond = timelineIntervalsPerSecond_.load();
     stats.cadenceDuplicateFrames = cadenceDuplicateFrames_.load();
     stats.catchUpDuplicateFrames = catchUpDuplicateFrames_.load();
     stats.coalescedIdleIntervals = coalescedIdleIntervals_.load();
     stats.droppedFrames = droppedFrames_.load();
     stats.gpuProtectionDrops = gpuProtectionDrops_.load();
     stats.idleFrameSkips = idleFrameSkips_.load();
+    stats.cursorOnlyFrames = cursorOnlyFrames_.load();
     stats.systemAudioQueueDrops = systemAudioQueueDrops_.load();
     stats.microphoneAudioQueueDrops = microphoneAudioQueueDrops_.load();
     stats.replayVideoPackets = replay_.videoPacketCount();
@@ -559,8 +598,9 @@ RecordingStats RecorderController::stats() const {
         // while WGC waits for outstanding frame leases, so never block UI for it.
         std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
         if (gpuLock.owns_lock() && encoder_) {
-            stats.encoder = encoder_->stats();
+            lastEncoderStats_ = encoder_->stats();
         }
+        stats.encoder = lastEncoderStats_;
     }
     stats.encoder.queueDepth = static_cast<uint32_t>(frameQueue_.size());
     return stats;
@@ -570,9 +610,9 @@ EncoderCapabilities RecorderController::encoderCapabilities() const {
     // See stats(): reporting must not wait for GPU teardown or recreation.
     std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
     if (gpuLock.owns_lock() && encoder_) {
-        return encoder_->capabilities();
+        lastEncoderCapabilities_ = encoder_->capabilities();
     }
-    return {};
+    return lastEncoderCapabilities_;
 }
 
 AppSettings RecorderController::settings() const {
@@ -583,6 +623,15 @@ AppSettings RecorderController::settings() const {
 std::wstring RecorderController::captureBackendStatus() const {
     std::scoped_lock lock(captureStatusMutex_);
     return captureBackendStatus_;
+}
+
+AntiCheatKind RecorderController::consumeAntiCheatBlock() {
+    std::scoped_lock lock(captureStatusMutex_);
+    if (!captureAntiCheatBlocked_) {
+        return AntiCheatKind::None;
+    }
+    captureAntiCheatBlocked_ = false;
+    return captureAntiCheatKind_;
 }
 
 std::wstring RecorderController::lastRecordingError() const {
@@ -598,7 +647,11 @@ bool RecorderController::ensurePipeline() {
     AppSettings snapshot = settings();
     Logger::instance().info(L"recorder", std::wstring(L"Starting capture pipeline: clips=") + snapshot.clipDirectory.wstring() +
                             L", captureBackend=" +
-                            (snapshot.preferredCaptureBackend == CaptureBackend::WindowsGraphicsCapture ? L"WGC" : L"Desktop Duplication") +
+                            (snapshot.preferredCaptureBackend == CaptureBackend::DesktopDuplication
+                                 ? L"Desktop Duplication"
+                                 : snapshot.preferredCaptureBackend == CaptureBackend::GameCapture
+                                     ? L"Game Capture"
+                                     : L"WGC") +
                             L", followFocusedMonitor=" + (snapshot.followFocusedMonitor ? L"yes" : L"no") +
                             L", followMouseMonitor=" + (snapshot.followMouseMonitor ? L"yes" : L"no") +
                             L", systemAudio=" + (snapshot.captureSystemAudio ? L"yes" : L"no") +
@@ -637,12 +690,15 @@ bool RecorderController::ensurePipeline() {
     // recreateGpuPipeline may have requested a keyframe; keep that flag.
     capturedFrames_ = 0;
     sourceFrames_ = 0;
+    sourceFramesPerSecond_ = 0;
+    timelineIntervalsPerSecond_ = 0;
     cadenceDuplicateFrames_ = 0;
     catchUpDuplicateFrames_ = 0;
     coalescedIdleIntervals_ = 0;
     droppedFrames_ = 0;
     gpuProtectionDrops_ = 0;
     idleFrameSkips_ = 0;
+    cursorOnlyFrames_ = 0;
     systemAudioQueueDrops_ = 0;
     microphoneAudioQueueDrops_ = 0;
     lastEncodedVideoPts100ns_ = 0;
@@ -875,11 +931,17 @@ bool RecorderController::recreateGpuPipeline(
     return true;
 }
 
-bool RecorderController::createCaptureSource(const CaptureTarget& target) {
+bool RecorderController::createCaptureSource(
+    const CaptureTarget& target,
+    bool exclusiveRecovery,
+    bool allowDesktopDuplication,
+    bool allowGameCapture,
+    bool* gameCaptureAttempted) {
+    if (gameCaptureAttempted) {
+        *gameCaptureAttempted = false;
+    }
     AppSettings snapshot = settings();
     const CaptureBackend selectedBackend = selectedBackendForSettings(snapshot);
-    bool wgcAttempted = false;
-    bool wgcFailed = false;
 
     {
         std::scoped_lock lock(captureStatusMutex_);
@@ -890,13 +952,35 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
         captureBackendStatus_ = std::wstring(L"Selected backend: ") + captureBackendDisplayName(selectedBackend) + L"; initializing";
     }
 
-    auto tryInitialize = [&](std::unique_ptr<ICaptureSource> source, const wchar_t* name) -> std::unique_ptr<ICaptureSource> {
+    // Desktop Duplication keeps exclusive ownership of its output. Release an
+    // access-lost source before attempting DuplicateOutput for a replacement.
+    if (capture_) {
+        Logger::instance().info(L"recorder", L"Releasing previous capture source before replacement");
+        capture_->shutdown();
+        capture_.reset();
+    }
+
+    bool gameCapTargetDied = false;
+    bool gameCapAntiCheatBlocked = false;
+    AntiCheatKind gameCapAntiCheatKind = AntiCheatKind::None;
+    auto tryInitialize = [&](std::unique_ptr<ICaptureSource> source, const wchar_t* name,
+                             const CaptureTarget& initTarget) -> std::unique_ptr<ICaptureSource> {
         Logger::instance().info(L"recorder", std::wstring(L"Initializing capture source: ") + name);
-        if (source->initialize(d3d_, snapshot, target)) {
+        if (source->initialize(d3d_, snapshot, initTarget)) {
             Logger::instance().info(L"recorder", std::wstring(L"Capture source initialized: ") + name);
             return std::move(source);
         }
         Logger::instance().warning(L"recorder", std::wstring(L"Capture source initialization failed: ") + name);
+        if (source->backend() == CaptureBackend::GameCapture) {
+            auto* gc = static_cast<GameCaptureSource*>(source.get());
+            if (gc->targetProcessExited()) {
+                gameCapTargetDied = true;
+            }
+            if (gc->antiCheatBlocked()) {
+                gameCapAntiCheatBlocked = true;
+                gameCapAntiCheatKind = gc->antiCheatKind();
+            }
+        }
         source->shutdown();
         return {};
     };
@@ -909,43 +993,144 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
         location.adapterIndex == d3d_.adapterIndex();
     bool dxgiSkippedForTarget = false;
 
-    std::unique_ptr<ICaptureSource> initialized;
-    if (selectedBackend == CaptureBackend::WindowsGraphicsCapture) {
-        wgcAttempted = true;
-        initialized = tryInitialize(std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture");
-        wgcFailed = !initialized;
+    CaptureTarget monitorTarget = target;
+    monitorTarget.window = nullptr;
+    CaptureTarget windowTarget = target;
+    const bool hasWindowTarget = windowTarget.window && IsWindow(windowTarget.window);
+    if (!hasWindowTarget) {
+        windowTarget.window = nullptr;
     }
 
-    if (!initialized && selectedBackend == CaptureBackend::DesktopDuplication && !dxgiTargetOnActiveAdapter) {
-        const wchar_t* detail = !location.valid()
-            ? L"monitor has no DXGI output"
-            : !dxgiTargetEncodable
-                ? L"monitor adapter has no supported hardware encoder"
-                : L"target adapter differs from active D3D adapter";
-        Logger::instance().warning(L"recorder",
-            std::wstring(L"Desktop Duplication unavailable for target; using WGC: ") + detail);
-        dxgiSkippedForTarget = true;
-        wgcAttempted = true;
-        initialized = tryInitialize(std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture");
-        wgcFailed = !initialized;
+    std::unique_ptr<ICaptureSource> initialized;
+
+    // Auto Game Capture is exclusive-only. Windowed/borderless recovery must
+    // return to desktop composition so title bars and taskbar remain recorded.
+    const GameCaptureMode gameMode = snapshot.gameCaptureMode;
+    const bool tryGameCapture =
+        allowGameCapture &&
+        gameMode != GameCaptureMode::Off &&
+        (exclusiveRecovery ||
+         !allowDesktopDuplication ||
+         gameMode == GameCaptureMode::On ||
+         selectedBackend == CaptureBackend::GameCapture);
+    if (tryGameCapture) {
+        // Preserve exclusiveTargetWindow validated by the recovery state
+        // machine. monitorTarget intentionally has no window for desktop APIs.
+        CaptureTarget gameTarget = target;
+        // Automatic exclusive recovery must inject only the window validated
+        // when the capture loss occurred, never whichever app is foreground.
+        if (!gameTarget.window && !exclusiveRecovery) {
+            gameTarget.window = GetForegroundWindow();
+        }
+        if (gameTarget.window) {
+            if (gameCaptureAttempted) {
+                *gameCaptureAttempted = true;
+            }
+            initialized = tryInitialize(
+                std::make_unique<GameCaptureSource>(), L"Game Capture", gameTarget);
+        }
+    }
+
+    // GameCap-only exclusive probe: do not fall through to DXGI/WGC.
+    if (!initialized && !allowDesktopDuplication) {
+        std::scoped_lock lock(captureStatusMutex_);
+        captureBackendActive_ = false;
+        captureBackendFallbackUsed_ = false;
+        captureBackendStatus_ = L"Game capture unavailable; exclusive hold";
+        return false;
+    }
+
+    // Inject killed the game — never thrash DXGI as fake recovery.
+    if (!initialized && gameCapTargetDied && exclusiveRecovery) {
+        Logger::instance().warning(
+            L"recorder",
+            L"Game died on inject — exclusive hold, no DXGI thrash");
+        std::scoped_lock lock(captureStatusMutex_);
+        captureBackendActive_ = false;
+        captureBackendFallbackUsed_ = false;
+        captureBackendStatus_ = L"Exclusive: game died on inject (holding last frame)";
+        return false;
+    }
+
+    // Respect an explicit DXGI choice before considering WGC window capture.
+    // Window targeting is an optimization, not permission to override capture
+    // method selected by user.
+    if (!initialized && selectedBackend == CaptureBackend::DesktopDuplication &&
+        !exclusiveRecovery && dxgiTargetOnActiveAdapter) {
+        initialized = tryInitialize(
+            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
+    }
+
+    // Normal WGC path can target window. Exclusive recovery uses monitor DXGI
+    // only after validated Game Capture attempt.
+    if (!initialized && hasWindowTarget && !exclusiveRecovery &&
+        selectedBackend != CaptureBackend::DesktopDuplication) {
+        initialized = tryInitialize(
+            std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture (window)", windowTarget);
+    }
+
+    if (!initialized && exclusiveRecovery && allowDesktopDuplication &&
+        dxgiTargetOnActiveAdapter) {
+        Logger::instance().info(L"recorder", L"Attempting Desktop Duplication recovery");
+        initialized = tryInitialize(
+            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
+    }
+
+    if (!initialized && selectedBackend == CaptureBackend::WindowsGraphicsCapture &&
+        !exclusiveRecovery) {
+        initialized = tryInitialize(
+            std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture", monitorTarget);
+    }
+
+    if (!initialized && selectedBackend == CaptureBackend::GameCapture &&
+        dxgiTargetOnActiveAdapter &&
+        !exclusiveRecovery) {
+        initialized = tryInitialize(
+            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
+    }
+
+    if (!initialized && selectedBackend == CaptureBackend::DesktopDuplication) {
+        if (!dxgiTargetOnActiveAdapter) {
+            const wchar_t* detail = !location.valid()
+                ? L"monitor has no DXGI output"
+                : !dxgiTargetEncodable
+                    ? L"monitor adapter has no supported hardware encoder"
+                    : L"target adapter differs from active D3D adapter";
+            Logger::instance().warning(L"recorder",
+                std::wstring(L"Desktop Duplication unavailable for target; using WGC: ") + detail);
+            dxgiSkippedForTarget = true;
+        } else {
+            Logger::instance().warning(L"recorder",
+                L"Desktop Duplication failed; attempting Windows Graphics Capture fallback");
+        }
+        if (hasWindowTarget) {
+            initialized = tryInitialize(
+                std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture (window)", windowTarget);
+        }
+        if (!initialized) {
+            initialized = tryInitialize(
+                std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture", monitorTarget);
+        }
     }
 
     // WGC fallback may use Desktop Duplication only when output and active D3D
     // device share an encoder-capable adapter.
-    if (!initialized && dxgiTargetOnActiveAdapter) {
-        if (wgcAttempted && wgcFailed) {
-            Logger::instance().info(L"recorder", L"WGC failed; attempting Desktop Duplication fallback");
-        }
-        initialized = tryInitialize(std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication");
+    if (!initialized && selectedBackend == CaptureBackend::WindowsGraphicsCapture &&
+        !exclusiveRecovery && dxgiTargetOnActiveAdapter) {
+        Logger::instance().info(L"recorder", L"WGC failed; attempting Desktop Duplication fallback");
+        initialized = tryInitialize(
+            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
     }
+
+    // Exclusive recovery: if GameCapture and DXGI both
+    // failed, leave capture null so the loop deep-holds lastFrame. Do not thrash WGC.
 
     if (!initialized) {
         std::scoped_lock lock(captureStatusMutex_);
         captureBackendActive_ = false;
         captureBackendFallbackUsed_ = false;
-        captureBackendStatus_ = wgcAttempted && wgcFailed
-            ? L"Selected backend: Windows Graphics Capture; WGC failed and Desktop Duplication fallback also failed"
-            : std::wstring(L"Selected backend: ") + captureBackendDisplayName(selectedBackend) + L"; initialization failed";
+        captureBackendStatus_ = std::wstring(L"Selected backend: ") + captureBackendDisplayName(selectedBackend) +
+            L"; initialization failed";
         return false;
     }
 
@@ -959,15 +1144,27 @@ bool RecorderController::createCaptureSource(const CaptureTarget& target) {
         captureBackendFallbackUsed_ = fallbackUsed;
         captureBackendStatus_ = std::wstring(L"Selected backend: ") + captureBackendDisplayName(selectedBackend) +
             L"; active backend: " + captureBackendDisplayName(activeBackend);
-        if (fallbackUsed) {
+        if (gameCapAntiCheatBlocked) {
+            // Anti-cheat titles never receive the injected hook. Surface the
+            // reason explicitly so the user understands why WGC is active.
+            captureBackendStatus_ = std::wstring(L"Game Capture disabled for anti-cheat title (") +
+                antiCheatDisplayName(gameCapAntiCheatKind) +
+                L"), using " + captureBackendDisplayName(activeBackend);
+        } else if (fallbackUsed) {
             captureBackendStatus_ += dxgiSkippedForTarget
                 ? L" (DXGI unavailable for target adapter)"
-                : L" (fallback after WGC failed)";
+                : selectedBackend == CaptureBackend::DesktopDuplication
+                    ? L" (fallback after DXGI failed)"
+                    : L" (fallback after WGC failed)";
         }
     }
-
-    if (capture_) {
-        capture_->shutdown();
+    {
+        // Edge-triggered latch: the observer fires the failure beep once per
+        // transition into the anti-cheat-blocked state. Re-arm when a later
+        // rebind is no longer blocked so a subsequent block beeps again.
+        std::scoped_lock lock(captureStatusMutex_);
+        captureAntiCheatBlocked_ = gameCapAntiCheatBlocked;
+        captureAntiCheatKind_ = gameCapAntiCheatBlocked ? gameCapAntiCheatKind : AntiCheatKind::None;
     }
 
     capture_ = std::move(initialized);
@@ -1018,6 +1215,11 @@ bool RecorderController::shouldDropForGpuProtection(
 void RecorderController::captureLoop() {
     setThreadDescriptionSafe(L"Backtrack capture");
     const HANDLE mmcssHandle = enableMmcssForCaptureThread();
+    // Session-scoped: raises the global system timer resolution for the whole
+    // capture/encode session, then restores it on loop exit. Without this,
+    // coarse cadence waits quantize to the 15.6ms default and 60fps aliases to
+    // ~30fps in windowed mode (exclusive fullscreen raises the period for us).
+    const HighResolutionTimerScope timerScope;
 
     AppSettings captureSettings = settings();
     VideoSettings videoSettings;
@@ -1029,13 +1231,48 @@ void RecorderController::captureLoop() {
     }
     GpuFrame lastFrame;
     auto nextEmit = std::chrono::steady_clock::now();
+    auto lastSourceFrameAt = nextEmit;
     auto nextMonitorPoll = std::chrono::steady_clock::now();
     auto nextSoundSeparationPoll = std::chrono::steady_clock::now();
     auto pendingMonitorSince = std::chrono::steady_clock::now();
     auto lastVideoSubmission = SteadyClock::time_point::min();
+    auto statsSampleAt = std::chrono::steady_clock::now();
+    uint64_t sourceFramesAtLastSample = 0;
+    uint64_t timelineIntervalsAtLastSample = 0;
+    auto lastCaptureRebindAt = SteadyClock::time_point::min();
+    auto accessLostAt = SteadyClock::time_point::min();
     HMONITOR pendingMonitor = nullptr;
     bool emitClockStarted = false;
+    auto lastEmitTime = SteadyClock::time_point::min();
     bool requestKeyFrameAfterAcceptedFrame = false;
+    // Known fullscreen mode switches may accept the first fresh source frame. The
+    // longer sustained-frame gate remains for ambiguous capture-loss recovery.
+    bool acceptFirstLiveFrameAfterTransition = false;
+    bool immediateRebindPending = false;
+    // Capture session under exclusive fullscreen:
+    // Capturing → AccessLost → WaitStable → Rebind (DXGI only) → Capturing | Holding.
+    // Never thrash WGC CreateForWindow for exclusive cover (zero frames).
+    enum class CaptureSessionState {
+        Capturing,
+        AccessLost,
+        WaitStable,
+        Rebind,
+        Holding,
+    };
+    CaptureSessionState captureSession = CaptureSessionState::Capturing;
+    auto liveFramesSince = SteadyClock::time_point::min();
+    int rebindAttempts = 0;
+    int exclusiveDxgiAttempts = 0;
+    int sustainedLiveFrameCount = 0;
+    bool exclusiveCoverActive = false;
+    HWND exclusiveTargetWindow = nullptr;
+    bool loggedExclusiveHold = false;
+    bool exclusiveBlind = false;
+    // A monitor-sized borderless game remains an exclusive-cover candidate.
+    // Periodically test desktop composition without retrying Game Capture.
+    bool desktopRecoveryProbe = false;
+    auto lastGameCapFailureAt = SteadyClock::time_point::min();
+    auto rebindSourceBornAt = SteadyClock::time_point::min();
     DXGI_FORMAT encoderInputFormat;
     {
         std::scoped_lock gpuLock(pipelineGpuMutex_);
@@ -1049,7 +1286,53 @@ void RecorderController::captureLoop() {
     VideoTimelineScheduler timelineScheduler(nominalFrameDuration100ns);
     const auto keyFrameHeartbeatInterval =
         std::chrono::seconds(std::max<uint32_t>(1, videoSettings.gopSeconds));
+    // Exclusive-blind: coalesce only (no periodic GOP Submit of frozen texture).
+    // One IDR on enter hold + on first real live frames after recover.
+    bool captureStallHold = false;
+    auto enterAccessLost = [&](const wchar_t* reason) {
+        if (captureSession == CaptureSessionState::AccessLost ||
+            captureSession == CaptureSessionState::WaitStable ||
+            captureSession == CaptureSessionState::Rebind ||
+            captureSession == CaptureSessionState::Holding) {
+            captureStallHold = true;
+            return;
+        }
+        accessLostAt = std::chrono::steady_clock::now();
+        exclusiveTargetWindow = exclusiveCoverActive ? GetForegroundWindow() : nullptr;
+        captureSession = CaptureSessionState::AccessLost;
+        captureStallHold = true;
+        liveFramesSince = SteadyClock::time_point::min();
+        sustainedLiveFrameCount = 0;
+        Logger::instance().warning(L"recorder",
+            std::wstring(L"Capture session AccessLost: ") + (reason ? reason : L"unspecified"));
+    };
+    auto enterExclusiveHold = [&](const wchar_t* reason) {
+        const bool firstHold = !loggedExclusiveHold;
+        captureSession = CaptureSessionState::Holding;
+        captureStallHold = true;
+        exclusiveBlind = true;
+        sustainedLiveFrameCount = 0;
+        liveFramesSince = SteadyClock::time_point::min();
+        if (firstHold) {
+            forceVideoHeartbeat_ = true; // one IDR of freeze; no periodic slideshow
+            loggedExclusiveHold = true;
+            Logger::instance().warning(L"recorder",
+                std::wstring(L"Exclusive fullscreen hold: ") +
+                    (reason ? reason : L"desktop APIs blind") +
+                    L". Holding last frame (no slideshow).");
+            {
+                std::scoped_lock lock(captureStatusMutex_);
+                captureBackendStatus_ =
+                    L"Exclusive: frozen (last frame) — game capture needed for live";
+            }
+        }
+    };
     auto idleCoalescingAllowed = [&]() {
+        // Stall/hold: always coalesce duplicates (stop slideshow). Do not gate on
+        // zeroReorderDelay — that was re-encoding frozen texture every cadence tick.
+        if (captureStallHold || captureSession != CaptureSessionState::Capturing) {
+            return true;
+        }
         std::scoped_lock gpuLock(pipelineGpuMutex_);
         return gpuSettings.allowIdleFrameSkipping &&
                encoder_ && encoder_->capabilities().effective.zeroReorderDelay;
@@ -1062,7 +1345,11 @@ void RecorderController::captureLoop() {
 
     auto emitFrame = [&](const GpuFrame& source, SteadyClock::time_point emitTime, uint32_t intervalCount) {
         const bool forcedHeartbeat = forceVideoHeartbeat_.exchange(false);
+        // Stall/hold: suppress periodic GOP Submit of same texture (slideshow).
+        // Forced heartbeat (enter hold / recover) still allowed for seekability.
         const bool periodicHeartbeat =
+            !captureStallHold &&
+            captureSession == CaptureSessionState::Capturing &&
             lastVideoSubmission != SteadyClock::time_point::min() &&
             emitTime - lastVideoSubmission >= keyFrameHeartbeatInterval;
         const VideoTimelineEmission emission = timelineScheduler.plan(
@@ -1165,33 +1452,54 @@ void RecorderController::captureLoop() {
         requestKeyFrameAfterAcceptedFrame = true;
     };
 
-    auto switchCaptureTarget = [&](const CaptureTarget& target, const wchar_t* reason) -> bool {
+    auto switchCaptureTarget = [&](const CaptureTarget& target,
+                                    const wchar_t* reason,
+                                    bool exclusiveRecovery = false,
+                                    bool allowDesktopDuplication = true,
+                                    bool allowGameCapture = true,
+                                    bool* gameCaptureAttempted = nullptr) -> bool {
         const uint32_t targetAdapter = pipelineAdapterForTarget(target);
         if (targetAdapter != d3d_.adapterIndex()) {
-            return recreateGpuPipeline(target, reason, targetAdapter);
+            // Full device recreate invalidates lastFrame GPU resources.
+            if (!recreateGpuPipeline(target, reason, targetAdapter)) {
+                return false;
+            }
+            resetVideoHandoff();
+            {
+                std::scoped_lock stateLock(stateMutex_);
+                videoSettings = activeVideoSettings_;
+                gpuSettings = activeGpuSettings_;
+            }
+            {
+                std::scoped_lock gpuLock(pipelineGpuMutex_);
+                encoderInputFormat = encoder_
+                    ? encoder_->preferredInputFormat()
+                    : DXGI_FORMAT_B8G8R8A8_UNORM;
+            }
+            return true;
         }
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
-            if (!createCaptureSource(target) || !capture_) {
+            if (!createCaptureSource(
+                    target,
+                    exclusiveRecovery,
+                    allowDesktopDuplication,
+                    allowGameCapture,
+                    gameCaptureAttempted) ||
+                !capture_) {
                 return false;
             }
             if (encoder_) {
                 encoder_->resetInputResources();
             }
+            // Scaler pool slots held by lastFrame stay alive via shared_ptr leases.
             scaler_.reset();
             scaler_.setPoolSize(captureTexturePoolSize(gpuSettings));
         }
+        // Drop in-flight queue frames from the previous source, but keep lastFrame
+        // and the emit clock so exclusive-fullscreen ACCESS_LOST / WGC stalls do
+        // not punch a hole in the replay timeline (freeze until live frames return).
         discardQueuedFrames_.store(true, std::memory_order_release);
-        durationUpdatePending_.store(false, std::memory_order_release);
-        {
-            std::scoped_lock lock(durationUpdateMutex_);
-            pendingDurationPts100ns_ = 0;
-            pendingDuration100ns_ = 0;
-        }
-        lastFrame = {};
-        emitClockStarted = false;
-        timelineScheduler.reset();
-        lastVideoSubmission = SteadyClock::time_point::min();
         requestKeyFrameAfterAcceptedFrame = true;
         if (frameEvent_) {
             SetEvent(frameEvent_);
@@ -1209,7 +1517,7 @@ void RecorderController::captureLoop() {
             refreshSystemAudioCapture(captureSettings);
         }
 
-        if (captureSettings.followFocusedMonitor && loopNow >= nextMonitorPoll) {
+        if (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && loopNow >= nextMonitorPoll) {
             nextMonitorPoll = loopNow + monitorPollInterval;
             CaptureTarget focusedTarget = captureTargetForSettings(captureSettings);
             if (!focusedTarget.monitor || focusedTarget.monitor == activeCaptureTarget_.monitor) {
@@ -1226,16 +1534,47 @@ void RecorderController::captureLoop() {
                 if (switchCaptureTarget(focusedTarget, reason)) {
                     lastMonitorSwitch = loopNow;
                     pendingMonitor = nullptr;
+                    captureSession = CaptureSessionState::Capturing;
+                    rebindAttempts = 0;
+                    loggedExclusiveHold = false;
+                    lastCaptureRebindAt = loopNow;
+                    lastSourceFrameAt = loopNow;
+                    captureStallHold = true;
+                    liveFramesSince = SteadyClock::time_point::min();
                 }
             }
         }
 
-        if (!capture_) {
-            CaptureTarget target = captureSettings.followFocusedMonitor
+        // Missing-capture recovery is handled below with cooldown so lastFrame
+        // heartbeats keep running during exclusive-fullscreen DuplicateOutput waits.
+
+        const auto nowLoop = std::chrono::steady_clock::now();
+        exclusiveCoverActive =
+            foregroundWindowCoversMonitor(monitorForCaptureTarget(activeCaptureTarget_));
+
+        // Auto Game Capture has game-backbuffer semantics. Once F11 returns to
+        // windowed mode, immediately recover desktop composition instead.
+        if (captureSession == CaptureSessionState::Capturing &&
+            capture_ && capture_->backend() == CaptureBackend::GameCapture &&
+            captureSettings.gameCaptureMode == GameCaptureMode::Auto &&
+            !exclusiveCoverActive) {
+            // F11 back to windowed mode is a known source change, not a failed
+            // capture session. Swap directly instead of entering recovery hold.
+            CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
                 ? captureTargetForSettings(captureSettings)
                 : activeCaptureTarget_;
-            if (!switchCaptureTarget(target, L"capture source recreated")) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            target.window = nullptr;
+            if (switchCaptureTarget(target, L"exclusive cover ended", false)) {
+                captureSession = CaptureSessionState::Capturing;
+                captureStallHold = true;
+                acceptFirstLiveFrameAfterTransition = true;
+                immediateRebindPending = false;
+                lastSourceFrameAt = nowLoop;
+                forceVideoHeartbeat_ = true;
+                Logger::instance().info(L"recorder",
+                    L"Fast fullscreen transition: Game Capture -> desktop capture");
+            } else {
+                enterAccessLost(L"exclusive cover ended while Game Capture active");
             }
         }
 
@@ -1251,64 +1590,160 @@ void RecorderController::captureLoop() {
             }
         }
 
-            const bool acquired = capture_ && capture_->acquireNextFrame(frame, timeoutMs);
+        // Keep acquiring while holding. A borderless game still covers its monitor,
+        // so cover detection alone cannot tell that exclusive mode has ended.
+        // Sustained desktop frames below are the proof that composition resumed.
+        const bool skipAcquire =
+            (captureSession != CaptureSessionState::Capturing &&
+             captureSession != CaptureSessionState::Holding) ||
+            (capture_ && capture_->isDeviceLost()) ||
+            !capture_;
+        const bool acquired =
+            !skipAcquire && capture_ && capture_->acquireNextFrame(frame, timeoutMs);
         if (acquired) {
-            ++sourceFrames_;
-            if (frame.pts100ns <= lastFrame.pts100ns) {
-                frame.pts100ns = steadyNow100ns();
-            }
-            captureWidth_ = frame.width;
-            captureHeight_ = frame.height;
+            lastSourceFrameAt = std::chrono::steady_clock::now();
+            // Exclusive + stall/hold/blind: desktop WGC/DXGI frames are sparse or
+            // stale. Do not promote them into lastFrame (slideshow). Healthy
+            // continuous desktop capture under borderless cover still encodes.
+            // GameCapture always counts as live.
+            const bool desktopBackend =
+                capture_ &&
+                capture_->backend() != CaptureBackend::GameCapture;
+            const bool desktopRecoveryProbeActive =
+                desktopRecoveryProbe &&
+                exclusiveCoverActive &&
+                desktopBackend;
+            const bool freezeDesktopFrame =
+                exclusiveCoverActive &&
+                desktopBackend &&
+                !desktopRecoveryProbeActive &&
+                (captureStallHold ||
+                 exclusiveBlind ||
+                 exclusiveDxgiAttempts >= 1 ||
+                 captureSession != CaptureSessionState::Capturing);
+            if (freezeDesktopFrame) {
+                // Drain acquire only; keep frozen lastFrame + coalesce.
+            } else {
+                if (liveFramesSince == SteadyClock::time_point::min()) {
+                    liveFramesSince = lastSourceFrameAt;
+                }
+                ++sustainedLiveFrameCount;
+                // Healthy only after sustained live frames (not one transient DXGI blip).
+                // During a hold, sustained desktop frames prove a monitor-sized
+                // borderless window has left exclusive mode.
+                constexpr auto kSustainedLiveMs = std::chrono::milliseconds(500);
+                constexpr int kSustainedLiveFrames = 10;
+                const bool backendOkForExclusive =
+                    !exclusiveCoverActive ||
+                    desktopRecoveryProbeActive ||
+                    desktopRecoveryProbe ||
+                    (capture_ && capture_->backend() == CaptureBackend::GameCapture);
+                const bool sustained =
+                    backendOkForExclusive &&
+                    sustainedLiveFrameCount >= kSustainedLiveFrames &&
+                    lastSourceFrameAt - liveFramesSince >= kSustainedLiveMs &&
+                    !(capture_ && capture_->isDeviceLost());
+                ++sourceFrames_;
+                cursorOnlyFrames_.store(capture_->cursorOnlyFrames(), std::memory_order_relaxed);
+                if (frame.pts100ns <= lastFrame.pts100ns) {
+                    frame.pts100ns = steadyNow100ns();
+                }
+                captureWidth_ = frame.width;
+                captureHeight_ = frame.height;
 
-            if (shouldDropForGpuProtection(false, gpuSettings)) {
-                ++droppedFrames_;
-                ++gpuProtectionDrops_;
-                continue;
-            }
+                if (shouldDropForGpuProtection(false, gpuSettings)) {
+                    ++droppedFrames_;
+                    ++gpuProtectionDrops_;
+                    continue;
+                }
 
-            GpuFrame encodeFrame;
-            bool scaled = false;
-            {
-                std::scoped_lock gpuLock(pipelineGpuMutex_);
-                // Keep encoder/lastFrame input independent from either capture
-                // backend's pool while settings teardown destroys the source.
-                const bool forceOwnedTexture =
-                    (capture_ &&
-                     (capture_->backend() == CaptureBackend::WindowsGraphicsCapture ||
-                      capture_->backend() == CaptureBackend::DesktopDuplication)) ||
-                    (captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
-                scaled = scaler_.scale(
-                    d3d_,
-                    frame,
-                    videoSettings.width,
-                    videoSettings.height,
-                    encodeFrame,
-                    captureSettings.followFocusedMonitor,
-                    forceOwnedTexture,
-                    encoderInputFormat);
-            }
-            if (!scaled) {
-                ++droppedFrames_;
-                continue;
-            }
-
-            lastFrame = encodeFrame;
-            if (requestKeyFrameAfterAcceptedFrame) {
-                discardQueuedFrames_ = true;
+                GpuFrame encodeFrame;
+                bool scaled = false;
                 {
                     std::scoped_lock gpuLock(pipelineGpuMutex_);
-                    if (encoder_) {
-                        encoder_->requestKeyFrame();
+                    const bool forceOwnedTexture =
+                        (capture_ &&
+                         (capture_->backend() == CaptureBackend::WindowsGraphicsCapture ||
+                          capture_->backend() == CaptureBackend::DesktopDuplication ||
+                          capture_->backend() == CaptureBackend::GameCapture)) ||
+                        (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
+                    scaled = scaler_.scale(
+                        d3d_,
+                        frame,
+                        videoSettings.width,
+                        videoSettings.height,
+                        encodeFrame,
+                        captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor,
+                        forceOwnedTexture,
+                        encoderInputFormat);
+                }
+                if (!scaled) {
+                    ++droppedFrames_;
+                    liveFramesSince = SteadyClock::time_point::min();
+                    continue;
+                }
+
+                if ((captureStallHold || captureSession != CaptureSessionState::Capturing) &&
+                    (acceptFirstLiveFrameAfterTransition || sustained)) {
+                    captureStallHold = false;
+                    exclusiveBlind = false;
+                    captureSession = CaptureSessionState::Capturing;
+                    rebindAttempts = 0;
+                    exclusiveDxgiAttempts = 0;
+                    desktopRecoveryProbe = false;
+                    loggedExclusiveHold = false;
+                    acceptFirstLiveFrameAfterTransition = false;
+                    forceVideoHeartbeat_ = true;
+                    Logger::instance().info(L"recorder", L"Capture session Capturing (live frames resumed)");
+                }
+
+                lastFrame = encodeFrame;
+                if (requestKeyFrameAfterAcceptedFrame) {
+                    discardQueuedFrames_ = true;
+                    {
+                        std::scoped_lock gpuLock(pipelineGpuMutex_);
+                        if (encoder_) {
+                            encoder_->requestKeyFrame();
+                        }
+                    }
+                    requestKeyFrameAfterAcceptedFrame = false;
+                    if (frameEvent_) {
+                        SetEvent(frameEvent_);
                     }
                 }
-                requestKeyFrameAfterAcceptedFrame = false;
-                if (frameEvent_) {
-                    SetEvent(frameEvent_);
+                if (!emitClockStarted) {
+                    nextEmit = std::chrono::steady_clock::now();
+                    emitClockStarted = true;
+                } else {
+                    // Track A: re-phase the emit grid to the frame's real DWM present
+                    // time. The free-running grid otherwise beats against the (jittery,
+                    // vsync) source phase, producing a periodic dup+skip micro-hitch even
+                    // at matched 60->60. Re-locking makes output PTS track genuine
+                    // delivery cadence, killing the beat.
+                    //
+                    // Use encodeFrame.pts100ns (WGC SystemRelativeTime, QPC epoch == MSVC
+                    // steady_clock) NOT the drain wall-clock (lastSourceFrameAt): the
+                    // drain instant is scheduling-jittered and only trades the structural
+                    // beat for arrival jitter. The present time is the evenly-spaced clock.
+                    //
+                    // Scope-gated: only healthy windowed desktop capture. Exclusive-
+                    // fullscreen and GameCapture paths keep the free-running grid (their
+                    // present times are already 1:1 with vsync -- no beat to fix, and we
+                    // must not perturb the smooth path or the game-capture pipeline).
+                    const bool relockPhase =
+                        desktopBackend &&
+                        !exclusiveCoverActive &&
+                        captureSession == CaptureSessionState::Capturing;
+                    // Only snap forward and only past the last emitted instant, so the
+                    // emit timeline stays strictly monotonic (advanceVideoCadence emits
+                    // at emitTime == nextEmit; a backward snap would double-emit).
+                    const auto presentInstant = steadyPointFrom100ns(encodeFrame.pts100ns);
+                    if (relockPhase &&
+                        presentInstant > nextEmit &&
+                        presentInstant > lastEmitTime) {
+                        nextEmit = presentInstant;
+                    }
                 }
-            }
-            if (!emitClockStarted) {
-                nextEmit = std::chrono::steady_clock::now();
-                emitClockStarted = true;
             }
         }
 
@@ -1317,55 +1752,271 @@ void RecorderController::captureLoop() {
         bool encoderFaulted = false;
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
-            captureLost = capture_ && capture_->isDeviceLost();
+            captureLost = !capture_ || capture_->isDeviceLost();
             deviceRemoved = d3d_.isDeviceRemoved();
             encoderFaulted = encoder_ && !encoder_->stats().encoderAvailable;
         }
-        if (captureLost || deviceRemoved || encoderFaulted) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            CaptureTarget target = captureSettings.followFocusedMonitor
+
+        if (deviceRemoved || encoderFaulted) {
+            CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
                 ? captureTargetForSettings(captureSettings)
                 : activeCaptureTarget_;
-            if (deviceRemoved || encoderFaulted) {
-                Logger::instance().warning(L"recorder",
-                    deviceRemoved
-                        ? L"D3D device removed; recreating full GPU pipeline"
-                        : L"Hardware encoder faulted; recreating full GPU pipeline");
-                if (recreateGpuPipeline(
-                        target,
-                        deviceRemoved ? L"device removed" : L"encoder fault",
-                        pipelineAdapterForTarget(target))) {
-                    // Full recreate waits for encode-loop discard before refreshing both settings.
-                    {
-                        std::scoped_lock stateLock(stateMutex_);
-                        videoSettings = activeVideoSettings_;
-                        gpuSettings = activeGpuSettings_;
-                    }
-                    resetVideoHandoff();
-                    {
-                        std::scoped_lock gpuLock(pipelineGpuMutex_);
-                        encoderInputFormat = encoder_
-                            ? encoder_->preferredInputFormat()
-                            : DXGI_FORMAT_B8G8R8A8_UNORM;
-                    }
-                    if (recording_) {
-                        waitingForRecordingKeyFrame_ = true;
-                        forceVideoHeartbeat_ = true;
-                        std::scoped_lock gpuLock(pipelineGpuMutex_);
-                        if (encoder_) {
-                            encoder_->requestKeyFrame();
-                        }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            Logger::instance().warning(L"recorder",
+                deviceRemoved
+                    ? L"D3D device removed; recreating full GPU pipeline"
+                    : L"Hardware encoder faulted; recreating full GPU pipeline");
+            if (recreateGpuPipeline(
+                    target,
+                    deviceRemoved ? L"device removed" : L"encoder fault",
+                    pipelineAdapterForTarget(target))) {
+                {
+                    std::scoped_lock stateLock(stateMutex_);
+                    videoSettings = activeVideoSettings_;
+                    gpuSettings = activeGpuSettings_;
+                }
+                resetVideoHandoff();
+                {
+                    std::scoped_lock gpuLock(pipelineGpuMutex_);
+                    encoderInputFormat = encoder_
+                        ? encoder_->preferredInputFormat()
+                        : DXGI_FORMAT_B8G8R8A8_UNORM;
+                }
+                if (recording_) {
+                    waitingForRecordingKeyFrame_ = true;
+                    forceVideoHeartbeat_ = true;
+                    std::scoped_lock gpuLock(pipelineGpuMutex_);
+                    if (encoder_) {
+                        encoder_->requestKeyFrame();
                     }
                 }
-            } else {
-                Logger::instance().warning(L"recorder", L"Capture access lost; recreating capture source");
-                if (switchCaptureTarget(target, L"device/access loss")) {
-                    // capture-only path
+                captureSession = CaptureSessionState::Capturing;
+                rebindAttempts = 0;
+                captureStallHold = true;
+                lastSourceFrameAt = std::chrono::steady_clock::now();
+            }
+        } else {
+            // ---- Capture session state machine (exclusive-aware) ----
+            // Exclusive rebind: GameCap first; DXGI only if GameCap not just failed.
+            // GameCap death / cooldown → hold (no DXGI thrash / slideshow).
+            constexpr auto kWaitStableMs = std::chrono::milliseconds(1200);
+            constexpr auto kRebindCooldownMs = std::chrono::milliseconds(2500);
+            constexpr auto kHoldDesktopProbeMs = std::chrono::milliseconds(2000);
+            // WGC legitimately remains quiet for unchanged borderless content.
+            // Require a sustained stall before treating a full-monitor window
+            // as exclusive and switching to Present-hook capture.
+            constexpr auto kWgcStallUnderExclusiveMs = std::chrono::milliseconds(2000);
+            constexpr auto kMaxFastRebinds = 1;
+            constexpr auto kExclusiveNoFrameMs = std::chrono::milliseconds(2000);
+            constexpr auto kPostCrashInjectCooldownMs = std::chrono::milliseconds(60000);
+            constexpr auto kDxgiInstantDeathMs = std::chrono::milliseconds(400);
+            constexpr auto kSoftStallMs = std::chrono::milliseconds(750);
+
+            // Instant DXGI death after exclusive rebind → hard hold (no loop).
+            if (exclusiveCoverActive &&
+                captureSession == CaptureSessionState::Capturing &&
+                captureLost &&
+                rebindSourceBornAt != SteadyClock::time_point::min() &&
+                nowLoop - rebindSourceBornAt < kDxgiInstantDeathMs) {
+                enterExclusiveHold(L"DXGI died immediately under exclusive");
+            } else if (captureLost && captureSession == CaptureSessionState::Capturing) {
+                // Desktop Duplication reports ACCESS_LOST as exclusive mode takes
+                // ownership. Rebind straight to the Present hook; one bad first
+                // frame is preferable to freezing the replay for seconds.
+                immediateRebindPending = exclusiveCoverActive && capture_ &&
+                    capture_->backend() == CaptureBackend::DesktopDuplication;
+                enterAccessLost(L"ACCESS_LOST / invalid duplication");
+            }
+
+            // WGC under exclusive: one recovery path (no CreateForWindow thrash).
+            if (captureSession == CaptureSessionState::Capturing &&
+                capture_ &&
+                capture_->backend() == CaptureBackend::WindowsGraphicsCapture &&
+                exclusiveCoverActive &&
+                !acquired &&
+                nowLoop - lastSourceFrameAt >= kWgcStallUnderExclusiveMs) {
+                enterAccessLost(L"WGC stall under exclusive cover");
+            }
+
+            if (captureSession == CaptureSessionState::AccessLost) {
+                // Already proven blind this cover session → skip rebind thrash.
+                if (exclusiveCoverActive && exclusiveBlind) {
+                    enterExclusiveHold(L"still exclusive-blind");
+                } else {
+                    captureSession = CaptureSessionState::WaitStable;
+                    accessLostAt = nowLoop;
+                }
+            }
+
+            if (captureSession == CaptureSessionState::WaitStable) {
+                captureStallHold = true;
+                if (immediateRebindPending || nowLoop - accessLostAt >= kWaitStableMs) {
+                    captureSession = CaptureSessionState::Rebind;
+                }
+            }
+
+            if (captureSession == CaptureSessionState::Rebind) {
+                captureStallHold = true;
+                if (lastCaptureRebindAt != SteadyClock::time_point::min() &&
+                    nowLoop - lastCaptureRebindAt < kRebindCooldownMs &&
+                    !immediateRebindPending) {
+                    // Holding lastFrame between rebinds.
+                } else {
+                    const bool validatedExclusiveTarget =
+                        exclusiveCoverActive &&
+                        exclusiveTargetWindow &&
+                        GetForegroundWindow() == exclusiveTargetWindow;
+                    CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
+                        ? captureTargetForSettings(captureSettings)
+                        : activeCaptureTarget_;
+                    target.window = validatedExclusiveTarget ? exclusiveTargetWindow : nullptr;
+                    ++rebindAttempts;
+                    lastCaptureRebindAt = nowLoop;
+                    const bool skipGameCap =
+                        lastGameCapFailureAt != SteadyClock::time_point::min() &&
+                        nowLoop - lastGameCapFailureAt < kPostCrashInjectCooldownMs;
+                    // Exclusive + GameCap just failed/cooldown: never thrash DXGI.
+                    // Exclusive + one DXGI death: also skip further DXGI.
+                    const bool skipDxgi =
+                        validatedExclusiveTarget &&
+                        (exclusiveDxgiAttempts >= 1 ||
+                         (skipGameCap && !desktopRecoveryProbe));
+                    Logger::instance().warning(L"recorder",
+                        L"Capture session Rebind (game/DXGI) attempt=" +
+                        std::to_wstring(rebindAttempts) +
+                        L", exclusiveCover=" + (exclusiveCoverActive ? L"yes" : L"no") +
+                        L", skipGameCap=" + (skipGameCap ? L"yes" : L"no") +
+                        L", skipDxgi=" + (skipDxgi ? L"yes" : L"no"));
+
+                    bool switched = false;
+                    bool gameCaptureAttempted = false;
+                    if (skipDxgi && skipGameCap) {
+                        switched = false;
+                    } else {
+                        switched = switchCaptureTarget(
+                            target,
+                            validatedExclusiveTarget
+                                ? L"exclusive capture rebind"
+                                : L"desktop capture rebind",
+                            validatedExclusiveTarget,
+                             !skipDxgi,
+                            validatedExclusiveTarget && !skipGameCap && !desktopRecoveryProbe,
+                            &gameCaptureAttempted);
+                        if (validatedExclusiveTarget && capture_ &&
+                            capture_->backend() == CaptureBackend::DesktopDuplication) {
+                            ++exclusiveDxgiAttempts;
+                        }
+                        if (validatedExclusiveTarget && gameCaptureAttempted &&
+                            (!switched ||
+                             !capture_ ||
+                             capture_->backend() != CaptureBackend::GameCapture)) {
+                            lastGameCapFailureAt = nowLoop;
+                        }
+                        if (switched &&
+                            capture_ &&
+                            capture_->backend() != CaptureBackend::GameCapture) {
+                            rebindSourceBornAt = nowLoop;
+                        }
+                    }
+
+                    captureStallHold = true;
+                    liveFramesSince = SteadyClock::time_point::min();
+                    sustainedLiveFrameCount = 0;
+                    lastSourceFrameAt = nowLoop;
+                    if (switched && immediateRebindPending) {
+                        acceptFirstLiveFrameAfterTransition = true;
+                        Logger::instance().info(L"recorder",
+                            L"Fast fullscreen transition: desktop capture -> Game Capture");
+                    }
+                    immediateRebindPending = false;
+
+                    if (switched && capture_ &&
+                        capture_->backend() == CaptureBackend::GameCapture) {
+                        lastGameCapFailureAt = SteadyClock::time_point::min();
+                        rebindSourceBornAt = SteadyClock::time_point::min();
+                        // Stay stall-hold until sustained live frames prove health.
+                        captureSession = CaptureSessionState::Capturing;
+                    } else if (switched) {
+                        // Desktop mode and provisional DXGI recovery both need
+                        // sustained live frames before removing stall hold.
+                        captureSession = CaptureSessionState::Capturing;
+                    } else if (!validatedExclusiveTarget) {
+                        // F11 or focus changed during recovery. A stale
+                        // exclusive incident must not force Game Capture/hold.
+                        captureSession = CaptureSessionState::WaitStable;
+                        accessLostAt = nowLoop;
+                    } else if (
+                        rebindAttempts >= kMaxFastRebinds || skipGameCap || skipDxgi || !switched) {
+                        enterExclusiveHold(
+                            !switched ? L"GameCap/DXGI unavailable"
+                                      : L"desktop APIs blind under exclusive");
+                    }
+                }
+            }
+
+            if (captureSession == CaptureSessionState::Holding) {
+                captureStallHold = true;
+                if (!exclusiveCoverActive) {
+                    Logger::instance().info(L"recorder",
+                        L"Exclusive cover ended; rebinding desktop capture");
+                    rebindAttempts = 0;
+                    exclusiveDxgiAttempts = 0;
+                    exclusiveBlind = false;
+                    exclusiveTargetWindow = nullptr;
+                    loggedExclusiveHold = false;
+                    lastCaptureRebindAt = SteadyClock::time_point::min();
+                    // Keep inject cooldown after GameCap crash; only clear on success path.
+                    rebindSourceBornAt = SteadyClock::time_point::min();
+                    sustainedLiveFrameCount = 0;
+                    CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
+                        ? captureTargetForSettings(captureSettings)
+                        : activeCaptureTarget_;
+                    target.window = nullptr;
+                    // Desktop only — do not inject GameCapture after alt-tab.
+                    if (switchCaptureTarget(target, L"exclusive cover ended", false)) {
+                        captureSession = CaptureSessionState::Capturing;
+                        captureStallHold = true;
+                        liveFramesSince = SteadyClock::time_point::min();
+                        lastSourceFrameAt = nowLoop;
+                        forceVideoHeartbeat_ = true;
+                    } else {
+                        captureSession = CaptureSessionState::Rebind;
+                    }
+                } else if (nowLoop - lastCaptureRebindAt >= kHoldDesktopProbeMs) {
+                    // Full-monitor borderless still satisfies exclusive-cover geometry.
+                    // Probe Desktop Duplication only; Vanguard blocks Game Capture and
+                    // repeated injection attempts would not make desktop capture recover.
+                    exclusiveBlind = false;
+                    exclusiveDxgiAttempts = 0;
+                    rebindAttempts = 0;
+                    desktopRecoveryProbe = true;
+                    captureSession = CaptureSessionState::Rebind;
+                }
+            }
+
+            // Soft stall: coalesce only. Do not thrash from Holding.
+            if (captureSession == CaptureSessionState::Capturing &&
+                !acquired && !captureLost) {
+                const auto noFrameFor = nowLoop - lastSourceFrameAt;
+                if (exclusiveCoverActive && noFrameFor >= kExclusiveNoFrameMs) {
+                    if (exclusiveBlind || exclusiveDxgiAttempts >= 1 ||
+                        (lastGameCapFailureAt != SteadyClock::time_point::min() &&
+                         nowLoop - lastGameCapFailureAt < kPostCrashInjectCooldownMs)) {
+                        enterExclusiveHold(L"no live frames under exclusive cover");
+                    } else {
+                        enterAccessLost(L"no live frames under exclusive cover");
+                    }
+                } else if (!exclusiveCoverActive && noFrameFor >= kSoftStallMs) {
+                    captureStallHold = true;
+                    sustainedLiveFrameCount = 0;
                 }
             }
         }
 
-        if (lastFrame.texture && emitClockStarted) {
+        // Emit cadence even when capture is lost/null: lastFrame heartbeats keep
+        // the replay timeline continuous across exclusive-fullscreen recovery.
+        // Stall hold forces coalescing so GOP IDRs do not produce a slideshow.
+        if (!deviceRemoved && !encoderFaulted && lastFrame.texture && emitClockStarted) {
             const auto now = std::chrono::steady_clock::now();
             if (const auto advance = advanceVideoCadence(
                     now,
@@ -1373,11 +2024,29 @@ void RecorderController::captureLoop() {
                     frameInterval,
                     stopRequested_.load(std::memory_order_acquire))) {
                 nextEmit = advance->nextEmit;
+                lastEmitTime = advance->emitTime;
                 emitFrame(lastFrame, advance->emitTime, advance->intervalCount);
             }
             if (now - nextEmit > std::chrono::seconds(1)) {
                 nextEmit = now;
             }
+        }
+
+        const auto statsNow = std::chrono::steady_clock::now();
+        if (statsNow - statsSampleAt >= std::chrono::seconds(1)) {
+            const auto elapsedMs = std::max<int64_t>(1,
+                std::chrono::duration_cast<std::chrono::milliseconds>(statsNow - statsSampleAt).count());
+            const uint64_t sourceFrames = sourceFrames_.load(std::memory_order_relaxed);
+            const uint64_t timelineIntervals = capturedFrames_.load(std::memory_order_relaxed);
+            sourceFramesPerSecond_.store(
+                (sourceFrames - sourceFramesAtLastSample) * 1000 / static_cast<uint64_t>(elapsedMs),
+                std::memory_order_relaxed);
+            timelineIntervalsPerSecond_.store(
+                (timelineIntervals - timelineIntervalsAtLastSample) * 1000 / static_cast<uint64_t>(elapsedMs),
+                std::memory_order_relaxed);
+            sourceFramesAtLastSample = sourceFrames;
+            timelineIntervalsAtLastSample = timelineIntervals;
+            statsSampleAt = statsNow;
         }
     }
 

@@ -3,6 +3,7 @@
 #include "audio/WasapiCapture.h"
 #include "capture/D3D11FrameScaler.h"
 #include "capture/D3DDevice.h"
+#include "capture/game/AntiCheatGuard.h"
 #include "capture/ICaptureSource.h"
 #include "core/SpscQueue.h"
 #include "core/Types.h"
@@ -41,12 +42,24 @@ public:
     AppSettings settings() const;
     std::wstring captureBackendStatus() const;
     std::wstring lastRecordingError() const;
+    // Edge-triggered: returns the anti-cheat kind once when a GameCapture attempt
+    // was refused for an anti-cheat title, then clears the latch. AntiCheatKind::None
+    // means no new block since the last poll. UI thread fires the failure beep.
+    AntiCheatKind consumeAntiCheatBlock();
 
 private:
     bool ensurePipeline();
     void stopPipeline();
     bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason, uint32_t adapterIndex);
-    bool createCaptureSource(const CaptureTarget& target);
+    // exclusiveRecovery: GameCap then DXGI, skipping WGC thrash only while a
+    // validated foreground window remains in exclusive fullscreen.
+    // allowDesktopDuplication / allowGameCapture: gate backends under exclusive hold.
+    bool createCaptureSource(
+        const CaptureTarget& target,
+        bool exclusiveRecovery = false,
+        bool allowDesktopDuplication = true,
+        bool allowGameCapture = true,
+        bool* gameCaptureAttempted = nullptr);
     uint32_t pipelineAdapterForTarget(const CaptureTarget& target) const;
     uint32_t activeFrameQueueLimit(const GpuOptimizationSettings& gpuSettings) const;
     bool shouldDropForGpuProtection(bool duplicateFrame, const GpuOptimizationSettings& gpuSettings) const;
@@ -76,8 +89,16 @@ private:
     bool captureBackendActive_ = false;
     bool captureBackendFallbackUsed_ = false;
     std::wstring captureBackendStatus_ = L"Capture backend has not started";
+    // Latched when a GameCapture attempt is refused because the target runs an
+    // anti-cheat we never inject into. Consumed once by the UI-thread stats poll
+    // to fire an edge-triggered failure beep, then re-armed on the next attempt.
+    bool captureAntiCheatBlocked_ = false;
+    AntiCheatKind captureAntiCheatKind_ = AntiCheatKind::None;
     D3D11FrameScaler scaler_;
     std::unique_ptr<IEncoder> encoder_;
+    // Read and updated while pipelineGpuMutex_ is held; preserves diagnostics during contention.
+    mutable EncoderCapabilities lastEncoderCapabilities_;
+    mutable EncoderStats lastEncoderStats_;
     Mp4Muxer muxer_;
     ReplayBuffer replay_;
     WasapiCapture systemAudio_;
@@ -116,12 +137,15 @@ private:
     std::atomic<uint32_t> audioInputVolumePercent_{100};
     std::atomic<uint64_t> capturedFrames_{0};
     std::atomic<uint64_t> sourceFrames_{0};
+    std::atomic<uint64_t> sourceFramesPerSecond_{0};
+    std::atomic<uint64_t> timelineIntervalsPerSecond_{0};
     std::atomic<uint64_t> cadenceDuplicateFrames_{0};
     std::atomic<uint64_t> catchUpDuplicateFrames_{0};
     std::atomic<uint64_t> coalescedIdleIntervals_{0};
     std::atomic<uint64_t> droppedFrames_{0};
     std::atomic<uint64_t> gpuProtectionDrops_{0};
     std::atomic<uint64_t> idleFrameSkips_{0};
+    std::atomic<uint64_t> cursorOnlyFrames_{0};
     std::atomic<uint64_t> systemAudioQueueDrops_{0};
     std::atomic<uint64_t> microphoneAudioQueueDrops_{0};
     std::atomic<int64_t> lastEncodedVideoPts100ns_{0};

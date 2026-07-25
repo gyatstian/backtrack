@@ -218,9 +218,9 @@ struct NvencEncoder::Impl {
     mutable std::mutex mutex;
 
     struct RegisteredResource {
-        // Hold a strong ref so a freed+reallocated texture cannot reuse this address
-        // while the registration is still cached.
-        ComPtr<ID3D11Texture2D> texture;
+        // Scaler owns these textures for its lifetime. Keeping another ComPtr here
+        // would pin every pool slot and permanently exhaust capture after one pass.
+        ID3D11Texture2D* texture = nullptr;
         NV_ENC_REGISTERED_PTR registered = nullptr;
         uint64_t generation = 0;
     };
@@ -470,10 +470,10 @@ struct NvencEncoder::Impl {
     NV_ENC_REGISTERED_PTR registeredResourceFor(ID3D11Texture2D* texture, NV_ENC_BUFFER_FORMAT bufferFormat) {
         const auto existing = registeredResources.find(texture);
         if (existing != registeredResources.end()) {
-            // Reject stale entries: generation mismatch or pointer identity no longer matches
-            // the held ComPtr (defensive against address reuse after partial invalidation).
+            // Pool resets unregister resources before destroying textures; generation
+            // rejects entries left over from a reset.
             if (existing->second.generation == registrationGeneration &&
-                existing->second.texture.Get() == texture &&
+                existing->second.texture == texture &&
                 existing->second.registered) {
                 return existing->second.registered;
             }

@@ -28,7 +28,13 @@ inline std::optional<CadenceAdvance> advanceVideoCadence(
     result.intervalCount = 1;
     result.nextEmit = nextEmit + frameInterval;
     maximumCollapsedIntervals = std::max<uint32_t>(maximumCollapsedIntervals, 1);
-    while (now >= result.nextEmit && result.intervalCount < maximumCollapsedIntervals) {
+    // Only collapse an extra interval when we have overshot its boundary by at
+    // least half a frame. A single late wake (timer jitter, ~1-3ms) leaves now
+    // just past nextEmit; collapsing on that alias drops a real frame and halves
+    // the effective rate. Requiring a >=1.5-interval overshoot means we only
+    // collapse when genuinely behind (true backlog), not on ordinary jitter.
+    const auto collapseSlack = frameInterval / 2;
+    while (now >= result.nextEmit + collapseSlack && result.intervalCount < maximumCollapsedIntervals) {
         result.nextEmit += frameInterval;
         ++result.intervalCount;
     }
@@ -84,6 +90,9 @@ public:
             return emission;
         }
 
+        // Stall-hold path: allowIdleCoalescing is forced true, but GOP/forced
+        // heartbeats still Submit for seekability. Close the preceding sample
+        // duration across the full gap so replay never strobes frozen textures.
         emission.action = VideoTimelineAction::Submit;
         if (haveLastSubmittedFrame_) {
             emission.previousFramePts100ns = lastSubmittedPts100ns_;

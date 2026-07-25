@@ -33,6 +33,14 @@ enum class VideoCodec {
 enum class CaptureBackend {
     WindowsGraphicsCapture,
     DesktopDuplication,
+    GameCapture,
+};
+
+// Exclusive-fullscreen: inject Present hook when desktop APIs are blind.
+enum class GameCaptureMode {
+    Off,
+    Auto, // use when exclusive cover detected
+    On,   // always prefer game capture for focused window
 };
 
 enum class GpuVendor {
@@ -168,6 +176,11 @@ struct AppSettings {
     GameIntegrationSettings gameIntegrations;
     std::filesystem::path clipDirectory;
     CaptureBackend preferredCaptureBackend = CaptureBackend::WindowsGraphicsCapture;
+    GameCaptureMode gameCaptureMode = GameCaptureMode::Auto;
+    // Advanced override: allow injecting the game-capture hook into titles
+    // protected by kernel anti-cheat (Vanguard/EAC/BattlEye). Default false so
+    // the guard fails closed and falls back to Windows Graphics Capture.
+    bool allowAntiCheatGameCapture = false;
     bool captureMicrophone = true;
     bool captureSystemAudio = true;
     std::wstring audioInputDeviceId;
@@ -187,6 +200,7 @@ struct AppSettings {
     uint32_t notificationSoundVolumePercent = 100;
     bool libraryGalleryView = false;
     uint32_t monitorIndex = 0;
+    bool multiMonitorSupport = false;
     bool followFocusedMonitor = false;
     bool followMouseMonitor = false;
     bool captureCursor = true;
@@ -196,6 +210,8 @@ struct AppSettings {
 struct CaptureTarget {
     HMONITOR monitor = nullptr;
     uint32_t monitorIndex = 0;
+    // Optional WGC CreateForWindow target (exclusive-fullscreen recovery).
+    HWND window = nullptr;
 };
 
 struct AudioDeviceInfo {
@@ -280,12 +296,15 @@ struct RecordingStats {
     std::wstring captureBackendStatus;
     uint64_t capturedFrames = 0;
     uint64_t sourceFrames = 0;
+    uint64_t sourceFramesPerSecond = 0;
+    uint64_t timelineIntervalsPerSecond = 0;
     uint64_t cadenceDuplicateFrames = 0;
     uint64_t catchUpDuplicateFrames = 0;
     uint64_t coalescedIdleIntervals = 0;
     uint64_t droppedFrames = 0;
     uint64_t gpuProtectionDrops = 0;
     uint64_t idleFrameSkips = 0;
+    uint64_t cursorOnlyFrames = 0;
     uint64_t systemAudioQueueDrops = 0;
     uint64_t microphoneAudioQueueDrops = 0;
     uint64_t replayVideoPackets = 0;

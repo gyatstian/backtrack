@@ -3,6 +3,7 @@
 #include "capture/D3DDevice.h"
 #include "capture/ICaptureSource.h"
 
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -17,6 +18,10 @@ public:
     CaptureBackend backend() const override { return CaptureBackend::DesktopDuplication; }
     uint32_t width() const override { return width_; }
     uint32_t height() const override { return height_; }
+    uint64_t cursorOnlyFrames() const override { return cursorOnlyFrames_; }
+
+    // True after at least one frame with a desktop present (not cursor-only).
+    bool hasPresentedContent() const { return havePresentedContent_; }
 
 private:
     struct TextureSlot {
@@ -26,11 +31,10 @@ private:
 
     std::shared_ptr<TextureSlot> acquireSlot();
     bool createTexturePool(uint32_t width, uint32_t height, DXGI_FORMAT format, uint32_t poolSize);
+    void markLost(const wchar_t* reason, HRESULT hr);
+    void releaseHeldFrame();
+    void logAcquireFailureOnce(const wchar_t* reason, HRESULT hr);
 
-    // Cursor compositing. Desktop Duplication delivers the desktop image and the
-    // mouse pointer separately; we persist the latest desktop image and blend the
-    // cursor onto each emitted frame so a moving pointer over a static desktop
-    // still produces fresh frames.
     bool ensureCompositor();
     void updateCursorState(const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
     bool refreshCursorShape(uint32_t bufferSize);
@@ -42,19 +46,27 @@ private:
     std::vector<std::shared_ptr<TextureSlot>> pool_;
     uint64_t poolExhaustionDrops_ = 0;
     uint64_t frameIndex_ = 0;
+    uint64_t cursorOnlyFrames_ = 0;
+    std::chrono::steady_clock::time_point nextCursorOnlyFrameAt_{};
+    std::chrono::nanoseconds cursorOnlyFrameInterval_{};
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t poolSize_ = 0;
     DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
     bool deviceLost_ = false;
     bool haveContent_ = false;
+    bool havePresentedContent_ = false;
+    bool frameHeld_ = false;
 
-    // Persistent full-desktop image; blended with the cursor into each pool slot.
+    // Rate-limit repeated acquire failure logs.
+    HRESULT lastLoggedAcquireHr_ = S_OK;
+    uint64_t suppressedAcquireLogs_ = 0;
+    std::chrono::steady_clock::time_point lastAcquireLogAt_{};
+
     ComPtr<ID3D11Texture2D> desktopCopy_;
     ComPtr<ID3D11ShaderResourceView> desktopCopySrv_;
     bool captureCursor_ = true;
 
-    // Latest decoded cursor shape and position.
     std::vector<uint8_t> cursorShapeBuffer_;
     DXGI_OUTDUPL_POINTER_SHAPE_INFO cursorShapeInfo_{};
     POINT cursorPosition_{};
@@ -67,7 +79,6 @@ private:
     uint32_t cursorTexHeight_ = 0;
     uint32_t cursorShapeType_ = 0;
 
-    // Alpha-blend quad pipeline used to draw the cursor onto a slot.
     ComPtr<ID3D11VertexShader> cursorVs_;
     ComPtr<ID3D11PixelShader> cursorPs_;
     ComPtr<ID3D11Buffer> cursorConstantBuffer_;

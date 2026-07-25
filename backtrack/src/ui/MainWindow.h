@@ -38,10 +38,11 @@ private:
     };
 
     enum class SettingsCategory {
-        General = 0,
-        Advanced = 1,
-        SoundSeparation = 2,
-        GameIntegrations = 3,
+        App = 0,
+        Capture = 1,
+        Video = 2,
+        Audio = 3,
+        GameIntegrations = 4,
     };
 
     enum class LibraryViewMode {
@@ -87,6 +88,7 @@ private:
         RECT design{};
         int windowHeight = 0;
         Kind kind = Kind::Content;
+        bool sectionHeading = false;
     };
 
     struct ClipThumbnail {
@@ -165,9 +167,10 @@ private:
     void buildSettingsCategoryTabs(int y);
     void buildSettingsCategoryBody();
     void rebuildSettingsCategoryBody();
-    void buildSettingsGeneralPage();
-    void buildSettingsAdvancedPage();
-    void buildSettingsSoundSeparationPage();
+    void buildSettingsAppPage();
+    void buildSettingsCapturePage();
+    void buildSettingsVideoPage();
+    void buildSettingsAudioPage();
     void buildSettingsGameIntegrationsPage();
     void buildCapturePage();
     void buildStatsPage();
@@ -286,7 +289,7 @@ private:
     HPEN selectedOutlinePen_ = nullptr;
     HPEN tabActiveOutlinePen_ = nullptr;
     Page page_ = Page::Capture;
-    SettingsCategory settingsCategory_ = SettingsCategory::General;
+    SettingsCategory settingsCategory_ = SettingsCategory::App;
     std::array<PageCache, 4> pageCaches_{};
     std::vector<HWND> pageControls_;
     std::vector<ClipInfo> clips_;
@@ -311,6 +314,7 @@ private:
     HWND widthEdit_ = nullptr;
     HWND heightEdit_ = nullptr;
     HWND followFocusedMonitorCheck_ = nullptr;
+    HWND multiMonitorSupportCheck_ = nullptr;
     HWND followMouseMonitorCheck_ = nullptr;
     HWND captureCursorCheck_ = nullptr;
     HWND systemAudioCheck_ = nullptr;
@@ -342,6 +346,8 @@ private:
     HWND gpuFrameQueueLimitEdit_ = nullptr;
     HWND idleFrameCoalescingCheck_ = nullptr;
     HWND captureMethodCombo_ = nullptr;
+    HWND gameCaptureModeCombo_ = nullptr;
+    HWND allowAntiCheatGameCaptureCheck_ = nullptr;
     HWND stableMultimonitorFramesCheck_ = nullptr;
     HWND soundSeparationEnabledCheck_ = nullptr;
     HWND soundSeparationAppCombo_ = nullptr;
@@ -369,6 +375,7 @@ private:
     bool buttonHoverTracking_ = false;
     std::unordered_map<HWND, std::wstring> statusHelpTexts_;
     std::vector<LayoutItem> layoutItems_;
+    std::vector<RECT> sectionPanels_;
     std::vector<AudioDeviceInfo> outputDevices_;
     std::vector<AudioDeviceInfo> inputDevices_;
     std::vector<AudioSessionAppInfo> soundSeparationAvailableApps_;

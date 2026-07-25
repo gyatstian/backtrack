@@ -313,6 +313,65 @@ bool MainWindow::layoutCurrentPage() {
         }
     }
 
+    sectionPanels_.clear();
+    const bool useSectionPanels =
+        page_ == Page::Capture || page_ == Page::Settings || page_ == Page::Diagnostics;
+    if (useSectionPanels) {
+        // Keep each section on a gray card, separated by the dark page background.
+        constexpr int kPanelPadding = 8;
+        std::unordered_map<HWND, RECT> placementRects;
+        placementRects.reserve(placements.size());
+        for (const auto& placement : placements) {
+            placementRects.emplace(placement.control, placement.rect);
+        }
+
+        bool panelOpen = false;
+        RECT panel{};
+        auto flushPanel = [&]() {
+            if (panelOpen) {
+                sectionPanels_.push_back(panel);
+                panelOpen = false;
+            }
+        };
+        for (const auto& item : layoutItems_) {
+            if (!item.control ||
+                item.kind == LayoutItem::Kind::Footer ||
+                isSettingsCategoryTab(item.control)) {
+                continue;
+            }
+            auto it = placementRects.find(item.control);
+            if (it == placementRects.end()) {
+                continue;
+            }
+            const RECT& rect = it->second;
+            if (item.sectionHeading) {
+                flushPanel();
+                if (page_ == Page::Diagnostics) {
+                    panel = RECT{
+                        std::max(0L, rect.left - kPanelPadding),
+                        rect.top - kPanelPadding,
+                        std::min(static_cast<LONG>(viewportWidth), rect.right + kPanelPadding),
+                        rect.bottom + kPanelPadding};
+                } else {
+                    panel = RECT{
+                        std::max(0, kLayoutPadding - kPanelPadding),
+                        rect.top - kPanelPadding,
+                        std::max(1, viewportWidth - kLayoutPadding + kPanelPadding),
+                        rect.bottom + kPanelPadding};
+                }
+                panelOpen = true;
+            } else if (panelOpen) {
+                if (page_ == Page::Diagnostics) {
+                    panel.left = std::min(panel.left, rect.left - kPanelPadding);
+                    panel.right = std::max(panel.right, rect.right + kPanelPadding);
+                }
+                panel.top = std::min(panel.top, static_cast<LONG>(rect.top - kPanelPadding));
+                panel.bottom = std::max(panel.bottom, static_cast<LONG>(rect.bottom + kPanelPadding));
+            }
+        }
+        flushPanel();
+    }
+
     int footerHeight = 0;
     for (const auto* footer : footers) {
         footerHeight = std::max(footerHeight, footer->windowHeight > 0

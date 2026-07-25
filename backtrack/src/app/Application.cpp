@@ -100,8 +100,7 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     const auto capabilities = controller_.encoderCapabilities();
     Logger::instance().info(
         L"app",
-        L"Environment: Windows=" + std::to_wstring(GetVersion()) +
-            L", adapter=" + (capabilities.adapterName.empty() ? L"unknown" : capabilities.adapterName) +
+        L"Environment: adapter=" + (capabilities.adapterName.empty() ? L"unknown" : capabilities.adapterName) +
             L", encoder=" + (capabilities.backendName.empty() ? L"unknown" : capabilities.backendName) +
             L", encoderAvailable=" + (capabilities.available ? L"yes" : L"no") +
             L", H264=" + (capabilities.h264 ? L"yes" : L"no") +

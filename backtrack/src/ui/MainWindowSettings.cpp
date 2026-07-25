@@ -52,6 +52,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (heightEdit_) {
         target.video.height = std::max<uint32_t>(16, readUIntControl(heightEdit_, target.video.height));
     }
+    if (multiMonitorSupportCheck_) {
+        target.multiMonitorSupport = SendMessageW(multiMonitorSupportCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
     if (followFocusedMonitorCheck_) {
         target.followFocusedMonitor = SendMessageW(followFocusedMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
@@ -175,6 +178,20 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
         } else if (selected == 1) {
             target.preferredCaptureBackend = CaptureBackend::DesktopDuplication;
         }
+    }
+    if (gameCaptureModeCombo_) {
+        const auto selected = SendMessageW(gameCaptureModeCombo_, CB_GETCURSEL, 0, 0);
+        if (selected == 0) {
+            target.gameCaptureMode = GameCaptureMode::Off;
+        } else if (selected == 2) {
+            target.gameCaptureMode = GameCaptureMode::On;
+        } else {
+            target.gameCaptureMode = GameCaptureMode::Auto;
+        }
+    }
+    if (allowAntiCheatGameCaptureCheck_) {
+        target.allowAntiCheatGameCapture =
+            SendMessageW(allowAntiCheatGameCaptureCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (stableMultimonitorFramesCheck_) {
         target.gpu.stableMultimonitorFrames =

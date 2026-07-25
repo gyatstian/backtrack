@@ -39,8 +39,37 @@ bool D3D11FrameScaler::scale(
             : preferredOutputFormat;
 
     for (uint32_t attempt = 0; attempt < 2; ++attempt) {
-        if (sizeMatches && input.format == outputFormat && !forceOutputTexture) {
+        if (sizeMatches && input.format == outputFormat) {
+            if (!forceOutputTexture) {
+                output = input;
+                return true;
+            }
+
+            // Sources such as Desktop Duplication must outlive their acquire call,
+            // but a same-format, same-size frame does not need VideoProcessorBlt.
+            // The copy path still needs pooled output textures; build them here
+            // since ensureInitialized (and its pool allocation) is skipped.
+            if (!ensureCopyPool(device, outputWidth, outputHeight, outputFormat)) {
+                return false;
+            }
+            auto slot = acquireSlot();
+            if (!slot) {
+                if (shouldLogRepeatedDrop(poolExhaustionDrops_)) {
+                    Logger::instance().warning(L"capture",
+                        L"D3D11 scaler texture pool exhausted; dropping frame count=" +
+                        std::to_wstring(poolExhaustionDrops_));
+                }
+                return false;
+            }
+            poolExhaustionDrops_ = 0;
+            {
+                std::scoped_lock lock(device.immediateContextMutex());
+                device.context()->CopyResource(slot->texture.Get(), input.texture.Get());
+            }
             output = input;
+            output.texture = slot->texture;
+            output.lease = slot;
+            output.format = outputFormat;
             return true;
         }
 
@@ -340,6 +369,61 @@ bool D3D11FrameScaler::ensureInitialized(
         std::to_wstring(inputWidth) + L"x" + std::to_wstring(inputHeight) +
         L" -> " + std::to_wstring(outputWidth) + L"x" + std::to_wstring(outputHeight) +
         (outputFormat == DXGI_FORMAT_NV12 ? L" NV12" : L" BGRA"));
+    return true;
+}
+
+bool D3D11FrameScaler::ensureCopyPool(
+    D3DDevice& device,
+    uint32_t width,
+    uint32_t height,
+    DXGI_FORMAT format) {
+    // Reuse the existing pool when it already matches the requested output.
+    // Covers both a prior copy-pool build and a slow-path build at the same
+    // dimensions/format.
+    if (!pool_.empty() &&
+        outputWidth_ == width &&
+        outputHeight_ == height &&
+        outputFormat_ == format) {
+        return true;
+    }
+
+    releaseResources();
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    // Mirror the slow-path bind flags so NVENC accepts these textures as input.
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+        desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    }
+
+    for (uint32_t index = 0; index < poolSize_; ++index) {
+        auto slot = std::make_shared<TextureSlot>();
+        const HRESULT hr = device.device()->CreateTexture2D(&desc, nullptr, &slot->texture);
+        if (FAILED(hr)) {
+            Logger::instance().warning(L"capture",
+                L"CreateTexture2D for D3D11 scaler copy pool failed: " + hresultToString(hr));
+            releaseResources();
+            return false;
+        }
+        pool_.push_back(std::move(slot));
+    }
+
+    inputWidth_ = width;
+    inputHeight_ = height;
+    outputWidth_ = width;
+    outputHeight_ = height;
+    outputFormat_ = format;
+    Logger::instance().debug(L"capture",
+        L"D3D11 scaler copy pool initialized " +
+        std::to_wstring(width) + L"x" + std::to_wstring(height) +
+        (format == DXGI_FORMAT_NV12 ? L" NV12" : L" BGRA"));
     return true;
 }
 

@@ -371,6 +371,7 @@ void MainWindow::addSettingHelp(HWND control, int x, int y, const std::wstring& 
 void MainWindow::addStatusHelp(HWND control, const std::wstring& text) {
     if (control && !text.empty()) {
         statusHelpTexts_[control] = text;
+        SetWindowSubclass(control, statusHelpSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
     }
 }
 

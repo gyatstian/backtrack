@@ -145,6 +145,7 @@ private:
     static LRESULT CALLBACK pageHostProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK clipListSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
     static LRESULT CALLBACK comboBoxSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
+    static LRESULT CALLBACK statusHelpSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
     LRESULT handleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
     void buildTabs();

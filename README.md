@@ -31,10 +31,6 @@ i might fix or i might not fix. but feel free to report anything, i dont murder 
 - cool icon that im proud of myself
 - game integrations (only LoL works, and it only beeps. i amde it beacuse i forget to clip on kills)
 
-## bad features
-- "save log" button saves 55k lines and im not bothering to fix it sorry
-- "follow mouse" doesnt work with the multi-montior (you must focus an app to record the specific monitor sorry)
-
 ## defaults
 
 - Start/stop recording: `Ctrl+Alt+F9`

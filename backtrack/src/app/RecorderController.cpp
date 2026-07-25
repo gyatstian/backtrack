@@ -1245,8 +1245,8 @@ void RecorderController::captureLoop() {
     bool emitClockStarted = false;
     auto lastEmitTime = SteadyClock::time_point::min();
     bool requestKeyFrameAfterAcceptedFrame = false;
-    // Known fullscreen mode switches may accept the first fresh source frame. The
-    // longer sustained-frame gate remains for ambiguous capture-loss recovery.
+    // Known source switches may accept the first fresh source frame. The longer
+    // sustained-frame gate remains for ambiguous capture-loss recovery.
     bool acceptFirstLiveFrameAfterTransition = false;
     bool immediateRebindPending = false;
     // Capture session under exclusive fullscreen:
@@ -1337,10 +1337,10 @@ void RecorderController::captureLoop() {
         return gpuSettings.allowIdleFrameSkipping &&
                encoder_ && encoder_->capabilities().effective.zeroReorderDelay;
     };
-    const auto monitorPollInterval = std::chrono::milliseconds(250);
+    const auto monitorPollInterval = std::chrono::milliseconds(100);
     const auto soundSeparationPollInterval = std::chrono::seconds(2);
-    const auto monitorSwitchStableInterval = std::chrono::milliseconds(1500);
-    const auto monitorSwitchCooldown = std::chrono::milliseconds(3000);
+    const auto monitorSwitchStableInterval = std::chrono::milliseconds(300);
+    const auto monitorSwitchCooldown = std::chrono::milliseconds(750);
     auto lastMonitorSwitch = SteadyClock::time_point::min();
 
     auto emitFrame = [&](const GpuFrame& source, SteadyClock::time_point emitTime, uint32_t intervalCount) {
@@ -1541,6 +1541,9 @@ void RecorderController::captureLoop() {
                     lastSourceFrameAt = loopNow;
                     captureStallHold = true;
                     liveFramesSince = SteadyClock::time_point::min();
+                    // Target selection was already debounced. Do not hold a valid
+                    // first frame behind the recovery gate intended for lost capture.
+                    acceptFirstLiveFrameAfterTransition = true;
                 }
             }
         }

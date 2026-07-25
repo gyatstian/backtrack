@@ -221,6 +221,33 @@ LRESULT CALLBACK MainWindow::comboBoxSubclassProc(HWND window, UINT message, WPA
     return DefSubclassProc(window, message, wParam, lParam);
 }
 
+LRESULT CALLBACK MainWindow::statusHelpSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
+    auto* self = reinterpret_cast<MainWindow*>(refData);
+    switch (message) {
+    case WM_MOUSEMOVE:
+        if (self) {
+            self->updateStatusHelp(window);
+            TRACKMOUSEEVENT track{};
+            track.cbSize = sizeof(track);
+            track.dwFlags = TME_LEAVE;
+            track.hwndTrack = window;
+            TrackMouseEvent(&track);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        if (self) {
+            self->updateStatusHelp(nullptr);
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, statusHelpSubclassProc, subclassId);
+        break;
+    default:
+        break;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
 LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     if (message == backtrackActivationMessage()) {
         restoreFromTray();

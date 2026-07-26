@@ -262,8 +262,12 @@ AppSettings SettingsStore::load() const {
     settings.captureCursor = readBool(values, L"capture.cursor", settings.captureCursor);
     settings.preferredCaptureBackend = captureBackendFromName(
         readString(values, L"capture.backend", captureBackendName(settings.preferredCaptureBackend)));
-    settings.gameCaptureMode = gameCaptureModeFromName(
+    // Game capture disabled app-wide: hidden from UI and force-off at load so
+    // stale/legacy configs (auto/on) cannot trigger DLL injection. Re-enable by
+    // restoring the parsed value below and un-#if-0 the UI in MainWindowPages.cpp.
+    (void)gameCaptureModeFromName(
         readString(values, L"capture.gameCapture", gameCaptureModeName(settings.gameCaptureMode)));
+    settings.gameCaptureMode = GameCaptureMode::Off;
     settings.allowAntiCheatGameCapture =
         readBool(values, L"capture.allowAntiCheatGameCapture", settings.allowAntiCheatGameCapture);
     settings.clipDirectory = readString(values, L"clips.directory", settings.clipDirectory.wstring());

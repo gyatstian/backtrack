@@ -414,6 +414,23 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         result.savedReplay = !result.clipPath.empty();
         if (result.savedReplay && !action.replayTag.empty()) {
             ClipManager manager(controller_.settings().clipDirectory);
+            if (action.replayTag == L"Kill clip") {
+                const auto clipsDirectory = result.clipPath.parent_path() / L"clips";
+                auto organizedPath = clipsDirectory / result.clipPath.filename();
+                std::error_code error;
+                std::filesystem::create_directories(clipsDirectory, error);
+                for (unsigned int suffix = 2; !error && std::filesystem::exists(organizedPath, error); ++suffix) {
+                    organizedPath = clipsDirectory / (result.clipPath.stem().wstring() + L"_" + std::to_wstring(suffix) + result.clipPath.extension().wstring());
+                }
+                if (!error) {
+                    std::filesystem::rename(result.clipPath, organizedPath, error);
+                }
+                if (error) {
+                    Logger::instance().warning(L"ui", L"Could not move kill clip to " + clipsDirectory.wstring() + L": " + utf8ToWide(error.message()));
+                } else {
+                    result.clipPath = organizedPath;
+                }
+            }
             if (!manager.addTag(result.clipPath, action.replayTag)) {
                 Logger::instance().warning(L"ui", L"Could not tag saved replay: " + result.clipPath.wstring());
             }

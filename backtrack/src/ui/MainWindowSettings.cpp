@@ -822,6 +822,17 @@ bool MainWindow::isSoundSeparationMutedLabel(HWND control) const {
     return lstrcmpW(text, L"MUTED") == 0;
 }
 
+bool MainWindow::isGameCaptureWarningLabel(HWND control) const {
+    if (!control) {
+        return false;
+    }
+    wchar_t text[32]{};
+    if (GetWindowTextW(control, text, static_cast<int>(_countof(text))) <= 0) {
+        return false;
+    }
+    return lstrcmpW(text, L"Game capture !!!") == 0;
+}
+
 void MainWindow::updateStartupRegistration() {
     updateWindowsStartupRegistration(settings_.startWithWindowsMinimized);
 }

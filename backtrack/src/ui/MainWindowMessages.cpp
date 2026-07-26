@@ -508,7 +508,16 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         break;
     case WM_CTLCOLORSTATIC:
-        SetTextColor(reinterpret_cast<HDC>(wParam), isSoundSeparationMutedLabel(reinterpret_cast<HWND>(lParam)) ? RGB(232, 72, 72) : kText);
+        {
+            const HWND ctlColorTarget = reinterpret_cast<HWND>(lParam);
+            COLORREF staticColor = kText;
+            if (isGameCaptureWarningLabel(ctlColorTarget)) {
+                staticColor = RGB(255, 0, 0);
+            } else if (isSoundSeparationMutedLabel(ctlColorTarget)) {
+                staticColor = RGB(232, 72, 72);
+            }
+            SetTextColor(reinterpret_cast<HDC>(wParam), staticColor);
+        }
         if (reinterpret_cast<HWND>(lParam) == status_) {
             SetBkMode(reinterpret_cast<HDC>(wParam), OPAQUE);
             SetBkColor(reinterpret_cast<HDC>(wParam), kPanel);

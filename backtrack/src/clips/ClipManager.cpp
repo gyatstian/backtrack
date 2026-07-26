@@ -145,45 +145,54 @@ std::vector<ClipInfo> ClipManager::listClips() const {
         return clips;
     }
 
-    std::filesystem::directory_iterator iterator(directory_, error);
-    const std::filesystem::directory_iterator end;
-    if (error) {
-        Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-        return clips;
-    }
-    for (; iterator != end; iterator.increment(error)) {
-        const auto& entry = *iterator;
-        const auto path = entry.path();
-        if (!entry.is_regular_file(error) || error || !hasMp4Extension(path)) {
+    const auto appendDirectoryClips = [&](const std::filesystem::path& scanDirectory) {
+        std::filesystem::directory_iterator iterator(scanDirectory, error);
+        const std::filesystem::directory_iterator end;
+        if (error) {
+            Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + scanDirectory.wstring() + L" (" + utf8ToWide(error.message()) + L")");
             error = {};
-            continue;
+            return;
         }
+        for (; iterator != end; iterator.increment(error)) {
+            const auto& entry = *iterator;
+            const auto path = entry.path();
+            if (!entry.is_regular_file(error) || error || !hasMp4Extension(path)) {
+                error = {};
+                continue;
+            }
 
-        // Iterator yields only direct children of configured clip directory. Re-canonicalizing
-        // root and every child here caused synchronous filesystem work for every library item.
-        ClipInfo info;
-        info.path = path;
-        info.bytes = entry.file_size(error);
-        if (error) {
-            Logger::instance().warning(L"clips", L"Could not read clip file size: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            ClipInfo info;
+            info.path = path;
+            info.bytes = entry.file_size(error);
+            if (error) {
+                Logger::instance().warning(L"clips", L"Could not read clip file size: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+                error = {};
+                continue;
+            }
+            info.modifiedTime = entry.last_write_time(error);
+            if (error) {
+                Logger::instance().warning(L"clips", L"Could not read clip modified time: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+                error = {};
+                continue;
+            }
+            info.duration100ns = readMediaDuration(path);
+            info.favorite = std::filesystem::exists(favoriteMarker(path), error);
             error = {};
-            continue;
+            info.tags = readTags(path);
+            clips.push_back(std::move(info));
         }
-        info.modifiedTime = entry.last_write_time(error);
         if (error) {
-            Logger::instance().warning(L"clips", L"Could not read clip modified time: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            Logger::instance().warning(L"clips", L"Could not finish enumerating clips directory: " + scanDirectory.wstring() + L" (" + utf8ToWide(error.message()) + L")");
             error = {};
-            continue;
         }
-        info.duration100ns = readMediaDuration(path);
-        info.favorite = std::filesystem::exists(favoriteMarker(path), error);
-        error = {};
-        info.tags = readTags(path);
-        clips.push_back(std::move(info));
+    };
+
+    appendDirectoryClips(directory_);
+    const auto organizedDirectory = directory_ / L"clips";
+    if (std::filesystem::is_directory(organizedDirectory, error)) {
+        appendDirectoryClips(organizedDirectory);
     }
-    if (error) {
-        Logger::instance().warning(L"clips", L"Could not finish enumerating clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-    }
+    error = {};
 
     std::sort(clips.begin(), clips.end(), [](const ClipInfo& left, const ClipInfo& right) {
         if (left.modifiedTime != right.modifiedTime) {

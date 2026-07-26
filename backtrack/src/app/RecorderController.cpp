@@ -1264,6 +1264,10 @@ void RecorderController::captureLoop() {
     int rebindAttempts = 0;
     int exclusiveDxgiAttempts = 0;
     int sustainedLiveFrameCount = 0;
+    // Tracks capture_->cursorOnlyFrames() from the last delivered frame. A DXGI
+    // frame whose counter did not advance carries a real desktop present (proof of
+    // composited/capturable content); a cursor-only stale frame advances it.
+    uint64_t prevCursorOnlyFrames = 0;
     bool exclusiveCoverActive = false;
     HWND exclusiveTargetWindow = nullptr;
     bool loggedExclusiveHold = false;
@@ -1612,6 +1616,29 @@ void RecorderController::captureLoop() {
             const bool desktopBackend =
                 capture_ &&
                 capture_->backend() != CaptureBackend::GameCapture;
+            // WGC captures flip-model / Fullscreen Optimizations fullscreen. Unlike
+            // DXGI Desktop Duplication (which can hand back stale frames under true
+            // exclusive), a delivered WGC frame is proof the surface is composited
+            // and capturable, so it must be treated as live, not frozen/held.
+            const bool wgcBackend =
+                capture_ &&
+                capture_->backend() == CaptureBackend::WindowsGraphicsCapture;
+            // DXGI Desktop Duplication also captures flip-model / FSO fullscreen,
+            // but (unlike WGC) it can deliver cursor-only stale frames. Per-frame
+            // proof: a delivered DXGI frame that did NOT advance the cursor-only
+            // counter carries a real desktop present -> surface is composited and
+            // capturable, so treat it as live (not frozen/held). A cursor-only
+            // stale frame advances the counter and stays frozen. Counter reset on
+            // rebind can only yield a harmless one-frame false-negative, never a
+            // false-positive that would let stale content through.
+            const bool dxgiBackend =
+                capture_ &&
+                capture_->backend() == CaptureBackend::DesktopDuplication;
+            const uint64_t curCursorOnlyFrames =
+                capture_ ? capture_->cursorOnlyFrames() : prevCursorOnlyFrames;
+            const bool dxgiPresentProof =
+                dxgiBackend && curCursorOnlyFrames == prevCursorOnlyFrames;
+            prevCursorOnlyFrames = curCursorOnlyFrames;
             const bool desktopRecoveryProbeActive =
                 desktopRecoveryProbe &&
                 exclusiveCoverActive &&
@@ -1619,6 +1646,8 @@ void RecorderController::captureLoop() {
             const bool freezeDesktopFrame =
                 exclusiveCoverActive &&
                 desktopBackend &&
+                !wgcBackend &&
+                !dxgiPresentProof &&
                 !desktopRecoveryProbeActive &&
                 (captureStallHold ||
                  exclusiveBlind ||
@@ -1638,6 +1667,8 @@ void RecorderController::captureLoop() {
                 constexpr int kSustainedLiveFrames = 10;
                 const bool backendOkForExclusive =
                     !exclusiveCoverActive ||
+                    wgcBackend ||
+                    dxgiPresentProof ||
                     desktopRecoveryProbeActive ||
                     desktopRecoveryProbe ||
                     (capture_ && capture_->backend() == CaptureBackend::GameCapture);

@@ -209,6 +209,7 @@ private:
     void toggleSoundSeparationApp(size_t index);
     void removeSoundSeparationApp(size_t index);
     bool isSoundSeparationMutedLabel(HWND control) const;
+    bool isGameCaptureWarningLabel(HWND control) const;
     void updateResolutionControls();
     void updateStartupRegistration();
     void browseClipFolder();

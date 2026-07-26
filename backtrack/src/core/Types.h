@@ -176,7 +176,7 @@ struct AppSettings {
     GameIntegrationSettings gameIntegrations;
     std::filesystem::path clipDirectory;
     CaptureBackend preferredCaptureBackend = CaptureBackend::WindowsGraphicsCapture;
-    GameCaptureMode gameCaptureMode = GameCaptureMode::Auto;
+    GameCaptureMode gameCaptureMode = GameCaptureMode::Off;
     // Advanced override: allow injecting the game-capture hook into titles
     // protected by kernel anti-cheat (Vanguard/EAC/BattlEye). Default false so
     // the guard fails closed and falls back to Windows Graphics Capture.

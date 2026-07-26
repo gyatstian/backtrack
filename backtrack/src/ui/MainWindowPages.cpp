@@ -990,8 +990,10 @@ void MainWindow::buildSettingsCapturePage() {
         settings_.preferredCaptureBackend == CaptureBackend::DesktopDuplication ? 1 : 0,
         0);
     y += kRowHeight;
-    addRowLabel(L"Game capture");
+#if 0 // Game capture UI hidden for now; code retained. Toggle to 1 to re-enable.
+    addRowLabel(L"Game capture !!!");
     gameCaptureModeCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kGameCaptureModeComboId);
+    addSettingHelp(gameCaptureModeCombo_, 0, 0, L"WARNING: Enabling game capture injects into the target process and will get you banned. Do not use this.");
     SendMessageW(gameCaptureModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Off"));
     SendMessageW(gameCaptureModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto (exclusive)"));
     SendMessageW(gameCaptureModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Always"));
@@ -1011,6 +1013,7 @@ void MainWindow::buildSettingsCapturePage() {
         SendMessageW(allowAntiCheatGameCaptureCheck_, BM_SETCHECK, settings_.allowAntiCheatGameCapture ? BST_CHECKED : BST_UNCHECKED, 0);
         y += kRowHeight;
     }
+#endif
     finishSection();
     addSection(L"Multi-monitor");
     addRowLabel(L"Multi-monitor support");

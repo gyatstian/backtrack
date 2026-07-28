@@ -410,6 +410,12 @@ bool MainWindow::layoutCurrentPage() {
         const int width = std::min(std::max(120, designWidth), std::max(1, viewportWidth - kLayoutPadding * 2));
         const int y = std::max(kLayoutPadding, viewportHeight - kLayoutPadding - height);
         changed = moveWindowIfChanged(footer->control, kLayoutPadding, y, width, height) || changed;
+        // Sticky footer overlaps scrolled content; keep it above sibling controls
+        // so its border/text is not clipped by controls drawn on top.
+        if (footer->control && IsWindowVisible(footer->control)) {
+            SetWindowPos(footer->control, HWND_TOP, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
     if (changed) {
         InvalidateRect(pageHost_, nullptr, FALSE);

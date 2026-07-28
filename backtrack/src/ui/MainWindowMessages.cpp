@@ -254,6 +254,22 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    // Explorer.exe can restart (crash/update), which silently destroys all
+    // tray icons. It broadcasts "TaskbarCreated" so apps can re-register.
+    // Without this, an app hidden in the tray loses its icon permanently and
+    // becomes invisible in both taskbar and tray with no way to restore it.
+    static const UINT taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
+    if (message == taskbarCreatedMessage && taskbarCreatedMessage != 0) {
+        // Clear the latch so addTrayIcon actually re-adds the (now-gone) icon.
+        trayVisible_ = false;
+        if (!addTrayIcon() && !IsWindowVisible(window_)) {
+            // Re-add failed while hidden: surface the window so the user is
+            // never locked out.
+            restoreFromTray();
+        }
+        return 0;
+    }
+
     switch (message) {
     case WM_COMMAND: {
         const int controlId = static_cast<int>(LOWORD(wParam));
@@ -552,9 +568,14 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         if (settings_.exitToTray && !exitFromTray_) {
-            addTrayIcon();
-            ShowWindow(window_, SW_HIDE);
-            setStatus(L"Backtrack is running in the tray");
+            if (addTrayIcon()) {
+                ShowWindow(window_, SW_HIDE);
+                setStatus(L"Backtrack is running in the tray");
+                return 0;
+            }
+            // Tray icon unavailable: keep window visible so the app never
+            // becomes inaccessible (invisible in both taskbar and tray).
+            setStatus(L"Tray unavailable; keeping window open");
             return 0;
         }
         break;
@@ -640,6 +661,7 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool selected = selectedTab || selectedLibraryView || selectedSettingsCategory;
     const bool hovered = !pressed && !disabled && item.hwndItem == hoveredButton_;
+    const bool saveButton = controlId == kSaveSettingsButtonId;
     const COLORREF textColor = disabled ? kMutedText : kText;
 
     HBRUSH brush = controlBrush_;
@@ -647,6 +669,10 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
         brush = buttonPressedBrush_ ? buttonPressedBrush_ : selectionBrush_;
     } else if (selected) {
         brush = tabActiveBrush_ ? tabActiveBrush_ : selectionBrush_;
+    } else if (saveButton) {
+        // Distinct dark accent so the Save button stands apart from the
+        // surrounding kPanel sections instead of blending in.
+        brush = saveButtonBrush_ ? saveButtonBrush_ : controlBrush_;
     } else if (hovered) {
         brush = buttonHoverBrush_ ? buttonHoverBrush_ : controlBrush_;
     }

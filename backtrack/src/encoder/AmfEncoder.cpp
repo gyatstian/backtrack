@@ -358,6 +358,15 @@ struct AmfEncoder::Impl {
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH)));
         setProp(encoder, AMF_VIDEO_ENCODER_FRAMESIZE,
                 amf::AMFVariant(AMFConstructSize(settings.width, settings.height)));
+        setProp(encoder, AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(idrPeriod)));
+        // Insert SPS/PPS periodically (AMF range 0-1000). Forced IDRs also set InsertSPS/PPS.
+        setProp(encoder, AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING,
+                amf::AMFVariant(static_cast<amf_int64>(std::min<uint32_t>(idrPeriod, 1000))));
+
+        // B-frames reorder output; keep them off when zero-latency/idle coalescing is desired.
+        const bool useBFrames = effective.bFrames && caps.bFrames && !effective.zeroReorderDelay;
+        setProp(encoder, AMF_VIDEO_ENCODER_B_PIC_PATTERN,
+                amf::AMFVariant(static_cast<amf_int64>(useBFrames ? 2 : 0)));
 
         // Init with the actual input surface format. The capture pipeline feeds
         // BGRA D3D11 textures; the AMF encoder performs BGRA->NV12 color
@@ -382,16 +391,8 @@ struct AmfEncoder::Impl {
         setProp(encoder, AMF_VIDEO_ENCODER_ENFORCE_HRD, amf::AMFVariant(true));
         setProp(encoder, AMF_VIDEO_ENCODER_FRAMERATE,
                 amf::AMFVariant(AMFConstructRate(settings.fps, 1)));
-        setProp(encoder, AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(idrPeriod)));
-        // Insert SPS/PPS periodically (AMF range 0-1000). Forced IDRs also set InsertSPS/PPS.
-        setProp(encoder, AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING,
-                amf::AMFVariant(static_cast<amf_int64>(std::min<uint32_t>(idrPeriod, 1000))));
         setProp(encoder, AMF_VIDEO_ENCODER_ENABLE_VBAQ, amf::AMFVariant(effective.spatialAQ));
 
-        // B-frames reorder output; keep them off when zero-latency/idle coalescing is desired.
-        const bool useBFrames = effective.bFrames && caps.bFrames && !effective.zeroReorderDelay;
-        setProp(encoder, AMF_VIDEO_ENCODER_B_PIC_PATTERN,
-                amf::AMFVariant(static_cast<amf_int64>(useBFrames ? 2 : 0)));
         if (effective.lookahead && caps.lookahead) {
             setProp(encoder, AMF_VIDEO_ENCODER_PREENCODE_ENABLE,
                     amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PREENCODE_ENABLED)));
@@ -428,6 +429,11 @@ struct AmfEncoder::Impl {
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_TIER_MAIN)));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_FRAMESIZE,
                 amf::AMFVariant(AMFConstructSize(settings.width, settings.height)));
+        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(gopSize)));
+        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, amf::AMFVariant(static_cast<amf_int64>(1)));
+        // VPS/SPS/PPS on every IDR for clean mid-session mux starts.
+        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
+                amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)));
 
         AMF_RESULT result = encoder->Init(inputSurfaceFormat,
                                           static_cast<amf_int32>(settings.width),
@@ -446,11 +452,6 @@ struct AmfEncoder::Impl {
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD, amf::AMFVariant(true));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_FRAMERATE,
                 amf::AMFVariant(AMFConstructRate(settings.fps, 1)));
-        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(gopSize)));
-        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, amf::AMFVariant(static_cast<amf_int64>(1)));
-        // VPS/SPS/PPS on every IDR for clean mid-session mux starts.
-        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
-                amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, amf::AMFVariant(effective.spatialAQ));
         if (effective.lookahead && caps.lookahead) {
             setProp(encoder, AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, amf::AMFVariant(true));
@@ -592,9 +593,12 @@ struct AmfEncoder::Impl {
             const int64_t outputPts = static_cast<int64_t>(buffer->GetPts());
             const int64_t outputDuration = static_cast<int64_t>(buffer->GetDuration());
 
-            // Match by PTS when B-frames reorder output; FIFO only as last resort.
+            // Match by PTS when B-frames reorder output; FIFO metadata is an
+            // all-or-nothing fallback so it cannot be combined with an
+            // unrelated AMF timestamp.
             PendingInput pending;
             bool matched = false;
+            bool usedFallbackMetadata = false;
             if (outputPts != 0) {
                 for (auto it = inFlight.begin(); it != inFlight.end(); ++it) {
                     if (it->fallbackPts100ns == outputPts) {
@@ -608,14 +612,19 @@ struct AmfEncoder::Impl {
             if (!matched && !inFlight.empty()) {
                 pending = std::move(inFlight.front());
                 inFlight.pop_front();
+                usedFallbackMetadata = true;
             }
 
             EncodedPacket packet;
             const auto* begin = static_cast<const uint8_t*>(buffer->GetNative());
             const size_t size = buffer->GetSize();
             packet.bytes.assign(begin, begin + size);
-            packet.pts100ns = outputPts != 0 ? outputPts : pending.fallbackPts100ns;
-            packet.duration100ns = outputDuration != 0 ? outputDuration : pending.fallbackDuration100ns;
+            packet.pts100ns = !usedFallbackMetadata && outputPts != 0
+                ? outputPts
+                : pending.fallbackPts100ns;
+            packet.duration100ns = !usedFallbackMetadata && outputDuration != 0
+                ? outputDuration
+                : pending.fallbackDuration100ns;
             packet.codec = settings.codec;
             packet.keyFrame = outputIsKeyFrame(buffer) || bitstreamContainsKeyFrame(settings.codec, packet.bytes);
 

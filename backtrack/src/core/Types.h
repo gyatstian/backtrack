@@ -57,7 +57,6 @@ enum class AudioTrack {
 };
 
 enum class ResolutionMode {
-    Native,
     P240,
     P480,
     P720,
@@ -127,7 +126,7 @@ struct VideoSettings {
     uint32_t bitrateKbps = 24000;
     VideoCodec codec = VideoCodec::H264;
     uint32_t gopSeconds = 2;
-    ResolutionMode resolutionMode = ResolutionMode::Native;
+    ResolutionMode resolutionMode = ResolutionMode::P1080;
     EncoderPreset encoderPreset = EncoderPreset::P4;
     EncoderMode encoderMode = EncoderMode::HighQuality;
     EncoderProfile encoderProfile = EncoderProfile::LowestGpu;
@@ -142,11 +141,13 @@ struct VideoSettings {
     bool encoderAdaptiveIFrames = false;
     bool encoderZeroReorderDelay = true;
     uint32_t encoderReferenceFrames = 1;
+    bool operator==(const VideoSettings&) const = default;
 };
 
 struct ReplaySettings {
     uint32_t seconds = 120;
     bool enabled = true;
+    bool operator==(const ReplaySettings&) const = default;
 };
 
 struct GpuOptimizationSettings {
@@ -155,6 +156,7 @@ struct GpuOptimizationSettings {
     uint32_t frameQueueLimit = 4;
     bool allowIdleFrameSkipping = true;
     bool stableMultimonitorFrames = true;
+    bool operator==(const GpuOptimizationSettings&) const = default;
 };
 
 struct HotkeySettings {
@@ -162,10 +164,12 @@ struct HotkeySettings {
     uint32_t startStopVirtualKey = VK_F9;
     uint32_t saveReplayModifiers = MOD_CONTROL | MOD_ALT;
     uint32_t saveReplayVirtualKey = VK_F10;
+    bool operator==(const HotkeySettings&) const = default;
 };
 
 struct GameIntegrationSettings {
     bool leagueOfLegendsKillReminder = false;
+    bool operator==(const GameIntegrationSettings&) const = default;
 };
 
 struct AppSettings {
@@ -192,6 +196,7 @@ struct AppSettings {
         std::wstring name;
         std::filesystem::path executablePath;
         bool muted = true;
+        bool operator==(const SoundSeparationApp&) const = default;
     };
     std::vector<SoundSeparationApp> soundSeparationApps;
     bool startWithWindowsMinimized = false;
@@ -205,6 +210,7 @@ struct AppSettings {
     bool followMouseMonitor = false;
     bool captureCursor = true;
     LogLevel logLevel = LogLevel::Debug;
+    bool operator==(const AppSettings&) const = default;
 };
 
 struct CaptureTarget {

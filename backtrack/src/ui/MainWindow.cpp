@@ -43,6 +43,7 @@ MainWindow::MainWindow(RecorderController& controller, SettingsStore& settingsSt
               PostMessageW(window_, kLeagueKillDetectedMessage, 0, 0);
           }
       }) {
+    savedSettings_ = settings_;
     libraryViewMode_ = settings_.libraryGalleryView ? LibraryViewMode::Gallery : LibraryViewMode::List;
     recordHotkeyModifiers_ = settings_.hotkeys.startStopModifiers;
     recordHotkeyVirtualKey_ = settings_.hotkeys.startStopVirtualKey;
@@ -88,6 +89,9 @@ MainWindow::~MainWindow() {
     if (buttonPressedBrush_) {
         DeleteObject(buttonPressedBrush_);
     }
+    if (saveButtonBrush_) {
+        DeleteObject(saveButtonBrush_);
+    }
     if (tabActiveOutlinePen_) {
         DeleteObject(tabActiveOutlinePen_);
     }
@@ -113,6 +117,7 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     tabActiveBrush_ = CreateSolidBrush(kTabActive);
     buttonHoverBrush_ = CreateSolidBrush(kButtonHover);
     buttonPressedBrush_ = CreateSolidBrush(kButtonPressed);
+    saveButtonBrush_ = CreateSolidBrush(kSaveButton);
     outlinePen_ = CreatePen(PS_SOLID, 1, kOutline);
     selectedOutlinePen_ = CreatePen(PS_SOLID, 1, kText);
     tabActiveOutlinePen_ = CreatePen(PS_SOLID, 1, kTabActiveOutline);

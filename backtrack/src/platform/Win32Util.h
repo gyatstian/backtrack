@@ -6,8 +6,19 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace backtrack {
+
+// One entry per active display, in EnumDisplayMonitors order so index aligns
+// with monitorFromIndex / settings.monitorIndex.
+struct MonitorEnumEntry {
+    uint32_t index = 0;
+    std::wstring deviceName; // e.g. "\\.\DISPLAY1"
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool primary = false;
+};
 
 inline constexpr wchar_t kBacktrackMainWindowClassName[] = L"BacktrackMainWindow";
 inline constexpr wchar_t kBacktrackSingleInstanceMutexName[] = L"Local\\Backtrack.SingleInstance";
@@ -65,6 +76,8 @@ std::wstring moduleDirectory();
 bool updateWindowsStartupRegistration(bool enabled);
 void pruneStaleMicrophoneConsentEntries();
 HMONITOR monitorFromIndex(uint32_t index);
+// Enumerates active displays with native pixel size and primary flag.
+std::vector<MonitorEnumEntry> enumerateMonitors();
 HMONITOR focusedMonitorOrFallback(uint32_t fallbackIndex);
 HMONITOR cursorMonitorOrFallback(uint32_t fallbackIndex);
 // Returns DXGI output index on the given adapter for HMONITOR, or UINT32_MAX if none.

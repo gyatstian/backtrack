@@ -117,18 +117,10 @@ CaptureBackend selectedBackendForSettings(const AppSettings& settings) {
     return settings.preferredCaptureBackend;
 }
 
-VideoSettings activeVideoSettingsFor(const AppSettings& settings, uint32_t sourceWidth, uint32_t sourceHeight) {
+VideoSettings activeVideoSettingsFor(const AppSettings& settings) {
     VideoSettings active = settings.video;
-    if (settings.video.resolutionMode == ResolutionMode::Native && sourceWidth > 0 && sourceHeight > 0) {
-        // Keep native source size even when follow-monitor is enabled so the
-        // first monitor's resolution is encoded 1:1; later switches letterbox
-        // into this canvas via the scaler fit-with-bars path.
-        active.width = evenEncodeDimension(sourceWidth);
-        active.height = evenEncodeDimension(sourceHeight);
-    } else {
-        active.width = evenEncodeDimension(active.width);
-        active.height = evenEncodeDimension(active.height);
-    }
+    active.width = evenEncodeDimension(active.width);
+    active.height = evenEncodeDimension(active.height);
     return active;
 }
 
@@ -896,7 +888,7 @@ bool RecorderController::recreateGpuPipeline(
     captureHeight_ = sourceHeight;
 
     AppSettings snapshot = settings();
-    const VideoSettings videoSettings = activeVideoSettingsFor(snapshot, sourceWidth, sourceHeight);
+    const VideoSettings videoSettings = activeVideoSettingsFor(snapshot);
     const GpuOptimizationSettings gpuSettings = snapshot.gpu;
     {
         std::scoped_lock stateLock(stateMutex_);

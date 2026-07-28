@@ -4,6 +4,7 @@
 #include "clips/ClipManager.h"
 #include "hotkeys/HotkeyService.h"
 #include "integrations/LeagueOfLegendsIntegration.h"
+#include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
 
 #include <Windows.h>
@@ -178,7 +179,8 @@ private:
     void buildClipsPage();
     void switchSettingsCategory(SettingsCategory category);
 
-    bool readVisibleSettingsInto(AppSettings& target);
+    bool readVisibleSettingsInto(AppSettings& target, bool allowFilesystemEffects = true);
+    bool computeSettingsDirty();
     void stashVisibleSettings();
     void applyVisibleSettings();
     void addDirtySaveButton();
@@ -250,7 +252,7 @@ private:
     void controllerWorkerLoop();
     ControllerActionResult executeControllerAction(const ControllerAction& action);
     void handleControllerActionComplete(const ControllerActionResult& result);
-    void addTrayIcon();
+    bool addTrayIcon();
     void removeTrayIcon();
     void restoreFromTray();
     void showTrayMenu();
@@ -265,6 +267,10 @@ private:
     RecorderController& controller_;
     SettingsStore& settingsStore_;
     AppSettings settings_;
+    // Pristine baseline of the last saved/loaded settings. The Save button is
+    // shown only when the visible settings differ from this snapshot, so
+    // reverting an edit back to its saved value hides the button again.
+    AppSettings savedSettings_;
     ClipManager clipManager_;
     HotkeyService hotkeys_;
     LeagueOfLegendsIntegration leagueIntegration_;
@@ -287,6 +293,7 @@ private:
     HBRUSH tabActiveBrush_ = nullptr;
     HBRUSH buttonHoverBrush_ = nullptr;
     HBRUSH buttonPressedBrush_ = nullptr;
+    HBRUSH saveButtonBrush_ = nullptr;
     HPEN outlinePen_ = nullptr;
     HPEN selectedOutlinePen_ = nullptr;
     HPEN tabActiveOutlinePen_ = nullptr;
@@ -313,6 +320,13 @@ private:
     HWND renameEdit_ = nullptr;
     HWND fpsEdit_ = nullptr;
     HWND resolutionModeCombo_ = nullptr;
+    // Number of preset items (P240..Custom) that precede the monitor entries in
+    // resolutionModeCombo_. Custom is the last enum value, so count is +1.
+    static constexpr int kResolutionPresetCount = static_cast<int>(ResolutionMode::Custom) + 1;
+    // Monitor entries appended after the preset items in resolutionModeCombo_.
+    // Combo index for entry i is kResolutionPresetCount + i. Selecting one sets
+    // encode width/height to that monitor's native size (mode stays Custom).
+    std::vector<MonitorEnumEntry> resolutionMonitorEntries_;
     HWND widthEdit_ = nullptr;
     HWND heightEdit_ = nullptr;
     HWND followFocusedMonitorCheck_ = nullptr;

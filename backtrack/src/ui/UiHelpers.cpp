@@ -897,7 +897,6 @@ bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height
         width = 3840;
         height = 2160;
         return true;
-    case ResolutionMode::Native:
     case ResolutionMode::Custom:
         break;
     }

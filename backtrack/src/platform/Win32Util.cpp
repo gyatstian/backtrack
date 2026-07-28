@@ -488,6 +488,30 @@ HMONITOR monitorFromIndex(uint32_t index) {
     return state.monitor;
 }
 
+std::vector<MonitorEnumEntry> enumerateMonitors() {
+    std::vector<MonitorEnumEntry> monitors;
+    EnumDisplayMonitors(
+        nullptr,
+        nullptr,
+        [](HMONITOR monitor, HDC, LPRECT, LPARAM param) -> BOOL {
+            auto* list = reinterpret_cast<std::vector<MonitorEnumEntry>*>(param);
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (GetMonitorInfoW(monitor, &info)) {
+                MonitorEnumEntry entry;
+                entry.index = static_cast<uint32_t>(list->size());
+                entry.deviceName = info.szDevice;
+                entry.width = static_cast<uint32_t>(info.rcMonitor.right - info.rcMonitor.left);
+                entry.height = static_cast<uint32_t>(info.rcMonitor.bottom - info.rcMonitor.top);
+                entry.primary = (info.dwFlags & MONITORINFOF_PRIMARY) != 0;
+                list->push_back(std::move(entry));
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&monitors));
+    return monitors;
+}
+
 uint32_t dxgiOutputIndexForMonitor(IDXGIAdapter* adapter, HMONITOR monitor) {
     if (!adapter || !monitor) {
         return UINT32_MAX;

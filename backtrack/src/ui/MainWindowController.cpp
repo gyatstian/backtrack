@@ -63,6 +63,7 @@ void MainWindow::handleHotkey(int id) {
 
 void MainWindow::updateGameIntegrations() {
     settings_ = controller_.settings();
+    savedSettings_ = settings_;
     const bool leagueEnabled =
         settings_.replay.enabled &&
         settings_.gameIntegrations.leagueOfLegendsKillReminder;
@@ -79,6 +80,7 @@ void MainWindow::stopGameIntegrations() {
 
 void MainWindow::handleLeagueKillDetected() {
     settings_ = controller_.settings();
+    savedSettings_ = settings_;
     if (!settings_.replay.enabled || !settings_.gameIntegrations.leagueOfLegendsKillReminder) {
         return;
     }
@@ -160,9 +162,9 @@ bool MainWindow::handleShortcut(MSG& message) {
     return false;
 }
 
-void MainWindow::addTrayIcon() {
+bool MainWindow::addTrayIcon() {
     if (trayVisible_) {
-        return;
+        return true;
     }
 
     NOTIFYICONDATAW data{};
@@ -177,6 +179,7 @@ void MainWindow::addTrayIcon() {
     }
     lstrcpynW(data.szTip, L"Backtrack", static_cast<int>(_countof(data.szTip)));
     trayVisible_ = Shell_NotifyIconW(NIM_ADD, &data) == TRUE;
+    return trayVisible_;
 }
 
 void MainWindow::removeTrayIcon() {

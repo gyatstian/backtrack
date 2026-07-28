@@ -33,23 +33,38 @@
 #include <utility>
 
 namespace backtrack {
-bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
+bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesystemEffects) {
     if (bitrateEdit_) {
         target.video.bitrateKbps = readUIntControl(bitrateEdit_, target.video.bitrateKbps);
     }
     if (fpsEdit_) {
         target.video.fps = std::max<uint32_t>(1, readUIntControl(fpsEdit_, target.video.fps));
     }
+    bool monitorEntrySelected = false;
     if (resolutionModeCombo_) {
         const auto selected = SendMessageW(resolutionModeCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= static_cast<LRESULT>(ResolutionMode::Custom)) {
             target.video.resolutionMode = static_cast<ResolutionMode>(selected);
+        } else if (selected >= static_cast<LRESULT>(kResolutionPresetCount)) {
+            // Monitor entry: resolution shortcut. Persist as Custom with that
+            // monitor's native size. Capture target is unaffected.
+            const size_t monitorIdx = static_cast<size_t>(selected) - kResolutionPresetCount;
+            if (monitorIdx < resolutionMonitorEntries_.size()) {
+                const MonitorEnumEntry& monitor = resolutionMonitorEntries_[monitorIdx];
+                target.video.resolutionMode = ResolutionMode::Custom;
+                target.video.width = monitor.width;
+                target.video.height = monitor.height;
+                monitorEntrySelected = true;
+            }
         }
     }
-    if (widthEdit_) {
+    // When a monitor entry is selected the size comes from the monitor, not the
+    // width/height edits (which still hold the previous mode's values until the
+    // category body is rebuilt).
+    if (widthEdit_ && !monitorEntrySelected) {
         target.video.width = std::max<uint32_t>(16, readUIntControl(widthEdit_, target.video.width));
     }
-    if (heightEdit_) {
+    if (heightEdit_ && !monitorEntrySelected) {
         target.video.height = std::max<uint32_t>(16, readUIntControl(heightEdit_, target.video.height));
     }
     if (multiMonitorSupportCheck_) {
@@ -228,15 +243,23 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target) {
                 return false;
             }
             if (folderError) {
-                setStatus(L"Clip folder could not be checked");
-                return false;
+                if (allowFilesystemEffects) {
+                    setStatus(L"Clip folder could not be checked");
+                    return false;
+                }
+                // During dirty-detection we only compare values; a transient
+                // stat failure should not block the diff. Accept the text.
+                target.clipDirectory = folder;
+            } else {
+                if (allowFilesystemEffects) {
+                    std::filesystem::create_directories(folderPath, folderError);
+                    if (folderError) {
+                        setStatus(L"Clip folder could not be created");
+                        return false;
+                    }
+                }
+                target.clipDirectory = folder;
             }
-            std::filesystem::create_directories(folderPath, folderError);
-            if (folderError) {
-                setStatus(L"Clip folder could not be created");
-                return false;
-            }
-            target.clipDirectory = folder;
         }
     }
     target.libraryGalleryView = libraryViewMode_ == LibraryViewMode::Gallery;
@@ -262,6 +285,9 @@ void MainWindow::applyVisibleSettings() {
     }
     updateStartupRegistration();
     settingsStore_.save(settings_);
+    // Settings are now persisted; this becomes the pristine baseline the Save
+    // button diffs against, so further edits reverted to these values hide it.
+    savedSettings_ = settings_;
     clipManager_.setDirectory(settings_.clipDirectory);
     const bool hotkeysOk = hotkeys_.registerHotkeys(window_, settings_.hotkeys);
     const std::wstring hotkeyError = hotkeys_.lastErrorMessage();
@@ -311,14 +337,30 @@ void MainWindow::updateSaveSettingsButton() {
     }
 }
 
+bool MainWindow::computeSettingsDirty() {
+    // Overlay the currently visible controls onto a copy of the live settings
+    // (which already holds non-visible fields and the sound-separation list),
+    // then compare against the pristine saved baseline. Skip filesystem side
+    // effects: this runs on every keystroke and must not create folders.
+    AppSettings candidate = settings_;
+    if (!readVisibleSettingsInto(candidate, /*allowFilesystemEffects=*/false)) {
+        // Could not read a coherent snapshot (e.g. clip folder is a file);
+        // treat that as dirty so the user can see/fix it via Save.
+        return true;
+    }
+    candidate = sanitizeSettings(candidate);
+    return !(candidate == sanitizeSettings(savedSettings_));
+}
+
 void MainWindow::markSettingsDirty() {
     if (buildingPage_) {
         return;
     }
-    if (settingsDirty_) {
+    const bool dirty = computeSettingsDirty();
+    if (dirty == settingsDirty_) {
         return;
     }
-    settingsDirty_ = true;
+    settingsDirty_ = dirty;
     updateSaveSettingsButton();
     updateTabChrome();
 }
@@ -349,6 +391,7 @@ bool MainWindow::promptSaveSettingsIfDirty(bool allowCancel) {
     }
     if (result == IDNO) {
         settings_ = controller_.settings();
+        savedSettings_ = settings_;
         recordHotkeyModifiers_ = settings_.hotkeys.startStopModifiers;
         recordHotkeyVirtualKey_ = settings_.hotkeys.startStopVirtualKey;
         replayHotkeyModifiers_ = settings_.hotkeys.saveReplayModifiers;
@@ -468,10 +511,12 @@ void MainWindow::updateResolutionControls() {
     }
 
     const auto selected = SendMessageW(resolutionModeCombo_, CB_GETCURSEL, 0, 0);
+    // Monitor entries (selected >= preset count) are resolution shortcuts that
+    // persist as Custom, so treat anything outside the preset range as Custom.
     const ResolutionMode mode =
         selected >= 0 && selected <= static_cast<LRESULT>(ResolutionMode::Custom)
             ? static_cast<ResolutionMode>(selected)
-            : ResolutionMode::Native;
+            : ResolutionMode::Custom;
 
     uint32_t presetWidth = 0;
     uint32_t presetHeight = 0;
@@ -488,8 +533,7 @@ void MainWindow::updateResolutionControls() {
             SendMessageW(followMouseMonitorCheck_, BM_SETCHECK, BST_UNCHECKED, 0);
         }
     }
-    const BOOL editableSize =
-        (mode == ResolutionMode::Custom || (followFocusedMonitor && mode == ResolutionMode::Native)) ? TRUE : FALSE;
+    const BOOL editableSize = (mode == ResolutionMode::Custom) ? TRUE : FALSE;
     EnableWindow(widthEdit_, editableSize);
     EnableWindow(heightEdit_, editableSize);
 }

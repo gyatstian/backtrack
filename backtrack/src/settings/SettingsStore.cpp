@@ -153,7 +153,6 @@ bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height
         width = 3840;
         height = 2160;
         return true;
-    case ResolutionMode::Native:
     case ResolutionMode::Custom:
         break;
     }
@@ -459,8 +458,6 @@ VideoCodec codecFromName(const std::wstring& value) {
 
 const wchar_t* resolutionModeName(ResolutionMode mode) {
     switch (mode) {
-    case ResolutionMode::Native:
-        return L"native";
     case ResolutionMode::P240:
         return L"240p";
     case ResolutionMode::P480:
@@ -476,7 +473,7 @@ const wchar_t* resolutionModeName(ResolutionMode mode) {
     case ResolutionMode::Custom:
         return L"custom";
     }
-    return L"native";
+    return L"1080p";
 }
 
 ResolutionMode resolutionModeFromName(const std::wstring& value) {
@@ -501,7 +498,12 @@ ResolutionMode resolutionModeFromName(const std::wstring& value) {
     if (value == L"custom" || value == L"CUSTOM") {
         return ResolutionMode::Custom;
     }
-    return ResolutionMode::Native;
+    // Legacy "native" mode was removed. Preserve the persisted width/height by
+    // migrating to Custom (which keeps the explicit size) rather than a preset.
+    if (value == L"native" || value == L"NATIVE") {
+        return ResolutionMode::Custom;
+    }
+    return ResolutionMode::P1080;
 }
 
 const wchar_t* encoderPresetName(EncoderPreset preset) {

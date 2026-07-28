@@ -698,6 +698,7 @@ HWND MainWindow::addSectionLabel(const wchar_t* text, int x, int y, int width) {
 void MainWindow::buildSettingsPage() {
     if (!settingsDirty_) {
         settings_ = controller_.settings();
+        savedSettings_ = settings_;
     }
     buildSettingsCategoryTabs(78);
     buildSettingsCategoryBody();
@@ -837,11 +838,23 @@ void MainWindow::buildSettingsVideoPage() {
     addSection(L"Quality");
     addRowLabel(L"Resolution");
     resolutionModeCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 220, kResolutionModeComboId);
-    for (const wchar_t* label : {L"Native display", L"240p", L"480p", L"720p", L"1080p", L"2K", L"4K", L"Custom size"}) {
+    for (const wchar_t* label : {L"240p", L"480p", L"720p", L"1080p", L"2K", L"4K", L"Custom size"}) {
         SendMessageW(resolutionModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
     }
+    // Append one entry per monitor after the presets. Selecting one sets encode
+    // width/height to that monitor's native size (resolution shortcut only; it
+    // does not change which monitor is captured).
+    resolutionMonitorEntries_ = enumerateMonitors();
+    for (const MonitorEnumEntry& monitor : resolutionMonitorEntries_) {
+        std::wstring label = std::to_wstring(monitor.width) + L"x" + std::to_wstring(monitor.height) +
+            L" " + monitor.deviceName;
+        if (monitor.primary) {
+            label = L"MAIN " + label;
+        }
+        SendMessageW(resolutionModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+    }
     SendMessageW(resolutionModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.resolutionMode), 0);
-    addSettingHelp(resolutionModeCombo_, 0, 0, L"Native records at captured display size. Presets scale to fixed 16:9 encode sizes. Custom enables Width and Height.");
+    addSettingHelp(resolutionModeCombo_, 0, 0, L"Presets scale to fixed 16:9 encode sizes. Monitor entries match that display's native size. Custom enables Width and Height.");
     y += kRowHeight;
 
     if (settings_.video.resolutionMode == ResolutionMode::Custom) {
@@ -1179,6 +1192,7 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
 void MainWindow::buildCapturePage() {
     if (!settingsDirty_) {
         settings_ = controller_.settings();
+        savedSettings_ = settings_;
     }
 
     constexpr int kX = 44;

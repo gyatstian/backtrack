@@ -127,6 +127,9 @@ constexpr COLORREF kFavorite = RGB(255, 213, 74);
 constexpr COLORREF kFavoriteText = RGB(22, 18, 6);
 constexpr COLORREF kOutline = RGB(70, 76, 88);
 constexpr COLORREF kTabActiveOutline = RGB(120, 168, 230);
+// Distinct dark fill for the Save Settings button so it stands out from the
+// panel-colored sections behind it.
+constexpr COLORREF kSaveButton = RGB(10, 9, 8);
 constexpr int kListClipItemHeight = 30;
 constexpr int kGalleryClipColumns = 3;
 constexpr int kGalleryClipMinimumItemHeight = 220;

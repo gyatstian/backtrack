@@ -71,6 +71,21 @@ void MainWindow::layoutWindow() {
         }
     }
 
+    if (updateButton_) {
+        constexpr int kUpdateButtonWidth = 150;
+        constexpr int kUpdateButtonHeight = 32;
+        const int x = std::max(kOuterMargin, clientWidth - kOuterMargin - kUpdateButtonWidth);
+        const int y = std::max(pageTop, pageBottom - kLayoutPadding - kUpdateButtonHeight);
+        changed = moveWindowIfChanged(updateButton_, x, y, kUpdateButtonWidth, kUpdateButtonHeight) || changed;
+        if (updateAvailable_) {
+            changed = showWindowIfHidden(updateButton_) || changed;
+            SetWindowPos(updateButton_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        } else if (IsWindowVisible(updateButton_)) {
+            ShowWindow(updateButton_, SW_HIDE);
+            changed = true;
+        }
+    }
+
     changed = layoutCurrentPage() || changed;
     if (changed) {
         InvalidateRect(window_, nullptr, FALSE);

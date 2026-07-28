@@ -380,7 +380,8 @@ bool isButtonId(WPARAM id) {
            controlId == kFavoriteClipButtonId ||
            controlId == kClipListViewButtonId ||
            controlId == kClipGalleryViewButtonId ||
-           controlId == kSaveLogButtonId;
+           controlId == kSaveLogButtonId ||
+           controlId == kUpdateButtonId;
 }
 
 bool isSoundSeparationMuteButtonId(int controlId) {

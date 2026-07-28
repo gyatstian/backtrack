@@ -343,6 +343,13 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kSaveLogButtonId:
             saveLog();
             return 0;
+        case kUpdateButtonId: {
+            constexpr wchar_t kReleasesUrl[] = L"https://github.com/gyatstian/backtrack/releases";
+            if (!shellExecuteSucceeded(ShellExecuteW(window_, L"open", kReleasesUrl, nullptr, nullptr, SW_SHOWNORMAL))) {
+                setStatus(L"Could not open releases page");
+            }
+            return 0;
+        }
         case kOpenLogFolderButtonId: {
             const auto logPath = Logger::instance().currentPath();
             if (logPath.empty()) {
@@ -430,6 +437,9 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     }
     case kLeagueKillDetectedMessage:
         handleLeagueKillDetected();
+        return 0;
+    case kUpdateCheckCompleteMessage:
+        handleUpdateCheckComplete(wParam != 0);
         return 0;
     case kClipThumbnailReadyMessage: {
         std::unique_ptr<ThumbnailResult> result(reinterpret_cast<ThumbnailResult*>(lParam));
@@ -583,6 +593,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         KillTimer(window_, kDiagnosticsTimerId);
         diagnosticsTimerActive_ = false;
         clearControllerBusyTimer();
+        stopUpdateCheck();
         removeTrayIcon();
         hotkeys_.unregisterHotkeys(window_);
         stopGameIntegrations();
@@ -661,7 +672,7 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool selected = selectedTab || selectedLibraryView || selectedSettingsCategory;
     const bool hovered = !pressed && !disabled && item.hwndItem == hoveredButton_;
-    const bool saveButton = controlId == kSaveSettingsButtonId;
+    const bool saveButton = controlId == kSaveSettingsButtonId || controlId == kUpdateButtonId;
     const COLORREF textColor = disabled ? kMutedText : kText;
 
     HBRUSH brush = controlBrush_;
@@ -670,7 +681,7 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
     } else if (selected) {
         brush = tabActiveBrush_ ? tabActiveBrush_ : selectionBrush_;
     } else if (saveButton) {
-        // Distinct dark accent so the Save button stands apart from the
+        // Distinct dark accent so Save/Update actions stand apart from the
         // surrounding kPanel sections instead of blending in.
         brush = saveButtonBrush_ ? saveButtonBrush_ : controlBrush_;
     } else if (hovered) {

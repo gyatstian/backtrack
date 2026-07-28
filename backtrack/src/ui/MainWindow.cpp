@@ -3,6 +3,7 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
+#include "core/AppVersion.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -17,6 +18,7 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <uxtheme.h>
+#include <winhttp.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -28,11 +30,165 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <sstream>
+#include <string_view>
 #include <unordered_set>
 #include <utility>
 
 namespace backtrack {
+namespace {
+
+constexpr wchar_t kGithubHost[] = L"api.github.com";
+constexpr wchar_t kLatestReleasePath[] = L"/repos/gyatstian/backtrack/releases/latest";
+
+struct InternetHandle {
+    HINTERNET value = nullptr;
+
+    InternetHandle() = default;
+    explicit InternetHandle(HINTERNET handle)
+        : value(handle) {
+    }
+    ~InternetHandle() {
+        if (value) {
+            WinHttpCloseHandle(value);
+        }
+    }
+
+    InternetHandle(const InternetHandle&) = delete;
+    InternetHandle& operator=(const InternetHandle&) = delete;
+
+    explicit operator bool() const {
+        return value != nullptr;
+    }
+};
+
+size_t skipJsonWhitespace(std::string_view json, size_t pos) {
+    while (pos < json.size()) {
+        const char ch = json[pos];
+        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+            break;
+        }
+        ++pos;
+    }
+    return pos;
+}
+
+std::optional<std::wstring> parseJsonStringAt(std::string_view json, size_t quotePos) {
+    if (quotePos >= json.size() || json[quotePos] != '"') {
+        return std::nullopt;
+    }
+
+    std::string value;
+    bool escaped = false;
+    for (size_t index = quotePos + 1; index < json.size(); ++index) {
+        const char ch = json[index];
+        if (escaped) {
+            value.push_back(ch);
+            escaped = false;
+            continue;
+        }
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            return utf8ToWide(value);
+        }
+        value.push_back(ch);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::wstring> latestReleaseVersionFromJson(std::string_view json) {
+    constexpr std::string_view kTagField = "\"tag_name\"";
+    const size_t field = json.find(kTagField);
+    if (field == std::string_view::npos) {
+        return std::nullopt;
+    }
+    size_t pos = json.find(':', field + kTagField.size());
+    if (pos == std::string_view::npos) {
+        return std::nullopt;
+    }
+    pos = skipJsonWhitespace(json, pos + 1);
+    return parseJsonStringAt(json, pos);
+}
+
+std::optional<std::wstring> fetchLatestReleaseVersion() {
+    InternetHandle session(WinHttpOpen(
+        L"Backtrack/1.0.5",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS,
+        0));
+    if (!session) {
+        return std::nullopt;
+    }
+
+    WinHttpSetTimeouts(session.value, 2000, 2000, 2000, 2000);
+
+    InternetHandle connection(WinHttpConnect(session.value, kGithubHost, INTERNET_DEFAULT_HTTPS_PORT, 0));
+    if (!connection) {
+        return std::nullopt;
+    }
+
+    InternetHandle request(WinHttpOpenRequest(
+        connection.value,
+        L"GET",
+        kLatestReleasePath,
+        nullptr,
+        WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE));
+    if (!request) {
+        return std::nullopt;
+    }
+
+    constexpr wchar_t kHeaders[] =
+        L"User-Agent: Backtrack/1.0.5\r\n"
+        L"Accept: application/vnd.github+json\r\n"
+        L"X-GitHub-Api-Version: 2022-11-28\r\n";
+    if (!WinHttpSendRequest(request.value, kHeaders, static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+        !WinHttpReceiveResponse(request.value, nullptr)) {
+        return std::nullopt;
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusCodeSize = sizeof(statusCode);
+    if (!WinHttpQueryHeaders(
+            request.value,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX,
+            &statusCode,
+            &statusCodeSize,
+            WINHTTP_NO_HEADER_INDEX) ||
+        statusCode != 200) {
+        return std::nullopt;
+    }
+
+    std::string body;
+    for (;;) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.value, &available)) {
+            return std::nullopt;
+        }
+        if (available == 0) {
+            break;
+        }
+        const size_t offset = body.size();
+        body.resize(offset + available);
+        DWORD read = 0;
+        if (!WinHttpReadData(request.value, body.data() + offset, available, &read)) {
+            return std::nullopt;
+        }
+        body.resize(offset + read);
+    }
+
+    return latestReleaseVersionFromJson(body);
+}
+
+} // namespace
+
 MainWindow::MainWindow(RecorderController& controller, SettingsStore& settingsStore)
     : controller_(controller),
       settingsStore_(settingsStore),
@@ -52,6 +208,7 @@ MainWindow::MainWindow(RecorderController& controller, SettingsStore& settingsSt
 }
 
 MainWindow::~MainWindow() {
+    stopUpdateCheck();
     stopGameIntegrations();
     stopThumbnailWorker();
     stopControllerWorker();
@@ -199,6 +356,7 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     setDefaultFont(status_);
     applyDarkTheme(status_);
     displayedStatusText_ = statusText_;
+    createUpdateButton();
     switchPage(Page::Capture);
     layoutWindow();
 
@@ -216,6 +374,7 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : initialShowCommand);
     UpdateWindow(window_);
     addTrayIcon();
+    startUpdateCheck();
     if (settings_.replay.enabled) {
         setStatus(L"Starting replay buffer...");
     }
@@ -226,6 +385,62 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     action.hotkeyError = hotkeyError;
     queueControllerAction(std::move(action), L"Recorder is starting");
     return true;
+}
+
+void MainWindow::createUpdateButton() {
+    updateButton_ = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Update available",
+        WS_CHILD | WS_CLIPSIBLINGS | BS_OWNERDRAW | WS_TABSTOP,
+        0,
+        0,
+        150,
+        32,
+        window_,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kUpdateButtonId)),
+        nullptr,
+        nullptr);
+    setDefaultFont(updateButton_);
+    applyDarkTheme(updateButton_);
+}
+
+void MainWindow::startUpdateCheck() {
+    if (updateCheckThread_.joinable()) {
+        return;
+    }
+    updateCheckStopping_.store(false);
+    updateCheckThread_ = std::thread([this] {
+        const auto latestVersion = fetchLatestReleaseVersion();
+        if (!latestVersion) {
+            Logger::instance().debug(L"ui", L"Update check failed");
+            return;
+        }
+
+        const bool updateAvailable = *latestVersion != kCurrentAppVersion;
+        Logger::instance().info(
+            L"ui",
+            std::wstring(L"Latest release: ") + *latestVersion + L"; current: " + std::wstring(kCurrentAppVersion));
+        if (!updateCheckStopping_.load() && window_ && IsWindow(window_)) {
+            PostMessageW(window_, kUpdateCheckCompleteMessage, updateAvailable ? 1 : 0, 0);
+        }
+    });
+}
+
+void MainWindow::stopUpdateCheck() {
+    updateCheckStopping_.store(true);
+    if (updateCheckThread_.joinable()) {
+        updateCheckThread_.join();
+    }
+}
+
+void MainWindow::handleUpdateCheckComplete(bool updateAvailable) {
+    updateAvailable_ = updateAvailable;
+    if (updateButton_) {
+        EnableWindow(updateButton_, updateAvailable ? TRUE : FALSE);
+        ShowWindow(updateButton_, updateAvailable ? SW_SHOW : SW_HIDE);
+    }
+    layoutWindow();
 }
 
 int MainWindow::runMessageLoop() {

@@ -164,6 +164,10 @@ private:
     HWND addControl(const wchar_t* className, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id);
     HWND addSectionLabel(const wchar_t* text, int x, int y, int width);
     void setDefaultFont(HWND control);
+    void createUpdateButton();
+    void startUpdateCheck();
+    void stopUpdateCheck();
+    void handleUpdateCheckComplete(bool updateAvailable);
 
     void buildSettingsPage();
     void buildSettingsCategoryTabs(int y);
@@ -282,6 +286,7 @@ private:
     std::vector<HWND> settingsCategoryButtons_;
     HWND status_ = nullptr;
     HWND saveSettingsButton_ = nullptr;
+    HWND updateButton_ = nullptr;
     HWND startStopButton_ = nullptr;
     HFONT font_ = nullptr;
     HFONT headingFont_ = nullptr;
@@ -372,6 +377,7 @@ private:
     bool trayVisible_ = false;
     bool exitFromTray_ = false;
     bool settingsDirty_ = false;
+    bool updateAvailable_ = false;
     bool buildingPage_ = false;
     bool diagnosticsTimerActive_ = false;
     LibraryViewMode libraryViewMode_ = LibraryViewMode::List;
@@ -411,6 +417,8 @@ private:
     bool controllerWorkerStopping_ = false;
     bool controllerBusyTimerActive_ = false;
     std::wstring controllerBusyStatus_;
+    std::thread updateCheckThread_;
+    std::atomic<bool> updateCheckStopping_{false};
     std::thread thumbnailWorker_;
     std::mutex thumbnailQueueMutex_;
     std::condition_variable thumbnailQueueCv_;

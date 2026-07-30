@@ -125,6 +125,9 @@ void MainWindow::updateStats() {
         stream << L"Encoded keyframes: " << stats.encoder.keyFrames << L"\r\n";
         stream << L"Replay packets: " << stats.replayVideoPackets << L"\r\n";
         stream << L"Replay keyframes: " << stats.replayKeyFrames << L"\r\n";
+        const auto voiceStats = voiceCommandService_.stats();
+        stream << L"Voice command: " << voiceStats.status << L"\r\n";
+        stream << L"Voice accepted/rejected: " << voiceStats.accepted << L"/" << voiceStats.rejected << L"\r\n";
         stream << L"Average encode: " << stats.encoder.averageEncodeMs << L" ms";
         setText(statsLabel_, stream.str());
     }

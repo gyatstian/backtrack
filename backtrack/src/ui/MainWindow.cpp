@@ -657,7 +657,10 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         }
         result.ok = result.savedReplay;
         result.refreshLibrary = result.savedReplay;
-        playActionIndicator(result.savedReplay ? MB_OK : MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
+        playActionIndicator(
+            result.savedReplay ? MB_OK : MB_ICONHAND,
+            controller_.settings().notificationSoundVolumePercent,
+            result.savedReplay ? controller_.settings().customNotificationSoundPath : std::filesystem::path{});
         if (result.savedReplay) {
             result.status = action.replayTag.empty()
                 ? L"Replay saved"

@@ -41,23 +41,29 @@ void MainWindow::handleHotkey(int id) {
             setStatus(controller_.isRecording() ? L"Stopping recording..." : L"Starting recording...");
         }
     } else if (id == HotkeyService::kSaveReplayId) {
-        ControllerAction action;
-        action.kind = ControllerActionKind::SaveReplay;
-        const auto now = SteadyClock::now();
-        if (killClipTagDeadline_ != SteadyClock::time_point::min()) {
-            if (now <= killClipTagDeadline_) {
-                action.replayTag = L"Kill clip";
-            } else {
-                killClipTagDeadline_ = SteadyClock::time_point::min();
-            }
+        requestSaveReplay(L"hotkey");
+    }
+}
+
+void MainWindow::requestSaveReplay(const wchar_t* source) {
+    ControllerAction action;
+    action.kind = ControllerActionKind::SaveReplay;
+    const auto now = SteadyClock::now();
+    if (killClipTagDeadline_ != SteadyClock::time_point::min()) {
+        if (now <= killClipTagDeadline_) {
+            action.replayTag = L"Kill clip";
+        } else {
+            killClipTagDeadline_ = SteadyClock::time_point::min();
         }
-        const bool taggingKillClip = !action.replayTag.empty();
-        if (queueControllerAction(std::move(action), L"Recorder is busy; replay hotkey ignored")) {
-            if (taggingKillClip) {
-                killClipTagDeadline_ = SteadyClock::time_point::min();
-            }
-            setStatus(taggingKillClip ? L"Saving kill clip..." : L"Saving replay...");
+    }
+    const bool taggingKillClip = !action.replayTag.empty();
+    const std::wstring busyStatus = std::wstring(L"Recorder is busy; replay ") + source + L" ignored";
+    if (queueControllerAction(std::move(action), busyStatus)) {
+        if (taggingKillClip) {
+            killClipTagDeadline_ = SteadyClock::time_point::min();
         }
+        Logger::instance().info(L"ui", std::wstring(L"Replay requested by ") + source);
+        setStatus(taggingKillClip ? L"Saving kill clip..." : L"Saving replay...");
     }
 }
 
@@ -72,10 +78,22 @@ void MainWindow::updateGameIntegrations() {
     } else {
         leagueIntegration_.stop();
     }
+    if (settings_.gameIntegrations.discordRichPresence !=
+        GameIntegrationSettings::DiscordRichPresenceMode::Off) {
+        discordRichPresence_.start(settings_.gameIntegrations.discordRichPresence);
+    } else {
+        discordRichPresence_.stop();
+    }
+    voiceCommandService_.configure(
+        window_,
+        settings_.gameIntegrations.voiceCommand,
+        settings_.replay.enabled);
 }
 
 void MainWindow::stopGameIntegrations() {
+    voiceCommandService_.stop();
     leagueIntegration_.stop();
+    discordRichPresence_.stop();
 }
 
 void MainWindow::handleLeagueKillDetected() {

@@ -116,6 +116,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.notificationSoundVolumePercent =
             readUIntControl(notificationSoundVolumeEdit_, target.notificationSoundVolumePercent);
     }
+    if (customNotificationSoundEdit_) {
+        target.customNotificationSoundPath = trimText(readText(customNotificationSoundEdit_));
+    }
     if (encoderPresetCombo_) {
         const auto selected = SendMessageW(encoderPresetCombo_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= 6) {
@@ -221,6 +224,20 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     if (leagueKillReminderCheck_) {
         target.gameIntegrations.leagueOfLegendsKillReminder =
             SendMessageW(leagueKillReminderCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
+    if (voiceCommandCombo_) {
+        const LRESULT selected = SendMessageW(voiceCommandCombo_, CB_GETCURSEL, 0, 0);
+        if (selected >= 0 && selected <= 2) {
+            target.gameIntegrations.voiceCommand =
+                static_cast<GameIntegrationSettings::VoiceCommandMode>(selected);
+        }
+    }
+    if (discordRichPresenceCombo_) {
+        const LRESULT selected = SendMessageW(discordRichPresenceCombo_, CB_GETCURSEL, 0, 0);
+        if (selected >= 0 && selected <= 2) {
+            target.gameIntegrations.discordRichPresence =
+                static_cast<GameIntegrationSettings::DiscordRichPresenceMode>(selected);
+        }
     }
     if (soundSeparationEnabledCheck_) {
         target.soundSeparationEnabled = SendMessageW(soundSeparationEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -900,6 +917,55 @@ void MainWindow::browseClipFolder() {
         markSettingsDirty();
     }
     CoTaskMemFree(item);
+}
+
+void MainWindow::browseCustomNotificationSound() {
+    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        setStatus(L"Sound picker could not open");
+        return;
+    }
+
+    COMDLG_FILTERSPEC filters[] = {
+        {L"WAV files", L"*.wav"},
+        {L"All files", L"*.*"},
+    };
+    dialog->SetTitle(L"Choose custom notification sound");
+    dialog->SetFileTypes(static_cast<UINT>(_countof(filters)), filters);
+    dialog->SetFileTypeIndex(1);
+    dialog->SetDefaultExtension(L"wav");
+
+    hr = dialog->Show(window_);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        return;
+    }
+    if (FAILED(hr)) {
+        setStatus(L"Sound picker failed");
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<IShellItem> item;
+    hr = dialog->GetResult(&item);
+    if (FAILED(hr) || !item) {
+        setStatus(L"No sound file selected");
+        return;
+    }
+
+    PWSTR rawPath = nullptr;
+    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
+    if (FAILED(hr) || !rawPath) {
+        CoTaskMemFree(rawPath);
+        setStatus(L"Selected sound path could not be read");
+        return;
+    }
+
+    const std::wstring path(rawPath);
+    CoTaskMemFree(rawPath);
+    if (customNotificationSoundEdit_) {
+        setText(customNotificationSoundEdit_, path);
+        markSettingsDirty();
+    }
 }
 
 } // namespace backtrack

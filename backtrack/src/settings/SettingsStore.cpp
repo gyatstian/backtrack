@@ -254,6 +254,8 @@ AppSettings SettingsStore::load() const {
     settings.logLevel = logLevelFromName(readString(values, L"diagnostics.logLevel", logLevelName(settings.logLevel)), settings.logLevel);
     settings.notificationSoundVolumePercent =
         readUInt(values, L"general.notificationSoundVolumePercent", settings.notificationSoundVolumePercent);
+    settings.customNotificationSoundPath =
+        readString(values, L"general.customNotificationSoundPath", settings.customNotificationSoundPath.wstring());
     settings.monitorIndex = readUInt(values, L"capture.monitorIndex", settings.monitorIndex);
     settings.multiMonitorSupport = readBool(values, L"capture.multiMonitorSupport", settings.followFocusedMonitor);
     settings.followFocusedMonitor = readBool(values, L"capture.followFocusedMonitor", settings.followFocusedMonitor);
@@ -275,6 +277,24 @@ AppSettings SettingsStore::load() const {
     settings.hotkeys.startStopVirtualKey = readUInt(values, L"hotkeys.startStop.vk", settings.hotkeys.startStopVirtualKey);
     settings.hotkeys.saveReplayModifiers = readUInt(values, L"hotkeys.saveReplay.modifiers", settings.hotkeys.saveReplayModifiers);
     settings.hotkeys.saveReplayVirtualKey = readUInt(values, L"hotkeys.saveReplay.vk", settings.hotkeys.saveReplayVirtualKey);
+    settings.gameIntegrations.voiceCommand = voiceCommandModeFromName(
+        readString(values, L"integrations.voiceCommand", voiceCommandModeName(settings.gameIntegrations.voiceCommand)));
+    {
+        const std::wstring raw = readString(
+            values,
+            L"integrations.discordRichPresence",
+            discordRichPresenceModeName(settings.gameIntegrations.discordRichPresence));
+        // Legacy bool values from older settings files: 1/true -> Always, 0/false -> Off.
+        if (raw == L"1" || raw == L"true") {
+            settings.gameIntegrations.discordRichPresence =
+                GameIntegrationSettings::DiscordRichPresenceMode::Always;
+        } else if (raw == L"0" || raw == L"false") {
+            settings.gameIntegrations.discordRichPresence =
+                GameIntegrationSettings::DiscordRichPresenceMode::Off;
+        } else {
+            settings.gameIntegrations.discordRichPresence = discordRichPresenceModeFromName(raw);
+        }
+    }
 
     return sanitizeSettings(settings);
 }
@@ -316,6 +336,9 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"replay.enabled=" << (normalized.replay.enabled ? 1 : 0) << L"\n";
     output << L"replay.seconds=" << normalized.replay.seconds << L"\n";
     output << L"integrations.leagueOfLegends.killReminder=" << (normalized.gameIntegrations.leagueOfLegendsKillReminder ? 1 : 0) << L"\n";
+    output << L"integrations.voiceCommand=" << voiceCommandModeName(normalized.gameIntegrations.voiceCommand) << L"\n";
+    output << L"integrations.discordRichPresence="
+           << discordRichPresenceModeName(normalized.gameIntegrations.discordRichPresence) << L"\n";
     output << L"gpu.adaptiveMode=" << gpuAdaptiveModeName(normalized.gpu.adaptiveMode) << L"\n";
     output << L"gpu.wgcZeroCopy=" << (normalized.gpu.wgcZeroCopy ? 1 : 0) << L"\n";
     output << L"gpu.frameQueueLimit=" << normalized.gpu.frameQueueLimit << L"\n";
@@ -341,6 +364,7 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
     output << L"diagnostics.logLevel=" << logLevelName(normalized.logLevel) << L"\n";
     output << L"general.notificationSoundVolumePercent=" << normalized.notificationSoundVolumePercent << L"\n";
+    output << L"general.customNotificationSoundPath=" << normalized.customNotificationSoundPath.wstring() << L"\n";
     output << L"capture.monitorIndex=" << normalized.monitorIndex << L"\n";
     output << L"capture.multiMonitorSupport=" << (normalized.multiMonitorSupport ? 1 : 0) << L"\n";
     output << L"capture.followFocusedMonitor=" << (normalized.followFocusedMonitor ? 1 : 0) << L"\n";
@@ -688,6 +712,50 @@ GameCaptureMode gameCaptureModeFromName(const std::wstring& value) {
         return GameCaptureMode::On;
     }
     return GameCaptureMode::Auto;
+}
+
+const wchar_t* voiceCommandModeName(GameIntegrationSettings::VoiceCommandMode mode) {
+    switch (mode) {
+    case GameIntegrationSettings::VoiceCommandMode::Disabled:
+        return L"disabled";
+    case GameIntegrationSettings::VoiceCommandMode::ClipThat:
+        return L"clip-that";
+    case GameIntegrationSettings::VoiceCommandMode::RecordVideo:
+        return L"record-video";
+    }
+    return L"disabled";
+}
+
+GameIntegrationSettings::VoiceCommandMode voiceCommandModeFromName(const std::wstring& value) {
+    if (value == L"clip-that") {
+        return GameIntegrationSettings::VoiceCommandMode::ClipThat;
+    }
+    if (value == L"record-video") {
+        return GameIntegrationSettings::VoiceCommandMode::RecordVideo;
+    }
+    return GameIntegrationSettings::VoiceCommandMode::Disabled;
+}
+
+const wchar_t* discordRichPresenceModeName(GameIntegrationSettings::DiscordRichPresenceMode mode) {
+    switch (mode) {
+    case GameIntegrationSettings::DiscordRichPresenceMode::Always:
+        return L"always";
+    case GameIntegrationSettings::DiscordRichPresenceMode::FullscreenOnly:
+        return L"fullscreen-only";
+    case GameIntegrationSettings::DiscordRichPresenceMode::Off:
+        return L"off";
+    }
+    return L"off";
+}
+
+GameIntegrationSettings::DiscordRichPresenceMode discordRichPresenceModeFromName(const std::wstring& value) {
+    if (value == L"always") {
+        return GameIntegrationSettings::DiscordRichPresenceMode::Always;
+    }
+    if (value == L"fullscreen-only") {
+        return GameIntegrationSettings::DiscordRichPresenceMode::FullscreenOnly;
+    }
+    return GameIntegrationSettings::DiscordRichPresenceMode::Off;
 }
 
 } // namespace backtrack

@@ -38,5 +38,9 @@ const wchar_t* captureBackendName(CaptureBackend backend);
 CaptureBackend captureBackendFromName(const std::wstring& value);
 const wchar_t* gameCaptureModeName(GameCaptureMode mode);
 GameCaptureMode gameCaptureModeFromName(const std::wstring& value);
+const wchar_t* voiceCommandModeName(GameIntegrationSettings::VoiceCommandMode mode);
+GameIntegrationSettings::VoiceCommandMode voiceCommandModeFromName(const std::wstring& value);
+const wchar_t* discordRichPresenceModeName(GameIntegrationSettings::DiscordRichPresenceMode mode);
+GameIntegrationSettings::DiscordRichPresenceMode discordRichPresenceModeFromName(const std::wstring& value);
 
 } // namespace backtrack

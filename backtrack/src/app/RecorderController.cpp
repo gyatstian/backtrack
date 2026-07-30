@@ -373,6 +373,29 @@ bool RecorderController::initialize(AppSettings settings) {
 
 bool RecorderController::updateSettings(AppSettings settings) {
     settings = sanitizeSettings(std::move(settings));
+    bool startReplayPipeline = false;
+    {
+        std::scoped_lock lock(stateMutex_);
+        AppSettings currentWithoutVoice = settings_;
+        currentWithoutVoice.gameIntegrations.voiceCommand = settings.gameIntegrations.voiceCommand;
+        if (currentWithoutVoice == settings) {
+            settings_.gameIntegrations.voiceCommand = settings.gameIntegrations.voiceCommand;
+            // Startup queues updateSettings with identical settings after initialize().
+            // Still start the replay pipeline on that path; otherwise the first save
+            // only has the cold-start IDR (one frame / 0:00).
+            if (settings_.replay.enabled && !pipelineRunning_.load()) {
+                startReplayPipeline = true;
+            } else {
+                Logger::instance().info(L"recorder", L"Applied voice command setting without restarting capture pipeline");
+                return true;
+            }
+        }
+    }
+    if (startReplayPipeline) {
+        Logger::instance().info(L"recorder",
+            L"Settings unchanged; starting capture pipeline because replay is enabled and pipeline is stopped");
+        return ensurePipeline();
+    }
     const bool wasRunning = pipelineRunning_.load();
     const bool wasRecording = recording_.load();
     Logger::instance().info(L"recorder", std::wstring(L"Applying recorder settings: pipelineRunning=") + (wasRunning ? L"yes" : L"no") +

@@ -331,6 +331,15 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kBrowseClipFolderButtonId:
             browseClipFolder();
             return 0;
+        case kBrowseCustomNotificationSoundButtonId:
+            browseCustomNotificationSound();
+            return 0;
+        case kResetCustomNotificationSoundButtonId:
+            if (customNotificationSoundEdit_) {
+                setText(customNotificationSoundEdit_, L"");
+                markSettingsDirty();
+            }
+            return 0;
         case kSoundSeparationRefreshButtonId:
             refreshSoundSeparationApps();
             return 0;
@@ -440,6 +449,9 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         return 0;
     case kUpdateCheckCompleteMessage:
         handleUpdateCheckComplete(wParam != 0);
+        return 0;
+    case kVoiceCommandMessage:
+        requestSaveReplay(L"voice command");
         return 0;
     case kClipThumbnailReadyMessage: {
         std::unique_ptr<ThumbnailResult> result(reinterpret_cast<ThumbnailResult*>(lParam));

@@ -168,7 +168,21 @@ struct HotkeySettings {
 };
 
 struct GameIntegrationSettings {
+    enum class VoiceCommandMode {
+        Disabled,
+        ClipThat,
+        RecordVideo,
+    };
+
+    enum class DiscordRichPresenceMode {
+        Always,
+        FullscreenOnly,
+        Off,
+    };
+
     bool leagueOfLegendsKillReminder = false;
+    VoiceCommandMode voiceCommand = VoiceCommandMode::Disabled;
+    DiscordRichPresenceMode discordRichPresence = DiscordRichPresenceMode::Off;
     bool operator==(const GameIntegrationSettings&) const = default;
 };
 
@@ -203,6 +217,8 @@ struct AppSettings {
     bool pruneStaleMicrophoneConsentEntries = false;
     bool exitToTray = false;
     uint32_t notificationSoundVolumePercent = 100;
+    // Empty = built-in success tone. Used when a replay saves successfully.
+    std::filesystem::path customNotificationSoundPath;
     bool libraryGalleryView = false;
     uint32_t monitorIndex = 0;
     bool multiMonitorSupport = false;

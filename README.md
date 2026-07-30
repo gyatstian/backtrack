@@ -10,9 +10,6 @@ the goal was to create as lightweight clipping software as possible and i did so
   <img src="capture.png" alt="Screenshot" width="500">
 </div>
 
-## why
-i use nvidia and hate the bloat that comes with shadowplay, idk if works on a completely clean install but i used nvcleanstall with almost no dependencies and works purrfectly
-
 ## amd
 i dont use amd, some features might not work. dont expect much
 
@@ -20,16 +17,15 @@ i dont use amd, some features might not work. dont expect much
 Q: how well does it work<br>
 A: it works thankyou for the qeustion
 
-## issues
-i might fix or i might not fix. but feel free to report anything, i dont murder people.
-
 ## cool features
-- customization of the gpu settigns
-- multi-monitor support: the clip follows the focused monitor, pretty cool i'd say (can be turned off)
+- customization of the gpu/encoding settigns
+- multi-monitor support
 - library and you can drag out clips from it, it's cool, i recommend to change to gallery as its even more cool. you can favorite cool stuff which is pretty damn cool
-- sound separation (you can disable spotify and other stuff
-- cool icon that im proud of myself
-- game integrations (only LoL works, and it only beeps. i amde it beacuse i forget to clip on kills)
+- sound separation (you can disable spotify and other stuff)
+- cool icon
+- game integrations (only lol)
+- discord rpc
+- voice commands
 
 ## defaults
 

@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <cwctype>
+#include <filesystem>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -369,8 +370,10 @@ bool isButtonId(WPARAM id) {
            (controlId >= kSoundSeparationRemoveButtonBaseId && controlId < kSoundSeparationRemoveButtonBaseId + 512) ||
            controlId == kStartStopButtonId ||
            controlId == kSaveSettingsButtonId ||
-           controlId == kBrowseClipFolderButtonId ||
-           controlId == kSaveReplayButtonId ||
+            controlId == kBrowseClipFolderButtonId ||
+            controlId == kBrowseCustomNotificationSoundButtonId ||
+            controlId == kResetCustomNotificationSoundButtonId ||
+            controlId == kSaveReplayButtonId ||
            controlId == kRecoverFailedRecordingButtonId ||
            controlId == kSoundSeparationRefreshButtonId ||
            controlId == kSoundSeparationManualButtonId ||
@@ -414,6 +417,7 @@ bool isSettingsControlId(int controlId) {
     case kPruneStaleMicrophoneConsentEntriesCheckId:
     case kExitToTrayCheckId:
     case kNotificationSoundVolumeEditId:
+    case kCustomNotificationSoundEditId:
     case kEncoderPresetComboId:
     case kEncoderModeComboId:
     case kEncoderProfileComboId:
@@ -448,6 +452,8 @@ bool isSettingsControlId(int controlId) {
     case kReplaySecondsEditId:
     case kReplayHotkeyId:
     case kLeagueKillReminderCheckId:
+    case kVoiceCommandComboId:
+    case kDiscordRichPresenceComboId:
     case kSoundSeparationEnabledCheckId:
         return true;
     default:
@@ -732,7 +738,104 @@ const std::vector<uint8_t>& actionIndicatorWav(UINT type) {
     return attention;
 }
 
-void playActionIndicator(UINT type, uint32_t volumePercent) {
+std::vector<uint8_t> loadWavFile(const std::filesystem::path& path) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+        return {};
+    }
+    const auto fileSize = std::filesystem::file_size(path, error);
+    if (error || fileSize < 44 || fileSize > 8 * 1024 * 1024) {
+        return {};
+    }
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+
+    std::vector<uint8_t> bytes(static_cast<size_t>(fileSize));
+    DWORD bytesRead = 0;
+    const BOOL ok = ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &bytesRead, nullptr);
+    CloseHandle(file);
+    if (!ok || bytesRead != bytes.size()) {
+        return {};
+    }
+    if (bytes.size() < 12 ||
+        std::memcmp(bytes.data(), "RIFF", 4) != 0 ||
+        std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
+        return {};
+    }
+    return bytes;
+}
+
+size_t findWavPcmDataOffset(const std::vector<uint8_t>& wav, uint16_t& bitsPerSample) {
+    bitsPerSample = 0;
+    if (wav.size() < 44) {
+        return 0;
+    }
+
+    size_t offset = 12;
+    size_t dataOffset = 0;
+    uint32_t dataSize = 0;
+    while (offset + 8 <= wav.size()) {
+        const char* chunkId = reinterpret_cast<const char*>(wav.data() + offset);
+        const uint32_t chunkSize =
+            static_cast<uint32_t>(wav[offset + 4]) |
+            (static_cast<uint32_t>(wav[offset + 5]) << 8) |
+            (static_cast<uint32_t>(wav[offset + 6]) << 16) |
+            (static_cast<uint32_t>(wav[offset + 7]) << 24);
+        const size_t payload = offset + 8;
+        if (payload + chunkSize > wav.size()) {
+            break;
+        }
+        if (std::memcmp(chunkId, "fmt ", 4) == 0 && chunkSize >= 16) {
+            const uint16_t formatTag =
+                static_cast<uint16_t>(wav[payload]) | (static_cast<uint16_t>(wav[payload + 1]) << 8);
+            bitsPerSample =
+                static_cast<uint16_t>(wav[payload + 14]) | (static_cast<uint16_t>(wav[payload + 15]) << 8);
+            if (formatTag != 1 || bitsPerSample != 16) {
+                bitsPerSample = 0;
+            }
+        } else if (std::memcmp(chunkId, "data", 4) == 0) {
+            dataOffset = payload;
+            dataSize = chunkSize;
+            break;
+        }
+        offset = payload + chunkSize + (chunkSize & 1u);
+    }
+    if (dataOffset == 0 || bitsPerSample != 16 || dataOffset + dataSize > wav.size()) {
+        return 0;
+    }
+    return dataOffset;
+}
+
+void applyWavVolume(std::vector<uint8_t>& wav, uint32_t volumePercent) {
+    if (volumePercent >= 100 || wav.size() <= 44) {
+        return;
+    }
+    uint16_t bitsPerSample = 0;
+    const size_t dataOffset = findWavPcmDataOffset(wav, bitsPerSample);
+    if (dataOffset == 0) {
+        return;
+    }
+    const double gain = static_cast<double>(volumePercent) / 100.0;
+    for (size_t offset = dataOffset; offset + 1 < wav.size(); offset += 2) {
+        const auto sample = static_cast<int16_t>(
+            static_cast<uint16_t>(wav[offset]) | (static_cast<uint16_t>(wav[offset + 1]) << 8));
+        const auto adjusted = static_cast<int16_t>(std::lround(static_cast<double>(sample) * gain));
+        wav[offset] = static_cast<uint8_t>(static_cast<uint16_t>(adjusted) & 0xff);
+        wav[offset + 1] = static_cast<uint8_t>((static_cast<uint16_t>(adjusted) >> 8) & 0xff);
+    }
+}
+
+void playActionIndicator(UINT type, uint32_t volumePercent, const std::filesystem::path& customSuccessSoundPath) {
     volumePercent = std::min<uint32_t>(volumePercent, 100);
     if (volumePercent == 0) {
         return;
@@ -744,18 +847,22 @@ void playActionIndicator(UINT type, uint32_t volumePercent) {
     std::lock_guard<std::mutex> lock(playMutex);
     PlaySoundW(nullptr, nullptr, 0);
 
+    if (type == MB_OK && !customSuccessSoundPath.empty()) {
+        auto customWav = loadWavFile(customSuccessSoundPath);
+        if (!customWav.empty()) {
+            applyWavVolume(customWav, volumePercent);
+            scaled = std::move(customWav);
+            if (PlaySoundW(reinterpret_cast<LPCWSTR>(scaled.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {
+                return;
+            }
+        }
+    }
+
     const auto& wav = actionIndicatorWav(type);
     const std::vector<uint8_t>* playback = &wav;
     if (volumePercent < 100 && wav.size() > 44) {
         scaled = wav;
-        const double gain = static_cast<double>(volumePercent) / 100.0;
-        for (size_t offset = 44; offset + 1 < scaled.size(); offset += 2) {
-            const auto sample = static_cast<int16_t>(
-                static_cast<uint16_t>(scaled[offset]) | (static_cast<uint16_t>(scaled[offset + 1]) << 8));
-            const auto adjusted = static_cast<int16_t>(std::lround(static_cast<double>(sample) * gain));
-            scaled[offset] = static_cast<uint8_t>(static_cast<uint16_t>(adjusted) & 0xff);
-            scaled[offset + 1] = static_cast<uint8_t>((static_cast<uint16_t>(adjusted) >> 8) & 0xff);
-        }
+        applyWavVolume(scaled, volumePercent);
         playback = &scaled;
     }
 

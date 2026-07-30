@@ -248,6 +248,55 @@ std::wstring foregroundApplicationName() {
     return sanitizeFileNamePart(std::move(name));
 }
 
+namespace {
+
+struct FullscreenEnumContext {
+    bool coversAnyMonitor = false;
+};
+
+BOOL CALLBACK fullscreenMonitorEnumProc(HMONITOR monitor, HDC, LPRECT, LPARAM lParam) {
+    auto* context = reinterpret_cast<FullscreenEnumContext*>(lParam);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) {
+        return TRUE;
+    }
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground || !IsWindowVisible(foreground) || IsIconic(foreground)) {
+        // foreground invalid for the whole enum; stop iterating.
+        return FALSE;
+    }
+    RECT windowRect{};
+    if (!GetWindowRect(foreground, &windowRect)) {
+        return TRUE;
+    }
+    if (windowRect.left <= info.rcMonitor.left &&
+        windowRect.top <= info.rcMonitor.top &&
+        windowRect.right >= info.rcMonitor.right &&
+        windowRect.bottom >= info.rcMonitor.bottom) {
+        context->coversAnyMonitor = true;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+} // namespace
+
+bool foregroundWindowIsFullscreen() {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground || !IsWindow(foreground) || !IsWindowVisible(foreground) || IsIconic(foreground)) {
+        return false;
+    }
+    // Skip child/owned windows; they are never the fullscreen application surface.
+    if (GetWindow(foreground, GW_OWNER) ||
+        (GetWindowLongPtrW(foreground, GWL_STYLE) & WS_CHILD) != 0) {
+        return false;
+    }
+    FullscreenEnumContext context;
+    EnumDisplayMonitors(nullptr, nullptr, fullscreenMonitorEnumProc, reinterpret_cast<LPARAM>(&context));
+    return context.coversAnyMonitor;
+}
+
 void setThreadDescriptionSafe(const wchar_t* description) {
     using SetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PCWSTR);
     static auto fn = reinterpret_cast<SetThreadDescriptionFn>(

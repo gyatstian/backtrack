@@ -37,6 +37,10 @@ std::filesystem::path localAppDataPath();
 std::filesystem::path defaultClipDirectory();
 std::wstring makeTimestampedFileName(const wchar_t* prefix, const wchar_t* extension);
 std::wstring foregroundApplicationName();
+// Returns true when the foreground window covers an entire monitor (borderless
+// / exclusive fullscreen on any display). Used by Discord Rich Presence to
+// restrict activity updates to fullscreen games.
+bool foregroundWindowIsFullscreen();
 void setThreadDescriptionSafe(const wchar_t* description);
 HANDLE enableMmcssForCaptureThread();
 void disableMmcssForThread(HANDLE handle);

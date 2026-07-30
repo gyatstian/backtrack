@@ -99,6 +99,7 @@ void MainWindow::rebindPageControlPointers() {
     replaySecondsEdit_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
+    discordRichPresenceCombo_ = nullptr;
     statsLabel_ = nullptr;
     capsLabel_ = nullptr;
     diagnosticLogLabel_ = nullptr;
@@ -125,6 +126,7 @@ void MainWindow::rebindPageControlPointers() {
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
+    customNotificationSoundEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
     encoderModeCombo_ = nullptr;
     encoderProfileCombo_ = nullptr;
@@ -151,6 +153,8 @@ void MainWindow::rebindPageControlPointers() {
     soundSeparationAppCombo_ = nullptr;
     soundSeparationRefreshButton_ = nullptr;
     soundSeparationManualButton_ = nullptr;
+    voiceCommandCombo_ = nullptr;
+    discordRichPresenceCombo_ = nullptr;
     soundSeparationRowsY_ = 0;
 
     if (!pageHost_) {
@@ -188,6 +192,7 @@ void MainWindow::rebindPageControlPointers() {
     pruneStaleMicrophoneConsentEntriesCheck_ = child(kPruneStaleMicrophoneConsentEntriesCheckId);
     exitToTrayCheck_ = child(kExitToTrayCheckId);
     notificationSoundVolumeEdit_ = child(kNotificationSoundVolumeEditId);
+    customNotificationSoundEdit_ = child(kCustomNotificationSoundEditId);
     encoderPresetCombo_ = child(kEncoderPresetComboId);
     encoderModeCombo_ = child(kEncoderModeComboId);
     encoderProfileCombo_ = child(kEncoderProfileComboId);
@@ -215,6 +220,8 @@ void MainWindow::rebindPageControlPointers() {
     soundSeparationRefreshButton_ = child(kSoundSeparationRefreshButtonId);
     soundSeparationManualButton_ = child(kSoundSeparationManualButtonId);
     leagueKillReminderCheck_ = child(kLeagueKillReminderCheckId);
+    voiceCommandCombo_ = child(kVoiceCommandComboId);
+    discordRichPresenceCombo_ = child(kDiscordRichPresenceComboId);
     statsLabel_ = child(kStatsLabelId);
     capsLabel_ = child(kCapsLabelId);
     diagnosticLogLabel_ = child(kDiagnosticLogLabelId);
@@ -479,6 +486,7 @@ void MainWindow::clearPageControls() {
     replaySecondsEdit_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
+    discordRichPresenceCombo_ = nullptr;
     statsLabel_ = nullptr;
     capsLabel_ = nullptr;
     diagnosticLogLabel_ = nullptr;
@@ -506,6 +514,7 @@ void MainWindow::clearPageControls() {
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
+    customNotificationSoundEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
     encoderModeCombo_ = nullptr;
     encoderProfileCombo_ = nullptr;
@@ -585,6 +594,7 @@ void MainWindow::clearSettingsBodyControls() {
     codecCombo_ = nullptr;
     clipFolderEdit_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
+    discordRichPresenceCombo_ = nullptr;
     fpsEdit_ = nullptr;
     resolutionModeCombo_ = nullptr;
     widthEdit_ = nullptr;
@@ -603,6 +613,7 @@ void MainWindow::clearSettingsBodyControls() {
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
+    customNotificationSoundEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
     encoderModeCombo_ = nullptr;
     encoderProfileCombo_ = nullptr;
@@ -743,7 +754,7 @@ void MainWindow::buildSettingsCategoryTabs(int y) {
     constexpr int kTabWidth = 150;
     constexpr int kTabHeight = 30;
     constexpr int kTabGap = 8;
-    const wchar_t* labels[] = {L"App", L"Capture", L"Video", L"Audio", L"Game integrations"};
+    const wchar_t* labels[] = {L"App", L"Capture", L"Video", L"Audio", L"Integrations"};
 
     settingsCategoryButtons_.clear();
     for (int index = 0; index < kSettingsCategoryCount; ++index) {
@@ -1076,6 +1087,36 @@ void MainWindow::buildSettingsAudioPage() {
     addRowLabel(L"Notification volume");
     notificationSoundVolumeEdit_ = addControl(L"EDIT", std::to_wstring(settings_.notificationSoundVolumePercent).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, 96, 24, kNotificationSoundVolumeEditId);
     y += kRowHeight;
+    addRowLabel(L"Custom notification sound");
+    constexpr int kSoundPathWidth = kComboWidth - 188;
+    customNotificationSoundEdit_ = addControl(
+        L"EDIT",
+        settings_.customNotificationSoundPath.wstring().c_str(),
+        WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP,
+        kControlX,
+        y,
+        kSoundPathWidth,
+        24,
+        kCustomNotificationSoundEditId);
+    addControl(
+        L"BUTTON",
+        L"Browse",
+        BS_PUSHBUTTON | WS_TABSTOP,
+        kControlX + kSoundPathWidth + 8,
+        y - 2,
+        80,
+        30,
+        kBrowseCustomNotificationSoundButtonId);
+    addControl(
+        L"BUTTON",
+        L"Reset",
+        BS_PUSHBUTTON | WS_TABSTOP,
+        kControlX + kSoundPathWidth + 96,
+        y - 2,
+        72,
+        30,
+        kResetCustomNotificationSoundButtonId);
+    y += kRowHeight;
 
     finishSection();
     addSection(L"Devices");
@@ -1163,6 +1204,7 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
     constexpr int kControlX = 224;
     constexpr int kControlWidth = 430;
     constexpr int kRowHeight = 42;
+    constexpr int kSectionGap = 22;
     int y = 128;
 
     auto addRowLabel = [&](const wchar_t* text) {
@@ -1170,11 +1212,14 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
     };
     auto addSection = [&](const wchar_t* text) {
         addSectionLabel(text, kX, y, 260);
-        y += 36;
+        y += 38;
+    };
+    auto finishSection = [&]() {
+        y += kSectionGap;
     };
 
-    addSection(L"Game integrations");
-    addRowLabel(L"League of Legends");
+    addSection(L"League of Legends");
+    addRowLabel(L"Kill reminder");
     leagueKillReminderCheck_ = addControl(
         L"BUTTON",
         L"Beep on champion kills",
@@ -1186,6 +1231,60 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         kLeagueKillReminderCheckId);
     SendMessageW(leagueKillReminderCheck_, BM_SETCHECK, settings_.gameIntegrations.leagueOfLegendsKillReminder ? BST_CHECKED : BST_UNCHECKED, 0);
     addSettingHelp(leagueKillReminderCheck_, 0, 0, L"Polls League's local live-client API during active games. When your champion scores a kill, Backtrack beeps; if you save replay within 6 seconds, the clip is tagged as Kill clip.");
+    y += kRowHeight;
+    finishSection();
+
+    addSection(L"Voice command");
+    addRowLabel(L"Trigger phrase");
+    voiceCommandCombo_ = addControl(
+        WC_COMBOBOXW,
+        L"",
+        CBS_DROPDOWNLIST | WS_TABSTOP,
+        kControlX,
+        y,
+        kControlWidth,
+        120,
+        kVoiceCommandComboId);
+    SendMessageW(voiceCommandCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Off"));
+    SendMessageW(voiceCommandCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Backtrack clip that"));
+    SendMessageW(voiceCommandCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Record video"));
+    SendMessageW(
+        voiceCommandCombo_,
+        CB_SETCURSEL,
+        static_cast<int>(settings_.gameIntegrations.voiceCommand),
+        0);
+    addSettingHelp(
+        voiceCommandCombo_,
+        0,
+        0,
+        L"Uses offline Windows speech recognition for one exact phrase (Backtrack clip that or Record video). Either phrase saves the current replay buffer; Record video does not start continuous recording. Audio is not uploaded or stored by Backtrack.");
+    y += kRowHeight;
+    finishSection();
+
+    addSection(L"Discord");
+    addRowLabel(L"Rich presence");
+    discordRichPresenceCombo_ = addControl(
+        WC_COMBOBOXW,
+        L"",
+        CBS_DROPDOWNLIST | WS_TABSTOP,
+        kControlX,
+        y,
+        kControlWidth,
+        120,
+        kDiscordRichPresenceComboId);
+    SendMessageW(discordRichPresenceCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Always"));
+    SendMessageW(discordRichPresenceCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Only on fullscreen apps/games"));
+    SendMessageW(discordRichPresenceCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Never"));
+    SendMessageW(
+        discordRichPresenceCombo_,
+        CB_SETCURSEL,
+        static_cast<int>(settings_.gameIntegrations.discordRichPresence),
+        0);
+    addSettingHelp(
+        discordRichPresenceCombo_,
+        0,
+        0,
+        L"Shows \"Clipping <game>\" on Discord with a button leading to the github repo.");
     y += kRowHeight;
 }
 

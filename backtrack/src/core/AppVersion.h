@@ -4,6 +4,6 @@
 
 namespace backtrack {
 
-constexpr std::wstring_view kCurrentAppVersion = L"v1.0.5";
+constexpr std::wstring_view kCurrentAppVersion = L"v1.1";
 
 } // namespace backtrack

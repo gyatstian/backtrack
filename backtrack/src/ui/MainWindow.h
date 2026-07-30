@@ -3,9 +3,11 @@
 #include "app/RecorderController.h"
 #include "clips/ClipManager.h"
 #include "hotkeys/HotkeyService.h"
+#include "integrations/DiscordRichPresence.h"
 #include "integrations/LeagueOfLegendsIntegration.h"
 #include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
+#include "voice/VoiceCommandService.h"
 
 #include <Windows.h>
 
@@ -219,6 +221,7 @@ private:
     void updateResolutionControls();
     void updateStartupRegistration();
     void browseClipFolder();
+    void browseCustomNotificationSound();
     void saveLog();
     void updateStats();
     void refreshClips();
@@ -243,6 +246,7 @@ private:
     void toggleSelectedFavorite();
     std::filesystem::path selectedClipPath() const;
     void handleHotkey(int id);
+    void requestSaveReplay(const wchar_t* source);
     bool handleShortcut(MSG& message);
     void updateGameIntegrations();
     void stopGameIntegrations();
@@ -278,6 +282,8 @@ private:
     ClipManager clipManager_;
     HotkeyService hotkeys_;
     LeagueOfLegendsIntegration leagueIntegration_;
+    DiscordRichPresence discordRichPresence_;
+    VoiceCommandService voiceCommandService_;
 
     HWND window_ = nullptr;
     HWND pageHost_ = nullptr;
@@ -316,6 +322,8 @@ private:
     HWND replaySecondsEdit_ = nullptr;
     HWND replayHotkey_ = nullptr;
     HWND leagueKillReminderCheck_ = nullptr;
+    HWND voiceCommandCombo_ = nullptr;
+    HWND discordRichPresenceCombo_ = nullptr;
     HWND statsLabel_ = nullptr;
     HWND capsLabel_ = nullptr;
     HWND diagnosticLogLabel_ = nullptr;
@@ -348,6 +356,7 @@ private:
     HWND pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     HWND exitToTrayCheck_ = nullptr;
     HWND notificationSoundVolumeEdit_ = nullptr;
+    HWND customNotificationSoundEdit_ = nullptr;
     HWND encoderPresetCombo_ = nullptr;
     HWND encoderModeCombo_ = nullptr;
     HWND encoderProfileCombo_ = nullptr;

@@ -130,6 +130,7 @@ target_link_libraries(Backtrack PRIVATE
     uuid
     winmm
     winhttp
+    sapi
     psapi)
 
 if (MSVC AND DEFINED CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION AND DEFINED ENV{WindowsSdkDir})

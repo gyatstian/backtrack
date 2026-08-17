@@ -352,6 +352,7 @@ private:
     HWND inputDeviceCombo_ = nullptr;
     HWND outputVolumeEdit_ = nullptr;
     HWND inputVolumeEdit_ = nullptr;
+    HWND inputAutoGainCheck_ = nullptr;
     HWND startWithWindowsCheck_ = nullptr;
     HWND pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     HWND exitToTrayCheck_ = nullptr;

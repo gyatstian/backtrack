@@ -758,9 +758,9 @@ bool WasapiCapture::start(CaptureOptions options, AudioPacketCallback callback) 
     // while activation fails asynchronously, causing callers that poll
     // running() to retry (and re-log) every cycle forever.
     const bool started = startedFuture.get();
-    if (!started && thread_.joinable()) {
-        thread_.join();
-    }
+    // Do not join on failure: the capture thread stays alive and keeps retrying
+    // to reconnect (a failed first activation can still succeed later when the
+    // device comes back). It is reaped by stop() or by a subsequent start().
     return started;
 }
 
@@ -815,189 +815,276 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
     HRESULT hr = com.result();
     ScopedMmcssTask mmcss(L"Pro Audio", AVRT_PRIORITY_HIGH);
 
-    Microsoft::WRL::ComPtr<IAudioClient> audioClient;
-    if (options.processLoopback) {
-        hr = activateProcessLoopbackAudioClient(options.processId, options.processLoopbackMode, &audioClient);
-        if (FAILED(hr)) {
-            Logger::instance().warning(L"audio", L"Process loopback capture could not start for PID " +
-                                       std::to_wstring(options.processId) + L": " + hresultToString(hr));
-            running_ = false;
-            return;
-        }
-    } else {
-        Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
-        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
-        if (FAILED(hr)) {
-            Logger::instance().error(L"audio", L"CoCreateInstance(MMDeviceEnumerator) failed: " + hresultToString(hr));
-            running_ = false;
-            return;
-        }
+    // A WASAPI capture client dies with AUDCLNT_E_DEVICE_INVALIDATED whenever the
+    // endpoint disappears or Windows switches default devices (headset unplugged,
+    // Bluetooth drop, device swapped). If the thread just stopped there the
+    // settings checkbox would stay "on" while no audio ever reached the replay
+    // buffer again. Instead, rebuild the audio client and reconnect with backoff
+    // so a recovered or newly selected device is picked up automatically.
+    constexpr int64_t kMaxReconnectDelayMs = 2000;
+    int64_t reconnectDelayMs = 250;
+    unsigned reconnectCount = 0;
 
-        Microsoft::WRL::ComPtr<IMMDevice> endpoint;
-        if (!options.deviceId.empty()) {
-            hr = enumerator->GetDevice(options.deviceId.c_str(), &endpoint);
-            if (FAILED(hr)) {
-                Logger::instance().warning(L"audio", std::wstring(L"Configured audio device was not found for ") + trackName(track) + L"; falling back to default");
-            }
-        }
-        if (!endpoint) {
-            hr = enumerator->GetDefaultAudioEndpoint(dataFlowFor(track), eConsole, &endpoint);
-        }
-        if (FAILED(hr)) {
-            Logger::instance().error(L"audio", std::wstring(L"GetDefaultAudioEndpoint failed for ") + trackName(track) + L": " + hresultToString(hr));
-            running_ = false;
-            return;
-        }
-
-        hr = endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &audioClient);
-        if (FAILED(hr)) {
-            Logger::instance().error(L"audio", L"IMMDevice::Activate(IAudioClient) failed: " + hresultToString(hr));
-            running_ = false;
-            return;
-        }
-    }
-
-    WAVEFORMATEX* rawMixFormat = nullptr;
-    hr = audioClient->GetMixFormat(&rawMixFormat);
-    std::unique_ptr<WAVEFORMATEX, WaveFormatDeleter> mixFormat(rawMixFormat);
-    if (FAILED(hr) || !mixFormat) {
-        Logger::instance().error(L"audio", L"IAudioClient::GetMixFormat failed: " + hresultToString(hr));
+    // Waits out the backoff (interruptibly, via wakeEvent_, so stop() wakes the
+    // thread immediately) and returns true when another connection attempt should
+    // run, or false when stop() was requested while waiting.
+    auto reconnectBackoff = [&](bool wasCapturing) -> bool {
         running_ = false;
-        return;
-    }
+        signalStarted(false);
+        const int64_t delayMs = reconnectDelayMs;
+        ++reconnectCount;
+        if (reconnectCount == 1) {
+            Logger::instance().info(L"audio",
+                std::wstring(wasCapturing ? L"WASAPI capture session lost for " : L"WASAPI capture could not start for ") +
+                trackName(track) + L"; retrying in " + std::to_wstring(delayMs) + L"ms");
+        } else {
+            Logger::instance().debug(L"audio",
+                std::wstring(L"WASAPI capture reconnect attempt ") + std::to_wstring(reconnectCount) +
+                L" for " + trackName(track) + L" pending; next retry in " + std::to_wstring(delayMs) + L"ms");
+        }
+        if (WaitForSingleObject(wakeEvent_, static_cast<DWORD>(delayMs)) == WAIT_OBJECT_0 && stopRequested_) {
+            return false;
+        }
+        reconnectDelayMs = std::min<int64_t>(reconnectDelayMs * 2, kMaxReconnectDelayMs);
+        return true;
+    };
 
-    const auto streamFormat = std::make_shared<const WaveFormatBlob>(copyWaveFormat(mixFormat.get()));
-    {
-        std::scoped_lock lock(formatMutex_);
-        format_ = *streamFormat;
-    }
-
-    constexpr REFERENCE_TIME bufferDuration = 10'000'000;
-    DWORD streamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-    if (track == AudioTrack::System || options.processLoopback) {
-        streamFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
-    }
-
-    hr = audioClient->Initialize(
-        AUDCLNT_SHAREMODE_SHARED,
-        streamFlags,
-        bufferDuration,
-        0,
-        mixFormat.get(),
-        nullptr);
-    if (FAILED(hr)) {
-        Logger::instance().error(L"audio", std::wstring(L"IAudioClient::Initialize failed for ") + trackName(track) + L": " + hresultToString(hr));
-        running_ = false;
-        return;
-    }
-
-    hr = audioClient->SetEventHandle(wakeEvent_);
-    if (FAILED(hr)) {
-        Logger::instance().warning(L"audio", L"IAudioClient::SetEventHandle failed; capture will use timed polling: " + hresultToString(hr));
-    }
-
-    Microsoft::WRL::ComPtr<IAudioCaptureClient> captureClient;
-    hr = audioClient->GetService(IID_PPV_ARGS(&captureClient));
-    if (FAILED(hr)) {
-        Logger::instance().error(L"audio", L"IAudioClient::GetService(IAudioCaptureClient) failed: " + hresultToString(hr));
-        running_ = false;
-        return;
-    }
-
-    hr = audioClient->Start();
-    if (FAILED(hr)) {
-        Logger::instance().error(L"audio", L"IAudioClient::Start failed: " + hresultToString(hr));
-        running_ = false;
-        return;
-    }
-
-    Logger::instance().info(L"audio", std::wstring(L"WASAPI capture started for ") + trackName(track));
-    running_ = true;
-    signalStarted(true);
-
-    const int64_t qpcCalibration100ns = qpcNow100ns();
-    const bool hasQpcCalibration = qpcCalibration100ns > 0;
-    const int64_t qpcToSteadyOffset100ns = hasQpcCalibration
-        ? steadyNow100ns() - qpcCalibration100ns
-        : 0;
-
-    int64_t nextPacketPts100ns = -1;
     while (!stopRequested_) {
-        WaitForSingleObject(wakeEvent_, 20);
+        Microsoft::WRL::ComPtr<IAudioClient> audioClient;
+        if (options.processLoopback) {
+            hr = activateProcessLoopbackAudioClient(options.processId, options.processLoopbackMode, &audioClient);
+            if (FAILED(hr)) {
+                if (reconnectCount == 0) {
+                    Logger::instance().warning(L"audio", L"Process loopback capture could not start for PID " +
+                                               std::to_wstring(options.processId) + L": " + hresultToString(hr));
+                }
+                if (!reconnectBackoff(false)) {
+                    break;
+                }
+                continue;
+            }
+        } else {
+            Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+            hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+            if (FAILED(hr)) {
+                if (reconnectCount == 0) {
+                    Logger::instance().error(L"audio", L"CoCreateInstance(MMDeviceEnumerator) failed: " + hresultToString(hr));
+                }
+                if (!reconnectBackoff(false)) {
+                    break;
+                }
+                continue;
+            }
 
-        UINT32 packetFrames = 0;
-        hr = captureClient->GetNextPacketSize(&packetFrames);
-        if (FAILED(hr)) {
-            Logger::instance().warning(L"audio", L"GetNextPacketSize failed: " + hresultToString(hr));
-            break;
+            Microsoft::WRL::ComPtr<IMMDevice> endpoint;
+            if (!options.deviceId.empty()) {
+                hr = enumerator->GetDevice(options.deviceId.c_str(), &endpoint);
+                if (FAILED(hr) && reconnectCount == 0) {
+                    Logger::instance().warning(L"audio", std::wstring(L"Configured audio device was not found for ") + trackName(track) + L"; falling back to default");
+                }
+            }
+            if (!endpoint) {
+                hr = enumerator->GetDefaultAudioEndpoint(dataFlowFor(track), eConsole, &endpoint);
+            }
+            if (FAILED(hr)) {
+                if (reconnectCount == 0) {
+                    Logger::instance().error(L"audio", std::wstring(L"GetDefaultAudioEndpoint failed for ") + trackName(track) + L": " + hresultToString(hr));
+                }
+                if (!reconnectBackoff(false)) {
+                    break;
+                }
+                continue;
+            }
+
+            hr = endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &audioClient);
+            if (FAILED(hr)) {
+                if (reconnectCount == 0) {
+                    Logger::instance().error(L"audio", L"IMMDevice::Activate(IAudioClient) failed: " + hresultToString(hr));
+                }
+                if (!reconnectBackoff(false)) {
+                    break;
+                }
+                continue;
+            }
         }
 
-        while (packetFrames > 0) {
-            BYTE* data = nullptr;
-            UINT32 framesAvailable = 0;
-            DWORD flags = 0;
-            UINT64 devicePosition = 0;
-            UINT64 qpcPosition = 0;
-
-            hr = captureClient->GetBuffer(&data, &framesAvailable, &flags, &devicePosition, &qpcPosition);
-            if (FAILED(hr)) {
-                Logger::instance().warning(L"audio", L"IAudioCaptureClient::GetBuffer failed: " + hresultToString(hr));
+        WAVEFORMATEX* rawMixFormat = nullptr;
+        hr = audioClient->GetMixFormat(&rawMixFormat);
+        std::unique_ptr<WAVEFORMATEX, WaveFormatDeleter> mixFormat(rawMixFormat);
+        if (FAILED(hr) || !mixFormat) {
+            if (reconnectCount == 0) {
+                Logger::instance().error(L"audio", L"IAudioClient::GetMixFormat failed: " + hresultToString(hr));
+            }
+            if (!reconnectBackoff(false)) {
                 break;
             }
+            continue;
+        }
 
-            const size_t byteCount = static_cast<size_t>(framesAvailable) * mixFormat->nBlockAlign;
-            AudioPacket packet;
-            packet.track = track;
-            packet.processId = options.processId;
-            packet.frameCount = framesAvailable;
-            const int64_t packetDuration100ns = mixFormat->nSamplesPerSec > 0
-                ? static_cast<int64_t>(
-                      (static_cast<int64_t>(framesAvailable) * kHundredNanosecondsPerSecond) /
-                      mixFormat->nSamplesPerSec)
-                : 0;
-            const bool timestampError = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0;
-            const int64_t capturedPts100ns = !timestampError && hasQpcCalibration && qpcPosition != 0
-                ? std::max<int64_t>(0, static_cast<int64_t>(qpcPosition) + qpcToSteadyOffset100ns)
-                : std::max<int64_t>(0, steadyNow100ns() - packetDuration100ns);
-            packet.format = streamFormat;
+        const auto streamFormat = std::make_shared<const WaveFormatBlob>(copyWaveFormat(mixFormat.get()));
+        {
+            std::scoped_lock lock(formatMutex_);
+            format_ = *streamFormat;
+        }
 
-            const bool hasTimeline = nextPacketPts100ns >= 0;
-            const bool discontinuity = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
-            const int64_t drift100ns = hasTimeline ? capturedPts100ns - nextPacketPts100ns : 0;
-            const bool resyncTimeline =
-                !hasTimeline ||
-                discontinuity ||
-                drift100ns < -kAudioTimestampResyncThreshold100ns ||
-                drift100ns > kAudioTimestampResyncThreshold100ns;
-            packet.pts100ns = resyncTimeline ? capturedPts100ns : nextPacketPts100ns;
-            nextPacketPts100ns = packet.pts100ns + packetDuration100ns;
+        constexpr REFERENCE_TIME bufferDuration = 10'000'000;
+        DWORD streamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        if (track == AudioTrack::System || options.processLoopback) {
+            streamFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+        }
 
-            if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data) {
-                packet.bytes.assign(byteCount, 0);
-            } else {
-                packet.bytes.assign(data, data + byteCount);
+        hr = audioClient->Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            streamFlags,
+            bufferDuration,
+            0,
+            mixFormat.get(),
+            nullptr);
+        if (FAILED(hr)) {
+            if (reconnectCount == 0) {
+                Logger::instance().error(L"audio", std::wstring(L"IAudioClient::Initialize failed for ") + trackName(track) + L": " + hresultToString(hr));
             }
-
-            hr = captureClient->ReleaseBuffer(framesAvailable);
-            if (FAILED(hr)) {
-                Logger::instance().warning(L"audio", L"IAudioCaptureClient::ReleaseBuffer failed: " + hresultToString(hr));
-                packetFrames = 0;
-                callback(std::move(packet));
+            if (!reconnectBackoff(false)) {
                 break;
             }
+            continue;
+        }
 
-            callback(std::move(packet));
+        hr = audioClient->SetEventHandle(wakeEvent_);
+        if (FAILED(hr) && reconnectCount == 0) {
+            Logger::instance().warning(L"audio", L"IAudioClient::SetEventHandle failed; capture will use timed polling: " + hresultToString(hr));
+        }
 
+        Microsoft::WRL::ComPtr<IAudioCaptureClient> captureClient;
+        hr = audioClient->GetService(IID_PPV_ARGS(&captureClient));
+        if (FAILED(hr)) {
+            if (reconnectCount == 0) {
+                Logger::instance().error(L"audio", L"IAudioClient::GetService(IAudioCaptureClient) failed: " + hresultToString(hr));
+            }
+            if (!reconnectBackoff(false)) {
+                break;
+            }
+            continue;
+        }
+
+        hr = audioClient->Start();
+        if (FAILED(hr)) {
+            if (reconnectCount == 0) {
+                Logger::instance().error(L"audio", L"IAudioClient::Start failed: " + hresultToString(hr));
+            }
+            if (!reconnectBackoff(false)) {
+                break;
+            }
+            continue;
+        }
+
+        const bool reconnected = reconnectCount > 0;
+        reconnectCount = 0;
+        reconnectDelayMs = 250;
+        running_ = true;
+        signalStarted(true);
+        if (reconnected) {
+            Logger::instance().info(L"audio", std::wstring(L"WASAPI capture reconnected for ") + trackName(track));
+        } else {
+            Logger::instance().info(L"audio", std::wstring(L"WASAPI capture started for ") + trackName(track));
+        }
+
+        const int64_t qpcCalibration100ns = qpcNow100ns();
+        const bool hasQpcCalibration = qpcCalibration100ns > 0;
+        const int64_t qpcToSteadyOffset100ns = hasQpcCalibration
+            ? steadyNow100ns() - qpcCalibration100ns
+            : 0;
+
+        int64_t nextPacketPts100ns = -1;
+        bool sessionLost = false;
+        while (!stopRequested_ && !sessionLost) {
+            WaitForSingleObject(wakeEvent_, 20);
+
+            UINT32 packetFrames = 0;
             hr = captureClient->GetNextPacketSize(&packetFrames);
             if (FAILED(hr)) {
-                Logger::instance().warning(L"audio", L"GetNextPacketSize failed after ReleaseBuffer: " + hresultToString(hr));
-                packetFrames = 0;
+                Logger::instance().warning(L"audio", L"GetNextPacketSize failed: " + hresultToString(hr));
+                sessionLost = true;
+                break;
+            }
+
+            while (packetFrames > 0) {
+                BYTE* data = nullptr;
+                UINT32 framesAvailable = 0;
+                DWORD flags = 0;
+                UINT64 devicePosition = 0;
+                UINT64 qpcPosition = 0;
+
+                hr = captureClient->GetBuffer(&data, &framesAvailable, &flags, &devicePosition, &qpcPosition);
+                if (FAILED(hr)) {
+                    Logger::instance().warning(L"audio", L"IAudioCaptureClient::GetBuffer failed: " + hresultToString(hr));
+                    sessionLost = true;
+                    break;
+                }
+
+                const size_t byteCount = static_cast<size_t>(framesAvailable) * mixFormat->nBlockAlign;
+                AudioPacket packet;
+                packet.track = track;
+                packet.processId = options.processId;
+                packet.frameCount = framesAvailable;
+                const int64_t packetDuration100ns = mixFormat->nSamplesPerSec > 0
+                    ? static_cast<int64_t>(
+                          (static_cast<int64_t>(framesAvailable) * kHundredNanosecondsPerSecond) /
+                          mixFormat->nSamplesPerSec)
+                    : 0;
+                const bool timestampError = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0;
+                const int64_t capturedPts100ns = !timestampError && hasQpcCalibration && qpcPosition != 0
+                    ? std::max<int64_t>(0, static_cast<int64_t>(qpcPosition) + qpcToSteadyOffset100ns)
+                    : std::max<int64_t>(0, steadyNow100ns() - packetDuration100ns);
+                packet.format = streamFormat;
+
+                const bool hasTimeline = nextPacketPts100ns >= 0;
+                const bool discontinuity = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
+                const int64_t drift100ns = hasTimeline ? capturedPts100ns - nextPacketPts100ns : 0;
+                const bool resyncTimeline =
+                    !hasTimeline ||
+                    discontinuity ||
+                    drift100ns < -kAudioTimestampResyncThreshold100ns ||
+                    drift100ns > kAudioTimestampResyncThreshold100ns;
+                packet.pts100ns = resyncTimeline ? capturedPts100ns : nextPacketPts100ns;
+                nextPacketPts100ns = packet.pts100ns + packetDuration100ns;
+
+                if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data) {
+                    packet.bytes.assign(byteCount, 0);
+                } else {
+                    packet.bytes.assign(data, data + byteCount);
+                }
+
+                hr = captureClient->ReleaseBuffer(framesAvailable);
+                if (FAILED(hr)) {
+                    Logger::instance().warning(L"audio", L"IAudioCaptureClient::ReleaseBuffer failed: " + hresultToString(hr));
+                    packetFrames = 0;
+                    callback(std::move(packet));
+                    break;
+                }
+
+                callback(std::move(packet));
+
+                hr = captureClient->GetNextPacketSize(&packetFrames);
+                if (FAILED(hr)) {
+                    Logger::instance().warning(L"audio", L"GetNextPacketSize failed after ReleaseBuffer: " + hresultToString(hr));
+                    packetFrames = 0;
+                }
             }
         }
+
+        audioClient->Stop();
+        running_ = false;
+
+        if (sessionLost) {
+            if (!reconnectBackoff(true)) {
+                break;
+            }
+            continue;
+        }
+        break;
     }
 
-    audioClient->Stop();
-    running_ = false;
     Logger::instance().info(L"audio", std::wstring(L"WASAPI capture stopped for ") + trackName(track));
 
 }

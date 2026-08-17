@@ -23,6 +23,8 @@
 
 namespace backtrack {
 
+class MicrophoneAgc;
+
 class RecorderController {
 public:
     RecorderController();
@@ -133,8 +135,13 @@ private:
     std::atomic<uint64_t> discardCompletedGeneration_{0};
     std::atomic<bool> durationUpdatePending_{false};
     std::atomic<bool> forceVideoHeartbeat_{false};
-    std::atomic<uint32_t> audioOutputVolumePercent_{100};
+std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<uint32_t> audioInputVolumePercent_{100};
+    std::atomic<bool> audioInputAutoGain_{false};
+    // Set when the microphone stream restarts or AGC is toggled; the audio
+    // writer resets the AGC envelope on its own thread before the next packet.
+    std::atomic<bool> microphoneAgcResetPending_{true};
+    std::unique_ptr<MicrophoneAgc> microphoneAgc_;
     std::atomic<uint64_t> capturedFrames_{0};
     std::atomic<uint64_t> sourceFrames_{0};
     std::atomic<uint64_t> sourceFramesPerSecond_{0};

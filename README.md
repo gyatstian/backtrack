@@ -17,11 +17,11 @@ i dont use amd, some features might not work. dont expect much
 Q: how well does it work<br>
 A: it works thankyou for the qeustion
 
-## cool features
+## features
 - customization of the gpu/encoding settigns
 - multi-monitor support
-- library and you can drag out clips from it, it's cool, i recommend to change to gallery as its even more cool. you can favorite cool stuff which is pretty damn cool
-- sound separation (you can disable spotify and other stuff)
+- library
+- sound separation (you can disable sound from specific apps)
 - cool icon
 - game integrations (only lol)
 - discord rpc
@@ -34,7 +34,7 @@ A: it works thankyou for the qeustion
 - Clips: `%USERPROFILE%\Videos\Backtrack`
 - Settings/logs: `%LOCALAPPDATA%\Backtrack`
 
-## for anyone that actually cares about the "advanced" stuff (ai generated, im not writing allat myself):
+## for anyone that actually cares about the other things (ai generated, im not writing allat myself):
 ## Features
 
 - **GPU-first pipeline** - Direct3D 11 textures stay on the GPU through capture and encode. No CPU-side image conversion or readback in the capture path.
@@ -140,5 +140,3 @@ The recording and replay hotkeys are configurable in Settings. The clip folder i
 ## Notes
 
 The active implementation uses Direct3D 11 because NVENC can directly register D3D11 textures. WGC and Desktop Duplication both output BGRA D3D11 textures, which are copied GPU-to-GPU into a small texture pool (or passed through directly when WGC zero-copy is enabled) before being registered/mapped by the encoder. A GPU scaler converts each frame to the active encoder's preferred format (BGRA for both NVENC and AMF). Only the compressed H.264/HEVC bitstream is copied back to CPU memory.
-
-See `docs/architecture.md` for the full pipeline diagram, frame lifetime, and threading model.

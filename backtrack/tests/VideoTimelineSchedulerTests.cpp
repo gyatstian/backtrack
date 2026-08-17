@@ -164,6 +164,30 @@ void testResetAndCoalescingGate() {
     expect(afterReset.previousFrameDuration100ns == 0, "reset leaked a preceding sample duration");
 }
 
+void testCoalesceGapRecoveredByNextSubmit() {
+    // Idle coalescing extends the last submitted frame. If that side-channel
+    // update is dropped (encode thread racing), the next submit must re-cover
+    // the same gap through previousFrameDuration so the timeline stays hole-free.
+    VideoTimelineScheduler scheduler(kFrameDuration100ns);
+    constexpr int64_t startPts = 180'000'000;
+
+    const auto first = scheduler.plan(50, startPts, 1, true, false, false);
+    expect(first.action == VideoTimelineAction::Submit, "first source frame was not submitted");
+    scheduler.acceptSubmission(first);
+
+    const auto idle = scheduler.plan(50, startPts + kFrameDuration100ns, 1, true, false, false);
+    expect(idle.action == VideoTimelineAction::Coalesce, "idle frame was not coalesced");
+    expect(idle.coalescedFramePts100ns == startPts, "idle update targeted the wrong sample");
+    expect(idle.coalescedFrameDuration100ns == 2 * kFrameDuration100ns,
+        "idle update did not cover its timeline interval");
+
+    const auto next = scheduler.plan(51, startPts + 4 * kFrameDuration100ns, 1, true, false, false);
+    expect(next.action == VideoTimelineAction::Submit, "new source image was not submitted");
+    expect(next.previousFramePts100ns == startPts, "submit no longer references the coalesced sample");
+    expect(next.previousFrameDuration100ns == 4 * kFrameDuration100ns,
+        "submit did not re-cover the gap the coalesce would have extended");
+}
+
 void testStallHoldPreferCoalesceOverSlideshow() {
     // Simulates exclusive-fullscreen capture stall: same source index for a long
     // gap with forced idle coalescing; only GOP heartbeat should Submit.
@@ -204,6 +228,7 @@ int main() {
         testHeartbeatAndDistinctFrameSubmission();
         testQueueRejectionDoesNotCommitState();
         testResetAndCoalescingGate();
+        testCoalesceGapRecoveredByNextSubmit();
         testStallHoldPreferCoalesceOverSlideshow();
         std::cout << "VideoTimelineScheduler tests passed\n";
         return 0;

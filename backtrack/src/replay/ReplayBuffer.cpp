@@ -383,6 +383,22 @@ size_t ReplayBuffer::videoKeyFrameCount() const {
     return videoKeyFrames_;
 }
 
+int64_t ReplayBuffer::videoSpan100ns() const {
+    std::scoped_lock lock(mutex_);
+    if (video_.empty()) {
+        return 0;
+    }
+    const auto firstKeyFrame = std::find_if(video_.begin(), video_.end(), [](const auto& packet) {
+        return packet->keyFrame;
+    });
+    if (firstKeyFrame == video_.end()) {
+        return 0;
+    }
+    const int64_t newestVideoEndPts =
+        video_.back()->pts100ns + std::max<int64_t>(video_.back()->duration100ns, 0);
+    return std::max<int64_t>(0, newestVideoEndPts - (*firstKeyFrame)->pts100ns);
+}
+
 void ReplayBuffer::trimLocked() {
     if (video_.empty()) {
         systemAudio_.clear();

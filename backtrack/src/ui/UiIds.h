@@ -22,6 +22,7 @@ constexpr int kInputDeviceComboId = 87;
     constexpr int kCustomNotificationSoundEditId = 220;
     constexpr int kBrowseCustomNotificationSoundButtonId = 221;
     constexpr int kResetCustomNotificationSoundButtonId = 222;
+    constexpr int kInputAutoGainCheckId = 223;
 constexpr int kEncoderPresetComboId = 90;
 constexpr int kEncoderModeComboId = 91;
 constexpr int kEncoderProfileComboId = 92;

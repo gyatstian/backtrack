@@ -205,6 +205,9 @@ struct AppSettings {
     std::wstring audioOutputDeviceId;
     uint32_t audioInputVolumePercent = 100;
     uint32_t audioOutputVolumePercent = 100;
+    // Voice-oriented automatic gain control: normalizes quiet microphone streams
+    // (like Discord's own AGC) instead of relying on a fixed manual gain.
+    bool audioInputAutoGainEnabled = false;
     bool soundSeparationEnabled = false;
     struct SoundSeparationApp {
         std::wstring name;

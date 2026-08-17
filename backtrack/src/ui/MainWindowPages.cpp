@@ -122,6 +122,7 @@ void MainWindow::rebindPageControlPointers() {
     inputDeviceCombo_ = nullptr;
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
+    inputAutoGainCheck_ = nullptr;
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
@@ -188,6 +189,7 @@ void MainWindow::rebindPageControlPointers() {
     inputDeviceCombo_ = child(kInputDeviceComboId);
     outputVolumeEdit_ = child(kOutputVolumeEditId);
     inputVolumeEdit_ = child(kInputVolumeEditId);
+    inputAutoGainCheck_ = child(kInputAutoGainCheckId);
     startWithWindowsCheck_ = child(kStartWithWindowsCheckId);
     pruneStaleMicrophoneConsentEntriesCheck_ = child(kPruneStaleMicrophoneConsentEntriesCheckId);
     exitToTrayCheck_ = child(kExitToTrayCheckId);
@@ -510,6 +512,7 @@ void MainWindow::clearPageControls() {
     inputDeviceCombo_ = nullptr;
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
+    inputAutoGainCheck_ = nullptr;
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
@@ -609,6 +612,7 @@ void MainWindow::clearSettingsBodyControls() {
     inputDeviceCombo_ = nullptr;
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
+    inputAutoGainCheck_ = nullptr;
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
@@ -1127,8 +1131,9 @@ void MainWindow::buildSettingsAudioPage() {
     addRowLabel(L"Output device");
     outputDeviceCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kComboWidth, 180, kOutputDeviceComboId);
     y += kRowHeight;
-    addRowLabel(L"Output volume");
+    addRowLabel(L"Desktop gain (%)");
     outputVolumeEdit_ = addControl(L"EDIT", std::to_wstring(settings_.audioOutputVolumePercent).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, 96, 24, kOutputVolumeEditId);
+    addSettingHelp(outputVolumeEdit_, 0, 0, L"Desktop audio gain for recordings and replays. 100% is unchanged; 0% mutes it; up to 200% may clip audio.");
     y += kRowHeight;
     addRowLabel(L"Input audio");
     microphoneCheck_ = addControl(L"BUTTON", L"Capture input audio", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kComboWidth, 24, kMicrophoneCheckId);
@@ -1137,8 +1142,14 @@ void MainWindow::buildSettingsAudioPage() {
     addRowLabel(L"Input device");
     inputDeviceCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kComboWidth, 180, kInputDeviceComboId);
     y += kRowHeight;
-    addRowLabel(L"Input volume");
+    addRowLabel(L"Microphone gain (%)");
     inputVolumeEdit_ = addControl(L"EDIT", std::to_wstring(settings_.audioInputVolumePercent).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, 96, 24, kInputVolumeEditId);
+    addSettingHelp(inputVolumeEdit_, 0, 0, L"Manual microphone gain for recordings and replays. 100% is unchanged; 0% mutes it; up to 200% may clip audio. Raise this to make your microphone louder than desktop audio.");
+    y += kRowHeight;
+    addRowLabel(L"Auto mic gain");
+    inputAutoGainCheck_ = addControl(L"BUTTON", L"Normalize microphone volume (AGC)", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kComboWidth, 24, kInputAutoGainCheckId);
+    SendMessageW(inputAutoGainCheck_, BM_SETCHECK, settings_.audioInputAutoGainEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    addSettingHelp(inputAutoGainCheck_, 0, 0, L"Automatically boosts quiet microphones to a consistent level. Applies after the manual gain above; recommended when the raw microphone level is low.");
     y += kRowHeight;
     loadAudioDeviceCombos();
 

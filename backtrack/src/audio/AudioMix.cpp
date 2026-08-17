@@ -242,17 +242,15 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
         for (uint64_t index = 0; index < framesThisChunk; ++index) {
             for (uint16_t channel = 0; channel < 2; ++channel) {
                 float mixed = 0.0f;
-                uint32_t activeSources = 0;
                 const uint64_t outputFrame = frame + index;
                 for (auto& source : sources) {
                     if (outputFrame < source.outputFrames) {
                         mixed += sourceChannelAt(source, outputFrame, channel, kMuxAudioSampleRate);
-                        ++activeSources;
                     }
                 }
-                if (activeSources > 1) {
-                    mixed /= static_cast<float>(activeSources);
-                }
+                // Sum, do not average: each track's volume/gain is already baked
+                // into its WAV, and averaging would cancel microphone gain against
+                // desktop audio (200% mic would equal desktop, not exceed it).
                 mixed = std::clamp(mixed, -1.0f, 1.0f);
                 chunk.push_back(static_cast<int16_t>(std::lrintf(mixed * 32767.0f)));
             }

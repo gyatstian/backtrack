@@ -413,6 +413,7 @@ bool isSettingsControlId(int controlId) {
     case kInputDeviceComboId:
     case kOutputVolumeEditId:
     case kInputVolumeEditId:
+    case kInputAutoGainCheckId:
     case kStartWithWindowsCheckId:
     case kPruneStaleMicrophoneConsentEntriesCheckId:
     case kExitToTrayCheckId:

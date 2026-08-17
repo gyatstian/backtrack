@@ -233,6 +233,7 @@ AppSettings SettingsStore::load() const {
     settings.audioOutputDeviceId = readString(values, L"audio.outputDeviceId", settings.audioOutputDeviceId);
     settings.audioInputVolumePercent = readUInt(values, L"audio.inputVolumePercent", settings.audioInputVolumePercent);
     settings.audioOutputVolumePercent = readUInt(values, L"audio.outputVolumePercent", settings.audioOutputVolumePercent);
+    settings.audioInputAutoGainEnabled = readBool(values, L"audio.inputAutoGain", settings.audioInputAutoGainEnabled);
     settings.soundSeparationEnabled = readBool(values, L"audio.soundSeparation.enabled", settings.soundSeparationEnabled);
     const uint32_t soundSeparationCount = std::min<uint32_t>(
         readUInt(values, L"audio.soundSeparation.count", 0),
@@ -350,6 +351,7 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"audio.outputDeviceId=" << normalized.audioOutputDeviceId << L"\n";
     output << L"audio.inputVolumePercent=" << normalized.audioInputVolumePercent << L"\n";
     output << L"audio.outputVolumePercent=" << normalized.audioOutputVolumePercent << L"\n";
+    output << L"audio.inputAutoGain=" << (normalized.audioInputAutoGainEnabled ? 1 : 0) << L"\n";
     output << L"audio.soundSeparation.enabled=" << (normalized.soundSeparationEnabled ? 1 : 0) << L"\n";
     output << L"audio.soundSeparation.count=" << normalized.soundSeparationApps.size() << L"\n";
     for (size_t index = 0; index < normalized.soundSeparationApps.size(); ++index) {

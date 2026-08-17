@@ -332,10 +332,146 @@ void applyAudioVolume(AudioPacket& packet, uint32_t volumePercent) {
 
 } // namespace
 
+// Voice-oriented automatic gain control. Keeps a slow level envelope and drives
+// a smoothed gain so average speech lands near a target RMS, mirroring the AGC
+// Discord applies to quiet microphone streams. Slow attack/release prevents
+// pumping on individual words; the gain itself is time-smoothed as well.
+// Forward-declared in RecorderController.h; defined here at backtrack scope so
+// the class is visible where the unique_ptr member is constructed/destroyed.
+constexpr float kAgcFloorDb = -90.0f;
+
+class MicrophoneAgc {
+public:
+    void reset() {
+        envelopeDb_ = -90.0f;
+        gainDb_ = 0.0f;
+    }
+
+    // Advances the envelopes with this block's RMS (dBFS) and duration and
+    // returns the current smoothed linear gain to apply to the block.
+    float gainFor(float rmsDb, float blockSeconds) {
+        const float levelDb = std::max(rmsDb, -90.0f);
+        if (blockSeconds <= 0.0f) {
+            return linearGain();
+        }
+
+        // Fast attack on loud content, slow release when the mic goes quiet.
+        constexpr float kAttackTauSeconds = 0.03f;
+        constexpr float kReleaseTauSeconds = 0.40f;
+        const float envelopeTau = levelDb > envelopeDb_ ? kAttackTauSeconds : kReleaseTauSeconds;
+        const float envelopeCoeff = 1.0f - std::exp(-blockSeconds / envelopeTau);
+        envelopeDb_ += (levelDb - envelopeDb_) * envelopeCoeff;
+
+        // Bring the envelope to the target speech RMS. Boost up to +30 dB (the
+        // same range as a hardware "Microphone Boost"); only cut very loud mics.
+        constexpr float kTargetRmsDb = -22.0f;
+        constexpr float kMaxBoostDb = 30.0f;
+        constexpr float kMaxCutDb = 6.0f;
+        const float desiredGainDb = std::clamp(kTargetRmsDb - envelopeDb_, -kMaxCutDb, kMaxBoostDb);
+
+        // Smooth the gain itself so level changes do not pump on single words.
+        constexpr float kGainTauSeconds = 0.15f;
+        const float gainCoeff = 1.0f - std::exp(-blockSeconds / kGainTauSeconds);
+        gainDb_ += (desiredGainDb - gainDb_) * gainCoeff;
+        return linearGain();
+    }
+
+private:
+    float linearGain() const {
+        return std::pow(10.0f, gainDb_ / 20.0f);
+    }
+
+    float envelopeDb_ = -90.0f;
+    float gainDb_ = 0.0f;
+};
+
+struct BlockLevels {
+    float rmsDb = -90.0f;
+    float peakDb = -90.0f;
+};
+
+BlockLevels measureBlockLevels(const AudioPacket& packet, const AudioFormatInfo& format) {
+    BlockLevels levels;
+    const uint16_t bytesPerSample = format.bitsPerSample / 8;
+    if (bytesPerSample == 0 || packet.bytes.empty()) {
+        return levels;
+    }
+
+    uint64_t sampleCount = 0;
+    double sumOfSquares = 0.0;
+    float peak = 0.0f;
+    const uint8_t* data = packet.bytes.data();
+    const size_t byteCount = packet.bytes.size();
+    for (size_t offset = 0; offset + bytesPerSample <= byteCount; offset += bytesPerSample) {
+        float value = 0.0f;
+        if (format.encoding == AudioSampleEncoding::Float && format.bitsPerSample == 32) {
+            std::memcpy(&value, data + offset, sizeof(value));
+            value = std::clamp(value, -1.0f, 1.0f);
+        } else {
+            switch (format.bitsPerSample) {
+            case 8:
+                value = (static_cast<int>(data[offset]) - 128) / 128.0f;
+                break;
+            case 16: {
+                int16_t sample = 0;
+                std::memcpy(&sample, data + offset, sizeof(sample));
+                value = sample / 32768.0f;
+                break;
+            }
+            case 24:
+                value = readSigned24(data + offset) / 8388608.0f;
+                break;
+            case 32: {
+                int32_t sample = 0;
+                std::memcpy(&sample, data + offset, sizeof(sample));
+                value = sample / 2147483648.0f;
+                break;
+            }
+            default:
+                return levels;
+            }
+        }
+        const float magnitude = std::fabs(value);
+        peak = std::max(peak, magnitude);
+        sumOfSquares += static_cast<double>(value) * value;
+        ++sampleCount;
+    }
+    if (sampleCount == 0) {
+        return levels;
+    }
+    const double rms = std::sqrt(sumOfSquares / static_cast<double>(sampleCount));
+    levels.rmsDb = rms > 0.0 ? static_cast<float>(20.0 * std::log10(rms)) : kAgcFloorDb;
+    levels.peakDb = peak > 0.0f ? 20.0f * std::log10(peak) : kAgcFloorDb;
+    return levels;
+}
+
+void applyMicrophoneAgc(AudioPacket& packet, const AudioFormatInfo& format, MicrophoneAgc& agc) {
+    const uint16_t bytesPerSample = format.bitsPerSample / 8;
+    const float blockSeconds =
+        bytesPerSample > 0 && format.channels > 0 && format.samplesPerSec > 0
+            ? static_cast<float>(packet.bytes.size()) /
+                  (static_cast<float>(bytesPerSample) * static_cast<float>(format.channels) *
+                   static_cast<float>(format.samplesPerSec))
+            : 0.010f;
+    const BlockLevels levels = measureBlockLevels(packet, format);
+    const float gain = agc.gainFor(levels.rmsDb, blockSeconds);
+    switch (format.encoding) {
+    case AudioSampleEncoding::Pcm:
+        applyPcmVolume(packet, format.bitsPerSample, gain);
+        break;
+    case AudioSampleEncoding::Float:
+        applyFloatVolume(packet, format.bitsPerSample, gain);
+        break;
+    case AudioSampleEncoding::Unsupported:
+        break;
+    }
+}
+
 RecorderController::RecorderController()
     : frameQueue_(8),
       systemAudioQueue_(256),
-      microphoneAudioQueue_(256) {
+      microphoneAudioQueue_(256),
+      microphoneAgc_(std::make_unique<MicrophoneAgc>()) {
     frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     audioEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
@@ -361,6 +497,8 @@ bool RecorderController::initialize(AppSettings settings) {
         activeGpuSettings_ = settings_.gpu;
         audioOutputVolumePercent_.store(settings_.audioOutputVolumePercent, std::memory_order_relaxed);
         audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
+        audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
+        microphoneAgcResetPending_ = true;
         replay_.clear();
         replay_.configure(settings_.replay);
     }
@@ -409,12 +547,26 @@ bool RecorderController::updateSettings(AppSettings settings) {
 
     {
         std::scoped_lock lock(stateMutex_);
+        const VideoSettings oldVideo = activeVideoSettings_;
         settings_ = std::move(settings);
         activeVideoSettings_ = settings_.video;
         activeGpuSettings_ = settings_.gpu;
         audioOutputVolumePercent_.store(settings_.audioOutputVolumePercent, std::memory_order_relaxed);
         audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
+        audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
+        microphoneAgcResetPending_ = true;
         replay_.configure(settings_.replay);
+        // A codec/resolution/fps change makes every buffered packet's bitstream
+        // incompatible with the new pipeline. Keep them and a replay save would
+        // mix two SPS/PPS worlds into one clip. Drop the buffer so the timeline
+        // restarts cleanly; lastSaveEnd is reset too, so a consecutive save does
+        // not search for overlap across the encode-parameter switch.
+        if (oldVideo.codec != activeVideoSettings_.codec ||
+            oldVideo.width != activeVideoSettings_.width ||
+            oldVideo.height != activeVideoSettings_.height ||
+            oldVideo.fps != activeVideoSettings_.fps) {
+            replay_.clear();
+        }
     }
 
     if (settings_.replay.enabled) {
@@ -529,10 +681,27 @@ std::filesystem::path RecorderController::recoverFailedRecording() {
 
 std::filesystem::path RecorderController::saveReplay() {
     Logger::instance().info(L"recorder", L"Save replay requested");
-    // Buffer already has keyframes: mux without restarting capture (avoids WGC
-    // recreate hangs and is unnecessary work when pipeline is already warm).
-    if (replay_.videoKeyFrameCount() == 0) {
-        Logger::instance().info(L"recorder", L"Replay save has no buffered keyframe; ensuring pipeline and requesting IDR");
+    if (!settings().replay.enabled) {
+        Logger::instance().warning(L"recorder", L"Replay save ignored: instant replay is disabled");
+        return {};
+    }
+    // Never mux a near-empty buffer (e.g. a single cold-start IDR or a capture
+    // starved by exclusive fullscreen) into a one-frame clip. Collect at least
+    // this much muxable video before saving. For short windows demand a healthy
+    // fraction (the first keyframe can sit inside the window, so a full window
+    // may be unreachable); for long windows keep the 2-second minimum.
+    const int64_t replayWindow100ns =
+        secondsTo100ns(std::max<uint32_t>(1, settings().replay.seconds));
+    const int64_t minReplayVideo100ns = std::min<int64_t>(
+        2 * kHundredNanosecondsPerSecond,
+        std::max<int64_t>(kHundredNanosecondsPerSecond / 2, (replayWindow100ns * 2) / 3));
+    // Buffer already has enough video: mux without restarting capture (avoids
+    // WGC recreate hangs and is unnecessary work when pipeline is already warm).
+    if (replay_.videoKeyFrameCount() == 0 || replay_.videoSpan100ns() < minReplayVideo100ns) {
+        Logger::instance().info(L"recorder",
+            L"Replay save has no buffered keyframe or too little video (span=" +
+            std::to_wstring(replay_.videoSpan100ns() / kHundredNanosecondsPerSecond) +
+            L"s); ensuring pipeline and requesting IDR");
         if (!ensurePipeline()) {
             Logger::instance().error(L"recorder", L"Replay could not be saved because the capture pipeline failed to start");
             return {};
@@ -545,11 +714,19 @@ std::filesystem::path RecorderController::saveReplay() {
             }
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-        while (replay_.videoKeyFrameCount() == 0 && std::chrono::steady_clock::now() < deadline) {
+        while (replay_.videoKeyFrameCount() == 0 ||
+               replay_.videoSpan100ns() < minReplayVideo100ns) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         if (replay_.videoKeyFrameCount() == 0) {
             Logger::instance().warning(L"recorder", L"Replay save aborted: no keyframe arrived within 3s");
+            return {};
+        }
+        if (replay_.videoSpan100ns() < minReplayVideo100ns) {
+            Logger::instance().warning(L"recorder", L"Replay save aborted: insufficient video buffered within 3s");
             return {};
         }
     } else {
@@ -723,6 +900,7 @@ bool RecorderController::ensurePipeline() {
         refreshSystemAudioCapture(snapshot);
     }
     if (snapshot.captureMicrophone) {
+        microphoneAgcResetPending_ = true;
         if (!microphoneAudio_.start(AudioTrack::Microphone, snapshot.audioInputDeviceId, [this](AudioPacket&& packet) { handleAudioPacket(std::move(packet)); })) {
             Logger::instance().warning(L"recorder", L"Microphone capture did not start");
         }
@@ -749,9 +927,9 @@ void RecorderController::stopPipeline() {
 
     Logger::instance().info(L"recorder", L"Capture/encode pipeline stop requested");
     stopRequested_ = true;
-    // Do not drain stale GPU work during a settings/backend switch. This lets
-    // encodeLoop release frame leases and exit instead of submitting old input.
-    discardQueuedFrames_.store(true, std::memory_order_release);
+    // Drain (not discard) the remaining queue: encodeLoop exits only after the
+    // queue is empty, so queued frames still reach replay and the recording
+    // instead of silently vanishing on settings switches / shutdown.
     systemAudio_.stop();
     microphoneAudio_.stop();
     Logger::instance().info(L"recorder", L"Capture/encode pipeline audio stopped; joining video workers");
@@ -2271,6 +2449,15 @@ void RecorderController::handleAudioPacket(AudioPacket&& packet) {
 }
 
 void RecorderController::writeAudioPacket(AudioPacket&& packet) {
+    if (microphoneAgcResetPending_.exchange(false, std::memory_order_relaxed)) {
+        microphoneAgc_->reset();
+    }
+    if (packet.track == AudioTrack::Microphone &&
+        audioInputAutoGain_.load(std::memory_order_relaxed) &&
+        packet.format) {
+        const AudioFormatInfo format = audioFormatInfo(*packet.format);
+        applyMicrophoneAgc(packet, format, *microphoneAgc_);
+    }
     const uint32_t volumePercent = packet.track == AudioTrack::System
         ? audioOutputVolumePercent_.load(std::memory_order_relaxed)
         : audioInputVolumePercent_.load(std::memory_order_relaxed);

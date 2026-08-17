@@ -102,6 +102,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     if (inputVolumeEdit_) {
         target.audioInputVolumePercent = readUIntControl(inputVolumeEdit_, target.audioInputVolumePercent);
     }
+    if (inputAutoGainCheck_) {
+        target.audioInputAutoGainEnabled = SendMessageW(inputAutoGainCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
     if (startWithWindowsCheck_) {
         target.startWithWindowsMinimized = SendMessageW(startWithWindowsCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }

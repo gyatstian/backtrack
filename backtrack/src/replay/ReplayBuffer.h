@@ -19,6 +19,9 @@ public:
     void clear();
     size_t videoPacketCount() const;
     size_t videoKeyFrameCount() const;
+    // Duration (100ns) of muxable video currently buffered, from the first
+    // buffered keyframe to the newest packet end. 0 when empty or keyframe-less.
+    int64_t videoSpan100ns() const;
 
 private:
     void trimLocked();

@@ -576,7 +576,10 @@ void MainWindow::toggleSelectedFavorite() {
         setStatus(L"Select a clip to favorite");
         return;
     }
-    const bool currentlyFavorite = std::filesystem::exists(path.parent_path() / (path.filename().wstring() + L".favorite"));
+    std::error_code favoriteError;
+    const bool currentlyFavorite =
+        std::filesystem::exists(path.parent_path() / (path.filename().wstring() + L".favorite"), favoriteError) &&
+        !favoriteError;
     if (clipManager_.setFavorite(path, !currentlyFavorite)) {
         Logger::instance().info(L"ui", std::wstring(currentlyFavorite ? L"Removed favorite marker from clip: " : L"Marked clip as favorite: ") + path.wstring());
         refreshClips();

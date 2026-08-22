@@ -2,6 +2,7 @@
 
 #include "core/Logger.h"
 #include "encoder/BitstreamUtils.h"
+#include "encoder/DecodeOrderTimestamps.h"
 
 #include <Windows.h>
 
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -22,6 +24,7 @@
 #endif
 
 #if BACKTRACK_HAS_AMF
+#include "AMF/components/ColorSpace.h"
 #include "AMF/components/VideoEncoderHEVC.h"
 #include "AMF/components/VideoEncoderVCE.h"
 #include "AMF/core/Factory.h"
@@ -91,6 +94,13 @@ std::wstring amfResultName(AMF_RESULT result) {
     default:
         return L"AMF error " + std::to_wstring(static_cast<int>(result));
     }
+}
+
+// Formats the loaded amfrt64.dll runtime version for diagnostics.
+std::wstring runtimeVersionString(uint64_t version) {
+    return std::to_wstring(AMF_GET_MAJOR_VERSION(version)) + L"." +
+           std::to_wstring(AMF_GET_MINOR_VERSION(version)) + L"." +
+           std::to_wstring(AMF_GET_SUBMINOR_VERSION(version));
 }
 
 // Maps the requested encoder preset (P1 fastest .. P7 slowest) to the nearest
@@ -236,14 +246,194 @@ struct AmfEncoder::Impl {
 
     std::deque<PendingInput> inFlight;
     std::deque<EncodedPacket> readyPackets;
+    // Each inFlight entry pins a capture texture lease plus an AMF surface
+    // wrapper until its output packet is harvested. If QueryOutput starves,
+    // unbounded growth would pin every capture pool slot and stall capture
+    // itself. The floor covers low-latency profiles; lookahead legitimately
+    // keeps roughly its configured depth of inputs unharvested, so the cap
+    // scales with it instead of shedding frames during normal fill.
+    static constexpr size_t kMinInFlightCap = 16;
+    // Hard lifetime for an accepted-but-unharvested frame. This backend has
+    // no B-frame reordering and pre-analysis does not delay outputs, so a
+    // healthy encoder drains every input within a few frame intervals. An
+    // input older than this bound means the driver stopped producing output;
+    // escalate to an encoder fault instead of querying a dead component
+    // forever and pinning capture leases.
+    static constexpr auto kInFlightMaxAge = std::chrono::seconds(30);
+    uint64_t inFlightDropCount = 0;
+
+    size_t inFlightCap() const {
+        if (!caps.effective.lookahead) {
+            return kMinInFlightCap;
+        }
+        return std::max<size_t>(
+            kMinInFlightCap,
+            static_cast<size_t>(caps.effective.lookaheadDepth) + 8);
+    }
+
+    // Total pipeline depth between accepting an input and emitting its
+    // output: B-frame reordering (B_PIC_PATTERN 2) plus configured lookahead.
+    // DecodeOrderTimestamps must warm up with this so its pending queue
+    // settles at exactly this size; a smaller value makes every output look
+    // like a swallowed frame once the pipeline fills, tripping the desync
+    // watchdog on each output.
+    uint32_t reorderDelayFrames() const {
+        return (caps.effective.bFrames ? 2u : 0u) +
+               (caps.effective.lookahead ? caps.effective.lookaheadDepth : 0u);
+    }
+    DecodeOrderTimestamps decodeTimestamps;
+
+    // Cached codec parameter sets (VPS/SPS/PPS or SPS/PPS) captured from the
+    // first packet that carried them. Prepended to any keyframe packet that
+    // lacks them so a replay cut at an IDR is always self-contained even if
+    // the driver ignores header-insertion settings.
+    std::vector<uint8_t> cachedParameterSets;
     bool encoderFaulted = false;
     uint32_t consecutiveSubmitFailures = 0;
 
+    // Set when a Drain() exceeded its budget and was abandoned on a helper
+    // thread. shutdownEncoder() must then skip Terminate/FreeLibrary: the
+    // helper still executes inside the driver-owned component, and destroying
+    // it concurrently would race the stuck call.
+    bool drainAbandoned = false;
+
+    // AMF Drain() has no timeout parameter and blocks until the component is
+    // fully flushed; a dead driver would otherwise hang clip saving while
+    // pipelineGpuMutex_ is held. The flush therefore runs on a helper thread
+    // and this bound decides when to abandon it (escalating to an encoder
+    // fault so the capture pipeline recreates).
+    static constexpr auto kDrainTimeout = std::chrono::seconds(5);
+
     bool isHevc() const { return settings.codec == VideoCodec::Hevc; }
 
-    void setProp(amf::AMFPropertyStorage* store, const wchar_t* name, const amf::AMFVariant& value) {
-        if (store) {
-            store->SetProperty(name, value);
+    // Applies one encoder property. Returns false when the driver rejected
+    // it; optional-property failures are logged and tolerated, critical ones
+    // abort initialization.
+    bool setProp(amf::AMFPropertyStorage* store, const wchar_t* name, const amf::AMFVariant& value) {
+        if (!store) {
+            return false;
+        }
+        const AMF_RESULT result = store->SetProperty(name, value);
+        if (result != AMF_OK) {
+            Logger::instance().warning(L"encoder",
+                std::wstring(L"AMF SetProperty(") + name + L") failed: " + amfResultName(result));
+            return false;
+        }
+        return true;
+    }
+
+    // Reads a component property back after Init to detect drivers that accept
+    // properties yet silently drop or reset them (seen on old Adrenalin
+    // builds, which then encode with preset defaults).
+    bool verifyInt64Property(const wchar_t* name, int64_t expected) const {
+        if (!encoder) {
+            return false;
+        }
+        amf::AMFVariant value;
+        if (encoder->GetProperty(name, &value) != AMF_OK || value.Empty()) {
+            return false;
+        }
+        return value.ToInt64() == expected;
+    }
+
+    bool verifyRateProperty(const wchar_t* name, const AMFRate& expected) const {
+        if (!encoder) {
+            return false;
+        }
+        amf::AMFVariant value;
+        if (encoder->GetProperty(name, &value) != AMF_OK || value.Empty()) {
+            return false;
+        }
+        const AMFRate rate = value.ToRate();
+        return rate.num == expected.num && rate.den == expected.den;
+    }
+
+    std::wstring driverVersionHint() const {
+        const std::wstring version =
+            runtimeVersion != 0 ? runtimeVersionString(runtimeVersion) : L"unknown";
+        return L"AMD driver ignored required encoder settings (bitrate/GOP/framerate). "
+               L"AMD runtime " + version + L" is too old or faulty; update AMD Adrenalin.";
+    }
+
+    // Critical user-facing settings must survive initialization: the stored
+    // bitrate/GOP/framerate are read back right after Init so a session never
+    // runs half configured.
+    bool verifyCriticalSettings() const {
+        const int64_t bitrate = static_cast<int64_t>(settings.bitrateKbps) * 1000;
+        const amf_int64 gopFrames =
+            static_cast<amf_int64>(std::max<uint32_t>(1, settings.fps * settings.gopSeconds));
+        const AMFRate framerate = AMFConstructRate(settings.fps, 1);
+
+        if (isHevc()) {
+            return verifyInt64Property(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, bitrate) &&
+                   verifyInt64Property(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, gopFrames) &&
+                   verifyRateProperty(AMF_VIDEO_ENCODER_HEVC_FRAMERATE, framerate);
+        }
+        return verifyInt64Property(AMF_VIDEO_ENCODER_TARGET_BITRATE, bitrate) &&
+               verifyInt64Property(AMF_VIDEO_ENCODER_IDR_PERIOD, gopFrames) &&
+               verifyRateProperty(AMF_VIDEO_ENCODER_FRAMERATE, framerate);
+    }
+
+    // Read-back check for the header-insertion settings that decide whether
+    // IDRs carry SPS/PPS/VPS. A driver that silently dropped them would
+    // otherwise produce replays that cannot start decoding. Warning-only:
+    // the encoder also caches parameter sets from the bitstream and prepends
+    // them to header-less keyframes, so a dropped setting degrades gracefully.
+    void verifyHeaderInsertionSettings() const {
+        bool applied = false;
+        if (isHevc()) {
+            amf::AMFVariant value;
+            if (encoder && encoder->GetProperty(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE, &value) == AMF_OK &&
+                !value.Empty()) {
+                applied = value.ToInt64() ==
+                          static_cast<int64_t>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED);
+            }
+        } else {
+            amf::AMFVariant value;
+            if (encoder && encoder->GetProperty(AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING, &value) == AMF_OK &&
+                !value.Empty()) {
+                applied = value.ToInt64() > 0;
+            }
+        }
+        if (!applied) {
+            Logger::instance().warning(L"encoder",
+                L"AMD driver did not retain the SPS/PPS header-insertion setting; "
+                L"keyframes will be patched with cached headers instead");
+        }
+    }
+
+    // Pins BT.709 matrix/primaries/transfer with limited (studio) output range
+    // so clips decode with identical colors regardless of driver defaults.
+    // Input properties guide the internal BGRA->NV12 conversion; output
+    // properties land in the stream VUI where the runtime supports it.
+    void applyColorProperties(bool beforeInit) {
+        if (beforeInit) {
+            if (isHevc()) {
+                setProp(encoder, AMF_VIDEO_ENCODER_HEVC_INPUT_TRANSFER_CHARACTERISTIC,
+                        amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)));
+                setProp(encoder, AMF_VIDEO_ENCODER_HEVC_INPUT_COLOR_PRIMARIES,
+                        amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)));
+            } else {
+                setProp(encoder, AMF_VIDEO_ENCODER_INPUT_TRANSFER_CHARACTERISTIC,
+                        amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)));
+                setProp(encoder, AMF_VIDEO_ENCODER_INPUT_COLOR_PRIMARIES,
+                        amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)));
+            }
+            return;
+        }
+        if (isHevc()) {
+            setProp(encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_TRANSFER_CHARACTERISTIC,
+                    amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)));
+            setProp(encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PRIMARIES,
+                    amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)));
+            setProp(encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_FULL_RANGE_COLOR,
+                    amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE_STUDIO)));
+        } else {
+            setProp(encoder, AMF_VIDEO_ENCODER_OUTPUT_TRANSFER_CHARACTERISTIC,
+                    amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)));
+            setProp(encoder, AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES,
+                    amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)));
+            setProp(encoder, AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR, amf::AMFVariant(false));
         }
     }
 
@@ -358,7 +548,8 @@ struct AmfEncoder::Impl {
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PROFILE_HIGH)));
         setProp(encoder, AMF_VIDEO_ENCODER_FRAMESIZE,
                 amf::AMFVariant(AMFConstructSize(settings.width, settings.height)));
-        setProp(encoder, AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(idrPeriod)));
+        const bool gopApplied =
+            setProp(encoder, AMF_VIDEO_ENCODER_IDR_PERIOD, amf::AMFVariant(static_cast<amf_int64>(idrPeriod)));
         // Insert SPS/PPS periodically (AMF range 0-1000). Forced IDRs also set InsertSPS/PPS.
         setProp(encoder, AMF_VIDEO_ENCODER_HEADER_INSERTION_SPACING,
                 amf::AMFVariant(static_cast<amf_int64>(std::min<uint32_t>(idrPeriod, 1000))));
@@ -367,6 +558,8 @@ struct AmfEncoder::Impl {
         const bool useBFrames = effective.bFrames && caps.bFrames && !effective.zeroReorderDelay;
         setProp(encoder, AMF_VIDEO_ENCODER_B_PIC_PATTERN,
                 amf::AMFVariant(static_cast<amf_int64>(useBFrames ? 2 : 0)));
+
+        applyColorProperties(true);
 
         // Init with the actual input surface format. The capture pipeline feeds
         // BGRA D3D11 textures; the AMF encoder performs BGRA->NV12 color
@@ -379,18 +572,24 @@ struct AmfEncoder::Impl {
             caps.detail = L"AMF AVC encoder Init failed: " + amfResultName(result);
             return false;
         }
+        applyColorProperties(false);
 
         // Dynamic rate-control properties applied after Init so USAGE presets do
         // not overwrite them.
         setProp(encoder, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR)));
-        setProp(encoder, AMF_VIDEO_ENCODER_TARGET_BITRATE, amf::AMFVariant(bitrate));
+        const bool bitrateApplied =
+            setProp(encoder, AMF_VIDEO_ENCODER_TARGET_BITRATE, amf::AMFVariant(bitrate));
         setProp(encoder, AMF_VIDEO_ENCODER_PEAK_BITRATE, amf::AMFVariant(bitrate));
         setProp(encoder, AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, amf::AMFVariant(bitrate));
         setProp(encoder, AMF_VIDEO_ENCODER_FILLER_DATA_ENABLE, amf::AMFVariant(false));
         setProp(encoder, AMF_VIDEO_ENCODER_ENFORCE_HRD, amf::AMFVariant(true));
-        setProp(encoder, AMF_VIDEO_ENCODER_FRAMERATE,
+        const bool framerateApplied = setProp(encoder, AMF_VIDEO_ENCODER_FRAMERATE,
                 amf::AMFVariant(AMFConstructRate(settings.fps, 1)));
+        if (!gopApplied || !bitrateApplied || !framerateApplied) {
+            caps.detail = driverVersionHint();
+            return false;
+        }
         setProp(encoder, AMF_VIDEO_ENCODER_ENABLE_VBAQ, amf::AMFVariant(effective.spatialAQ));
 
         if (effective.lookahead && caps.lookahead) {
@@ -405,6 +604,12 @@ struct AmfEncoder::Impl {
         caps.effective = effective;
         caps.effective.bFrames = useBFrames;
         caps.effective.zeroReorderDelay = !useBFrames;
+        // This backend does not configure the features below; report them as
+        // off instead of echoing requested-but-ignored settings.
+        caps.effective.temporalAQ = false;
+        caps.effective.multipass = EncoderMultipass::Disabled;
+        caps.effective.adaptiveBFrames = false;
+        caps.effective.adaptiveIFrames = false;
         if (!caps.multipleReferenceFrames) {
             caps.effective.referenceFrames = 1;
         }
@@ -429,11 +634,14 @@ struct AmfEncoder::Impl {
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_TIER_MAIN)));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_FRAMESIZE,
                 amf::AMFVariant(AMFConstructSize(settings.width, settings.height)));
-        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(gopSize)));
+        const bool gopApplied =
+            setProp(encoder, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, amf::AMFVariant(static_cast<amf_int64>(gopSize)));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_NUM_GOPS_PER_IDR, amf::AMFVariant(static_cast<amf_int64>(1)));
         // VPS/SPS/PPS on every IDR for clean mid-session mux starts.
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)));
+
+        applyColorProperties(true);
 
         AMF_RESULT result = encoder->Init(inputSurfaceFormat,
                                           static_cast<amf_int32>(settings.width),
@@ -442,16 +650,22 @@ struct AmfEncoder::Impl {
             caps.detail = L"AMF HEVC encoder Init failed: " + amfResultName(result);
             return false;
         }
+        applyColorProperties(false);
 
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR)));
-        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, amf::AMFVariant(bitrate));
+        const bool bitrateApplied =
+            setProp(encoder, AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, amf::AMFVariant(bitrate));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, amf::AMFVariant(bitrate));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_VBV_BUFFER_SIZE, amf::AMFVariant(bitrate));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_FILLER_DATA_ENABLE, amf::AMFVariant(false));
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_ENFORCE_HRD, amf::AMFVariant(true));
-        setProp(encoder, AMF_VIDEO_ENCODER_HEVC_FRAMERATE,
+        const bool framerateApplied = setProp(encoder, AMF_VIDEO_ENCODER_HEVC_FRAMERATE,
                 amf::AMFVariant(AMFConstructRate(settings.fps, 1)));
+        if (!gopApplied || !bitrateApplied || !framerateApplied) {
+            caps.detail = driverVersionHint();
+            return false;
+        }
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, amf::AMFVariant(effective.spatialAQ));
         if (effective.lookahead && caps.lookahead) {
             setProp(encoder, AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, amf::AMFVariant(true));
@@ -465,6 +679,12 @@ struct AmfEncoder::Impl {
         caps.effective = effective;
         caps.effective.bFrames = false; // AMF HEVC has no B-frame pattern control here.
         caps.effective.zeroReorderDelay = true;
+        // This backend does not configure the features below; report them as
+        // off instead of echoing requested-but-ignored settings.
+        caps.effective.temporalAQ = false;
+        caps.effective.multipass = EncoderMultipass::Disabled;
+        caps.effective.adaptiveBFrames = false;
+        caps.effective.adaptiveIFrames = false;
         if (!caps.multipleReferenceFrames) {
             caps.effective.referenceFrames = 1;
         }
@@ -506,6 +726,23 @@ struct AmfEncoder::Impl {
         if (!configured) {
             return false;
         }
+
+        // Detect drivers that accept properties yet drop them at Init: the
+        // user's bitrate/GOP/framerate must read back unchanged, otherwise the
+        // session would silently encode with preset defaults.
+        if (!verifyCriticalSettings()) {
+            caps.detail = driverVersionHint();
+            return false;
+        }
+        // Same class of check for the SPS/PPS header insertion; warning-only
+        // because header-less keyframes are patched from the cached parameter
+        // sets at harvest time.
+        verifyHeaderInsertionSettings();
+
+        // Outputs lag accepted inputs by the full reorder pipeline depth
+        // (B-frames plus lookahead); see reorderDelayFrames().
+        decodeTimestamps.reset(reorderDelayFrames());
+        cachedParameterSets.clear();
 
         caps.available = true;
         caps.detail = std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
@@ -565,8 +802,33 @@ struct AmfEncoder::Impl {
         return true;
     }
 
-    // Retrieves any available encoded output. Non-blocking unless waitForAll.
+    // Prepends cached parameter sets to a keyframe packet that lacks them so
+    // every replay cut point is self-contained (see cachedParameterSets).
+    void ensureKeyFrameCarriesHeaders(EncodedPacket& packet) {
+        if (bitstreamContainsParameterSets(settings.codec, packet.bytes)) {
+            return;
+        }
+        if (!packet.keyFrame || cachedParameterSets.empty()) {
+            return;
+        }
+        std::vector<uint8_t> withHeaders;
+        withHeaders.reserve(cachedParameterSets.size() + packet.bytes.size());
+        withHeaders.insert(withHeaders.end(), cachedParameterSets.begin(), cachedParameterSets.end());
+        withHeaders.insert(withHeaders.end(), packet.bytes.begin(), packet.bytes.end());
+        packet.bytes = std::move(withHeaders);
+    }
+
+    // Retrieves any available encoded output. Non-blocking unless waitForAll
+    // (final drain). While draining, some drivers answer NEED_MORE_INPUT or
+    // REPEAT until the last packets are flushed; polling continues as long as
+    // output keeps arriving so trailing frames are not lost, bounded by an
+    // idle deadline so a wedged driver cannot hang clip saving. Unexpected
+    // QueryOutput errors during a drain are logged without faulting the
+    // session - Drain already reported its own status at that point.
     bool harvestOutputs(bool waitForAll) {
+        constexpr auto kIdleDrainLimit = std::chrono::seconds(5);
+        SteadyClock::time_point lastProgress = SteadyClock::now();
+
         while (true) {
             amf::AMFDataPtr data;
             AMF_RESULT result = encoder->QueryOutput(&data);
@@ -574,16 +836,32 @@ struct AmfEncoder::Impl {
             if (result == AMF_EOF) {
                 break;
             }
-            if (result == AMF_REPEAT || (result == AMF_OK && !data)) {
-                if (waitForAll) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
+            // NEED_MORE_INPUT means no packet is ready yet (some drivers emit
+            // it instead of REPEAT); treat both as "no output this round".
+            if (result == AMF_REPEAT || result == AMF_NEED_MORE_INPUT ||
+                (result == AMF_OK && !data)) {
+                if (!waitForAll) {
+                    break;
                 }
-                break;
+                if (SteadyClock::now() - lastProgress >= kIdleDrainLimit) {
+                    Logger::instance().warning(L"encoder",
+                        L"AMF encoder stopped producing output during drain; keeping " +
+                        std::to_wstring(readyPackets.size()) + L" harvested packet(s)");
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
             }
             if (result != AMF_OK) {
-                return fail(L"AMF QueryOutput failed: " + amfResultName(result));
+                const std::wstring detail = L"AMF QueryOutput failed: " + amfResultName(result);
+                if (waitForAll) {
+                    Logger::instance().error(L"encoder", detail);
+                    break;
+                }
+                return fail(detail);
             }
+
+            lastProgress = SteadyClock::now();
 
             amf::AMFBufferPtr buffer(data);
             if (!buffer) {
@@ -592,14 +870,22 @@ struct AmfEncoder::Impl {
 
             const int64_t outputPts = static_cast<int64_t>(buffer->GetPts());
             const int64_t outputDuration = static_cast<int64_t>(buffer->GetDuration());
+            // Driver-timestamp validity is explicit: GetPts() echoes the
+            // surface->SetPts(frame.pts100ns) we submitted (QPC-derived
+            // steady-clock time since boot), which can never legitimately be
+            // zero by the time frames reach the encoder. Unlike decode
+            // timestamps - which CAN be zero or negative and therefore carry
+            // hasDts (see Types.h) - this sentinel-free comparison is safe.
+            const bool driverPtsValid = outputPts != 0;
 
-            // Match by PTS when B-frames reorder output; FIFO metadata is an
-            // all-or-nothing fallback so it cannot be combined with an
-            // unrelated AMF timestamp.
+            // Match by PTS when B-frames reorder output; the oldest matching
+            // entry wins so duplicate timestamps keep decode order. When no
+            // entry matches, the FIFO front is popped anyway (its surface and
+            // capture lease must be released), but driver timestamps are kept
+            // whenever present instead of splicing unrelated metadata in.
             PendingInput pending;
             bool matched = false;
-            bool usedFallbackMetadata = false;
-            if (outputPts != 0) {
+            if (driverPtsValid) {
                 for (auto it = inFlight.begin(); it != inFlight.end(); ++it) {
                     if (it->fallbackPts100ns == outputPts) {
                         pending = std::move(*it);
@@ -612,25 +898,44 @@ struct AmfEncoder::Impl {
             if (!matched && !inFlight.empty()) {
                 pending = std::move(inFlight.front());
                 inFlight.pop_front();
-                usedFallbackMetadata = true;
             }
 
             EncodedPacket packet;
             const auto* begin = static_cast<const uint8_t*>(buffer->GetNative());
             const size_t size = buffer->GetSize();
             packet.bytes.assign(begin, begin + size);
-            packet.pts100ns = !usedFallbackMetadata && outputPts != 0
-                ? outputPts
-                : pending.fallbackPts100ns;
-            packet.duration100ns = !usedFallbackMetadata && outputDuration != 0
-                ? outputDuration
-                : pending.fallbackDuration100ns;
+            packet.pts100ns = driverPtsValid ? outputPts : pending.fallbackPts100ns;
+            packet.duration100ns = outputDuration != 0 ? outputDuration : pending.fallbackDuration100ns;
+            // AMF emits packets in decode order; map each output back to the
+            // submission slot it decodes at so PTS regressions within a GOP
+            // stay representable (the MP4 mux needs DTS for B-frames).
+            packet.dts100ns = decodeTimestamps.onOutput(packet.pts100ns, packet.duration100ns);
+            packet.hasDts = true;
             packet.codec = settings.codec;
-            packet.keyFrame = outputIsKeyFrame(buffer) || bitstreamContainsKeyFrame(settings.codec, packet.bytes);
+            // Only real IDR pictures are replay cut points: a plain I or CRA
+            // open-GOP picture leaves decoders referencing frames from before
+            // it, which breaks clips cut there.
+            const bool metadataIdr = outputIsKeyFrame(buffer);
+            packet.keyFrame = metadataIdr ||
+                (bitstreamContainsKeyFrame(settings.codec, packet.bytes) &&
+                 !bitstreamContainsCraFrame(settings.codec, packet.bytes));
 
             if (packet.bytes.empty()) {
                 ++encoderStats.droppedFrames;
                 continue;
+            }
+            ensureKeyFrameCarriesHeaders(packet);
+            // Capture the parameter sets from the first packet that carries
+            // them, regardless of whether header patching fired above: a
+            // driver that drops header insertion only ever emits them inside
+            // its keyframes, so gating extraction on patching would leave the
+            // cache empty (or holding a partial subset) exactly when it is
+            // needed. Mirrors the NVENC backend.
+            if (cachedParameterSets.empty()) {
+                std::vector<uint8_t> parameterSets;
+                if (extractParameterSets(settings.codec, packet.bytes, parameterSets)) {
+                    cachedParameterSets = std::move(parameterSets);
+                }
             }
 
             const auto elapsed = std::chrono::duration<double, std::milli>(
@@ -663,12 +968,47 @@ struct AmfEncoder::Impl {
             ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
         }
+        // Bounded input backlog: before accepting another surface, give the
+        // driver one chance to produce output. If the backlog is still full,
+        // shed the incoming frame (drop-newest, matching the frame-queue
+        // policy). This happens before CreateSurfaceFromDX11Native so nothing
+        // is pinned by a frame that will be dropped. Returning early also
+        // leaves any pending force-keyframe request armed for the next frame.
+        const size_t maxInFlight = inFlightCap();
+        if (inFlight.size() >= maxInFlight && !harvestOutputs(false)) {
+            return false;
+        }
+        if (inFlight.size() >= maxInFlight) {
+            ++encoderStats.droppedFrames;
+            ++inFlightDropCount;
+            if (inFlightDropCount == 1 || (inFlightDropCount % 300) == 0) {
+                Logger::instance().warning(L"encoder",
+                    L"AMF encoder output starved; input backlog full - dropping frames count=" +
+                    std::to_wstring(inFlightDropCount));
+            }
+            return popReadyPacket(packet);
+        }
 
         const auto start = std::chrono::steady_clock::now();
+
+        // Hard lifetime for accepted-but-unharvested frames: a healthy driver
+        // drains within a few frame intervals, so an input this old means the
+        // encoder stopped producing output. Fault the session (the capture
+        // loop recreates it) instead of querying a dead component forever.
+        if (!inFlight.empty() &&
+            SteadyClock::now() - inFlight.front().submittedAt >= kInFlightMaxAge) {
+            return fail(
+                L"AMF encoder produced no output for a submitted frame within " +
+                std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(kInFlightMaxAge).count()) +
+                L"s; encoder faulted so the capture pipeline can recreate it");
+        }
 
         amf::AMFSurfacePtr surface;
         AMF_RESULT result = context->CreateSurfaceFromDX11Native(frame.texture.Get(), &surface, nullptr);
         if (result != AMF_OK || !surface) {
+            // Frame lost before reaching the encoder; restart the next GOP so
+            // the stream never continues from a broken reference chain.
+            forceKeyFrame = true;
             ++encoderStats.droppedFrames;
             if (++consecutiveSubmitFailures == 30) {
                 return fail(L"AMF CreateSurfaceFromDX11Native failed repeatedly: " + amfResultName(result));
@@ -693,9 +1033,7 @@ struct AmfEncoder::Impl {
             bool submitted = false;
             for (int attempt = 0; attempt < 8 && !submitted; ++attempt) {
                 if (!harvestOutputs(false)) {
-                    if (requestedKeyFrame) {
-                        forceKeyFrame = true;
-                    }
+                    forceKeyFrame = true;
                     return false;
                 }
                 result = encoder->SubmitInput(surface);
@@ -709,9 +1047,9 @@ struct AmfEncoder::Impl {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             if (!submitted) {
-                if (requestedKeyFrame) {
-                    forceKeyFrame = true;
-                }
+                // The frame was never accepted; restart the next GOP so the
+                // stream continues from a clean reference state.
+                forceKeyFrame = true;
                 ++encoderStats.droppedFrames;
                 if (result == AMF_INPUT_FULL) {
                     return popReadyPacket(packet);
@@ -722,9 +1060,9 @@ struct AmfEncoder::Impl {
                 return popReadyPacket(packet);
             }
         } else if (result != AMF_OK && result != AMF_NEED_MORE_INPUT) {
-            if (requestedKeyFrame) {
-                forceKeyFrame = true;
-            }
+            // The frame was never accepted; restart the next GOP so the
+            // stream continues from a clean reference state.
+            forceKeyFrame = true;
             ++encoderStats.droppedFrames;
             if (++consecutiveSubmitFailures == 30) {
                 return fail(L"AMF SubmitInput failed repeatedly: " + amfResultName(result));
@@ -734,6 +1072,11 @@ struct AmfEncoder::Impl {
 
         consecutiveSubmitFailures = 0;
         ++encoderStats.submittedFrames;
+
+        // Accepted input: AMF produces exactly one output packet for it, in
+        // decode order. Record the submission slot for decode-timestamp
+        // assignment.
+        decodeTimestamps.onSubmit(frame.pts100ns);
 
         PendingInput pending;
         pending.surface = surface;
@@ -759,12 +1102,64 @@ struct AmfEncoder::Impl {
             return;
         }
 
-        const AMF_RESULT result = encoder->Drain();
-        if (result != AMF_OK && result != AMF_EOF) {
-            Logger::instance().error(L"encoder", L"AMF Drain failed: " + amfResultName(result));
+        // Bound the blocking driver-side flush (kDrainTimeout). Drain() runs
+        // on a helper thread; on timeout the worker is detached with its own
+        // reference to the component and this session is faulted so the
+        // capture pipeline recreates it instead of wedging every caller that
+        // holds pipelineGpuMutex_.
+        std::promise<AMF_RESULT> drainPromise;
+        auto drainFuture = drainPromise.get_future();
+        amf::AMFComponentPtr drainingComponent = encoder;
+        std::thread drainWorker(
+            [promise = std::move(drainPromise), component = drainingComponent]() mutable {
+                try {
+                    promise.set_value(component ? component->Drain() : AMF_OK);
+                } catch (...) {
+                    // Never leave the promise broken: get() below must either
+                    // yield a value or rethrow after join().
+                    promise.set_exception(std::current_exception());
+                }
+            });
+        if (drainFuture.wait_for(kDrainTimeout) == std::future_status::timeout) {
+            drainWorker.detach();
+            drainAbandoned = true;
+            encoderFaulted = true;
+            caps.available = false;
+            caps.detail =
+                L"AMF encoder did not finish flushing within " +
+                std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(kDrainTimeout).count()) +
+                L"s; capture pipeline will recreate the encoder";
+            encoderStats.encoderAvailable = false;
+            Logger::instance().error(L"encoder", caps.detail);
         } else {
-            harvestOutputs(true);
+            // Join before anything else so the thread object can never be
+            // destroyed while still joinable (that calls terminate()).
+            drainWorker.join();
+            AMF_RESULT result = AMF_OK;
+            try {
+                result = drainFuture.get();
+            } catch (const std::exception& error) {
+                Logger::instance().error(L"encoder",
+                    std::wstring(L"AMF Drain raised an exception: ") + utf8ToWide(error.what()));
+            } catch (...) {
+                Logger::instance().error(L"encoder", L"AMF Drain raised an unknown exception");
+            }
+            if (result == AMF_NEED_MORE_INPUT) {
+                // Some Adrenalin builds end the drain with NEED_MORE_INPUT even
+                // though outputs are still pending.
+                Logger::instance().info(L"encoder",
+                    L"AMF Drain ended with NEED_MORE_INPUT; harvesting pending outputs");
+            } else if (result != AMF_OK && result != AMF_EOF) {
+                Logger::instance().error(L"encoder", L"AMF Drain failed: " + amfResultName(result));
+            }
         }
+        // Harvest regardless of the drain status code: skipping this loses
+        // every output still queued in the encoder (the final seconds of the
+        // stream). QueryOutput is non-blocking and harvestOutputs() is
+        // idle-bounded. After an abandoned flush the component is presumed
+        // wedged, so only a single non-blocking sweep runs instead of polling
+        // a dead encoder for kIdleDrainLimit.
+        harvestOutputs(!drainAbandoned);
         while (!readyPackets.empty()) {
             packets.push_back(std::move(readyPackets.front()));
             readyPackets.pop_front();
@@ -773,6 +1168,22 @@ struct AmfEncoder::Impl {
 
     void shutdownEncoder() {
         inFlight.clear();
+        decodeTimestamps.reset(0);
+        if (drainAbandoned && (encoder || context)) {
+            // An abandoned Drain() may still be executing inside the driver.
+            // Terminating the component now would race it, so skip explicit
+            // teardown: the detached worker holds references to the AMF
+            // objects and releases them only after Drain() finally returns.
+            // The runtime DLL stays loaded for the same reason. This
+            // deliberately leaks one wedged session's resources in exchange
+            // for keeping clip saving and pipeline recreation alive.
+            encoder = nullptr;
+            context = nullptr;
+            factory = nullptr;
+            module = nullptr;
+            drainAbandoned = false;
+            return;
+        }
         if (encoder) {
             encoder->Terminate();
             encoder = nullptr;
@@ -822,6 +1233,7 @@ bool AmfEncoder::initialize(D3DDevice& device, const VideoSettings& settings) {
     impl_->caps.backendName = L"AMF";
 #if BACKTRACK_HAS_AMF
     impl_->encoderFaulted = false;
+    impl_->drainAbandoned = false;
     impl_->consecutiveSubmitFailures = 0;
     const bool initialized = impl_->initializeEncoder(device.device(), device.adapterName());
     if (!initialized) {

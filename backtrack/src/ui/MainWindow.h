@@ -224,6 +224,9 @@ private:
     void browseCustomNotificationSound();
     void saveLog();
     void updateStats();
+    // Edge-triggered audio-liveness warning shown in the status bar while a
+    // recording receives no packets from an enabled audio input (>2s).
+    void updateAudioLivenessWarning(const RecordingStats& stats);
     void refreshClips();
     void setLibraryViewMode(LibraryViewMode mode);
     void clearClipThumbnails();
@@ -402,6 +405,9 @@ private:
     std::filesystem::path clipDragPath_;
     std::wstring statusText_ = L"Ready";
     std::wstring displayedStatusText_;
+    // Current audio-liveness warning (empty when healthy). Appended to the
+    // status bar text by currentStatusDisplayText().
+    std::wstring audioLivenessWarning_;
     HWND hoveredHelpControl_ = nullptr;
     HWND hoveredButton_ = nullptr;
     bool buttonHoverTracking_ = false;

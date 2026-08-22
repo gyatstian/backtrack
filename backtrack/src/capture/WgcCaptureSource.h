@@ -18,6 +18,8 @@ public:
     CaptureBackend backend() const override { return CaptureBackend::WindowsGraphicsCapture; }
     uint32_t width() const override;
     uint32_t height() const override;
+    uint64_t resolutionChangeCount() const override;
+    void setCursorCaptureEnabled(bool enabled) override;
 
 private:
     struct Impl;

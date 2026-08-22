@@ -19,6 +19,7 @@ public:
     uint32_t width() const override { return width_; }
     uint32_t height() const override { return height_; }
     uint64_t cursorOnlyFrames() const override { return cursorOnlyFrames_; }
+    void setCursorCaptureEnabled(bool enabled) override { captureCursor_ = enabled; }
 
     // True after at least one frame with a desktop present (not cursor-only).
     bool hasPresentedContent() const { return havePresentedContent_; }
@@ -42,6 +43,7 @@ private:
     void compositeCursor(const std::shared_ptr<TextureSlot>& slot);
 
     D3DDevice* device_ = nullptr;
+    HMONITOR monitor_ = nullptr;
     ComPtr<IDXGIOutputDuplication> duplication_;
     std::vector<std::shared_ptr<TextureSlot>> pool_;
     uint64_t poolExhaustionDrops_ = 0;
@@ -53,6 +55,9 @@ private:
     uint32_t height_ = 0;
     uint32_t poolSize_ = 0;
     DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
+    // Advanced color (HDR/PQ) is active on the captured output. Frames are
+    // flagged so the scaler tone-maps them to SDR before encoding.
+    bool hdrActive_ = false;
     bool deviceLost_ = false;
     bool haveContent_ = false;
     bool havePresentedContent_ = false;

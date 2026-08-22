@@ -4,6 +4,7 @@
 #include "core/Types.h"
 
 #include <avrt.h>
+#include <dxgi1_6.h>
 #include <shlobj.h>
 #include <timeapi.h>
 #include <wrl/client.h>
@@ -306,13 +307,24 @@ void setThreadDescriptionSafe(const wchar_t* description) {
     }
 }
 
-HANDLE enableMmcssForCaptureThread() {
+HANDLE enableMmcssForThread(const wchar_t* taskName, AVRT_PRIORITY priority) {
     DWORD taskIndex = 0;
-    HANDLE handle = AvSetMmThreadCharacteristicsW(L"Capture", &taskIndex);
+    HANDLE handle = AvSetMmThreadCharacteristicsW(taskName, &taskIndex);
     if (handle) {
-        AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH);
+        AvSetMmThreadPriority(handle, priority);
     }
     return handle;
+}
+
+HANDLE enableMmcssForCaptureThread() {
+    return enableMmcssForThread(L"Capture", AVRT_PRIORITY_HIGH);
+}
+
+HANDLE enableMmcssForEncodeThread() {
+    // "Games" is the MMCSS profile for latency-sensitive game-adjacent work
+    // and sits above normal thread scheduling; HIGH matches the capture
+    // thread's relative boost inside its profile.
+    return enableMmcssForThread(L"Games", AVRT_PRIORITY_HIGH);
 }
 
 void disableMmcssForThread(HANDLE handle) {
@@ -559,6 +571,54 @@ std::vector<MonitorEnumEntry> enumerateMonitors() {
         },
         reinterpret_cast<LPARAM>(&monitors));
     return monitors;
+}
+
+bool monitorHasAdvancedColor(HMONITOR monitor) {
+    if (!monitor) {
+        return false;
+    }
+
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+        return false;
+    }
+
+    for (UINT adapterIndex = 0;; ++adapterIndex) {
+        ComPtr<IDXGIAdapter1> adapter;
+        const HRESULT adapterHr = factory->EnumAdapters1(adapterIndex, &adapter);
+        if (adapterHr == DXGI_ERROR_NOT_FOUND) {
+            break;
+        }
+        if (FAILED(adapterHr) || !adapter) {
+            continue;
+        }
+
+        for (UINT outputIndex = 0;; ++outputIndex) {
+            ComPtr<IDXGIOutput> output;
+            const HRESULT hr = adapter->EnumOutputs(outputIndex, &output);
+            if (hr == DXGI_ERROR_NOT_FOUND) {
+                break;
+            }
+            if (FAILED(hr) || !output) {
+                continue;
+            }
+            DXGI_OUTPUT_DESC desc{};
+            if (FAILED(output->GetDesc(&desc)) || desc.Monitor != monitor) {
+                continue;
+            }
+            // Advanced-color state lives on IDXGIOutput6 (Windows 10 1709+).
+            ComPtr<IDXGIOutput6> output6;
+            if (FAILED(output.As(&output6)) || !output6) {
+                return false;
+            }
+            DXGI_OUTPUT_DESC1 desc1{};
+            if (FAILED(output6->GetDesc1(&desc1))) {
+                return false;
+            }
+            return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        }
+    }
+    return false;
 }
 
 uint32_t dxgiOutputIndexForMonitor(IDXGIAdapter* adapter, HMONITOR monitor) {

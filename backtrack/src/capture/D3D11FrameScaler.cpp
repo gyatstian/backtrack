@@ -74,6 +74,7 @@ bool D3D11FrameScaler::scale(
         }
 
         bool conversionFailed = false;
+        bool hdrRejectedThisAttempt = false;
         if (!ensureInitialized(
                 device,
                 input.width,
@@ -148,11 +149,28 @@ bool D3D11FrameScaler::scale(
                     processor_.Get(), FALSE, &background);
                 videoContext_->VideoProcessorSetStreamFrameFormat(
                     processor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+                // HDR sources carry PQ (10-bit) or scRGB (FP16) content.
+                // Interpreting them as gamma-22 SDR washes out color and clips
+                // highlights; declaring the real input color space makes the
+                // video processor tone-map down to the SDR output. A rejected
+                // conversion falls back permanently to the legacy mapping so a
+                // limited processor degrades to old behavior, never to frame
+                // drops (finding 16).
+                DXGI_COLOR_SPACE_TYPE inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+                if (!hdrInputRejected_) {
+                    if (input.hdr && input.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                        inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                    } else if (input.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                        inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+                    }
+                }
+                const bool usedHdrInputSpace =
+                    inputColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
                 if (videoContext1_) {
                     videoContext1_->VideoProcessorSetStreamColorSpace1(
                         processor_.Get(),
                         0,
-                        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                        inputColorSpace);
                     videoContext1_->VideoProcessorSetOutputColorSpace1(
                         processor_.Get(),
                         outputFormat == DXGI_FORMAT_NV12
@@ -192,8 +210,17 @@ bool D3D11FrameScaler::scale(
                 const HRESULT hr = videoContext_->VideoProcessorBlt(
                     processor_.Get(), slot->outputView.Get(), 0, 1, &stream);
                 if (FAILED(hr)) {
-                    Logger::instance().warning(L"capture",
-                        L"D3D11 VideoProcessorBlt failed: " + hresultToString(hr));
+                    if (usedHdrInputSpace && !hdrInputRejected_) {
+                        hdrInputRejected_ = true;
+                        hdrRejectedThisAttempt = true;
+                        releaseResources();
+                        Logger::instance().warning(L"capture",
+                            L"D3D11 video processor rejected HDR input conversion (" +
+                            hresultToString(hr) + L"); falling back to SDR interpretation");
+                    } else {
+                        Logger::instance().warning(L"capture",
+                            L"D3D11 VideoProcessorBlt failed: " + hresultToString(hr));
+                    }
                     conversionFailed = true;
                 } else {
                     output = input;
@@ -205,6 +232,14 @@ bool D3D11FrameScaler::scale(
                     return true;
                 }
             }
+        }
+
+        // An HDR color-space rejection is not an NV12-path failure: the
+        // processor accepted RGB→NV12 and only refused tone-mapping. The
+        // sticky SDR mapping above applies from the next frame on, so keep
+        // NV12 instead of permanently degrading this session to BGRA.
+        if (hdrRejectedThisAttempt) {
+            return false;
         }
 
         if (!conversionFailed || outputFormat != DXGI_FORMAT_NV12) {
@@ -448,7 +483,14 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::inputViewFor(
         return existing->second.Get();
     }
     if (inputViews_.size() >= kMaxInputViewCacheEntries) {
-        inputViews_.clear();
+        pruneStaleInputViews();
+        if (inputViews_.size() >= kMaxInputViewCacheEntries) {
+            inputViews_.clear();
+        }
+    } else {
+        // Miss path: surfaces abandoned by a source rebind or a WGC pool
+        // recreate would otherwise stay pinned in VRAM for the session.
+        pruneStaleInputViews();
     }
 
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc{};
@@ -472,6 +514,25 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::inputViewFor(
         L"Capture texture is not directly compatible with the D3D11 video processor (" +
         hresultToString(hr) + L"); using a pooled BGRA input copy");
     return copiedInputViewFor(device, texture);
+}
+
+void D3D11FrameScaler::pruneStaleInputViews() {
+    for (auto it = inputViews_.begin(); it != inputViews_.end();) {
+        ID3D11Texture2D* texture = it->first;
+        // Read the live COM refcount with an AddRef/Release probe. The probe's
+        // own reference is released before the count is read, so `refs` equals
+        // the pre-probe count. Exactly one of those references belongs to the
+        // stored view; a total below two means no capture frame, pool slot, or
+        // shared texture still owns this surface and its VRAM can be
+        // reclaimed. Entries with any external owner stay cached.
+        texture->AddRef();
+        const ULONG refs = texture->Release();
+        if (refs < 2) {
+            it = inputViews_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 ID3D11VideoProcessorInputView* D3D11FrameScaler::copiedInputViewFor(

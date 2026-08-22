@@ -13,8 +13,12 @@ public:
     ~WavWriter();
 
     bool open(const std::filesystem::path& path, const WaveFormatBlob& format);
-    void write(const uint8_t* data, size_t size);
-    void writeSilenceFrames(uint64_t frames);
+    // Returns true when the full payload was handed to the stream without
+    // error. False means a write failure (typically disk full); the stream
+    // stays open so close() can still finalize what was written, but callers
+    // must stop feeding packets - every further write fails too.
+    bool write(const uint8_t* data, size_t size);
+    bool writeSilenceFrames(uint64_t frames);
     void close();
     void reset();
     bool isOpen() const { return stream_.is_open(); }
@@ -22,6 +26,8 @@ public:
     const std::filesystem::path& path() const { return path_; }
     uint16_t blockAlign() const { return blockAlign_; }
     uint32_t samplesPerSec() const { return samplesPerSec_; }
+    // Format blob the header was written with; empty before open().
+    const WaveFormatBlob& format() const { return format_; }
 
 private:
     void writeHeader(const WaveFormatBlob& format);
@@ -29,6 +35,7 @@ private:
 
     std::filesystem::path path_;
     std::ofstream stream_;
+    WaveFormatBlob format_;
     std::streampos dataSizePosition_{};
     uint64_t dataBytes_ = 0;
     uint64_t maxDataBytes_ = 0;

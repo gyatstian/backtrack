@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 namespace backtrack {
 
@@ -15,7 +16,10 @@ public:
     void pushVideo(EncodedPacket packet);
     bool extendLastVideoDuration(int64_t expectedPts100ns, int64_t duration100ns);
     void pushAudio(AudioPacket packet);
-    bool saveTo(const std::filesystem::path& outputPath, const VideoSettings& videoSettings);
+    bool saveTo(
+        const std::filesystem::path& outputPath,
+        const VideoSettings& videoSettings,
+        std::wstring* errorDetail = nullptr);
     void clear();
     size_t videoPacketCount() const;
     size_t videoKeyFrameCount() const;
@@ -33,6 +37,11 @@ private:
     std::deque<std::shared_ptr<const AudioPacket>> microphoneAudio_;
     size_t videoKeyFrames_ = 0;
     int64_t lastSaveEndPts100ns_ = 0;
+    // Codec parameter sets (SPS/PPS or VPS/SPS/PPS) captured from the first
+    // buffered packet that carried them. Prepended to a replay cut when its
+    // start packet lacks headers, so a clip never begins with an IDR that no
+    // decoder can bootstrap (drivers can ignore header-insertion settings).
+    std::vector<uint8_t> codecHeaderBytes_;
 };
 
 } // namespace backtrack

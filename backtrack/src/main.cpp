@@ -1,4 +1,5 @@
 #include "app/Application.h"
+#include "audio/WasapiCapture.h"
 #include "core/Logger.h"
 
 #include <Windows.h>
@@ -8,6 +9,9 @@
 
 namespace {
 
+// Sound-separation mutes are global system state (foreign apps' render
+// sessions). Every fatal exit path gets a best-effort restore so a crash can
+// never leave Discord/Spotify muted until the next clean Backtrack run.
 LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers) {
     std::wstringstream message;
     message << L"Unhandled SEH exception";
@@ -17,6 +21,7 @@ LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers) {
                 << L", address=" << record->ExceptionAddress;
     }
     backtrack::Logger::instance().error(L"fatal", message.str());
+    backtrack::WasapiCapture::emergencyRestoreSessionMutes();
     backtrack::Logger::instance().flush();
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -34,8 +39,25 @@ void terminateHandler() {
         }
     }
     backtrack::Logger::instance().error(L"fatal", message);
+    backtrack::WasapiCapture::emergencyRestoreSessionMutes();
     backtrack::Logger::instance().flush();
     std::abort();
+}
+
+BOOL WINAPI consoleCtrlHandler(DWORD controlType) {
+    // GUI app: this mostly covers CTRL_SHUTDOWN/CTRL_LOGOFF style events.
+    switch (controlType) {
+    case CTRL_C_EVENT:
+    case CTRL_BREAK_EVENT:
+    case CTRL_CLOSE_EVENT:
+    case CTRL_SHUTDOWN_EVENT:
+    case CTRL_LOGOFF_EVENT:
+        backtrack::WasapiCapture::emergencyRestoreSessionMutes();
+        break;
+    default:
+        break;
+    }
+    return FALSE; // never swallow default termination handling
 }
 
 } // namespace
@@ -43,6 +65,7 @@ void terminateHandler() {
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
     SetUnhandledExceptionFilter(unhandledExceptionFilter);
     std::set_terminate(terminateHandler);
+    SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
     backtrack::Application app;
     return app.run(instance, commandLine, showCommand);
 }

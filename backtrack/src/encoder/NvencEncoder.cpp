@@ -2,6 +2,7 @@
 
 #include "core/Logger.h"
 #include "encoder/BitstreamUtils.h"
+#include "encoder/DecodeOrderTimestamps.h"
 
 #include <Windows.h>
 
@@ -11,6 +12,7 @@
 #include <deque>
 #include <mutex>
 #include <numeric>
+#include <thread>
 #include <unordered_map>
 
 #ifndef BACKTRACK_HAS_NVENC
@@ -204,6 +206,19 @@ NV_ENC_NUM_REF_FRAMES nvencReferenceFrames(uint32_t referenceFrames) {
     return NV_ENC_NUM_REF_FRAMES_1;
 }
 
+// Captured desktop content is RGB; the encoder converts to YUV. Pin BT.709
+// matrix/primaries/transfer with limited (studio) range in the SPS/VPS VUI so
+// every clip decodes with identical colors regardless of driver defaults.
+void applyBt709LimitedRangeVui(NV_ENC_CONFIG_H264_VUI_PARAMETERS& vui) {
+    vui.videoSignalTypePresentFlag = 1;
+    vui.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+    vui.videoFullRangeFlag = 0;
+    vui.colourDescriptionPresentFlag = 1;
+    vui.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    vui.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+}
+
 } // namespace
 
 struct NvencEncoder::Impl {
@@ -232,23 +247,83 @@ struct NvencEncoder::Impl {
         NV_ENC_OUTPUT_PTR bitstream = nullptr;
         int64_t fallbackPts100ns = 0;
         int64_t fallbackDuration100ns = 0;
-        bool requestedKeyFrame = false;
         std::chrono::steady_clock::time_point submittedAt;
+        // Encoder submission counter when this frame was accepted. The output
+        // can only complete once enough later frames were submitted to fill
+        // the reorder pipeline; until then LOCK_BUSY is healthy, not wedged.
+        uint64_t submittedFramesAtSubmission = 0;
     };
+
+    // Cached codec parameter sets (SPS/PPS or VPS/SPS/PPS) captured from the
+    // first packet that carried them. Prepended to any keyframe packet that
+    // lacks them so a replay cut at an IDR is always self-contained even if
+    // the driver ignores repeatSPSPPS/header-insertion settings.
+    std::vector<uint8_t> cachedParameterSets;
 
     std::unordered_map<ID3D11Texture2D*, RegisteredResource> registeredResources;
     std::vector<NV_ENC_OUTPUT_PTR> bitstreamBuffers;
     std::deque<NV_ENC_OUTPUT_PTR> availableBitstreams;
     std::deque<PendingOutput> pendingOutputs;
     std::deque<EncodedPacket> readyPackets;
+    DecodeOrderTimestamps decodeTimestamps;
     std::atomic<bool> forceKeyFrame{true};
     size_t readyOutputCount = 0;
     uint32_t consecutiveRegisterFailures = 0;
     uint32_t consecutiveMapFailures = 0;
+    uint32_t consecutiveEncodeFailures = 0;
     uint32_t consecutiveNeedMoreInput = 0;
     uint32_t consecutiveOutputBufferStarvation = 0;
     uint32_t consecutiveLockFailures = 0;
     bool inputMappingFaulted = false;
+
+    // Non-blocking bitstream-lock support. Healthy drivers honour
+    // NV_ENC_LOCK_BITSTREAM::doNotWait=1 (returning LOCK_BUSY until the encode
+    // completes); some older drivers instead answer with an unsupported-
+    // parameter error. Probed on first use; a session that falls back to the
+    // blocking lock stays on it permanently so behaviour never changes
+    // mid-session.
+    enum class BitstreamPolling { Unknown, Supported, Unsupported };
+    BitstreamPolling bitstreamPolling = BitstreamPolling::Unknown;
+
+    // Hard ceiling for acquiring an output whose encode was already accepted.
+    // A LOCK_BUSY output is only wedged once the encoder received enough
+    // later frames to finish its reorder pipeline (see
+    // reorderDelayFrames()); before that, waiting is healthy. Once both
+    // conditions hold, escalate to an encoder fault (encoderAvailable=false)
+    // so the capture loop recreates the pipeline instead of hanging or
+    // recycling a stuck buffer while pipelineGpuMutex_ is held.
+    static constexpr auto kBitstreamLockTimeout = std::chrono::seconds(5);
+
+    uint32_t reorderDelayFrames() const {
+        return (caps.effective.bFrames ? 2u : 0u) +
+               (caps.effective.lookahead ? caps.effective.lookaheadDepth : 0u);
+    }
+
+    // True when this output must be lockable on request. Two independent
+    // bounds, either of which is sufficient: enough later frames entered the
+    // encoder to flush its reorder pipeline, or the frame's real-time reorder
+    // window plus a generous margin has passed since submission (capture feeds
+    // frames continuously at settings.fps, so age implies successors unless
+    // the pipeline itself stalled - and then the LOCK_BUSY escalation below
+    // faults it instead of waiting forever). The successor bound alone would
+    // deadlock once every output buffer sits in pendingOutputs: submissions
+    // stop because no buffer can be acquired, so the count can never advance.
+    bool outputShouldBeComplete(const PendingOutput& pending) const {
+        if (encoderStats.submittedFrames >=
+            pending.submittedFramesAtSubmission + reorderDelayFrames() + 1) {
+            return true;
+        }
+        const auto reorderWindowMs = std::chrono::milliseconds(
+            (1000 * (reorderDelayFrames() + 8)) / std::max<uint32_t>(settings.fps, 1));
+        return SteadyClock::now() - pending.submittedAt >= reorderWindowMs;
+    }
+
+    // Matches the AMF escalation threshold: a driver TDR/reset leaves the
+    // NVENC session permanently broken, so every submit fails while stats keep
+    // reporting healthy and the recording degrades into a freeze-frame. After
+    // this many consecutive failures the session is faulted (encoderAvailable
+    // = false) so the capture loop's recreateGpuPipeline path rebuilds it.
+    static constexpr uint32_t kMaxConsecutiveEncodeFailures = 30;
 
     bool loadApi() {
         module = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -318,7 +393,9 @@ struct NvencEncoder::Impl {
     bool initializeEncoder(ID3D11Device* device, const std::wstring& adapterName) {
         consecutiveMapFailures = 0;
         consecutiveRegisterFailures = 0;
+        consecutiveEncodeFailures = 0;
         inputMappingFaulted = false;
+        cachedParameterSets.clear();
         if (!loadApi() || !openSession(device)) {
             return false;
         }
@@ -348,6 +425,13 @@ struct NvencEncoder::Impl {
         }
         const uint32_t effectiveBFrameCount = caps.effective.bFrames ? 2 : 0;
         caps.effective.lookaheadDepth = std::min<uint32_t>(caps.effective.lookaheadDepth, 31 - effectiveBFrameCount);
+        // Warm up with the full pipeline depth the heuristics below assume:
+        // frameIntervalP holds bFrames + 1 frames before the first output
+        // appears, and enabled lookahead keeps roughly its configured depth
+        // of submissions unharvested in steady state. Resetting with less
+        // would make every output look surplus once the pipeline filled,
+        // tripping the desync watchdog (see DecodeOrderTimestamps).
+        decodeTimestamps.reset(reorderDelayFrames());
 
         const GUID requestedPreset = presetGuid(caps.effective.preset);
         const NV_ENC_TUNING_INFO requestedTuning = tuningInfo(caps.effective.mode);
@@ -405,6 +489,7 @@ struct NvencEncoder::Impl {
             h264.numRefL1 = caps.effective.bFrames ? nvencReferenceFrames(1) : NV_ENC_NUM_REF_FRAMES_AUTOSELECT;
             h264.useBFramesAsRef = NV_ENC_BFRAME_REF_MODE_DISABLED;
             h264.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL_0;
+            applyBt709LimitedRangeVui(h264.h264VUIParameters);
         } else {
             auto& hevc = encodeConfig.encodeCodecConfig.hevcConfig;
             hevc.idrPeriod = encodeConfig.gopLength;
@@ -417,6 +502,7 @@ struct NvencEncoder::Impl {
             hevc.numRefL1 = caps.effective.bFrames ? nvencReferenceFrames(1) : NV_ENC_NUM_REF_FRAMES_AUTOSELECT;
             hevc.useBFramesAsRef = NV_ENC_BFRAME_REF_MODE_DISABLED;
             hevc.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL_0;
+            applyBt709LimitedRangeVui(hevc.hevcVUIParameters);
         }
 
         NV_ENC_INITIALIZE_PARAMS initParams{};
@@ -601,22 +687,109 @@ struct NvencEncoder::Impl {
         return true;
     }
 
+    // Prepends cached parameter sets to a keyframe packet that lacks them so
+    // every replay cut point is self-contained (see cachedParameterSets).
+    void ensureKeyFrameCarriesHeaders(EncodedPacket& packet) {
+        if (!packet.keyFrame || bitstreamContainsParameterSets(settings.codec, packet.bytes)) {
+            return;
+        }
+        if (cachedParameterSets.empty()) {
+            return;
+        }
+        std::vector<uint8_t> withHeaders;
+        withHeaders.reserve(cachedParameterSets.size() + packet.bytes.size());
+        withHeaders.insert(withHeaders.end(), cachedParameterSets.begin(), cachedParameterSets.end());
+        withHeaders.insert(withHeaders.end(), packet.bytes.begin(), packet.bytes.end());
+        packet.bytes = std::move(withHeaders);
+    }
+
     bool harvestPendingOutputs(bool waitForCompletion) {
+        // Drain mode uses an idle bound refreshed on every successfully locked
+        // output instead of one absolute budget: a large queue of completed
+        // outputs drains fully, while a wedged driver still escalates after
+        // kBitstreamLockTimeout without progress.
+        SteadyClock::time_point idleDeadline = waitForCompletion
+            ? SteadyClock::now() + kBitstreamLockTimeout
+            : SteadyClock::time_point::max();
+
         while (!pendingOutputs.empty() && (waitForCompletion || readyOutputCount > 0)) {
             PendingOutput pending = std::move(pendingOutputs.front());
+            const bool oldestShouldBeComplete = outputShouldBeComplete(pending);
             pendingOutputs.pop_front();
 
             NV_ENC_LOCK_BITSTREAM lock{};
             lock.version = NV_ENC_LOCK_BITSTREAM_VER;
             lock.outputBitstream = pending.bitstream;
-            // This is a synchronous NVENC session. The driver completes the
-            // encode before this lock returns; polling can report unsupported
-            // errors on older NVIDIA drivers instead of NV_ENC_ERR_LOCK_BUSY.
-            lock.doNotWait = 0;
-            const NVENCSTATUS status = api.nvEncLockBitstream(session, &lock);
+
+            // Bounded acquisition. Prefer the non-blocking lock and poll so a
+            // wedged driver escalates to an encoder fault instead of blocking
+            // forever while pipelineGpuMutex_ is held.
+            NVENCSTATUS status = NV_ENC_SUCCESS;
+            for (;;) {
+                const bool polling = bitstreamPolling != BitstreamPolling::Unsupported;
+                // Legacy drivers only offer a blocking lock with no timeout.
+                // Never block on a frame whose reorder pipeline is not full
+                // yet (a healthy driver would answer instantly, a wedged one
+                // would hang the encode worker), and never block on an output
+                // that should long have completed: the LOCK_BUSY path below
+                // faults it instead of gambling on the lock returning.
+                if (!polling && !waitForCompletion &&
+                    (!oldestShouldBeComplete ||
+                     SteadyClock::now() - pending.submittedAt >= kBitstreamLockTimeout)) {
+                    status = NV_ENC_ERR_LOCK_BUSY;
+                    break;
+                }
+                lock.doNotWait = polling ? 1 : 0;
+                status = api.nvEncLockBitstream(session, &lock);
+
+                if (status == NV_ENC_SUCCESS) {
+                    bitstreamPolling = polling ? BitstreamPolling::Supported
+                                               : BitstreamPolling::Unsupported;
+                    break;
+                }
+                if (status == NV_ENC_ERR_LOCK_BUSY) {
+                    if (!waitForCompletion) {
+                        break; // not complete yet: defer below
+                    }
+                    if (SteadyClock::now() < idleDeadline) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        continue;
+                    }
+                    break; // drain deadline expired: fault below
+                }
+                if (polling && bitstreamPolling == BitstreamPolling::Unknown) {
+                    // Older drivers reject doNotWait=1 with an error other
+                    // than LOCK_BUSY. Probe the blocking lock once; success
+                    // pins this session to legacy blocking semantics.
+                    bitstreamPolling = BitstreamPolling::Unsupported;
+                    continue;
+                }
+                break; // terminal failure: handled below
+            }
+
             if (status == NV_ENC_ERR_LOCK_BUSY && !waitForCompletion) {
+                // A busy output that should long be complete means the driver
+                // stopped making progress.
+                if (oldestShouldBeComplete &&
+                    SteadyClock::now() - pending.submittedAt >= kBitstreamLockTimeout) {
+                    pendingOutputs.push_front(std::move(pending));
+                    return failEncoder(
+                        L"NVENC output was not lockable within " +
+                        std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(
+                                            kBitstreamLockTimeout)
+                                            .count()) +
+                        L"s although its reorder pipeline was full; encoder faulted so the capture pipeline can recreate it");
+                }
                 pendingOutputs.push_front(std::move(pending));
                 break;
+            }
+            if (status == NV_ENC_ERR_LOCK_BUSY) {
+                return failEncoder(
+                    L"NVENC drain did not produce a lockable output within " +
+                    std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(
+                                        kBitstreamLockTimeout)
+                                        .count()) +
+                    L"s; encoder faulted so the capture pipeline can recreate it");
             }
             if (status != NV_ENC_SUCCESS) {
                 ++consecutiveLockFailures;
@@ -629,19 +802,40 @@ struct NvencEncoder::Impl {
                 --readyOutputCount;
             }
             consecutiveLockFailures = 0;
+            // Progress made: extend the drain idle bound.
+            if (waitForCompletion) {
+                idleDeadline = SteadyClock::now() + kBitstreamLockTimeout;
+            }
 
             EncodedPacket packet;
             const auto* begin = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
             packet.bytes.assign(begin, begin + lock.bitstreamSizeInBytes);
-            packet.pts100ns = lock.outputTimeStamp != 0
+            // Driver-timestamp validity is explicit: outputTimeStamp echoes the
+            // pic.inputTimeStamp we submitted (frame.pts100ns, QPC-derived
+            // steady-clock time since boot), which can never legitimately be
+            // zero by the time frames reach the encoder. Unlike decode
+            // timestamps - which CAN be zero or negative and therefore carry
+            // hasDts (see Types.h) - this sentinel-free comparison is safe.
+            const bool driverPtsValid = lock.outputTimeStamp != 0;
+            packet.pts100ns = driverPtsValid
                 ? static_cast<int64_t>(lock.outputTimeStamp)
                 : pending.fallbackPts100ns;
             packet.duration100ns = lock.outputDuration != 0
                 ? static_cast<int64_t>(lock.outputDuration)
                 : pending.fallbackDuration100ns;
-            const bool metadataKeyFrame = lock.pictureType == NV_ENC_PIC_TYPE_IDR || lock.pictureType == NV_ENC_PIC_TYPE_I;
-            const bool requestedOutputKeyFrame = pending.requestedKeyFrame && packet.pts100ns == pending.fallbackPts100ns;
-            packet.keyFrame = requestedOutputKeyFrame || metadataKeyFrame || bitstreamContainsKeyFrame(settings.codec, packet.bytes);
+            // NVENC emits packets in decode order; map each output back to the
+            // submission slot it decodes at so PTS regressions within a GOP
+            // stay representable (the MP4 mux needs DTS for B-frames).
+            packet.dts100ns = decodeTimestamps.onOutput(packet.pts100ns, pending.fallbackDuration100ns);
+            packet.hasDts = true;
+            // Only real IDR pictures are replay cut points. A plain I picture
+            // (adaptive I-frames) or CRA open-GOP picture leaves decoders
+            // referencing frames from before it, which breaks clips cut there.
+            const bool metadataIdr = lock.pictureType == NV_ENC_PIC_TYPE_IDR;
+            packet.keyFrame = metadataIdr ||
+                (bitstreamContainsKeyFrame(settings.codec, packet.bytes) &&
+                 !bitstreamContainsCraFrame(settings.codec, packet.bytes));
+            ensureKeyFrameCarriesHeaders(packet);
             packet.codec = settings.codec;
 
             api.nvEncUnlockBitstream(session, pending.bitstream);
@@ -650,6 +844,12 @@ struct NvencEncoder::Impl {
             if (packet.bytes.empty()) {
                 ++encoderStats.droppedFrames;
                 continue;
+            }
+            if (cachedParameterSets.empty()) {
+                std::vector<uint8_t> parameterSets;
+                if (extractParameterSets(settings.codec, packet.bytes, parameterSets)) {
+                    cachedParameterSets = std::move(parameterSets);
+                }
             }
 
             const auto elapsed = std::chrono::duration<double, std::milli>(
@@ -699,6 +899,9 @@ struct NvencEncoder::Impl {
 
         NV_ENC_REGISTERED_PTR registered = registeredResourceFor(frame.texture.Get(), expectedBufferFormat);
         if (!registered) {
+            // Frame lost before reaching the encoder: restart the next GOP so
+            // the stream never continues from a broken reference chain.
+            forceKeyFrame = true;
             ++encoderStats.droppedFrames;
             return false;
         }
@@ -717,6 +920,7 @@ struct NvencEncoder::Impl {
                 status = api.nvEncMapInputResource(session, &map);
             }
             if (status != NV_ENC_SUCCESS) {
+                forceKeyFrame = true;
                 noteMapFailure(status);
                 ++encoderStats.droppedFrames;
                 return popReadyPacket(packet);
@@ -725,7 +929,23 @@ struct NvencEncoder::Impl {
         consecutiveMapFailures = 0;
 
         NV_ENC_OUTPUT_PTR bitstream = acquireBitstreamBuffer();
+        if (!bitstream && !pendingOutputs.empty()) {
+            // Every output buffer is an accepted-but-unlocked picture. This
+            // also means submission has stopped, so per-submission harvesting
+            // would never run again and neither the locks nor the
+            // wedged-driver escalation could ever make progress. Credit the
+            // pending outputs (the completion counter can legitimately be
+            // lower when every accept returned NEED_MORE_INPUT), then harvest
+            // once here - bounded, see harvestPendingOutputs - to free a
+            // buffer or fault a wedged session, and try again.
+            readyOutputCount = std::max<size_t>(readyOutputCount, pendingOutputs.size());
+            if (!harvestPendingOutputs(false)) {
+                return false;
+            }
+            bitstream = acquireBitstreamBuffer();
+        }
         if (!bitstream) {
+            forceKeyFrame = true;
             api.nvEncUnmapInputResource(session, map.mappedResource);
             ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
@@ -760,8 +980,32 @@ struct NvencEncoder::Impl {
         pending.bitstream = bitstream;
         pending.fallbackPts100ns = frame.pts100ns;
         pending.fallbackDuration100ns = static_cast<int64_t>(pic.inputDuration);
-        pending.requestedKeyFrame = requestedKeyFrame;
         pending.submittedAt = start;
+        pending.submittedFramesAtSubmission = encoderStats.submittedFrames;
+
+        if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
+            Logger::instance().error(L"encoder", L"nvEncEncodePicture failed: " + nvStatusName(status));
+            ++consecutiveEncodeFailures;
+            // The frame never reached the encoder; restart the next GOP so the
+            // stream continues from a clean reference state.
+            forceKeyFrame = true;
+            releaseBitstreamBuffer(bitstream);
+            ++encoderStats.droppedFrames;
+            if (consecutiveEncodeFailures >= kMaxConsecutiveEncodeFailures) {
+                return failEncoder(
+                    L"nvEncEncodePicture failed " +
+                    std::to_wstring(consecutiveEncodeFailures) +
+                    L" times in a row (" + nvStatusName(status) +
+                    L"); encoder faulted so the capture pipeline can recreate it");
+            }
+            return popReadyPacket(packet);
+        }
+        consecutiveEncodeFailures = 0;
+
+        // Accepted input: NVENC produces exactly one output packet for it, in
+        // decode order. Record the submission slot for decode-timestamp
+        // assignment.
+        decodeTimestamps.onSubmit(frame.pts100ns);
 
         if (status == NV_ENC_ERR_NEED_MORE_INPUT) {
             pendingOutputs.push_back(std::move(pending));
@@ -773,15 +1017,6 @@ struct NvencEncoder::Impl {
                     L"NVENC is still delaying output for reordering/lookahead; count=" +
                     std::to_wstring(consecutiveNeedMoreInput));
             }
-            return popReadyPacket(packet);
-        }
-        if (status != NV_ENC_SUCCESS) {
-            Logger::instance().error(L"encoder", L"nvEncEncodePicture failed: " + nvStatusName(status));
-            if (requestedKeyFrame) {
-                forceKeyFrame = true;
-            }
-            releaseBitstreamBuffer(bitstream);
-            ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
         }
 
@@ -811,11 +1046,12 @@ struct NvencEncoder::Impl {
         if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
             Logger::instance().error(L"encoder", L"nvEncEncodePicture(EOS) failed: " + nvStatusName(status));
         }
-
-        if (status == NV_ENC_SUCCESS) {
-            readyOutputCount = pendingOutputs.size();
-            harvestPendingOutputs(true);
-        }
+        // Harvest regardless of the EOS result: NEED_MORE_INPUT (and even some
+        // error codes on quirky drivers) can precede valid frames still queued
+        // in the encoder. Skipping the harvest here loses the tail of the
+        // recording. The drain harvest is idle-bounded, so this stays safe.
+        readyOutputCount = pendingOutputs.size();
+        harvestPendingOutputs(true);
         while (!readyPackets.empty()) {
             packets.push_back(std::move(readyPackets.front()));
             readyPackets.pop_front();
@@ -827,6 +1063,7 @@ struct NvencEncoder::Impl {
         readyPackets.clear();
         availableBitstreams.clear();
         readyOutputCount = 0;
+        decodeTimestamps.reset(0);
         if (session) {
             for (NV_ENC_OUTPUT_PTR buffer : bitstreamBuffers) {
                 if (buffer) {
@@ -836,6 +1073,7 @@ struct NvencEncoder::Impl {
         }
         bitstreamBuffers.clear();
         consecutiveNeedMoreInput = 0;
+        consecutiveEncodeFailures = 0;
         consecutiveOutputBufferStarvation = 0;
         consecutiveLockFailures = 0;
     }

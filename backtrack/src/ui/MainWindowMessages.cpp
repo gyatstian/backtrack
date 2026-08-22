@@ -516,8 +516,15 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         break;
     case WM_TIMER:
         if (wParam == kDiagnosticsTimerId) {
-            if (page_ == Page::Diagnostics && IsWindowVisible(window_) && !IsIconic(window_)) {
-                updateStats();
+            if (IsWindowVisible(window_) && !IsIconic(window_) &&
+                (page_ == Page::Diagnostics || controller_.isRecording())) {
+                if (page_ == Page::Diagnostics) {
+                    // Full diagnostics refresh; also drives the audio-liveness
+                    // warning through updateStats().
+                    updateStats();
+                } else {
+                    updateAudioLivenessWarning(controller_.stats());
+                }
             } else {
                 updateDiagnosticsTimer();
             }

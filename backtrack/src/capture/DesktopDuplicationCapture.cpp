@@ -140,6 +140,7 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     // Desktop Duplication is per-output and the output must belong to this
     // device's adapter. Never guess output 0: that silently records wrong monitor.
     const HMONITOR monitor = target.monitor ? target.monitor : monitorFromIndex(target.monitorIndex);
+    monitor_ = monitor;
     const DxgiOutputLocation location = dxgiOutputForMonitor(monitor);
     if (!location.valid()) {
         Logger::instance().error(L"capture", L"Desktop Duplication could not find requested monitor on any DXGI adapter");
@@ -169,6 +170,7 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     }
     width_ = static_cast<uint32_t>(outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left);
     height_ = static_cast<uint32_t>(outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top);
+    hdrActive_ = monitorHasAdvancedColor(monitor);
 
     ComPtr<IDXGIOutput1> output1;
     hr = output.As(&output1);
@@ -208,7 +210,8 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     }
 
     Logger::instance().info(L"capture",
-        L"Desktop Duplication initialized at " + std::to_wstring(width_) + L"x" + std::to_wstring(height_));
+        L"Desktop Duplication initialized at " + std::to_wstring(width_) + L"x" + std::to_wstring(height_) +
+        (hdrActive_ ? L" (HDR active; frames will be tone-mapped to SDR)" : L""));
     return true;
 }
 
@@ -263,6 +266,9 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         width_ = acquiredDesc.Width;
         height_ = acquiredDesc.Height;
         format_ = acquiredDesc.Format;
+        // A display-mode switch is also when HDR can toggle; refresh the flag
+        // so frames carry the correct color-space hint.
+        hdrActive_ = monitorHasAdvancedColor(monitor_);
         if (!createTexturePool(width_, height_, format_, poolSize_)) {
             markLost(L"Texture pool recreate failed", E_FAIL);
             return false;
@@ -342,13 +348,24 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
     const LONGLONG timestamp = frameInfo.LastPresentTime.QuadPart != 0
         ? frameInfo.LastPresentTime.QuadPart
         : frameInfo.LastMouseUpdateTime.QuadPart;
+    // Prefer the real QPC present/mouse timestamps (same epoch as MSVC
+    // steady_clock). When neither exists, fall back to the current steady
+    // clock instead of fabricating evenly spaced 60 FPS stamps: fake cadences
+    // drift against real audio/video timelines and corrupt clip durations.
     frame.pts100ns = qpcFrequency.QuadPart > 0 && timestamp != 0
         ? static_cast<int64_t>((static_cast<long double>(timestamp) * kHundredNanosecondsPerSecond)
             / static_cast<long double>(qpcFrequency.QuadPart))
-        : static_cast<int64_t>(frame.frameIndex * (kHundredNanosecondsPerSecond / 60));
+        : std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count();
     frame.width = width_;
     frame.height = height_;
     frame.format = format_;
+    // Only 10-bit/FP16 surfaces carry native PQ content; 8-bit BGRA under HDR
+    // is already SDR-mapped by the desktop composition.
+    frame.hdr = hdrActive_ &&
+        (format_ == DXGI_FORMAT_R10G10B10A2_UNORM ||
+         format_ == DXGI_FORMAT_R16G16B16A16_FLOAT);
     return true;
 }
 
@@ -359,6 +376,8 @@ void DesktopDuplicationCapture::shutdown() {
     havePresentedContent_ = false;
     frameHeld_ = false;
     deviceLost_ = true;
+    hdrActive_ = false;
+    monitor_ = nullptr;
     pool_.clear();
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();

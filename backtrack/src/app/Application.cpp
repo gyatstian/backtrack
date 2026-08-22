@@ -1,5 +1,6 @@
 #include "app/Application.h"
 
+#include "audio/WasapiCapture.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "ui/MainWindow.h"
@@ -90,6 +91,17 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
                                      std::to_wstring(settings.video.height) + L"@" + std::to_wstring(settings.video.fps));
     updateWindowsStartupRegistration(settings.startWithWindowsMinimized);
 
+    // Restore sound-separation session mutes a previous crashed session left
+    // applied system-wide. Runs after logger init and under the single-instance
+    // mutex, so no concurrent session can re-mute while sweeping.
+    try {
+        WasapiCapture::restoreOrphanedSessionMutes();
+    } catch (const std::exception& error) {
+        Logger::instance().warning(L"app", std::wstring(L"Orphaned session-mute sweep failed: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().warning(L"app", L"Orphaned session-mute sweep failed: unknown exception");
+    }
+
     if (settings.pruneStaleMicrophoneConsentEntries) {
         pruneStaleMicrophoneConsentEntries();
     }
@@ -97,6 +109,13 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     const HRESULT com = OleInitialize(nullptr);
 
     controller_.initialize(settings);
+    // The startup sweep of crash-recovery leftovers (recover newest valid
+    // manifest into a clip, delete older orphaned temporary data) now runs on
+    // a background thread owned by RecorderController so the main window
+    // appears immediately even when a large crashed recording must be
+    // remuxed. RecorderController serializes the sweep against recording,
+    // replay saves, and manual recovery; the single-instance mutex held below
+    // until exit still guarantees no concurrent session.
     const auto capabilities = controller_.encoderCapabilities();
     Logger::instance().info(
         L"app",

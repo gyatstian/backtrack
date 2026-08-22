@@ -550,39 +550,74 @@ void MainWindow::controllerWorkerLoop() {
     setThreadDescriptionSafe(L"Backtrack controller");
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-    for (;;) {
-        ControllerAction action;
-        {
-            std::unique_lock lock(controllerQueueMutex_);
-            controllerQueueCv_.wait(lock, [&] {
-                return controllerWorkerStopping_ || !controllerQueue_.empty();
-            });
-            if (controllerWorkerStopping_ && controllerQueue_.empty()) {
-                break;
+    try {
+        for (;;) {
+            ControllerAction action;
+            {
+                std::unique_lock lock(controllerQueueMutex_);
+                controllerQueueCv_.wait(lock, [&] {
+                    return controllerWorkerStopping_ || !controllerQueue_.empty();
+                });
+                if (controllerWorkerStopping_ && controllerQueue_.empty()) {
+                    break;
+                }
+                action = std::move(controllerQueue_.front());
+                controllerQueue_.pop_front();
             }
-            action = std::move(controllerQueue_.front());
-            controllerQueue_.pop_front();
-        }
 
-        auto result = std::make_unique<ControllerActionResult>(executeControllerAction(action));
+            // Catch-all per action: a stray exception (bad_alloc during a save,
+            // filesystem errors) must degrade that action, never kill the
+            // worker thread or the app mid-save.
+            ControllerActionResult outcome;
+            try {
+                outcome = executeControllerAction(action);
+            } catch (const std::exception& error) {
+                Logger::instance().error(
+                    L"ui",
+                    std::wstring(L"Recorder action failed unexpectedly: ") + utf8ToWide(error.what()));
+                outcome.kind = action.kind;
+                outcome.ok = false;
+                outcome.status = L"Action failed unexpectedly; see the diagnostics log";
+            } catch (...) {
+                Logger::instance().error(L"ui", L"Recorder action failed unexpectedly: unknown exception");
+                outcome.kind = action.kind;
+                outcome.ok = false;
+                outcome.status = L"Action failed unexpectedly; see the diagnostics log";
+            }
 
-        bool stopping = false;
-        {
-            std::scoped_lock lock(controllerQueueMutex_);
-            stopping = controllerWorkerStopping_;
-        }
-        if (!stopping && window_ && IsWindow(window_)) {
-            auto* rawResult = result.release();
-            if (!PostMessageW(window_, kControllerActionCompleteMessage, 0, reinterpret_cast<LPARAM>(rawResult))) {
-                delete rawResult;
+            bool stopping = false;
+            {
+                std::scoped_lock lock(controllerQueueMutex_);
+                stopping = controllerWorkerStopping_;
+            }
+            if (!stopping && window_ && IsWindow(window_)) {
+                auto* rawResult = new ControllerActionResult(std::move(outcome));
+                if (!PostMessageW(window_, kControllerActionCompleteMessage, 0, reinterpret_cast<LPARAM>(rawResult))) {
+                    delete rawResult;
+                    controllerActionPending_ = false;
+                }
+            } else {
                 controllerActionPending_ = false;
             }
-        } else {
-            controllerActionPending_ = false;
         }
+    } catch (const std::exception& error) {
+        Logger::instance().error(
+            L"ui",
+            std::wstring(L"Controller worker crashed: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().error(L"ui", L"Controller worker crashed: unknown exception");
     }
 
-    controller_.shutdown();
+    controllerActionPending_ = false;
+    try {
+        controller_.shutdown();
+    } catch (const std::exception& error) {
+        Logger::instance().error(
+            L"ui",
+            std::wstring(L"Recorder shutdown failed after an internal error: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().error(L"ui", L"Recorder shutdown failed after an internal error");
+    }
     if (SUCCEEDED(com)) {
         CoUninitialize();
     }
@@ -669,10 +704,15 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
             const std::wstring failureSummary = action.replayTag.empty()
                 ? L"Replay could not be saved"
                 : action.replayTag + L" could not be saved";
-            result.status = actionFailureStatus(
-                failureSummary.c_str(),
-                controller_.encoderCapabilities(),
-                controller_.stats());
+            // A specific cause from the save path beats the generic backend
+            // status: "disk full", "no keyframe buffered yet", an HRESULT, ...
+            const std::wstring detail = trimText(controller_.lastRecordingError());
+            result.status = !detail.empty()
+                ? failureSummary + L": " + detail
+                : actionFailureStatus(
+                    failureSummary.c_str(),
+                    controller_.encoderCapabilities(),
+                    controller_.stats());
         }
         break;
     case ControllerActionKind::RecoverFailedRecording:
@@ -703,10 +743,18 @@ void MainWindow::handleControllerActionComplete(const ControllerActionResult& re
     if (!result.status.empty()) {
         setStatus(result.status);
     }
-    if (result.kind == ControllerActionKind::ToggleRecording && page_ == Page::Capture) {
-        HWND button = startStopButton_ ? startStopButton_ : GetDlgItem(pageHost_, kStartStopButtonId);
-        setText(button, controller_.isRecording() ? L"Stop Recording" : L"Start Recording");
-        InvalidateRect(button, nullptr, FALSE);
+    if (result.kind == ControllerActionKind::ToggleRecording) {
+        if (page_ == Page::Capture) {
+            HWND button = startStopButton_ ? startStopButton_ : GetDlgItem(pageHost_, kStartStopButtonId);
+            setText(button, controller_.isRecording() ? L"Stop Recording" : L"Start Recording");
+            InvalidateRect(button, nullptr, FALSE);
+        }
+        // Start/stop of a recording changes whether the diagnostics timer must
+        // tick (audio-liveness status warning); reconcile immediately instead
+        // of waiting up to one timer period. Hotkey-initiated recordings can
+        // complete while any page is shown, so this must run regardless of
+        // the current page.
+        updateDiagnosticsTimer();
     }
     if (result.refreshLibrary && page_ == Page::Library) {
         refreshClips();
@@ -718,8 +766,10 @@ void MainWindow::updateDiagnosticsTimer() {
         return;
     }
 
+    // The timer drives the diagnostics refresh and the audio-liveness status
+    // warning, so it must also tick while recording on any page.
     const bool shouldRun =
-        page_ == Page::Diagnostics &&
+        (page_ == Page::Diagnostics || controller_.isRecording()) &&
         IsWindowVisible(window_) &&
         !IsIconic(window_);
     if (shouldRun) {
@@ -732,6 +782,9 @@ void MainWindow::updateDiagnosticsTimer() {
     if (diagnosticsTimerActive_) {
         KillTimer(window_, kDiagnosticsTimerId);
         diagnosticsTimerActive_ = false;
+        // Recording just stopped (or the window was hidden): clear any active
+        // liveness warning so it does not outlive its context.
+        updateAudioLivenessWarning(controller_.stats());
     }
 }
 

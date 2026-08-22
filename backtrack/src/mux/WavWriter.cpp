@@ -55,6 +55,7 @@ bool WavWriter::open(const std::filesystem::path& path, const WaveFormatBlob& fo
     dataSizePosition_ = {};
     blockAlign_ = 0;
     samplesPerSec_ = 0;
+    format_ = WaveFormatBlob{};
     sizeLimitLogged_ = false;
     const WaveFormatBlob effectiveFormat = format.bytes.empty() ? fallbackPcmFormat() : format;
     if (effectiveFormat.bytes.size() < sizeof(WAVEFORMATEX)) {
@@ -68,6 +69,7 @@ bool WavWriter::open(const std::filesystem::path& path, const WaveFormatBlob& fo
         Logger::instance().warning(L"mux", L"Rejected WAV stream with unusable format metadata: " + path_.wstring());
         return false;
     }
+    format_ = effectiveFormat;
     if (!path_.parent_path().empty()) {
         std::error_code error;
         std::filesystem::create_directories(path_.parent_path(), error);
@@ -83,9 +85,12 @@ bool WavWriter::open(const std::filesystem::path& path, const WaveFormatBlob& fo
     return true;
 }
 
-void WavWriter::write(const uint8_t* data, size_t size) {
-    if (!stream_.is_open() || !data || size == 0) {
-        return;
+bool WavWriter::write(const uint8_t* data, size_t size) {
+    if (!stream_.is_open()) {
+        return false;
+    }
+    if (!data || size == 0) {
+        return true;
     }
     uint64_t bytesToWrite = size;
     if (maxDataBytes_ > 0) {
@@ -94,7 +99,9 @@ void WavWriter::write(const uint8_t* data, size_t size) {
                 Logger::instance().warning(L"mux", L"WAV stream reached the RIFF size limit; dropping additional audio: " + path_.wstring());
                 sizeLimitLogged_ = true;
             }
-            return;
+            // Deliberate cap, not a write error: audio past the 4 GiB RIFF
+            // boundary is dropped by design so long recordings still save.
+            return true;
         }
         uint64_t remaining = maxDataBytes_ - dataBytes_;
         if (blockAlign_ > 0) {
@@ -107,19 +114,23 @@ void WavWriter::write(const uint8_t* data, size_t size) {
         }
     }
     if (bytesToWrite == 0 || bytesToWrite > static_cast<uint64_t>((std::numeric_limits<std::streamsize>::max)())) {
-        return;
+        return true;
     }
     stream_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytesToWrite));
     if (!stream_) {
-        Logger::instance().warning(L"mux", L"Could not write WAV audio data: " + path_.wstring());
-        return;
+        Logger::instance().error(L"mux", L"Could not write WAV audio data: " + path_.wstring());
+        return false;
     }
     dataBytes_ += bytesToWrite;
+    return true;
 }
 
-void WavWriter::writeSilenceFrames(uint64_t frames) {
-    if (!stream_.is_open() || blockAlign_ == 0 || frames == 0) {
-        return;
+bool WavWriter::writeSilenceFrames(uint64_t frames) {
+    if (!stream_.is_open() || blockAlign_ == 0) {
+        return false;
+    }
+    if (frames == 0) {
+        return true;
     }
     constexpr size_t kChunkBytes = 64 * 1024;
     const size_t alignedChunkBytes = std::max<size_t>(
@@ -138,9 +149,12 @@ void WavWriter::writeSilenceFrames(uint64_t frames) {
             break;
         }
         const size_t bytesToWrite = static_cast<size_t>(bytesThisChunk);
-        write(silence.data(), bytesToWrite);
+        if (!write(silence.data(), bytesToWrite)) {
+            return false;
+        }
         bytesRemaining -= bytesToWrite;
     }
+    return true;
 }
 
 void WavWriter::close() {
@@ -154,6 +168,7 @@ void WavWriter::close() {
 void WavWriter::reset() {
     close();
     path_.clear();
+    format_ = WaveFormatBlob{};
     dataSizePosition_ = {};
     dataBytes_ = 0;
     maxDataBytes_ = 0;

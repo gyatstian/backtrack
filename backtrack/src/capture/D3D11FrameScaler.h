@@ -50,6 +50,10 @@ private:
     std::shared_ptr<TextureSlot> acquireSlot();
     ID3D11VideoProcessorInputView* inputViewFor(D3DDevice& device, ID3D11Texture2D* texture);
     ID3D11VideoProcessorInputView* copiedInputViewFor(D3DDevice& device, ID3D11Texture2D* texture);
+    // Drops cached input views whose source texture is no longer referenced by
+    // anyone except this cache (and the view itself). Views pin their texture,
+    // so stale entries hold dead GPU surfaces in VRAM until pruned.
+    void pruneStaleInputViews();
 
     ComPtr<ID3D11VideoDevice> videoDevice_;
     ComPtr<ID3D11VideoContext> videoContext_;
@@ -63,6 +67,10 @@ private:
     uint64_t poolExhaustionDrops_ = 0;
     bool useCopiedInput_ = false;
     bool nv12Unavailable_ = false;
+    // Sticky: set when the video processor rejected an HDR (PQ/scRGB) input
+    // color space, so later frames fall back to the plain SDR interpretation
+    // instead of failing every frame.
+    bool hdrInputRejected_ = false;
     uint32_t inputWidth_ = 0;
     uint32_t inputHeight_ = 0;
     uint32_t outputWidth_ = 0;

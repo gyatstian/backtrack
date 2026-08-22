@@ -486,19 +486,26 @@ int MainWindow::statusHeightForWidth(int width) const {
 }
 
 std::wstring MainWindow::currentStatusDisplayText() const {
+    // Live audio-health warnings ride along with whatever status text is
+    // showing instead of replacing it, so action feedback is never lost.
+    const std::wstring base = audioLivenessWarning_.empty()
+        ? statusText_
+        : (statusText_.empty() || statusText_ == L"Ready"
+            ? audioLivenessWarning_
+            : statusText_ + L"  ·  " + audioLivenessWarning_);
     if (hoveredHelpControl_) {
         const auto help = statusHelpTexts_.find(hoveredHelpControl_);
         if (help != statusHelpTexts_.end()) {
-            if (statusText_.empty() || statusText_ == L"Ready") {
+            if (base.empty() || base == L"Ready") {
                 return help->second;
             }
-            if (statusText_ == help->second) {
-                return statusText_;
+            if (base == help->second) {
+                return base;
             }
-            return statusText_ + L"  ·  " + help->second;
+            return base + L"  ·  " + help->second;
         }
     }
-    return statusText_;
+    return base;
 }
 
 int MainWindow::statusHeightForText(int width, const std::wstring& text) const {

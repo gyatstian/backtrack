@@ -1,10 +1,12 @@
 #include "app/RecorderController.h"
 #include "app/VideoTimelineScheduler.h"
 
+#include "audio/AudioConvert.h"
 #include "capture/DesktopDuplicationCapture.h"
 #include "capture/WgcCaptureSource.h"
 #include "capture/game/GameCaptureSource.h"
 #include "core/Logger.h"
+#include "mux/RecoveryStore.h"
 #include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
 
@@ -16,6 +18,7 @@
 #include <cmath>
 #include <cwctype>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <thread>
 #include <unordered_set>
@@ -124,68 +127,6 @@ VideoSettings activeVideoSettingsFor(const AppSettings& settings) {
     return active;
 }
 
-bool isWaveExtensibleSubFormat(const GUID& guid, uint16_t tag) {
-    static constexpr std::array<uint8_t, 8> kWaveSubFormatTail = {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
-    return guid.Data1 == tag &&
-           guid.Data2 == 0 &&
-           guid.Data3 == 0x0010 &&
-           std::equal(std::begin(guid.Data4), std::end(guid.Data4), kWaveSubFormatTail.begin());
-}
-
-enum class AudioSampleEncoding {
-    Pcm,
-    Float,
-    Unsupported,
-};
-
-struct AudioFormatInfo {
-    AudioSampleEncoding encoding = AudioSampleEncoding::Unsupported;
-    uint16_t bitsPerSample = 0;
-    uint16_t channels = 0;
-    uint32_t samplesPerSec = 0;
-    uint16_t blockAlign = 0;
-};
-
-AudioFormatInfo audioFormatInfo(const WaveFormatBlob& blob) {
-    if (blob.bytes.size() < sizeof(WAVEFORMATEX)) {
-        return {};
-    }
-
-    const auto* format = reinterpret_cast<const WAVEFORMATEX*>(blob.bytes.data());
-    AudioFormatInfo info;
-    info.bitsPerSample = format->wBitsPerSample;
-    info.channels = format->nChannels;
-    info.samplesPerSec = format->nSamplesPerSec;
-    info.blockAlign = format->nBlockAlign;
-    if (format->wFormatTag == WAVE_FORMAT_PCM) {
-        info.encoding = AudioSampleEncoding::Pcm;
-    } else if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-        info.encoding = AudioSampleEncoding::Float;
-    } else if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && blob.bytes.size() >= sizeof(WAVEFORMATEXTENSIBLE)) {
-        const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(blob.bytes.data());
-        if (isWaveExtensibleSubFormat(extensible->SubFormat, WAVE_FORMAT_PCM)) {
-            info.encoding = AudioSampleEncoding::Pcm;
-        } else if (isWaveExtensibleSubFormat(extensible->SubFormat, WAVE_FORMAT_IEEE_FLOAT)) {
-            info.encoding = AudioSampleEncoding::Float;
-        }
-    }
-    return info;
-}
-
-int32_t readSigned24(const uint8_t* sample);
-void writeSigned24(uint8_t* sample, int32_t value);
-
-bool audioFormatUsable(const AudioFormatInfo& format) {
-    const uint16_t bytesPerSample = format.bitsPerSample / 8;
-    return format.encoding != AudioSampleEncoding::Unsupported &&
-           format.bitsPerSample > 0 &&
-           format.bitsPerSample % 8 == 0 &&
-           bytesPerSample > 0 &&
-           format.channels > 0 &&
-           format.samplesPerSec > 0 &&
-           format.blockAlign >= static_cast<uint16_t>(format.channels * bytesPerSample);
-}
-
 std::wstring normalizedExecutableKey(const std::filesystem::path& path) {
     std::wstring value = path.wstring();
     std::replace(value.begin(), value.end(), L'/', L'\\');
@@ -193,6 +134,37 @@ std::wstring normalizedExecutableKey(const std::filesystem::path& path) {
         return static_cast<wchar_t>(towlower(ch));
     });
     return value;
+}
+
+enum class OutputNameReservation {
+    Reserved,
+    AlreadyExists,
+    Failed,
+};
+
+// Atomically claims a clip output name by creating it as an empty hidden file
+// with fail-if-exists semantics and closing the handle again. The placeholder
+// holds the name from selection until the finished MP4 is published, so no
+// concurrent saver or external process can take the same name in between;
+// publishing consumes only such empty reservations and never overwrites real
+// content (see Mp4Muxer's staged publish).
+OutputNameReservation reserveClipOutputName(const std::filesystem::path& path) {
+    const HANDLE handle = CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        0,
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_HIDDEN,
+        nullptr);
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+        return OutputNameReservation::Reserved;
+    }
+    const DWORD error = GetLastError();
+    return (error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS)
+        ? OutputNameReservation::AlreadyExists
+        : OutputNameReservation::Failed;
 }
 
 std::vector<std::wstring> mutedSoundSeparationExecutableKeys(const AppSettings& settings) {
@@ -316,7 +288,7 @@ void applyAudioVolume(AudioPacket& packet, uint32_t volumePercent) {
     if (!packet.format) {
         return;
     }
-    const AudioFormatInfo format = audioFormatInfo(*packet.format);
+    const AudioFormatInfo format = parseAudioFormat(*packet.format);
     const float gain = static_cast<float>(std::clamp<uint32_t>(volumePercent, 0, 200)) / 100.0f;
     switch (format.encoding) {
     case AudioSampleEncoding::Pcm:
@@ -478,6 +450,11 @@ RecorderController::RecorderController()
 
 RecorderController::~RecorderController() {
     shutdown();
+    // Scope-guard for global system state: sound-separation mutes must be
+    // restored on every destruction path, including ones where stopPipeline
+    // early-outs (pipeline never reached running state after mutes were
+    // applied). No-op when nothing is muted.
+    WasapiCapture::clearSessionMutes();
     if (frameEvent_) {
         CloseHandle(frameEvent_);
         frameEvent_ = nullptr;
@@ -486,6 +463,37 @@ RecorderController::~RecorderController() {
         CloseHandle(audioEvent_);
         audioEvent_ = nullptr;
     }
+}
+
+void RecorderController::beginStartupSweep() {
+    std::scoped_lock lock(startupSweepMutex_);
+    if (startupSweepThread_.joinable()) {
+        return; // A sweep is already in flight.
+    }
+    // Capture the path: a settings change must not redirect the running sweep.
+    const std::filesystem::path clipDirectory = settings().clipDirectory;
+    Logger::instance().info(L"app", L"Startup recovery sweep started in background");
+    startupSweepThread_ = std::thread([clipDirectory]() {
+        try {
+            RecoveryStore::sweepOrphanedRecoveryData(clipDirectory);
+        } catch (const std::exception& error) {
+            Logger::instance().warning(L"app", std::wstring(L"Startup recovery sweep failed: ") + utf8ToWide(error.what()));
+        } catch (...) {
+            Logger::instance().warning(L"app", L"Startup recovery sweep failed: unknown exception");
+        }
+    });
+}
+
+void RecorderController::waitForStartupSweep() {
+    // Under the mutex so concurrent callers serialize instead of racing
+    // join() on the same thread object; the second caller observes a finished,
+    // non-joinable thread and returns immediately.
+    std::scoped_lock lock(startupSweepMutex_);
+    if (!startupSweepThread_.joinable()) {
+        return;
+    }
+    Logger::instance().debug(L"recorder", L"Waiting for startup recovery sweep to finish");
+    startupSweepThread_.join();
 }
 
 bool RecorderController::initialize(AppSettings settings) {
@@ -506,6 +514,12 @@ bool RecorderController::initialize(AppSettings settings) {
                             L", replay=" + (settings_.replay.enabled ? L"enabled" : L"disabled") +
                             L", fps=" + std::to_wstring(settings_.video.fps) +
                             L", bitrateKbps=" + std::to_wstring(settings_.video.bitrateKbps));
+    // Sweep crash-recovery leftovers from previous sessions in the background:
+    // recover the newest valid manifest into a clip, then delete older
+    // orphaned temporary data. The single-instance mutex guarantees no other
+    // concurrent session; recording/recovery actions below wait for the sweep,
+    // so no new recovery state can be created while it runs.
+    beginStartupSweep();
     return true;
 }
 
@@ -587,6 +601,9 @@ bool RecorderController::startRecording() {
         Logger::instance().info(L"recorder", L"Start recording requested while already recording");
         return true;
     }
+    // The startup sweep may still be remuxing a crashed session's recovery
+    // data; a new recording stages fresh state into the same directories.
+    waitForStartupSweep();
     Logger::instance().info(L"recorder", L"Start recording requested");
     setLastRecordingError({});
     if (!ensurePipeline()) {
@@ -601,7 +618,11 @@ bool RecorderController::startRecording() {
         videoSettings = activeVideoSettings_;
     }
     if (!muxer_.startRecording(output, videoSettings)) {
+        const std::wstring detail = L"could not create the recording temporary streams in " + output.parent_path().wstring();
         Logger::instance().error(L"recorder", L"Recording muxer could not start for output: " + output.wstring());
+        // Release the clip name reserved by nextClipPath; nothing was written.
+        removeEmptyOutputReservation(output);
+        setLastRecordingError(detail);
         if (!settings().replay.enabled) {
             stopPipeline();
         }
@@ -611,13 +632,11 @@ bool RecorderController::startRecording() {
     videoTimelineEndPts100ns_ = 0;
     waitingForRecordingKeyFrame_ = true;
     recording_ = true;
+    // Request the IDR via forceVideoHeartbeat_, consumed by the capture thread
+    // in emitFrame. Locking pipelineGpuMutex_ here would block this caller for
+    // as long as a concurrent pipeline recreate holds it (up to seconds).
+    // The flag survives a recreate in progress and takes effect afterwards.
     forceVideoHeartbeat_ = true;
-    {
-        std::scoped_lock gpuLock(pipelineGpuMutex_);
-        if (encoder_) {
-            encoder_->requestKeyFrame();
-        }
-    }
     Logger::instance().info(L"recorder", L"Recording started");
     return true;
 }
@@ -663,6 +682,9 @@ std::filesystem::path RecorderController::stopRecording() {
 
 std::filesystem::path RecorderController::recoverFailedRecording() {
     Logger::instance().info(L"recorder", L"Recover failed recording requested");
+    // Serialize with the background startup sweep: both pick and delete the
+    // newest recovery manifest, so overlapping runs could recover it twice.
+    waitForStartupSweep();
     if (recording_) {
         const std::wstring detail = L"Stop the active recording before recovering a failed recording";
         setLastRecordingError(detail);
@@ -681,8 +703,16 @@ std::filesystem::path RecorderController::recoverFailedRecording() {
 
 std::filesystem::path RecorderController::saveReplay() {
     Logger::instance().info(L"recorder", L"Save replay requested");
+    // Replay saves stage MP4 data through the same .backtrack_tmp tree the
+    // startup sweep maintains; never overlap with it.
+    waitForStartupSweep();
+    // Cleared up front so the UI never surfaces a stale reason from an
+    // earlier action; every failure path below stores a specific cause.
+    setLastRecordingError({});
     if (!settings().replay.enabled) {
-        Logger::instance().warning(L"recorder", L"Replay save ignored: instant replay is disabled");
+        const std::wstring detail = L"instant replay is disabled in settings";
+        Logger::instance().warning(L"recorder", L"Replay save ignored: " + detail);
+        setLastRecordingError(detail);
         return {};
     }
     // Never mux a near-empty buffer (e.g. a single cold-start IDR or a capture
@@ -703,16 +733,15 @@ std::filesystem::path RecorderController::saveReplay() {
             std::to_wstring(replay_.videoSpan100ns() / kHundredNanosecondsPerSecond) +
             L"s); ensuring pipeline and requesting IDR");
         if (!ensurePipeline()) {
-            Logger::instance().error(L"recorder", L"Replay could not be saved because the capture pipeline failed to start");
+            const std::wstring detail = L"capture pipeline could not be started";
+            Logger::instance().error(L"recorder", L"Replay could not be saved because the " + detail);
+            setLastRecordingError(detail);
             return {};
         }
+        // Same deferral as startRecording: forceVideoHeartbeat_ makes the
+        // capture thread request the IDR (and emit a heartbeat frame) without
+        // this thread waiting on pipelineGpuMutex_ during a recreate.
         forceVideoHeartbeat_ = true;
-        {
-            std::scoped_lock gpuLock(pipelineGpuMutex_);
-            if (encoder_) {
-                encoder_->requestKeyFrame();
-            }
-        }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (replay_.videoKeyFrameCount() == 0 ||
                replay_.videoSpan100ns() < minReplayVideo100ns) {
@@ -722,11 +751,18 @@ std::filesystem::path RecorderController::saveReplay() {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         if (replay_.videoKeyFrameCount() == 0) {
-            Logger::instance().warning(L"recorder", L"Replay save aborted: no keyframe arrived within 3s");
+            const std::wstring detail = L"no keyframe buffered yet";
+            Logger::instance().warning(L"recorder", L"Replay save aborted: " + detail + L" within 3s");
+            setLastRecordingError(detail);
             return {};
         }
         if (replay_.videoSpan100ns() < minReplayVideo100ns) {
+            const std::wstring detail =
+                L"only " + std::to_wstring(replay_.videoSpan100ns() / kHundredNanosecondsPerSecond) +
+                L"s of video buffered (need about " +
+                std::to_wstring(minReplayVideo100ns / kHundredNanosecondsPerSecond) + L"s)";
             Logger::instance().warning(L"recorder", L"Replay save aborted: insufficient video buffered within 3s");
+            setLastRecordingError(detail);
             return {};
         }
     } else {
@@ -740,14 +776,22 @@ std::filesystem::path RecorderController::saveReplay() {
         videoSettings = activeVideoSettings_;
     }
     Logger::instance().info(L"recorder", L"Replay saveTo begin: " + output.wstring());
-    const bool saved = replay_.saveTo(output, videoSettings);
+    std::wstring saveDetail;
+    const bool saved = replay_.saveTo(output, videoSettings, &saveDetail);
     if (!saved) {
+        setLastRecordingError(saveDetail.empty()
+            ? L"MP4 muxing failed; see log for details"
+            : saveDetail);
         Logger::instance().warning(L"recorder", std::wstring(L"Replay save failed: ") + output.wstring());
+    } else {
+        setLastRecordingError({});
     }
     return saved ? output : std::filesystem::path();
 }
 
 void RecorderController::shutdown() {
+    // Join the sweep worker before tearing down anything it could observe.
+    waitForStartupSweep();
     if (recording_) {
         stopRecording();
     }
@@ -779,6 +823,20 @@ RecordingStats RecorderController::stats() const {
     stats.cursorOnlyFrames = cursorOnlyFrames_.load();
     stats.systemAudioQueueDrops = systemAudioQueueDrops_.load();
     stats.microphoneAudioQueueDrops = microphoneAudioQueueDrops_.load();
+    stats.systemAudioActive = systemAudio_.running();
+    stats.microphoneAudioActive = microphoneAudio_.running();
+    {
+        const int64_t now100ns = steadyNow100ns();
+        const auto silenceMs = [&](const std::atomic<int64_t>& lastPacketAt) -> uint64_t {
+            const int64_t at = lastPacketAt.load(std::memory_order_relaxed);
+            if (at <= 0 || now100ns <= at) {
+                return 0;
+            }
+            return static_cast<uint64_t>((now100ns - at) / (kHundredNanosecondsPerSecond / 1000));
+        };
+        stats.systemAudioSilenceMs = silenceMs(systemAudioLastPacketAt100ns_);
+        stats.microphoneSilenceMs = silenceMs(microphoneAudioLastPacketAt100ns_);
+    }
     stats.replayVideoPackets = replay_.videoPacketCount();
     stats.replayKeyFrames = replay_.videoKeyFrameCount();
     stats.captureWidth = captureWidth_.load();
@@ -893,6 +951,10 @@ bool RecorderController::ensurePipeline() {
     cursorOnlyFrames_ = 0;
     systemAudioQueueDrops_ = 0;
     microphoneAudioQueueDrops_ = 0;
+    // Audio-liveness clocks start at pipeline start so a never-delivering
+    // input shows a growing silence age instead of 0.
+    systemAudioLastPacketAt100ns_.store(steadyNow100ns(), std::memory_order_relaxed);
+    microphoneAudioLastPacketAt100ns_.store(steadyNow100ns(), std::memory_order_relaxed);
     lastEncodedVideoPts100ns_ = 0;
     videoTimelineEndPts100ns_ = 0;
 
@@ -1406,6 +1468,24 @@ bool RecorderController::shouldDropForGpuProtection(
 }
 
 void RecorderController::captureLoop() {
+    try {
+        captureLoopImpl();
+    } catch (const std::exception& error) {
+        Logger::instance().error(L"recorder",
+            std::wstring(L"Capture worker crashed; capture degraded: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().error(L"recorder", L"Capture worker crashed; capture degraded: unknown exception");
+    }
+    if (!stopRequested_.load(std::memory_order_acquire)) {
+        // Crashed, not stopped. Surface the degradation instead of leaving the
+        // UI reporting a healthy backend that no longer delivers frames.
+        std::scoped_lock lock(captureStatusMutex_);
+        captureBackendActive_ = false;
+        captureBackendStatus_ += L"; capture worker stopped after an internal error";
+    }
+}
+
+void RecorderController::captureLoopImpl() {
     setThreadDescriptionSafe(L"Backtrack capture");
     const HANDLE mmcssHandle = enableMmcssForCaptureThread();
     // Session-scoped: raises the global system timer resolution for the whole
@@ -1457,10 +1537,14 @@ void RecorderController::captureLoop() {
     int rebindAttempts = 0;
     int exclusiveDxgiAttempts = 0;
     int sustainedLiveFrameCount = 0;
+    auto nextTargetLostCheckAt = SteadyClock::time_point::min();
     // Tracks capture_->cursorOnlyFrames() from the last delivered frame. A DXGI
     // frame whose counter did not advance carries a real desktop present (proof of
     // composited/capturable content); a cursor-only stale frame advances it.
     uint64_t prevCursorOnlyFrames = 0;
+    // Tracks capture_->resolutionChangeCount(); an advance means the source
+    // resized in place and the next accepted frame must open a new GOP.
+    uint64_t prevResolutionChanges = 0;
     bool exclusiveCoverActive = false;
     HWND exclusiveTargetWindow = nullptr;
     bool loggedExclusiveHold = false;
@@ -1470,6 +1554,23 @@ void RecorderController::captureLoop() {
     bool desktopRecoveryProbe = false;
     auto lastGameCapFailureAt = SteadyClock::time_point::min();
     auto rebindSourceBornAt = SteadyClock::time_point::min();
+    // Non-exclusive soft-stall episode tracking (see kSoftStallRecreateAfterMs).
+    // min() begin time means no stall is in progress; a delivered frame or any
+    // recovery transition ends the episode and re-arms the escalation budget.
+    auto softStallBeganAt = SteadyClock::time_point::min();
+    int softStallRecreates = 0;
+    auto lastSoftStallRecreateAt = SteadyClock::time_point::min();
+    // Capture-target-loss escalation (finding 18): an unplugged or dead target
+    // monitor would otherwise be retried forever while the recording holds one
+    // frozen frame. After enough failed desktop rebinds, either retarget once
+    // to another live display (when one exists) or latch a hard error that
+    // surfaces in diagnostics instead of silently freezing.
+    int deadTargetRebindFailures = 0;
+    bool captureTargetLostLatched = false;
+    bool retargetedToAlternateMonitor = false;
+    // Cursor-capture preference currently applied to the live source; polled
+    // once per stats interval so a settings toggle applies without a rebind.
+    bool appliedCursorPreference = captureSettings.captureCursor;
     DXGI_FORMAT encoderInputFormat;
     {
         std::scoped_lock gpuLock(pipelineGpuMutex_);
@@ -1500,6 +1601,8 @@ void RecorderController::captureLoop() {
         captureStallHold = true;
         liveFramesSince = SteadyClock::time_point::min();
         sustainedLiveFrameCount = 0;
+        softStallBeganAt = SteadyClock::time_point::min();
+        softStallRecreates = 0;
         Logger::instance().warning(L"recorder",
             std::wstring(L"Capture session AccessLost: ") + (reason ? reason : L"unspecified"));
     };
@@ -1510,6 +1613,8 @@ void RecorderController::captureLoop() {
         exclusiveBlind = true;
         sustainedLiveFrameCount = 0;
         liveFramesSince = SteadyClock::time_point::min();
+        softStallBeganAt = SteadyClock::time_point::min();
+        softStallRecreates = 0;
         if (firstHold) {
             forceVideoHeartbeat_ = true; // one IDR of freeze; no periodic slideshow
             loggedExclusiveHold = true;
@@ -1686,6 +1791,7 @@ void RecorderController::captureLoop() {
                 !capture_) {
                 return false;
             }
+            prevResolutionChanges = capture_->resolutionChangeCount();
             if (encoder_) {
                 encoder_->resetInputResources();
             }
@@ -1704,6 +1810,21 @@ void RecorderController::captureLoop() {
         refreshCaptureDimensions();
         Logger::instance().info(L"recorder", std::wstring(L"Capture source switched: ") + reason);
         return true;
+    };
+
+    // A monitor handle stays valid only while its display is attached to the
+    // desktop. Re-resolving the handle from its own rect detects unplugging
+    // even though stale HMONITOR values keep comparing equal.
+    auto monitorAlive = [](HMONITOR monitor) {
+        if (!monitor) {
+            return false;
+        }
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(monitor, &info)) {
+            return false;
+        }
+        return MonitorFromRect(&info.rcMonitor, MONITOR_DEFAULTTONULL) == monitor;
     };
 
     while (!stopRequested_) {
@@ -1800,8 +1921,49 @@ void RecorderController::captureLoop() {
             !capture_;
         const bool acquired =
             !skipAcquire && capture_ && capture_->acquireNextFrame(frame, timeoutMs);
+        if (capture_) {
+            // An in-place source resize (WGC FramePool.Recreate) must open a
+            // new GOP: request an IDR so the size jump never lands mid-GOP.
+            const uint64_t resolutionChanges = capture_->resolutionChangeCount();
+            if (resolutionChanges != prevResolutionChanges) {
+                prevResolutionChanges = resolutionChanges;
+                requestKeyFrameAfterAcceptedFrame = true;
+                Logger::instance().info(L"recorder",
+                    L"Capture source resized in place; keyframe requested at " +
+                    std::to_wstring(capture_->width()) + L"x" + std::to_wstring(capture_->height()));
+            }
+        }
+
+        // Recovery/wait states skip acquireNextFrame entirely. Without a wait
+        // here that path spins the loop at full CPU while rebind and
+        // stable-wait timers elapse. Pacing keeps stop/discard requests
+        // responsive through frameEvent_ and preserves emit-grid timing by
+        // sleeping only until the next due emission.
+        if (skipAcquire && !stopRequested_.load(std::memory_order_acquire)) {
+            const auto nowPace = std::chrono::steady_clock::now();
+            const bool emissionDue =
+                lastFrame.texture && emitClockStarted && nextEmit <= nowPace;
+            uint32_t paceMs = 4;
+            if (!emissionDue && lastFrame.texture && emitClockStarted) {
+                const auto untilEmitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    nextEmit - nowPace).count();
+                paceMs = static_cast<uint32_t>(std::clamp<int64_t>(untilEmitMs, 1, 16));
+            }
+            if (!emissionDue) {
+                if (frameEvent_) {
+                    WaitForSingleObject(frameEvent_, paceMs);
+                } else {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(paceMs));
+                }
+            }
+        }
         if (acquired) {
             lastSourceFrameAt = std::chrono::steady_clock::now();
+            // Frames are flowing again: any soft-stall episode is over and the
+            // escalation budget re-arms.
+            softStallBeganAt = SteadyClock::time_point::min();
+            softStallRecreates = 0;
+            deadTargetRebindFailures = 0;
             // Exclusive + stall/hold/blind: desktop WGC/DXGI frames are sparse or
             // stale. Do not promote them into lastFrame (slideshow). Healthy
             // continuous desktop capture under borderless cover still encodes.
@@ -1920,6 +2082,8 @@ void RecorderController::captureLoop() {
                     desktopRecoveryProbe = false;
                     loggedExclusiveHold = false;
                     acceptFirstLiveFrameAfterTransition = false;
+                    softStallBeganAt = SteadyClock::time_point::min();
+                    softStallRecreates = 0;
                     forceVideoHeartbeat_ = true;
                     Logger::instance().info(L"recorder", L"Capture session Capturing (live frames resumed)");
                 }
@@ -2022,6 +2186,36 @@ void RecorderController::captureLoop() {
                 captureStallHold = true;
                 lastSourceFrameAt = std::chrono::steady_clock::now();
             }
+        } else if (captureTargetLostLatched) {
+            // Hard-error hold (finding 18): the capture target is gone and
+            // could not be recovered or replaced. Stop rebind churn (which
+            // would otherwise retry a dead monitor forever) and hold the last
+            // frame while the cadence keeps the timeline continuous. Poll the
+            // configured target once per second so replugging recovers.
+            captureStallHold = true;
+            if (nextTargetLostCheckAt == SteadyClock::time_point::min() ||
+                nowLoop >= nextTargetLostCheckAt) {
+                nextTargetLostCheckAt = nowLoop + std::chrono::seconds(1);
+                const CaptureTarget desired = captureTargetForSettings(captureSettings);
+                const bool targetBackOnline =
+                    (desired.monitor && monitorAlive(desired.monitor)) ||
+                    (desired.window && IsWindow(desired.window));
+                if (targetBackOnline) {
+                    Logger::instance().info(L"recorder",
+                        L"Capture display is back online; recovering capture source");
+                    captureTargetLostLatched = false;
+                    retargetedToAlternateMonitor = false;
+                    deadTargetRebindFailures = 0;
+                    rebindAttempts = 0;
+                    lastCaptureRebindAt = SteadyClock::time_point::min();
+                    captureSession = CaptureSessionState::WaitStable;
+                    accessLostAt = nowLoop;
+                    setLastRecordingError({});
+                    std::scoped_lock lock(captureStatusMutex_);
+                    captureBackendActive_ = false;
+                    captureBackendStatus_ = L"Capture display returned; recovering capture source";
+                }
+            }
         } else {
             // ---- Capture session state machine (exclusive-aware) ----
             // Exclusive rebind: GameCap first; DXGI only if GameCap not just failed.
@@ -2038,6 +2232,15 @@ void RecorderController::captureLoop() {
             constexpr auto kPostCrashInjectCooldownMs = std::chrono::milliseconds(60000);
             constexpr auto kDxgiInstantDeathMs = std::chrono::milliseconds(400);
             constexpr auto kSoftStallMs = std::chrono::milliseconds(750);
+            // Non-exclusive frozen-source recovery: a wedged WGC/DXGI source
+            // can stop delivering frames without raising Closed/ACCESS_LOST,
+            // which would record a freeze-frame forever. After a sustained
+            // stall, recreate the capture source - bounded per stall episode
+            // and rate-limited by a cooldown so legitimately static content
+            // cannot trigger source churn.
+            constexpr auto kSoftStallRecreateAfterMs = std::chrono::milliseconds(3000);
+            constexpr int kMaxSoftStallRecreates = 3;
+            constexpr auto kSoftStallRecreateCooldownMs = std::chrono::milliseconds(10000);
 
             // Instant DXGI death after exclusive rebind → hard hold (no loop).
             if (exclusiveCoverActive &&
@@ -2178,6 +2381,79 @@ void RecorderController::captureLoop() {
                             !switched ? L"GameCap/DXGI unavailable"
                                       : L"desktop APIs blind under exclusive");
                     }
+
+                    // Dead-target escalation (finding 18): a desktop rebind
+                    // that produced no capture source at all usually means the
+                    // target display is unplugged or otherwise gone. Retrying
+                    // forever would keep recording a frozen frame, so after
+                    // enough failures either switch once to another live
+                    // display or latch a hard error that diagnostics surface.
+                    if (!switched && !validatedExclusiveTarget) {
+                        ++deadTargetRebindFailures;
+                        constexpr int kMaxDeadTargetRebinds = 4;
+                        if (deadTargetRebindFailures >= kMaxDeadTargetRebinds &&
+                            !captureTargetLostLatched) {
+                            deadTargetRebindFailures = 0;
+                            const HMONITOR targetMonitor =
+                                activeCaptureTarget_.monitor
+                                    ? activeCaptureTarget_.monitor
+                                    : monitorFromIndex(activeCaptureTarget_.monitorIndex);
+                            bool recovered = false;
+                            if (targetMonitor && !monitorAlive(targetMonitor) &&
+                                !retargetedToAlternateMonitor) {
+                                for (const auto& entry : enumerateMonitors()) {
+                                    CaptureTarget alternate;
+                                    alternate.monitorIndex = entry.index;
+                                    alternate.monitor = monitorFromIndex(entry.index);
+                                    if (!alternate.monitor || !monitorAlive(alternate.monitor)) {
+                                        continue;
+                                    }
+                                    Logger::instance().warning(L"recorder",
+                                        L"Capture display is gone; switching to live display " +
+                                        std::to_wstring(entry.index));
+                                    if (switchCaptureTarget(
+                                            alternate,
+                                            L"capture display lost; switched to a live display",
+                                            false,
+                                            true,
+                                            false)) {
+                                        retargetedToAlternateMonitor = true;
+                                        captureSession = CaptureSessionState::Capturing;
+                                        captureStallHold = true;
+                                        acceptFirstLiveFrameAfterTransition = true;
+                                        lastSourceFrameAt = nowLoop;
+                                        forceVideoHeartbeat_ = true;
+                                        {
+                                            std::scoped_lock lock(captureStatusMutex_);
+                                            captureBackendStatus_ +=
+                                                L"; capture display lost, switched to a live display";
+                                        }
+                                        recovered = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (!recovered && !capture_) {
+                                // No alternate display (or every candidate
+                                // failed). Latch a hard error instead of
+                                // retrying the dead target indefinitely.
+                                captureTargetLostLatched = true;
+                                nextTargetLostCheckAt = SteadyClock::time_point::min();
+                                const std::wstring detail =
+                                    L"Capture display is unavailable; recording holds its "
+                                    L"last frame. Reconnect the display or change the "
+                                    L"capture monitor in settings.";
+                                setLastRecordingError(detail);
+                                Logger::instance().error(L"recorder", detail);
+                                std::scoped_lock lock(captureStatusMutex_);
+                                captureBackendActive_ = false;
+                                captureBackendStatus_ =
+                                    L"Capture display unavailable; holding last frame";
+                            }
+                        }
+                    } else if (switched) {
+                        deadTargetRebindFailures = 0;
+                    }
                 }
             }
 
@@ -2236,6 +2512,47 @@ void RecorderController::captureLoop() {
                 } else if (!exclusiveCoverActive && noFrameFor >= kSoftStallMs) {
                     captureStallHold = true;
                     sustainedLiveFrameCount = 0;
+                    // Escalate a sustained non-exclusive stall: coalescing
+                    // alone keeps encoding a freeze-frame forever when the
+                    // source wedges without reporting device loss. Recreate
+                    // the desktop capture source after the stall persists,
+                    // bounded per episode and cooldown-limited.
+                    const bool desktopSourceRecoverable =
+                        capture_ &&
+                        (capture_->backend() == CaptureBackend::WindowsGraphicsCapture ||
+                         capture_->backend() == CaptureBackend::DesktopDuplication);
+                    if (softStallBeganAt == SteadyClock::time_point::min()) {
+                        softStallBeganAt = nowLoop - noFrameFor;
+                    }
+                    const bool recreateCooldownElapsed =
+                        lastSoftStallRecreateAt == SteadyClock::time_point::min() ||
+                        nowLoop - lastSoftStallRecreateAt >= kSoftStallRecreateCooldownMs;
+                    if (desktopSourceRecoverable &&
+                        softStallRecreates < kMaxSoftStallRecreates &&
+                        recreateCooldownElapsed &&
+                        nowLoop - softStallBeganAt >= kSoftStallRecreateAfterMs) {
+                        ++softStallRecreates;
+                        lastSoftStallRecreateAt = nowLoop;
+                        softStallBeganAt = nowLoop;
+                        CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
+                            ? captureTargetForSettings(captureSettings)
+                            : activeCaptureTarget_;
+                        target.window = nullptr;
+                        Logger::instance().warning(L"recorder",
+                            L"No frames for " +
+                            std::to_wstring(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(nowLoop - lastSourceFrameAt).count()) +
+                            L"ms without device loss; recreating capture source (attempt " +
+                            std::to_wstring(softStallRecreates) + L"/" +
+                            std::to_wstring(kMaxSoftStallRecreates) + L")");
+                        // Desktop backends only: never inject Game Capture from
+                        // an ambiguous stall. switchCaptureTarget discards
+                        // queued frames and arms a keyframe on the next live one.
+                        if (switchCaptureTarget(target, L"frozen source recovery", false, true, false)) {
+                            lastSourceFrameAt = nowLoop;
+                            prevCursorOnlyFrames = 0;
+                        }
+                    }
                 }
             }
         }
@@ -2274,6 +2591,18 @@ void RecorderController::captureLoop() {
             sourceFramesAtLastSample = sourceFrames;
             timelineIntervalsAtLastSample = timelineIntervals;
             statsSampleAt = statsNow;
+            // Cursor-capture preference changes normally arrive with a full
+            // pipeline restart; apply them to the live source as well so the
+            // setting takes effect immediately even when a rebind is not
+            // possible (finding 19).
+            const bool cursorPreference = settings().captureCursor;
+            if (cursorPreference != appliedCursorPreference && capture_) {
+                std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
+                if (gpuLock.owns_lock()) {
+                    capture_->setCursorCaptureEnabled(cursorPreference);
+                    appliedCursorPreference = cursorPreference;
+                }
+            }
         }
     }
 
@@ -2281,10 +2610,48 @@ void RecorderController::captureLoop() {
 }
 
 void RecorderController::encodeLoop() {
+    try {
+        encodeLoopImpl();
+    } catch (const std::exception& error) {
+        Logger::instance().error(L"recorder",
+            std::wstring(L"Encode worker crashed; encoding degraded: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().error(L"recorder", L"Encode worker crashed; encoding degraded: unknown exception");
+    }
+    // Harmless on the normal path (the drain already published this value) and
+    // essential on the crash path: recreateGpuPipeline blocks until this
+    // generation advances, so GPU teardown must never wait on a dead worker.
+    // Publishing under frameDiscardMutex_ pairs with the waiter's predicate
+    // check; without the lock a store+notify landing between the check and
+    // the sleep would be lost and recreateGpuPipeline could hang forever on
+    // this dead worker.
+    {
+        std::scoped_lock lock(frameDiscardMutex_);
+        discardCompletedGeneration_.store(
+            discardRequestGeneration_.load(std::memory_order_acquire),
+            std::memory_order_release);
+        frameDiscardComplete_.notify_all();
+    }
+}
+
+void RecorderController::encodeLoopImpl() {
     setThreadDescriptionSafe(L"Backtrack encode");
+    // MMCSS "Games" keeps the encode loop above background system load. The
+    // frame queue drops the newest frames under pressure, so a starved encoder
+    // would silently lose the most recent replay/recorded frames exactly when
+    // the machine is busy - the frames that matter most for a backtrack clip.
+    const HANDLE mmcssHandle = enableMmcssForEncodeThread();
 
     constexpr size_t kMaxPendingDurations = 512;
     std::unordered_map<int64_t, int64_t> pendingDurations;
+    // Insertion order of live pendingDurations keys. The encoder normally
+    // consumes each entry within a frame or two; only a pathological encoder
+    // stall lets the map reach the cap, and then the OLDEST entries are
+    // evicted one by one. Wholesale-clearing instead would drop every still
+    // unmatched duration extension at once, making video stts jump while
+    // audio is silence-filled and skewing the streams apart.
+    std::deque<int64_t> pendingDurationOrder;
+    uint64_t pendingDurationEvictions = 0;
 
     auto discardQueuedFrames = [&]() {
         GpuFrame discarded;
@@ -2297,23 +2664,50 @@ void RecorderController::encodeLoop() {
             durationUpdatePending_.store(false, std::memory_order_release);
         }
         pendingDurations.clear();
-        discardCompletedGeneration_.store(
-            discardRequestGeneration_.load(std::memory_order_acquire),
-            std::memory_order_release);
-        frameDiscardComplete_.notify_all();
+        pendingDurationOrder.clear();
+        // Same mutex pairing as the crash-path publish above: the store must
+        // happen under frameDiscardMutex_ or a waiter between its predicate
+        // check and its sleep can miss the notification forever.
+        {
+            std::scoped_lock lock(frameDiscardMutex_);
+            discardCompletedGeneration_.store(
+                discardRequestGeneration_.load(std::memory_order_acquire),
+                std::memory_order_release);
+            frameDiscardComplete_.notify_all();
+        }
     };
 
     auto extendVideoDuration = [&](int64_t pts100ns, int64_t duration100ns) {
         if (pts100ns <= 0 || duration100ns <= 0) {
             return;
         }
-        if (pendingDurations.size() >= kMaxPendingDurations &&
-            pendingDurations.find(pts100ns) == pendingDurations.end()) {
-            pendingDurations.clear();
-            Logger::instance().warning(L"recorder", L"Discarded unmatched pending video durations after reaching limit");
-        }
         auto [it, inserted] = pendingDurations.try_emplace(pts100ns, duration100ns);
-        if (!inserted) {
+        if (inserted) {
+            pendingDurationOrder.push_back(pts100ns);
+            // Drop already-consumed keys from the front so the order index
+            // stays proportional to the live map instead of total inserts.
+            while (!pendingDurationOrder.empty() &&
+                   pendingDurations.find(pendingDurationOrder.front()) == pendingDurations.end()) {
+                pendingDurationOrder.pop_front();
+            }
+            if (pendingDurations.size() > kMaxPendingDurations) {
+                // Evict oldest unconsumed entries; skip keys already consumed.
+                while (!pendingDurationOrder.empty() &&
+                       pendingDurations.size() > kMaxPendingDurations) {
+                    const int64_t oldest = pendingDurationOrder.front();
+                    pendingDurationOrder.pop_front();
+                    if (pendingDurations.erase(oldest) > 0) {
+                        ++pendingDurationEvictions;
+                        if (pendingDurationEvictions == 1 ||
+                            (pendingDurationEvictions % 512) == 0) {
+                            Logger::instance().warning(L"recorder",
+                                L"Encoder output is falling behind; evicted old unmatched video durations count=" +
+                                std::to_wstring(pendingDurationEvictions));
+                        }
+                    }
+                }
+            }
+        } else {
             it->second = std::max(it->second, duration100ns);
         }
         const bool recordingExtended =
@@ -2419,6 +2813,7 @@ void RecorderController::encodeLoop() {
     for (auto& packet : drained) {
         publishPacket(std::move(packet));
     }
+    disableMmcssForThread(mmcssHandle);
 }
 
 void RecorderController::handleAudioPacket(AudioPacket&& packet) {
@@ -2427,6 +2822,12 @@ void RecorderController::handleAudioPacket(AudioPacket&& packet) {
     }
 
     const AudioTrack track = packet.track;
+    // Liveness: record arrival before the packet can be dropped by a full
+    // queue - a starved queue must not read as a dead input.
+    (track == AudioTrack::System
+        ? systemAudioLastPacketAt100ns_
+        : microphoneAudioLastPacketAt100ns_)
+        .store(steadyNow100ns(), std::memory_order_relaxed);
     SpscQueue<AudioPacket>& queue = track == AudioTrack::System
         ? systemAudioQueue_
         : microphoneAudioQueue_;
@@ -2449,13 +2850,24 @@ void RecorderController::handleAudioPacket(AudioPacket&& packet) {
 }
 
 void RecorderController::writeAudioPacket(AudioPacket&& packet) {
+    // Canonicalize at ingest: every packet is converted to stereo float32 at
+    // the mux rate before it reaches the recording WAV writers or the replay
+    // buffer. A WASAPI reconnect (headset swap, default-device change) can
+    // silently change the capture mix format; without this conversion the
+    // timeline writers would append raw bytes in a new format to streams
+    // declared with the old one, producing pitch-shifted audio and duration
+    // skew. Unsupported formats cannot be converted and are dropped here
+    // instead of corrupting downstream timelines.
+    if (!convertAudioPacketToCanonical(packet)) {
+        return;
+    }
     if (microphoneAgcResetPending_.exchange(false, std::memory_order_relaxed)) {
         microphoneAgc_->reset();
     }
     if (packet.track == AudioTrack::Microphone &&
         audioInputAutoGain_.load(std::memory_order_relaxed) &&
         packet.format) {
-        const AudioFormatInfo format = audioFormatInfo(*packet.format);
+        const AudioFormatInfo format = parseAudioFormat(*packet.format);
         applyMicrophoneAgc(packet, format, *microphoneAgc_);
     }
     const uint32_t volumePercent = packet.track == AudioTrack::System
@@ -2470,6 +2882,17 @@ void RecorderController::writeAudioPacket(AudioPacket&& packet) {
 }
 
 void RecorderController::audioLoop() {
+    try {
+        audioLoopImpl();
+    } catch (const std::exception& error) {
+        Logger::instance().error(L"recorder",
+            std::wstring(L"Audio worker crashed; audio degraded: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().error(L"recorder", L"Audio worker crashed; audio degraded: unknown exception");
+    }
+}
+
+void RecorderController::audioLoopImpl() {
     setThreadDescriptionSafe(L"Backtrack audio writer");
 
     while (!stopRequested_ || systemAudioQueue_.size() > 0 || microphoneAudioQueue_.size() > 0) {
@@ -2539,6 +2962,12 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) 
 std::filesystem::path RecorderController::nextClipPath(const wchar_t* prefix) const {
     const auto snapshot = settings();
     const std::filesystem::path initial = snapshot.clipDirectory / makeTimestampedFileName(prefix, L".mp4");
+    if (reserveClipOutputName(initial) == OutputNameReservation::Reserved) {
+        return initial;
+    }
+
+    // The name could not be claimed exclusively; keep the previous best-effort
+    // existence probing so path selection still works on exotic failures.
     std::error_code error;
     if (!std::filesystem::exists(initial, error)) {
         return initial;
@@ -2547,6 +2976,9 @@ std::filesystem::path RecorderController::nextClipPath(const wchar_t* prefix) co
     const std::wstring stem = initial.stem().wstring();
     for (uint32_t suffix = 2; suffix < 1000; ++suffix) {
         const auto candidate = snapshot.clipDirectory / (stem + L"_" + std::to_wstring(suffix) + L".mp4");
+        if (reserveClipOutputName(candidate) == OutputNameReservation::Reserved) {
+            return candidate;
+        }
         error = {};
         if (!std::filesystem::exists(candidate, error)) {
             return candidate;

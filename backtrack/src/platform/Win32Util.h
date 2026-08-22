@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <avrt.h>
 #include <dxgi.h>
 
 #include <cstdint>
@@ -42,7 +43,13 @@ std::wstring foregroundApplicationName();
 // restrict activity updates to fullscreen games.
 bool foregroundWindowIsFullscreen();
 void setThreadDescriptionSafe(const wchar_t* description);
+// Registers the calling thread with the MMCSS task named by `taskName`
+// ("Capture", "Games", ...) and raises it to `priority` within that profile.
+HANDLE enableMmcssForThread(const wchar_t* taskName, AVRT_PRIORITY priority);
 HANDLE enableMmcssForCaptureThread();
+// Encode loop: "Games" profile keeps encoding above background load so the
+// drop-newest frame queue does not shed the freshest replay frames.
+HANDLE enableMmcssForEncodeThread();
 void disableMmcssForThread(HANDLE handle);
 
 // Raises the process-wide system timer resolution to its finest supported
@@ -82,6 +89,11 @@ void pruneStaleMicrophoneConsentEntries();
 HMONITOR monitorFromIndex(uint32_t index);
 // Enumerates active displays with native pixel size and primary flag.
 std::vector<MonitorEnumEntry> enumerateMonitors();
+// True when the output driving this monitor reports advanced color active
+// (HDR with ST.2084/PQ transfer). Best-effort: returns false on legacy
+// systems or when the output cannot be resolved, so callers treat SDR as the
+// safe default.
+bool monitorHasAdvancedColor(HMONITOR monitor);
 HMONITOR focusedMonitorOrFallback(uint32_t fallbackIndex);
 HMONITOR cursorMonitorOrFallback(uint32_t fallbackIndex);
 // Returns DXGI output index on the given adapter for HMONITOR, or UINT32_MAX if none.

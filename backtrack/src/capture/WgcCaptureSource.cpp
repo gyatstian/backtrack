@@ -10,6 +10,7 @@
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Security.Authorization.AppCapabilityAccess.h>
@@ -62,6 +63,14 @@ struct WgcCaptureSource::Impl {
     std::shared_ptr<std::atomic<uint32_t>> outstandingZeroCopyLeases =
         std::make_shared<std::atomic<uint32_t>>(0);
     std::atomic<bool> deviceLost{false};
+    // In-place content resizes handled via FramePool.Recreate. The capture
+    // loop watches this counter to force an encoder IDR across size jumps.
+    std::atomic<uint64_t> resolutionChanges{0};
+    // Pending in-place resize: Recreate is deferred until every frame of the
+    // old pool has been released (see completePendingPoolRecreate).
+    winrt::Windows::Graphics::SizeInt32 pendingResize{};
+    bool recreatePending = false;
+    uint32_t recreateDeferrals = 0;
 
     ~Impl() {
         shutdown();
@@ -205,6 +214,15 @@ struct WgcCaptureSource::Impl {
             return false;
         }
 
+        // A deferred pool recreate retries here first: Recreate can only make
+        // progress once every frame of the old pool has been released.
+        if (recreatePending) {
+            completePendingPoolRecreate();
+            if (recreatePending) {
+                return false;
+            }
+        }
+
         // Wait for the next frame. When a high-res cadence timer is available,
         // wait on both it and frameEvent so sub-15ms timeouts are honored even if
         // the global timer period was not raised. Timer expiry == cadence timeout.
@@ -258,13 +276,17 @@ struct WgcCaptureSource::Impl {
                     return false;
                 }
                 // Recreate requires every frame from the old pool to be released.
-                // Keeping this frame alive can stall capture across a display-mode change.
+                // Zero-copy frames still leased by the encoder would otherwise
+                // stall the new pool; defer instead of recreating under them.
                 frame = nullptr;
-                framePool.Recreate(
-                    winrtDevice,
-                    winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
-                    static_cast<int32_t>(framePoolSize),
-                    size);
+                pendingResize = size;
+                recreatePending = true;
+                recreateDeferrals = 0;
+                resolutionChanges.fetch_add(1, std::memory_order_release);
+                Logger::instance().info(L"capture",
+                    L"WGC content resized in place; recreating frame pool at " +
+                    std::to_wstring(width) + L"x" + std::to_wstring(height));
+                completePendingPoolRecreate();
                 return false;
             }
 
@@ -444,6 +466,8 @@ struct WgcCaptureSource::Impl {
         }
         item = nullptr;
         winrtDevice = nullptr;
+        recreatePending = false;
+        pendingResize = {};
         pool.clear();
         {
             std::scoped_lock lock(frameEventMutex);
@@ -460,10 +484,72 @@ struct WgcCaptureSource::Impl {
         deviceLost.store(true);
     }
 
+    // Completes a deferred FramePool.Recreate. Old-pool frames may still be
+    // leased to the encoder (zero-copy GpuFrames); calling Recreate while they
+    // are in flight is documented to stall capture. Wait briefly for the
+    // leases to drain; if the encoder has not released them in time, leave
+    // recreatePending set and retry on a later acquire() call instead of
+    // recreating under live frames.
+    void completePendingPoolRecreate() {
+        if (!recreatePending || !framePool) {
+            recreatePending = false;
+            return;
+        }
+
+        constexpr auto kLeaseDrainWait = std::chrono::milliseconds(150);
+        const auto deadline = std::chrono::steady_clock::now() + kLeaseDrainWait;
+        while (outstandingZeroCopyLeases->load(std::memory_order_acquire) > 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ++recreateDeferrals;
+                if (recreateDeferrals == 1 || (recreateDeferrals % 50) == 0) {
+                    Logger::instance().warning(L"capture",
+                        L"WGC frame pool recreate deferred; encoder still holds " +
+                        std::to_wstring(outstandingZeroCopyLeases->load(std::memory_order_acquire)) +
+                        L" zero-copy frame(s), deferral=" + std::to_wstring(recreateDeferrals));
+                }
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        recreateDeferrals = 0;
+        try {
+            framePool.Recreate(
+                winrtDevice,
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                static_cast<int32_t>(framePoolSize),
+                pendingResize);
+        } catch (const winrt::hresult_error& error) {
+            Logger::instance().warning(L"capture",
+                L"WGC frame pool recreate failed: " + std::wstring(error.message().c_str()));
+            deviceLost.store(true);
+        }
+        recreatePending = false;
+    }
+
     void signalFrameEvent() {
         std::scoped_lock lock(frameEventMutex);
         if (frameEvent) {
             SetEvent(frameEvent);
+        }
+    }
+
+    // Applies a cursor-capture preference change to the live session so a
+    // settings toggle takes effect immediately instead of waiting for the
+    // next backend rebind.
+    void setCursorCaptureEnabled(bool enabled) {
+        if (captureCursor == enabled) {
+            return;
+        }
+        captureCursor = enabled;
+        try {
+            if (session) {
+                session.IsCursorCaptureEnabled(enabled);
+            }
+        } catch (const winrt::hresult_error& error) {
+            Logger::instance().warning(L"capture",
+                L"Could not update WGC cursor capture on the live session: " +
+                std::wstring(error.message().c_str()));
         }
     }
 
@@ -488,7 +574,11 @@ struct WgcCaptureSource::Impl {
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        // RENDER_TARGET is required by some NVIDIA drivers before NVENC accepts
+        // the texture as a registered input (NV_ENC_ERR_RESOURCE_REGISTER_FAILED
+        // otherwise); SHADER_RESOURCE keeps the downstream scaler happy. This
+        // mirrors the other capture pools.
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
         for (uint32_t index = 0; index < texturePoolSize; ++index) {
             auto slot = std::make_shared<TextureSlot>();
@@ -536,6 +626,14 @@ uint32_t WgcCaptureSource::width() const {
 
 uint32_t WgcCaptureSource::height() const {
     return impl_->height;
+}
+
+uint64_t WgcCaptureSource::resolutionChangeCount() const {
+    return impl_->resolutionChanges.load(std::memory_order_acquire);
+}
+
+void WgcCaptureSource::setCursorCaptureEnabled(bool enabled) {
+    impl_->setCursorCaptureEnabled(enabled);
 }
 
 } // namespace backtrack

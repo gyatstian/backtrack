@@ -71,18 +71,24 @@ bool parseWav(const std::filesystem::path& path, WavInfo& info) {
     stream.read(wave, sizeof(wave));
     if (!stream ||
         std::string_view(riff, 4) != "RIFF" ||
-        std::string_view(wave, 4) != "WAVE" ||
-        riffSize < 4 ||
-        static_cast<uint64_t>(riffSize) > fileBytes - 8) {
+        std::string_view(wave, 4) != "WAVE") {
         return false;
     }
 
-    const uint64_t riffEnd = 8ull + static_cast<uint64_t>(riffSize);
+    // Trust the declared RIFF extent while it is plausible. A process killed
+    // before WavWriter::patchHeader() leaves zeroed/stale size fields behind;
+    // falling back to the real file size then keeps audio already on disk
+    // recoverable instead of discarding a whole recording over an unpatched
+    // header. Well-formed files take the exact same path as before.
+    const bool riffSizePlausible =
+        riffSize >= 4 && static_cast<uint64_t>(riffSize) <= fileBytes - 8;
+    const uint64_t scanEnd = riffSizePlausible ? 8ull + static_cast<uint64_t>(riffSize) : fileBytes;
+
     bool foundFormat = false;
     bool foundData = false;
     while (stream && (!foundFormat || !foundData)) {
         const std::streamoff chunkHeaderOffset = static_cast<std::streamoff>(stream.tellg());
-        if (chunkHeaderOffset < 0 || static_cast<uint64_t>(chunkHeaderOffset) + 8 > riffEnd) {
+        if (chunkHeaderOffset < 0 || static_cast<uint64_t>(chunkHeaderOffset) + 8 > scanEnd) {
             break;
         }
 
@@ -99,13 +105,17 @@ bool parseWav(const std::filesystem::path& path, WavInfo& info) {
             return false;
         }
         const uint64_t chunkData = static_cast<uint64_t>(chunkDataOffset);
-        if (static_cast<uint64_t>(size) > riffEnd - chunkData) {
-            return false;
+        const uint64_t remainingBytes = std::min(scanEnd, fileBytes) - chunkData;
+        uint64_t effectiveSize = size;
+        const bool dataChunk = std::string_view(id, 4) == "data";
+        if (dataChunk && (effectiveSize == 0 || effectiveSize > remainingBytes)) {
+            // Zero (never patched) or oversized data size: recover whatever
+            // payload actually reached the disk up to the trusted extent.
+            effectiveSize = remainingBytes;
+        } else if (effectiveSize > remainingBytes) {
+            break; // Chunk chain no longer trustworthy; use what was parsed.
         }
-        const uint64_t nextChunk = chunkData + static_cast<uint64_t>(size) + (size & 1u);
-        if (nextChunk > riffEnd + 1 || nextChunk > fileBytes) {
-            return false;
-        }
+        const uint64_t nextChunk = chunkData + effectiveSize + (effectiveSize & 1u);
 
         if (std::string_view(id, 4) == "fmt ") {
             if (size < sizeof(WAVEFORMATEX) || size > kMaxWaveFormatBytes) {
@@ -123,12 +133,15 @@ bool parseWav(const std::filesystem::path& path, WavInfo& info) {
             info.blockAlign = format->nBlockAlign;
             info.encoding = encodingFromFormat(info.format.bytes);
             foundFormat = true;
-        } else if (std::string_view(id, 4) == "data") {
+        } else if (dataChunk) {
             info.dataOffset = chunkData;
-            info.dataBytes = size;
+            info.dataBytes = effectiveSize;
             foundData = true;
         }
 
+        if (nextChunk <= chunkData) {
+            break;
+        }
         stream.seekg(static_cast<std::streamoff>(nextChunk), std::ios::beg);
     }
 

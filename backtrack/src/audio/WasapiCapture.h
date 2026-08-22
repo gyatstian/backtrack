@@ -31,6 +31,13 @@ public:
     // Restores any previously applied mutes that are no longer requested. Returns muted process count.
     static uint32_t applySessionMutesForExecutables(const std::vector<std::wstring>& mutedExecutableKeys);
     static void clearSessionMutes();
+    // Startup sweep: restores foreign render sessions that a previous crashed
+    // session left muted (tracked in a journal under the local app-data
+    // directory). No-op when no journal exists.
+    static void restoreOrphanedSessionMutes();
+    // Crash-path restore (unhandled exception / terminate / ctrl handler).
+    // Best effort and noexcept; skips when another thread holds the registry.
+    static void emergencyRestoreSessionMutes() noexcept;
 
     bool start(AudioTrack track, const std::wstring& deviceId, AudioPacketCallback callback);
     bool startProcessLoopback(uint32_t processId, AudioPacketCallback callback);

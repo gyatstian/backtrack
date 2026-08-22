@@ -52,6 +52,14 @@ public:
 private:
     bool ensurePipeline();
     void stopPipeline();
+    // Runs RecoveryStore::sweepOrphanedRecoveryData on a worker thread so the
+    // main window appears immediately even when a crashed session left a large
+    // recording to remux. startRecording/saveReplay/recoverFailedRecording/
+    // shutdown wait for it first: the sweep reads and deletes recovery data,
+    // so it must never overlap code that stages new recovery state or muxes
+    // from it.
+    void beginStartupSweep();
+    void waitForStartupSweep();
     bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason, uint32_t adapterIndex);
     // exclusiveRecovery: GameCap then DXGI, skipping WGC thrash only while a
     // validated foreground window remains in exclusive fullscreen.
@@ -65,9 +73,15 @@ private:
     uint32_t pipelineAdapterForTarget(const CaptureTarget& target) const;
     uint32_t activeFrameQueueLimit(const GpuOptimizationSettings& gpuSettings) const;
     bool shouldDropForGpuProtection(bool duplicateFrame, const GpuOptimizationSettings& gpuSettings) const;
+    // Thread procs. Each wraps its *Impl body in a catch-all so a stray
+    // exception (bad_alloc, filesystem errors) degrades that worker instead of
+    // terminating the process mid-save/mid-recording.
     void captureLoop();
+    void captureLoopImpl();
     void encodeLoop();
+    void encodeLoopImpl();
     void audioLoop();
+    void audioLoopImpl();
     void handleAudioPacket(AudioPacket&& packet);
     void writeAudioPacket(AudioPacket&& packet);
     void refreshSystemAudioCapture(const AppSettings& settings);
@@ -123,6 +137,10 @@ private:
     std::thread captureThread_;
     std::thread encodeThread_;
     std::thread audioThread_;
+    std::thread startupSweepThread_;
+    // Serializes spawn/join of startupSweepThread_: concurrent waiters must
+    // not call join() on the same thread object.
+    std::mutex startupSweepMutex_;
     HANDLE frameEvent_ = nullptr;
     HANDLE audioEvent_ = nullptr;
 
@@ -155,6 +173,12 @@ std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<uint64_t> cursorOnlyFrames_{0};
     std::atomic<uint64_t> systemAudioQueueDrops_{0};
     std::atomic<uint64_t> microphoneAudioQueueDrops_{0};
+    // Steady-clock arrival time (100ns) of the most recent packet per audio
+    // input. Seeded at pipeline start so silence ages count from startup;
+    // updated on the WASAPI capture threads. Drives the audio-liveness
+    // telemetry in RecordingStats.
+    std::atomic<int64_t> systemAudioLastPacketAt100ns_{0};
+    std::atomic<int64_t> microphoneAudioLastPacketAt100ns_{0};
     std::atomic<int64_t> lastEncodedVideoPts100ns_{0};
     std::atomic<int64_t> videoTimelineEndPts100ns_{0};
     std::atomic<uint32_t> captureWidth_{0};

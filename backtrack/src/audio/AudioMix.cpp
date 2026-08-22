@@ -187,10 +187,14 @@ WaveFormatBlob pcm16StereoFormat(uint32_t samplesPerSec) {
 
 bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& /*outputPath*/, std::filesystem::path& mixedPath) {
     std::vector<std::filesystem::path> audioPaths;
-    if (!inputs.systemAudioPath.empty() && std::filesystem::exists(inputs.systemAudioPath)) {
+    // error_code overloads: this runs inside every save; a throwing
+    // std::filesystem::exists on an unreadable file would terminate the app.
+    std::error_code systemError;
+    if (!inputs.systemAudioPath.empty() && std::filesystem::exists(inputs.systemAudioPath, systemError) && !systemError) {
         audioPaths.push_back(inputs.systemAudioPath);
     }
-    if (!inputs.microphoneAudioPath.empty() && std::filesystem::exists(inputs.microphoneAudioPath)) {
+    std::error_code microphoneError;
+    if (!inputs.microphoneAudioPath.empty() && std::filesystem::exists(inputs.microphoneAudioPath, microphoneError) && !microphoneError) {
         audioPaths.push_back(inputs.microphoneAudioPath);
     }
     if (audioPaths.empty()) {
@@ -255,7 +259,13 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
                 chunk.push_back(static_cast<int16_t>(std::lrintf(mixed * 32767.0f)));
             }
         }
-        writer.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * sizeof(int16_t));
+        if (!writer.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * sizeof(int16_t))) {
+            writer.close();
+            // A failed mixed-audio write is a hard error (disk full), not a
+            // "save without audio" case: the source WAVs were already readable
+            // and the mux would publish silently truncated audio.
+            return false;
+        }
     }
     writer.close();
     return true;

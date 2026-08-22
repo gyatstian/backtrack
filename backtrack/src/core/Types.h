@@ -261,11 +261,24 @@ struct GpuFrame {
     uint32_t width = 0;
     uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    // True when the source surface carries PQ (ST.2084) encoded HDR content
+    // (advanced color active on the output). The scaler tone-maps such frames
+    // to SDR before encoding; 8-bit SDR sources leave it false.
+    bool hdr = false;
 };
 
 struct EncodedPacket {
     std::vector<uint8_t> bytes;
     int64_t pts100ns = 0;
+    // Decode timestamp for B-frame reordering: packets are produced in decode
+    // order while pts100ns stays in presentation order, so PTS regresses
+    // within each GOP. Valid only when hasDts is set; without it the decode
+    // time equals the presentation time.
+    int64_t dts100ns = 0;
+    // Explicit validity flag for dts100ns: timestamps can legitimately be
+    // zero or negative (early-GOP extrapolation), so no value works as a
+    // "no decode timestamp" sentinel.
+    bool hasDts = false;
     int64_t duration100ns = 0;
     bool keyFrame = false;
     VideoCodec codec = VideoCodec::H264;
@@ -332,6 +345,16 @@ struct RecordingStats {
     uint64_t cursorOnlyFrames = 0;
     uint64_t systemAudioQueueDrops = 0;
     uint64_t microphoneAudioQueueDrops = 0;
+    // Audio-input liveness. `active` mirrors the WASAPI capture state; the
+    // silence ages are wall-time since the last packet arrived from that
+    // input (sampled on the stats poll). An input that never delivered a
+    // packet reports the full session age. This separates a dead or
+    // permanently reconnecting input (age grows, possibly inactive) from a
+    // healthy one that merely carries silence.
+    bool systemAudioActive = false;
+    bool microphoneAudioActive = false;
+    uint64_t systemAudioSilenceMs = 0;
+    uint64_t microphoneSilenceMs = 0;
     uint64_t replayVideoPackets = 0;
     uint64_t replayKeyFrames = 0;
     uint32_t captureWidth = 0;

@@ -175,6 +175,12 @@ std::vector<ClipInfo> ClipManager::listClips() const {
                 error = {};
                 continue;
             }
+            // Zero-byte files are transient output-name placeholders that hold
+            // a clip name between selection and MP4 publish; they are not
+            // playable clips and must not appear in the library.
+            if (info.bytes == 0) {
+                continue;
+            }
             info.duration100ns = readMediaDuration(path);
             info.favorite = std::filesystem::exists(favoriteMarker(path), error);
             error = {};
@@ -209,16 +215,22 @@ bool ClipManager::removeClip(const std::filesystem::path& path) const {
         return false;
     }
 
+    // Delete the media file first and drop favorite/tag sidecars only once the
+    // deletion is confirmed. Removing the markers up front would lose library
+    // state for a clip that survives a failed delete (locked file, sharing
+    // violation, ...).
     std::error_code error;
+    const bool removed = std::filesystem::remove(path, error);
+    if (error || (!removed && std::filesystem::exists(path, error))) {
+        Logger::instance().warning(L"clips", L"Could not delete clip: " + path.wstring() + (error ? L" (" + utf8ToWide(error.message()) + L")" : L""));
+        return false;
+    }
+
+    error = {};
     std::filesystem::remove(favoriteMarker(path), error);
     error = {};
     std::filesystem::remove(tagFile(path), error);
-    error = {};
-    const bool removed = std::filesystem::remove(path, error);
-    if (!removed || error) {
-        Logger::instance().warning(L"clips", L"Could not delete clip: " + path.wstring() + (error ? L" (" + utf8ToWide(error.message()) + L")" : L""));
-    }
-    return removed && !error;
+    return true;
 }
 
 bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstring& newStem) const {
@@ -244,7 +256,8 @@ bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstri
     }
 
     const auto oldMarker = favoriteMarker(path);
-    if (std::filesystem::exists(oldMarker)) {
+    std::error_code markerError;
+    if (std::filesystem::exists(oldMarker, markerError) && !markerError) {
         std::filesystem::rename(oldMarker, favoriteMarker(target), error);
         if (error) {
             Logger::instance().warning(L"clips", L"Could not rename favorite marker for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
@@ -252,7 +265,8 @@ bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstri
     }
     error = {};
     const auto oldTags = tagFile(path);
-    if (std::filesystem::exists(oldTags)) {
+    std::error_code tagsError;
+    if (std::filesystem::exists(oldTags, tagsError) && !tagsError) {
         std::filesystem::rename(oldTags, tagFile(target), error);
         if (error) {
             Logger::instance().warning(L"clips", L"Could not rename tag file for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");

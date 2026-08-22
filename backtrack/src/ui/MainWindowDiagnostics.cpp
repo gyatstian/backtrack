@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <memory>
@@ -119,6 +120,20 @@ void MainWindow::updateStats() {
         stream << L"Cursor-only desktop frames: " << stats.cursorOnlyFrames << L"\r\n";
         stream << L"System audio queue drops: " << stats.systemAudioQueueDrops << L"\r\n";
         stream << L"Microphone audio queue drops: " << stats.microphoneAudioQueueDrops << L"\r\n";
+        stream << L"System audio input: "
+               << (stats.systemAudioActive ? L"running" : L"not running");
+        if (stats.systemAudioActive) {
+            stream << L", last packet " << (stats.systemAudioSilenceMs / 1000) << L"."
+                   << std::setw(3) << std::setfill(L'0') << (stats.systemAudioSilenceMs % 1000) << L"s ago";
+        }
+        stream << L"\r\n";
+        stream << L"Microphone input: "
+               << (stats.microphoneAudioActive ? L"running" : L"not running");
+        if (stats.microphoneAudioActive) {
+            stream << L", last packet " << (stats.microphoneSilenceMs / 1000) << L"."
+                   << std::setw(3) << std::setfill(L'0') << (stats.microphoneSilenceMs % 1000) << L"s ago";
+        }
+        stream << L"\r\n";
         stream << L"Frame queue depth: " << stats.encoder.queueDepth << L"\r\n";
         stream << L"Encoder submissions: " << stats.encoder.submittedFrames << L"\r\n";
         stream << L"Encoded frames: " << stats.encoder.encodedFrames << L"\r\n";
@@ -128,6 +143,9 @@ void MainWindow::updateStats() {
         const auto voiceStats = voiceCommandService_.stats();
         stream << L"Voice command: " << voiceStats.status << L"\r\n";
         stream << L"Voice accepted/rejected: " << voiceStats.accepted << L"/" << voiceStats.rejected << L"\r\n";
+        if (const std::wstring saveFailure = trimText(controller_.lastRecordingError()); !saveFailure.empty()) {
+            stream << L"Last save failure: " << saveFailure << L"\r\n";
+        }
         stream << L"Average encode: " << stats.encoder.averageEncodeMs << L" ms";
         setText(statsLabel_, stream.str());
     }
@@ -198,6 +216,39 @@ void MainWindow::updateStats() {
         }
         setText(diagnosticLogLabel_, stream.str());
     }
+
+    updateAudioLivenessWarning(stats);
+}
+
+void MainWindow::updateAudioLivenessWarning(const RecordingStats& stats) {
+    // Live audio-health warning for the status bar. Edge-triggered: the text
+    // only changes (and the status bar only repaints) on a transition, so a
+    // permanently dead input does not spam. Only enabled inputs are checked,
+    // and only while recording - a silent input between recordings is not a
+    // problem worth alarming about.
+    std::wstring warning;
+    if (stats.recording) {
+        constexpr uint64_t kAudioStallWarnMs = 2000;
+        const auto describe = [&](bool active, uint64_t silenceMs, const wchar_t* label) -> std::wstring {
+            if (!active || silenceMs < kAudioStallWarnMs) {
+                return {};
+            }
+            std::wstringstream stream;
+            stream << label << L": no audio for " << (silenceMs / 1000)
+                   << L"s — recording may be video-only";
+            return stream.str();
+        };
+        warning = describe(stats.systemAudioActive, stats.systemAudioSilenceMs, L"System audio");
+        const std::wstring mic = describe(stats.microphoneAudioActive, stats.microphoneSilenceMs, L"Microphone");
+        if (!mic.empty()) {
+            warning = warning.empty() ? mic : warning + L"  ·  " + mic;
+        }
+    }
+    if (warning == audioLivenessWarning_) {
+        return;
+    }
+    audioLivenessWarning_ = std::move(warning);
+    applyStatusText(currentStatusDisplayText());
 }
 
 } // namespace backtrack

@@ -139,6 +139,10 @@ struct VideoSettings {
 struct ReplaySettings {
     uint32_t seconds = 120;
     bool enabled = true;
+    // Opt-in: buffer encoded video packets in a fixed-capacity on-disk ring
+    // file instead of process RAM. Audio stays memory-resident. When false
+    // the replay buffer behaves exactly as before.
+    bool diskBackedVideo = false;
     bool operator==(const ReplaySettings&) const = default;
 };
 
@@ -203,6 +207,19 @@ struct AppSettings {
         bool operator==(const SoundSeparationApp&) const = default;
     };
     std::vector<SoundSeparationApp> soundSeparationApps;
+    // Auto record: starts continuous recording when one of the selected
+    // executables has a visible window and stops it when the last one exits.
+    bool autoRecordEnabled = false;
+    struct AutoRecordApp {
+        std::wstring name;
+        std::filesystem::path executablePath;
+        bool operator==(const AutoRecordApp&) const = default;
+    };
+    std::vector<AutoRecordApp> autoRecordApps;
+    // Optional override for where the disk-backed replay ring file lives.
+    // Empty = next to the clip library (clipDirectory). Useful to keep the
+    // continuous ring writes off a game HDD, e.g. on an SSD.
+    std::filesystem::path replayRingDirectory;
     bool startWithWindowsMinimized = false;
     bool pruneStaleMicrophoneConsentEntries = false;
     bool exitToTray = false;

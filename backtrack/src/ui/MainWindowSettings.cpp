@@ -210,9 +210,20 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     if (replaySecondsEdit_) {
         target.replay.seconds = readUIntControl(replaySecondsEdit_, target.replay.seconds);
     }
+    if (replayDiskBackedCheck_) {
+        target.replay.diskBackedVideo =
+            SendMessageW(replayDiskBackedCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
+    if (replayRingDirEdit_) {
+        target.replayRingDirectory = trimText(readText(replayRingDirEdit_));
+    }
     if (leagueKillReminderCheck_) {
         target.gameIntegrations.leagueOfLegendsKillReminder =
             SendMessageW(leagueKillReminderCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
+    if (autoRecordEnabledCheck_) {
+        target.autoRecordEnabled =
+            SendMessageW(autoRecordEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (voiceCommandCombo_) {
         const LRESULT selected = SendMessageW(voiceCommandCombo_, CB_GETCURSEL, 0, 0);
@@ -868,6 +879,238 @@ void MainWindow::removeSoundSeparationApp(size_t index) {
     setStatus(L"App removed from sound separation");
 }
 
+void MainWindow::rebuildAutoRecordRows() {
+    destroyAutoRecordRows();
+    if (!pageHost_ || autoRecordRowsY_ <= 0) {
+        return;
+    }
+
+    constexpr int kX = 224;
+    constexpr int kIconSize = 24;
+    constexpr int kNameWidth = 300;
+    constexpr int kRemoveWidth = 88;
+    constexpr int kRowHeight = 42;
+    int y = autoRecordRowsY_;
+
+    if (settings_.autoRecordApps.empty()) {
+        AppListRowControls row;
+        row.nameLabel = addControl(L"STATIC", L"No apps selected", SS_LEFT, kX, y + 4, 360, 22, -1);
+        autoRecordRows_.push_back(row);
+        layoutCurrentPage();
+        redrawWindowAndChildren(pageHost_);
+        return;
+    }
+
+    for (size_t index = 0; index < settings_.autoRecordApps.size(); ++index) {
+        const auto& app = settings_.autoRecordApps[index];
+        AppListRowControls row;
+        row.iconControl = addControl(
+            L"STATIC",
+            L"",
+            SS_ICON,
+            kX,
+            y,
+            kIconSize,
+            kIconSize,
+            -1);
+        row.icon = loadExecutableIcon(app.executablePath);
+        if (row.icon) {
+            SendMessageW(row.iconControl, STM_SETIMAGE, IMAGE_ICON, reinterpret_cast<LPARAM>(row.icon));
+        }
+
+        const std::wstring name = app.name.empty() ? appNameFromPath(app.executablePath) : app.name;
+        row.nameLabel = addControl(
+            L"STATIC",
+            name.c_str(),
+            SS_LEFT | SS_NOPREFIX,
+            kX + 36,
+            y + 4,
+            kNameWidth,
+            22,
+            -1);
+        addSettingHelp(row.nameLabel, 0, 0, app.executablePath.wstring());
+
+        row.removeButton = addControl(
+            L"BUTTON",
+            L"Remove",
+            BS_PUSHBUTTON | WS_TABSTOP,
+            kX + 484,
+            y - 2,
+            kRemoveWidth,
+            30,
+            kAutoRecordRemoveButtonBaseId + static_cast<int>(index));
+        addSettingHelp(row.removeButton, 0, 0, L"Remove this app from auto record.");
+
+        autoRecordRows_.push_back(row);
+        y += kRowHeight;
+    }
+
+    layoutCurrentPage();
+    redrawWindowAndChildren(pageHost_);
+}
+
+void MainWindow::destroyAutoRecordRows() {
+    auto removeControl = [&](HWND control) {
+        if (!control) {
+            return;
+        }
+        statusHelpTexts_.erase(control);
+        pageControls_.erase(std::remove(pageControls_.begin(), pageControls_.end(), control), pageControls_.end());
+        layoutItems_.erase(
+            std::remove_if(
+                layoutItems_.begin(),
+                layoutItems_.end(),
+                [control](const LayoutItem& item) {
+                    return item.control == control;
+                }),
+            layoutItems_.end());
+        DestroyWindow(control);
+    };
+
+    for (auto& row : autoRecordRows_) {
+        removeControl(row.iconControl);
+        removeControl(row.nameLabel);
+        removeControl(row.removeButton);
+        if (row.icon) {
+            DestroyIcon(row.icon);
+            row.icon = nullptr;
+        }
+    }
+    autoRecordRows_.clear();
+}
+
+void MainWindow::releaseAutoRecordRowIcons() {
+    for (auto& row : autoRecordRows_) {
+        if (row.icon) {
+            DestroyIcon(row.icon);
+            row.icon = nullptr;
+        }
+    }
+    autoRecordRows_.clear();
+}
+
+void MainWindow::removeAutoRecordApp(size_t index) {
+    if (index >= settings_.autoRecordApps.size()) {
+        return;
+    }
+    settings_.autoRecordApps.erase(settings_.autoRecordApps.begin() + static_cast<std::ptrdiff_t>(index));
+    rebuildAutoRecordRows();
+    markSettingsDirty();
+    setStatus(L"App removed from auto record");
+}
+
+void MainWindow::refreshAutoRecordApps() {
+    autoRecordAvailableApps_ = WasapiCapture::enumerateOpenApps();
+
+    if (autoRecordAppCombo_) {
+        ScopedRedrawLock redraw(autoRecordAppCombo_);
+        SendMessageW(autoRecordAppCombo_, CB_RESETCONTENT, 0, 0);
+        SendMessageW(autoRecordAppCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Choose active app"));
+        for (const auto& app : autoRecordAvailableApps_) {
+            std::wstring label = app.name.empty() ? appNameFromPath(app.executablePath) : app.name;
+            const std::wstring fileName = app.executablePath.filename().wstring();
+            if (!fileName.empty() && label.find(fileName) == std::wstring::npos) {
+                label += L" (" + fileName + L")";
+            }
+            SendMessageW(autoRecordAppCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        }
+        SendMessageW(autoRecordAppCombo_, CB_SETCURSEL, 0, 0);
+    }
+
+    if (!buildingPage_) {
+        setStatus(L"Found " + std::to_wstring(autoRecordAvailableApps_.size()) +
+                  (autoRecordAvailableApps_.size() == 1 ? L" selectable app" : L" selectable apps"));
+    }
+}
+
+void MainWindow::addSelectedAutoRecordApp() {
+    if (!autoRecordAppCombo_) {
+        return;
+    }
+    const auto selected = SendMessageW(autoRecordAppCombo_, CB_GETCURSEL, 0, 0);
+    if (selected <= 0) {
+        return;
+    }
+    const size_t index = static_cast<size_t>(selected - 1);
+    if (index >= autoRecordAvailableApps_.size()) {
+        return;
+    }
+    const auto& app = autoRecordAvailableApps_[index];
+    addAutoRecordApp(app.name, app.executablePath);
+    SendMessageW(autoRecordAppCombo_, CB_SETCURSEL, 0, 0);
+}
+
+void MainWindow::addManualAutoRecordApp() {
+    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        setStatus(L"Manual app picker could not open");
+        return;
+    }
+
+    COMDLG_FILTERSPEC filters[] = {
+        {L"Applications", L"*.exe"},
+        {L"All files", L"*.*"},
+    };
+    dialog->SetTitle(L"Choose app executable");
+    dialog->SetFileTypes(static_cast<UINT>(_countof(filters)), filters);
+    dialog->SetFileTypeIndex(1);
+    dialog->SetDefaultExtension(L"exe");
+
+    hr = dialog->Show(window_);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        return;
+    }
+    if (FAILED(hr)) {
+        setStatus(L"Manual app picker failed");
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<IShellItem> item;
+    hr = dialog->GetResult(&item);
+    if (FAILED(hr) || !item) {
+        setStatus(L"No executable selected");
+        return;
+    }
+
+    PWSTR rawPath = nullptr;
+    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
+    if (FAILED(hr) || !rawPath) {
+        CoTaskMemFree(rawPath);
+        setStatus(L"Selected app path could not be read");
+        return;
+    }
+
+    std::filesystem::path executablePath(rawPath);
+    CoTaskMemFree(rawPath);
+    addAutoRecordApp(appNameFromPath(executablePath), executablePath);
+}
+
+void MainWindow::addAutoRecordApp(std::wstring name, std::filesystem::path executablePath) {
+    if (executablePath.empty()) {
+        setStatus(L"Selected app has no executable path");
+        return;
+    }
+
+    const std::wstring key = executableKey(executablePath);
+    for (const auto& existing : settings_.autoRecordApps) {
+        if (executableKey(existing.executablePath) == key) {
+            rebuildAutoRecordRows();
+            markSettingsDirty();
+            setStatus(L"App already listed");
+            return;
+        }
+    }
+
+    AppSettings::AutoRecordApp app;
+    app.name = name.empty() ? appNameFromPath(executablePath) : std::move(name);
+    app.executablePath = std::move(executablePath);
+    settings_.autoRecordApps.push_back(std::move(app));
+    rebuildAutoRecordRows();
+    markSettingsDirty();
+    setStatus(L"App added to auto record");
+}
+
 bool MainWindow::isSoundSeparationMutedLabel(HWND control) const {
     if (!control) {
         return false;
@@ -898,6 +1141,30 @@ void MainWindow::browseClipFolder() {
     wchar_t path[MAX_PATH]{};
     if (SHGetPathFromIDListW(item, path)) {
         setText(clipFolderEdit_, path);
+        markSettingsDirty();
+    }
+    CoTaskMemFree(item);
+}
+
+void MainWindow::browseRingDirectory() {
+    if (!replayRingDirEdit_) {
+        return;
+    }
+    wchar_t displayName[MAX_PATH]{};
+    BROWSEINFOW browse{};
+    browse.hwndOwner = window_;
+    browse.pszDisplayName = displayName;
+    browse.lpszTitle = L"Choose where the replay ring file is kept";
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+    if (!item) {
+        return;
+    }
+
+    wchar_t path[MAX_PATH]{};
+    if (SHGetPathFromIDListW(item, path)) {
+        setText(replayRingDirEdit_, path);
         markSettingsDirty();
     }
     CoTaskMemFree(item);

@@ -7,6 +7,8 @@
 #include <Windows.h>
 #include <mmreg.h>
 
+#include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -24,6 +26,9 @@ namespace backtrack {
 
 static MuxedInputs g_lastMuxedInputs;
 static std::optional<WavInfo> g_lastSystemWav;
+// Snapshot of the elementary stream at mux time: saveTo deletes its staging
+// directory right after the stub returns, so integrity checks must copy.
+static std::vector<char> g_lastVideoStreamBytes;
 
 bool Mp4Muxer::muxToMp4(
     const MuxedInputs& inputs,
@@ -36,6 +41,14 @@ bool Mp4Muxer::muxToMp4(
     }
     g_lastMuxedInputs = inputs;
     g_lastSystemWav.reset();
+    g_lastVideoStreamBytes.clear();
+    if (!inputs.videoPath.empty()) {
+        std::ifstream stream(inputs.videoPath, std::ios::binary);
+        if (stream.is_open()) {
+            g_lastVideoStreamBytes.assign(
+                std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+        }
+    }
     if (!inputs.systemAudioPath.empty()) {
         WavInfo info;
         if (parseWav(inputs.systemAudioPath, info)) {
@@ -567,6 +580,159 @@ void testRecoveryStillRejectsDamagedMetadata() {
     fixture.dispose();
 }
 
+EncodedPacket makeVideoPayload(
+    int64_t pts100ns, int64_t duration100ns, bool keyFrame, uint8_t fill,
+    size_t payloadBytes = 1024 * 1024 + 12345) {
+    EncodedPacket packet = makeVideo(pts100ns, duration100ns, keyFrame);
+    // Payload deliberately does not divide the ring capacity so packets
+    // genuinely straddle the wrap boundary (two-extent split).
+    packet.bytes.assign(payloadBytes, fill);
+    return packet;
+}
+
+void testDiskBackedRingRoundTripAndWrap() {
+    const auto storageRoot = testOutputDir() / L"disk_ring_storage";
+    std::error_code error;
+    std::filesystem::remove_all(storageRoot, error);
+    std::filesystem::create_directories(storageRoot, error);
+
+    const auto ringPath = storageRoot / L".backtrack_ring" / L"replay_video.bin";
+    VideoSettings videoSettings;
+    videoSettings.codec = VideoCodec::H264;
+    videoSettings.fps = 60;
+    videoSettings.width = 1920;
+    videoSettings.height = 1080;
+
+    {
+        // 3-second window (3 MiB of packets) fits the 8 MiB ring, so the
+        // final buffer is shaped purely by the time window; earlier pushes
+        // already exercised multiple physical wraps.
+        ReplaySettings diskSettings = settings(3);
+        diskSettings.diskBackedVideo = true;
+        ReplayBuffer buffer;
+        buffer.configure(diskSettings, storageRoot, 8ull * 1024 * 1024);
+
+        constexpr int64_t kTotalPackets = 40; // 40 MiB written through an 8 MiB ring
+        for (int64_t pts = 0; pts < kTotalPackets; ++pts) {
+            buffer.pushVideo(makeVideoPayload(
+                pts * kSecond100ns, kSecond100ns, (pts % 2) == 0, static_cast<uint8_t>(0x40 + pts)));
+        }
+        expect(std::filesystem::exists(ringPath, error), "ring file was not created");
+
+        expect(buffer.videoPacketCount() == 4, "disk ring did not keep the 3-second window");
+        expect(buffer.videoKeyFrameCount() == 2, "disk ring lost keyframe accounting across wraps");
+        expect(buffer.videoSpan100ns() == 4 * kSecond100ns, "disk ring span wrong after wraps");
+        expect(buffer.extendLastVideoDuration((kTotalPackets - 1) * kSecond100ns, 2 * kSecond100ns),
+            "disk ring rejected a live tail extension");
+
+        const auto output = testOutputDir() / L"disk_ring.mp4";
+        expect(buffer.saveTo(output, videoSettings), "saveTo failed for the disk-backed ring");
+
+        const auto& samples = backtrack::g_lastMuxedInputs.videoSamples;
+        expect(samples.size() == 4, "disk ring clip lost packets");
+        expect(samples.front().keyFrame && samples.front().pts100ns == 36 * kSecond100ns,
+            "disk ring clip starts at the wrong keyframe");
+        expect(samples.back().duration100ns == 2 * kSecond100ns,
+            "disk ring clip lost the live tail extension");
+
+        // Payload integrity: every sample's bytes must match the fill byte of
+        // the packet pushed with its PTS. The stub snapshotted the elementary
+        // stream before saveTo cleaned its staging directory.
+        const auto& streamBytes = backtrack::g_lastVideoStreamBytes;
+        expect(!streamBytes.empty(), "elementary stream snapshot is empty");
+        for (size_t index = 0; index < samples.size(); ++index) {
+            const auto& sample = samples[index];
+            expect(static_cast<size_t>(sample.offset) + sample.size <= streamBytes.size(),
+                "disk ring dump truncated a sample");
+            const auto expectedFill = static_cast<uint8_t>(0x40 + 36 + static_cast<int64_t>(index));
+            expect(std::all_of(
+                       streamBytes.begin() + static_cast<std::ptrdiff_t>(sample.offset),
+                       streamBytes.begin() + static_cast<std::ptrdiff_t>(sample.offset + sample.size),
+                       [expectedFill](char c) { return static_cast<uint8_t>(c) == expectedFill; }),
+                "disk ring returned corrupted payload (wrap mismatch)");
+        }
+
+        std::filesystem::remove_all(output.parent_path(), error);
+    }
+
+    // Lifecycle: destroying the buffer removes the ring file.
+    expect(!std::filesystem::exists(ringPath, error), "ring file survived buffer destruction");
+    std::filesystem::remove_all(storageRoot, error);
+}
+
+void testDiskBackedMatchesRamBackend() {
+    // Core acceptance: identical pushes through both backends must produce a
+    // byte-identical elementary stream and an identical sample table.
+    std::vector<EncodedPacket> packets;
+    constexpr int64_t kCount = 12;
+    for (int64_t pts = 0; pts < kCount; ++pts) {
+        packets.push_back(makeVideoPayload(
+            pts * kSecond100ns, kSecond100ns, (pts % 2) == 0,
+            static_cast<uint8_t>(0x20 + pts), 4096));
+    }
+
+    const auto push = [&packets](ReplayBuffer& buffer) {
+        for (const auto& packet : packets) {
+            buffer.pushVideo(packet);
+        }
+        buffer.extendLastVideoDuration((kCount - 1) * kSecond100ns, 2 * kSecond100ns);
+    };
+    VideoSettings videoSettings;
+    videoSettings.codec = VideoCodec::H264;
+    videoSettings.fps = 60;
+    videoSettings.width = 1920;
+    videoSettings.height = 1080;
+
+    ReplayBuffer ramBuffer;
+    ramBuffer.configure(settings(10));
+    push(ramBuffer);
+    const auto ramOutput = testOutputDir() / L"parity_ram.mp4";
+    expect(ramBuffer.saveTo(ramOutput, videoSettings), "RAM parity save failed");
+    const auto ramSamples = backtrack::g_lastMuxedInputs.videoSamples;
+    const auto ramBytes = backtrack::g_lastVideoStreamBytes;
+
+    const auto storageRoot = testOutputDir() / L"disk_ring_parity";
+    std::error_code error;
+    std::filesystem::remove_all(storageRoot, error);
+    std::filesystem::create_directories(storageRoot, error);
+    ReplaySettings diskSettings = settings(10);
+    diskSettings.diskBackedVideo = true;
+    ReplayBuffer diskBuffer;
+    diskBuffer.configure(diskSettings, storageRoot, 8ull * 1024 * 1024);
+    push(diskBuffer);
+    const auto diskOutput = testOutputDir() / L"parity_disk.mp4";
+    expect(diskBuffer.saveTo(diskOutput, videoSettings), "disk parity save failed");
+    const auto& diskSamples = backtrack::g_lastMuxedInputs.videoSamples;
+    const auto& diskBytes = backtrack::g_lastVideoStreamBytes;
+
+    expect(ramBytes == diskBytes, "elementary streams differ between backends");
+    expect(ramSamples.size() == diskSamples.size(), "sample tables differ in length");
+    for (size_t index = 0; index < ramSamples.size(); ++index) {
+        const auto& ram = ramSamples[index];
+        const auto& disk = diskSamples[index];
+        if (!(ram.offset == disk.offset && ram.size == disk.size &&
+              ram.pts100ns == disk.pts100ns && ram.dts100ns == disk.dts100ns &&
+              ram.hasDts == disk.hasDts && ram.duration100ns == disk.duration100ns &&
+              ram.keyFrame == disk.keyFrame)) {
+            std::cerr << "parity mismatch at sample " << index
+                      << ": offset(" << ram.offset << "/" << disk.offset << ")"
+                      << " size(" << ram.size << "/" << disk.size << ")"
+                      << " pts(" << ram.pts100ns << "/" << disk.pts100ns << ")"
+                      << " dur(" << ram.duration100ns << "/" << disk.duration100ns << ")"
+                      << " kf(" << ram.keyFrame << "/" << disk.keyFrame << ")\n";
+        }
+        expect(std::memcmp(&ram, &disk, sizeof(ram)) == 0 || (
+                   ram.offset == disk.offset && ram.size == disk.size &&
+                   ram.pts100ns == disk.pts100ns && ram.dts100ns == disk.dts100ns &&
+                   ram.hasDts == disk.hasDts && ram.duration100ns == disk.duration100ns &&
+                   ram.keyFrame == disk.keyFrame),
+            "sample table entry differs between backends");
+    }
+
+    std::filesystem::remove_all(ramOutput.parent_path(), error);
+    std::filesystem::remove_all(storageRoot, error);
+}
+
 } // namespace
 
 int main() {
@@ -584,6 +750,8 @@ int main() {
         testRecoveryRejectsPlausibleNonContiguousTail();
         testRecoveryAcceptsFewerLinesThanDeclared();
         testRecoveryStillRejectsDamagedMetadata();
+        testDiskBackedRingRoundTripAndWrap();
+        testDiskBackedMatchesRamBackend();
         std::cout << "ReplayBuffer tests passed\n";
         return 0;
     } catch (const std::exception& error) {

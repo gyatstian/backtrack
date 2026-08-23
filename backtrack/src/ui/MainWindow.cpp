@@ -374,6 +374,11 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     ShowWindow(window_, startMinimized ? SW_SHOWMINIMIZED : initialShowCommand);
     UpdateWindow(window_);
     addTrayIcon();
+    // Auto record watcher: ticks permanently; pollAutoRecord() early-returns
+    // while the feature is off. Runs even when the window is hidden in the tray.
+    if (!SetTimer(window_, kAutoRecordTimerId, kAutoRecordPollMs, nullptr)) {
+        Logger::instance().warning(L"ui", L"Could not create the auto record timer");
+    }
     startUpdateCheck();
     if (settings_.replay.enabled) {
         setStatus(L"Starting replay buffer...");

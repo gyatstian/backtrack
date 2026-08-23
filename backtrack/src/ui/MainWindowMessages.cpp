@@ -296,12 +296,28 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             addSelectedSoundSeparationApp();
             return 0;
         }
+        if (isAutoRecordRemoveButtonId(controlId) && notification == BN_CLICKED) {
+            removeAutoRecordApp(soundSeparationIndexFromButtonId(controlId, kAutoRecordRemoveButtonBaseId));
+            return 0;
+        }
+        if (controlId == kAutoRecordAppComboId && notification == CBN_SELCHANGE) {
+            addSelectedAutoRecordApp();
+            return 0;
+        }
         if (isSoundSeparationMuteButtonId(controlId) && notification == BN_CLICKED) {
             toggleSoundSeparationApp(soundSeparationIndexFromButtonId(controlId, kSoundSeparationMuteButtonBaseId));
             return 0;
         }
         if (isSoundSeparationRemoveButtonId(controlId) && notification == BN_CLICKED) {
             removeSoundSeparationApp(soundSeparationIndexFromButtonId(controlId, kSoundSeparationRemoveButtonBaseId));
+            return 0;
+        }
+        if (controlId == kReplayDiskBackedCheckId && notification == BN_CLICKED) {
+            // The ring-folder row only exists while the toggle is on; the
+            // rebuild reveals or removes it exactly like multi-monitor does.
+            stashVisibleSettings();
+            rebuildSettingsCategoryBody();
+            markSettingsDirty();
             return 0;
         }
         if (isSettingsControlId(controlId) &&
@@ -331,6 +347,9 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kBrowseClipFolderButtonId:
             browseClipFolder();
             return 0;
+        case kBrowseRingDirButtonId:
+            browseRingDirectory();
+            return 0;
         case kBrowseCustomNotificationSoundButtonId:
             browseCustomNotificationSound();
             return 0;
@@ -345,6 +364,12 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         case kSoundSeparationManualButtonId:
             addManualSoundSeparationApp();
+            return 0;
+        case kAutoRecordRefreshButtonId:
+            refreshAutoRecordApps();
+            return 0;
+        case kAutoRecordManualButtonId:
+            addManualAutoRecordApp();
             return 0;
         case kSaveReplayButtonId:
             handleHotkey(HotkeyService::kSaveReplayId);
@@ -534,6 +559,12 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             handleControllerBusySoftTimeout();
             return 0;
         }
+        if (wParam == kAutoRecordTimerId) {
+            // Runs regardless of window visibility so auto record also works
+            // while Backtrack is minimized to the tray.
+            pollAutoRecord();
+            return 0;
+        }
         break;
     case WM_MEASUREITEM:
         if (wParam == kClipListId) {
@@ -609,6 +640,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_DESTROY:
         KillTimer(window_, kDiagnosticsTimerId);
         diagnosticsTimerActive_ = false;
+        KillTimer(window_, kAutoRecordTimerId);
         clearControllerBusyTimer();
         stopUpdateCheck();
         removeTrayIcon();

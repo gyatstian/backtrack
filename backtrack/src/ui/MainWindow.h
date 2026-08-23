@@ -17,6 +17,7 @@
 #include <deque>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -133,6 +134,14 @@ private:
         HICON icon = nullptr;
     };
 
+    // Auto record row: icon + name + remove, no mute toggle.
+    struct AppListRowControls {
+        HWND iconControl = nullptr;
+        HWND nameLabel = nullptr;
+        HWND removeButton = nullptr;
+        HICON icon = nullptr;
+    };
+
     struct PageCache {
         HWND host = nullptr;
         bool built = false;
@@ -217,9 +226,18 @@ private:
     void toggleSoundSeparationApp(size_t index);
     void removeSoundSeparationApp(size_t index);
     bool isSoundSeparationMutedLabel(HWND control) const;
+    void refreshAutoRecordApps();
+    void addSelectedAutoRecordApp();
+    void addManualAutoRecordApp();
+    void addAutoRecordApp(std::wstring name, std::filesystem::path executablePath);
+    void rebuildAutoRecordRows();
+    void destroyAutoRecordRows();
+    void releaseAutoRecordRowIcons();
+    void removeAutoRecordApp(size_t index);
     void updateResolutionControls();
     void updateStartupRegistration();
     void browseClipFolder();
+    void browseRingDirectory();
     void browseCustomNotificationSound();
     void saveLog();
     void updateStats();
@@ -253,6 +271,12 @@ private:
     void updateGameIntegrations();
     void stopGameIntegrations();
     void handleLeagueKillDetected();
+    // Auto record watcher: polls running apps on a timer and toggles recording
+    // through the controller queue. See pollAutoRecord().
+    void pollAutoRecord();
+    std::optional<std::wstring> runningAutoRecordAppName() const;
+    void startRecordingForAutoRecord(const std::wstring& appName);
+    void stopRecordingForAutoRecord();
     void startControllerWorker();
     void stopControllerWorker();
     bool queueControllerAction(ControllerAction action, const std::wstring& busyStatus);
@@ -322,6 +346,8 @@ private:
     HWND clipFolderEdit_ = nullptr;
     HWND replayEnabledCheck_ = nullptr;
     HWND replaySecondsEdit_ = nullptr;
+    HWND replayDiskBackedCheck_ = nullptr;
+    HWND replayRingDirEdit_ = nullptr;
     HWND replayHotkey_ = nullptr;
     HWND leagueKillReminderCheck_ = nullptr;
     HWND voiceCommandCombo_ = nullptr;
@@ -384,6 +410,10 @@ private:
     HWND soundSeparationAppCombo_ = nullptr;
     HWND soundSeparationRefreshButton_ = nullptr;
     HWND soundSeparationManualButton_ = nullptr;
+    HWND autoRecordEnabledCheck_ = nullptr;
+    HWND autoRecordAppCombo_ = nullptr;
+    HWND autoRecordRefreshButton_ = nullptr;
+    HWND autoRecordManualButton_ = nullptr;
     bool trayVisible_ = false;
     bool exitFromTray_ = false;
     bool settingsDirty_ = false;
@@ -415,6 +445,8 @@ private:
     std::vector<AudioDeviceInfo> inputDevices_;
     std::vector<AudioSessionAppInfo> soundSeparationAvailableApps_;
     std::vector<SoundSeparationRowControls> soundSeparationRows_;
+    std::vector<AudioSessionAppInfo> autoRecordAvailableApps_;
+    std::vector<AppListRowControls> autoRecordRows_;
     std::vector<ClipThumbnail> clipThumbnails_;
     std::unordered_map<std::wstring, ThumbnailCacheEntry> thumbnailCache_;
     uint32_t recordHotkeyModifiers_ = 0;
@@ -422,6 +454,14 @@ private:
     uint32_t replayHotkeyModifiers_ = 0;
     uint32_t replayHotkeyVirtualKey_ = 0;
     int soundSeparationRowsY_ = 0;
+    int autoRecordRowsY_ = 0;
+    // Auto record watcher state. ownsRecording_ marks a recording that auto
+    // record started (so it stops it when the app exits); suppressStart_ holds
+    // off restarting after the user manually stopped an owned recording while
+    // the app is still running.
+    bool autoRecordAppRunning_ = false;
+    bool autoRecordOwnsRecording_ = false;
+    bool autoRecordSuppressStart_ = false;
     std::thread controllerWorker_;
     std::mutex controllerQueueMutex_;
     std::condition_variable controllerQueueCv_;

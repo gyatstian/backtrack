@@ -103,6 +103,26 @@ size_t frameQueueCapacityFor(const GpuOptimizationSettings& settings) {
     return static_cast<size_t>(std::clamp<uint32_t>(settings.frameQueueLimit, 1, 16));
 }
 
+// On-disk ring capacity for disk-backed replay buffering: one replay window
+// at the configured bitrate plus ~33% VBR headroom, clamped to a sane range.
+// ReplayBuffer ignores this unless replay.diskBackedVideo is enabled.
+uint64_t replayRingCapacityBytesFor(const AppSettings& settings) {
+    constexpr uint64_t kMinCapacityBytes = 64ull * 1024 * 1024;
+    constexpr uint64_t kMaxCapacityBytes = 16ull * 1024 * 1024 * 1024;
+    const uint64_t windowSeconds = std::max<uint32_t>(1, settings.replay.seconds);
+    const uint64_t bytesPerWindow =
+        (static_cast<uint64_t>(settings.video.bitrateKbps) * 1000ull / 8ull) * windowSeconds;
+    const uint64_t withHeadroom = bytesPerWindow + bytesPerWindow / 3;
+    return std::clamp<uint64_t>(withHeadroom, kMinCapacityBytes, kMaxCapacityBytes);
+}
+
+// Ring storage location: explicit override when set, otherwise next to the
+// clip library. Keeping this resolution here means ReplayBuffer stays agnostic
+// of where the user wants the file.
+std::filesystem::path replayRingDirectoryFor(const AppSettings& settings) {
+    return settings.replayRingDirectory.empty() ? settings.clipDirectory : settings.replayRingDirectory;
+}
+
 const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
     switch (backend) {
     case CaptureBackend::WindowsGraphicsCapture:
@@ -505,7 +525,7 @@ bool RecorderController::initialize(AppSettings settings) {
         audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
         microphoneAgcResetPending_ = true;
         replay_.clear();
-        replay_.configure(settings_.replay);
+        replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
     }
     Logger::instance().info(L"recorder", std::wstring(L"Recorder initialized: clips=") + settings_.clipDirectory.wstring() +
                             L", replay=" + (settings_.replay.enabled ? L"enabled" : L"disabled") +
@@ -566,7 +586,7 @@ bool RecorderController::updateSettings(AppSettings settings) {
         audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
         audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
         microphoneAgcResetPending_ = true;
-        replay_.configure(settings_.replay);
+        replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
         // A codec/resolution/fps change makes every buffered packet's bitstream
         // incompatible with the new pipeline. Keep them and a replay save would
         // mix two SPS/PPS worlds into one clip. Drop the buffer so the timeline
@@ -914,7 +934,7 @@ bool RecorderController::ensurePipeline() {
     const uint32_t sourceWidth = captureWidth_.load();
     const uint32_t sourceHeight = captureHeight_.load();
 
-    replay_.configure(snapshot.replay);
+    replay_.configure(snapshot.replay, replayRingDirectoryFor(snapshot), replayRingCapacityBytesFor(snapshot));
     stopRequested_ = false;
     discardQueuedFrames_ = false;
     durationUpdatePending_ = false;

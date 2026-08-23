@@ -371,12 +371,16 @@ bool isButtonId(WPARAM id) {
            controlId == kStartStopButtonId ||
            controlId == kSaveSettingsButtonId ||
             controlId == kBrowseClipFolderButtonId ||
+            controlId == kBrowseRingDirButtonId ||
             controlId == kBrowseCustomNotificationSoundButtonId ||
             controlId == kResetCustomNotificationSoundButtonId ||
             controlId == kSaveReplayButtonId ||
            controlId == kRecoverFailedRecordingButtonId ||
            controlId == kSoundSeparationRefreshButtonId ||
            controlId == kSoundSeparationManualButtonId ||
+           (controlId >= kAutoRecordRemoveButtonBaseId && controlId < kAutoRecordRemoveButtonBaseId + 512) ||
+           controlId == kAutoRecordRefreshButtonId ||
+           controlId == kAutoRecordManualButtonId ||
            controlId == kRefreshClipsButtonId ||
            controlId == kDeleteClipButtonId ||
            controlId == kRenameClipButtonId ||
@@ -395,6 +399,11 @@ bool isSoundSeparationMuteButtonId(int controlId) {
 bool isSoundSeparationRemoveButtonId(int controlId) {
     return controlId >= kSoundSeparationRemoveButtonBaseId &&
            controlId < kSoundSeparationRemoveButtonBaseId + 512;
+}
+
+bool isAutoRecordRemoveButtonId(int controlId) {
+    return controlId >= kAutoRecordRemoveButtonBaseId &&
+           controlId < kAutoRecordRemoveButtonBaseId + 512;
 }
 
 size_t soundSeparationIndexFromButtonId(int controlId, int baseId) {
@@ -449,11 +458,14 @@ bool isSettingsControlId(int controlId) {
     case kStableMultimonitorFramesCheckId:
     case kReplayEnabledId:
     case kReplaySecondsEditId:
+    case kReplayDiskBackedCheckId:
+    case kReplayRingDirEditId:
     case kReplayHotkeyId:
     case kLeagueKillReminderCheckId:
     case kVoiceCommandComboId:
     case kDiscordRichPresenceComboId:
     case kSoundSeparationEnabledCheckId:
+    case kAutoRecordEnabledCheckId:
         return true;
     default:
         return false;

@@ -97,6 +97,7 @@ void MainWindow::rebindPageControlPointers() {
     clipFolderEdit_ = nullptr;
     replayEnabledCheck_ = nullptr;
     replaySecondsEdit_ = nullptr;
+    replayDiskBackedCheck_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
@@ -154,7 +155,11 @@ void MainWindow::rebindPageControlPointers() {
     soundSeparationManualButton_ = nullptr;
     voiceCommandCombo_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
-    soundSeparationRowsY_ = 0;
+    autoRecordEnabledCheck_ = nullptr;
+    autoRecordAppCombo_ = nullptr;
+    autoRecordRefreshButton_ = nullptr;
+    autoRecordManualButton_ = nullptr;
+    autoRecordRowsY_ = 0;
 
     if (!pageHost_) {
         return;
@@ -168,6 +173,8 @@ void MainWindow::rebindPageControlPointers() {
     recordHotkey_ = child(kRecordHotkeyId);
     replayEnabledCheck_ = child(kReplayEnabledId);
     replaySecondsEdit_ = child(kReplaySecondsEditId);
+    replayDiskBackedCheck_ = child(kReplayDiskBackedCheckId);
+    replayRingDirEdit_ = child(kReplayRingDirEditId);
     replayHotkey_ = child(kReplayHotkeyId);
     saveSettingsButton_ = child(kSaveSettingsButtonId);
     bitrateEdit_ = child(kBitrateEditId);
@@ -220,6 +227,10 @@ void MainWindow::rebindPageControlPointers() {
     leagueKillReminderCheck_ = child(kLeagueKillReminderCheckId);
     voiceCommandCombo_ = child(kVoiceCommandComboId);
     discordRichPresenceCombo_ = child(kDiscordRichPresenceComboId);
+    autoRecordEnabledCheck_ = child(kAutoRecordEnabledCheckId);
+    autoRecordAppCombo_ = child(kAutoRecordAppComboId);
+    autoRecordRefreshButton_ = child(kAutoRecordRefreshButtonId);
+    autoRecordManualButton_ = child(kAutoRecordManualButtonId);
     statsLabel_ = child(kStatsLabelId);
     capsLabel_ = child(kCapsLabelId);
     diagnosticLogLabel_ = child(kDiagnosticLogLabelId);
@@ -241,6 +252,16 @@ void MainWindow::rebindPageControlPointers() {
         for (const auto& item : layoutItems_) {
             if (item.control == soundSeparationAppCombo_) {
                 soundSeparationRowsY_ = static_cast<int>(item.design.bottom) + kPageRect.top + 54;
+                break;
+            }
+        }
+    }
+    if (page_ == Page::Settings && settingsCategory_ == SettingsCategory::GameIntegrations) {
+        // Same row placement rule as the sound separation list above.
+        autoRecordRowsY_ = 250;
+        for (const auto& item : layoutItems_) {
+            if (item.control == autoRecordAppCombo_) {
+                autoRecordRowsY_ = static_cast<int>(item.design.bottom) + kPageRect.top + 54;
                 break;
             }
         }
@@ -469,6 +490,8 @@ void MainWindow::clearPageControls() {
     }
     releaseSoundSeparationRowIcons();
     soundSeparationRows_.clear();
+    releaseAutoRecordRowIcons();
+    autoRecordRows_.clear();
     pageControls_.clear();
     layoutItems_.clear();
     statusHelpTexts_.clear();
@@ -482,6 +505,7 @@ void MainWindow::clearPageControls() {
     clipFolderEdit_ = nullptr;
     replayEnabledCheck_ = nullptr;
     replaySecondsEdit_ = nullptr;
+    replayDiskBackedCheck_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
@@ -538,8 +562,12 @@ void MainWindow::clearPageControls() {
     soundSeparationAppCombo_ = nullptr;
     soundSeparationRefreshButton_ = nullptr;
     soundSeparationManualButton_ = nullptr;
-    soundSeparationAvailableApps_.clear();
-    soundSeparationRowsY_ = 0;
+    autoRecordEnabledCheck_ = nullptr;
+    autoRecordAppCombo_ = nullptr;
+    autoRecordRefreshButton_ = nullptr;
+    autoRecordManualButton_ = nullptr;
+    autoRecordAvailableApps_.clear();
+    autoRecordRowsY_ = 0;
     clipListItemHeight_ = 0;
 }
 
@@ -581,6 +609,8 @@ void MainWindow::clearSettingsBodyControls() {
 
     releaseSoundSeparationRowIcons();
     soundSeparationRows_.clear();
+    releaseAutoRecordRowIcons();
+    autoRecordRows_.clear();
     pageControls_ = std::move(keptControls);
     layoutItems_ = std::move(keptLayout);
     statusHelpTexts_ = std::move(keptHelp);
@@ -638,6 +668,12 @@ void MainWindow::clearSettingsBodyControls() {
     soundSeparationManualButton_ = nullptr;
     soundSeparationAvailableApps_.clear();
     soundSeparationRowsY_ = 0;
+    autoRecordEnabledCheck_ = nullptr;
+    autoRecordAppCombo_ = nullptr;
+    autoRecordRefreshButton_ = nullptr;
+    autoRecordManualButton_ = nullptr;
+    autoRecordAvailableApps_.clear();
+    autoRecordRowsY_ = 0;
 }
 
 HWND MainWindow::addControl(const wchar_t* className, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id) {
@@ -1125,6 +1161,24 @@ void MainWindow::buildSettingsCapturePage() {
         captureMethodCombo_,
         L"Screen capture backend. WGC (Windows Graphics Capture) is the modern API and supports zero-copy frames into the encoder. DXGI (Desktop Duplication) is the legacy path, sometimes lighter on old systems but must copy every frame. Recommended: WGC; Backtrack falls back automatically if the selected backend fails to start.");
     y += kRowHeight;
+    HWND diskBackedLabel = addRowLabel(L"Buffer on disk");
+    replayDiskBackedCheck_ = addControl(L"BUTTON", L"Keep replay video in a disk ring instead of RAM", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kWideControlWidth, 24, kReplayDiskBackedCheckId);
+    SendMessageW(replayDiskBackedCheck_, BM_SETCHECK, settings_.replay.diskBackedVideo ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(diskBackedLabel, replayDiskBackedCheck_,
+        L"Stores encoded replay video in a fixed-size ring file instead of system memory. "
+        L"Cuts buffer memory usage to almost zero; audio stays in memory. Changing this clears the current replay buffer. "
+        L"Pick the folder below to keep the continuous writes off a game drive, e.g. on an SSD.");
+    y += kRowHeight;
+    if (settings_.replay.diskBackedVideo) {
+        HWND ringDirLabel = addRowLabel(L"Buffer folder");
+        replayRingDirEdit_ = addControl(L"EDIT", settings_.replayRingDirectory.wstring().c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kControlX, y, kWideControlWidth - 100, 24, kReplayRingDirEditId);
+        addControl(L"BUTTON", L"Browse", BS_PUSHBUTTON | WS_TABSTOP, kControlX + kWideControlWidth - 88, y - 2, 88, 30, kBrowseRingDirButtonId);
+        addRowHelp(ringDirLabel, replayRingDirEdit_,
+            L"Where the ring file lives while this option is enabled. Leave empty to follow the clip library folder "
+            L"(currently " + settings_.clipDirectory.wstring() + L"). "
+            L"A fast SSD is recommended when gaming on an HDD; avoid cloud-synced folders. Changing it clears the current replay buffer.");
+        y += kRowHeight;
+    }
     finishSection();
     addSection(L"Multi-monitor");
     HWND multiMonitorLabel = addRowLabel(L"Multi-monitor support");
@@ -1152,6 +1206,7 @@ void MainWindow::buildSettingsCapturePage() {
         captureCursorCheck_ = addControl(L"BUTTON", L"Capture cursor", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kCaptureCursorCheckId);
         SendMessageW(captureCursorCheck_, BM_SETCHECK, settings_.captureCursor ? BST_CHECKED : BST_UNCHECKED, 0);
         addRowHelp(cursorLabel, captureCursorCheck_, L"Draws the mouse cursor into recorded frames. Negligible GPU impact either way; disable for clean gameplay footage.");
+        y += kRowHeight;
     }
 }
 
@@ -1416,6 +1471,67 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         discordRichPresenceCombo_,
         L"Shows \"Clipping <game>\" on Discord with a button leading to the github repo.");
     y += kRowHeight;
+    finishSection();
+
+    addSection(L"Auto record");
+    constexpr int kComboWidth = 360;
+    HWND autoRecordModeLabel = addRowLabel(L"Enable");
+    autoRecordEnabledCheck_ = addControl(
+        L"BUTTON",
+        L"Enable auto record",
+        BS_AUTOCHECKBOX | WS_TABSTOP,
+        kControlX,
+        y,
+        kComboWidth,
+        24,
+        kAutoRecordEnabledCheckId);
+    SendMessageW(autoRecordEnabledCheck_, BM_SETCHECK, settings_.autoRecordEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(autoRecordModeLabel, autoRecordEnabledCheck_,
+        L"Starts continuous recording automatically when one of the selected apps below is running and stops it when the last one exits. "
+        L"You can still start and stop manually; auto record never restarts a recording you stopped yourself while the app stays open.");
+    y += kRowHeight;
+
+    HWND activeAppLabel = addRowLabel(L"Active app");
+    autoRecordAppCombo_ = addControl(
+        WC_COMBOBOXW,
+        L"",
+        CBS_DROPDOWNLIST | WS_TABSTOP,
+        kControlX,
+        y,
+        kComboWidth,
+        180,
+        kAutoRecordAppComboId);
+    addStatusHelp(autoRecordAppCombo_, L"Choose a running app to add it to auto record. Matching is by executable path.");
+    if (activeAppLabel) {
+        addStatusHelp(activeAppLabel, L"Choose a running app to add it to auto record. Matching is by executable path.");
+    }
+    autoRecordRefreshButton_ = addControl(
+        L"BUTTON",
+        L"Refresh",
+        BS_PUSHBUTTON | WS_TABSTOP,
+        kControlX + kComboWidth + 12,
+        y - 2,
+        88,
+        30,
+        kAutoRecordRefreshButtonId);
+    addSettingHelp(autoRecordRefreshButton_, 0, 0, L"Scans visible running apps, then updates the app list.");
+    autoRecordManualButton_ = addControl(
+        L"BUTTON",
+        L"Manual",
+        BS_PUSHBUTTON | WS_TABSTOP,
+        kControlX + kComboWidth + 108,
+        y - 2,
+        88,
+        30,
+        kAutoRecordManualButtonId);
+    addSettingHelp(autoRecordManualButton_, 0, 0, L"Select an executable manually when the app is not currently running.");
+    y += kRowHeight;
+
+    addRowLabel(L"Selected apps");
+    y += 36;
+    autoRecordRowsY_ = y;
+    refreshAutoRecordApps();
+    rebuildAutoRecordRows();
 }
 
 void MainWindow::buildCapturePage() {

@@ -25,6 +25,7 @@ std::wstring bytesToText(uintmax_t bytes);
 bool isButtonId(WPARAM id);
 bool isSoundSeparationMuteButtonId(int controlId);
 bool isSoundSeparationRemoveButtonId(int controlId);
+bool isAutoRecordRemoveButtonId(int controlId);
 size_t soundSeparationIndexFromButtonId(int controlId, int baseId);
 bool isSettingsControlId(int controlId);
 std::wstring durationToText(uint64_t duration100ns);

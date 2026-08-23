@@ -109,6 +109,87 @@ void MainWindow::handleLeagueKillDetected() {
     setStatus(L"Kill detected; press replay hotkey within 6 seconds to tag it");
 }
 
+std::optional<std::wstring> MainWindow::runningAutoRecordAppName() const {
+    if (settings_.autoRecordApps.empty()) {
+        return std::nullopt;
+    }
+    std::unordered_set<std::wstring> keys;
+    keys.reserve(settings_.autoRecordApps.size());
+    for (const auto& app : settings_.autoRecordApps) {
+        keys.insert(executableKey(app.executablePath));
+    }
+    for (const auto& open : WasapiCapture::enumerateOpenApps()) {
+        if (keys.contains(executableKey(open.executablePath))) {
+            return open.name.empty() ? std::optional<std::wstring>(appNameFromPath(open.executablePath))
+                                     : std::optional<std::wstring>(open.name);
+        }
+    }
+    return std::nullopt;
+}
+
+void MainWindow::startRecordingForAutoRecord(const std::wstring& appName) {
+    ControllerAction action;
+    action.kind = ControllerActionKind::ToggleRecording;
+    if (queueControllerAction(std::move(action), L"Recorder is busy; auto record start ignored")) {
+        autoRecordOwnsRecording_ = true;
+        Logger::instance().info(L"ui", L"Auto record: starting recording for " + appName);
+        setStatus(L"Auto record: starting recording (" + appName + L")");
+    }
+}
+
+void MainWindow::stopRecordingForAutoRecord() {
+    const bool ownsRecording = autoRecordOwnsRecording_;
+    // Clear ownership up front so the completion poll cannot mistake this stop
+    // for a user-initiated one and suppress the next launch.
+    autoRecordOwnsRecording_ = false;
+    ControllerAction action;
+    action.kind = ControllerActionKind::ToggleRecording;
+    if (!queueControllerAction(std::move(action), L"Recorder is busy; auto record stop ignored")) {
+        // Keep ownership so the next tick retries the stop.
+        autoRecordOwnsRecording_ = ownsRecording;
+        return;
+    }
+    Logger::instance().info(L"ui", L"Auto record: app closed; stopping recording");
+    setStatus(L"Auto record: stopping recording");
+}
+
+void MainWindow::pollAutoRecord() {
+    if (controllerActionPending_.load(std::memory_order_acquire)) {
+        // Judge state once the in-flight action finishes; the next tick handles it.
+        return;
+    }
+
+    const bool featureOn =
+        settings_.autoRecordEnabled && !settings_.autoRecordApps.empty();
+    const auto runningName = runningAutoRecordAppName();
+    const bool running = featureOn && runningName.has_value();
+    const bool previousRunning = std::exchange(autoRecordAppRunning_, running);
+
+    if (previousRunning && !running) {
+        // Last selected app exited (or feature turned off): re-arm so the next
+        // launch triggers again even after a user override.
+        autoRecordSuppressStart_ = false;
+    }
+
+    // Recording ended without auto record stopping it (hotkey or failure):
+    // drop ownership and hold off restarting while the app stays open. Suppress
+    // only applies while a selected app is actually running; if the app also
+    // exited this tick, the re-arm above must survive (the next launch should
+    // trigger even though the user stopped the recording).
+    if (autoRecordOwnsRecording_ && !controller_.isRecording()) {
+        autoRecordOwnsRecording_ = false;
+        autoRecordSuppressStart_ = running;
+    }
+
+    if (running && !controller_.isRecording() && !autoRecordSuppressStart_) {
+        startRecordingForAutoRecord(runningName.value_or(L"selected app"));
+        return;
+    }
+    if (!running && controller_.isRecording() && autoRecordOwnsRecording_) {
+        stopRecordingForAutoRecord();
+    }
+}
+
 bool MainWindow::handleShortcut(MSG& message) {
     if (message.message != WM_KEYDOWN && message.message != WM_SYSKEYDOWN) {
         return false;

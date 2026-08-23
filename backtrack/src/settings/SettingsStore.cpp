@@ -127,6 +127,34 @@ uint32_t clampEven(uint32_t value, uint32_t minimum, uint32_t maximum) {
     return (value % 2) == 0 ? value : value - 1;
 }
 
+// Shared cleanup for the per-executable app lists (sound separation, auto
+// record): trim/default names, drop empty and duplicate paths, cap the size.
+template <typename App>
+void dedupeNamedExecutableApps(std::vector<App>& apps) {
+    std::vector<App> kept;
+    kept.reserve(apps.size());
+    std::unordered_set<std::wstring> seen;
+    for (auto app : apps) {
+        if (app.executablePath.empty()) {
+            continue;
+        }
+        app.name = trim(std::move(app.name));
+        if (app.name.empty()) {
+            app.name = app.executablePath.stem().wstring();
+        }
+        const std::wstring key = normalizedPathKey(app.executablePath);
+        if (key.empty() || seen.contains(key)) {
+            continue;
+        }
+        seen.insert(key);
+        kept.push_back(std::move(app));
+        if (kept.size() >= 128) {
+            break;
+        }
+    }
+    apps = std::move(kept);
+}
+
 bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height) {
     switch (mode) {
     case ResolutionMode::P240:
@@ -216,6 +244,8 @@ AppSettings SettingsStore::load() const {
     settings.video.encoderReferenceFrames = readUInt(values, L"video.encoderReferenceFrames", settings.video.encoderReferenceFrames);
     settings.replay.enabled = readBool(values, L"replay.enabled", settings.replay.enabled);
     settings.replay.seconds = readUInt(values, L"replay.seconds", settings.replay.seconds);
+    settings.replay.diskBackedVideo = readBool(values, L"replay.diskBackedVideo", settings.replay.diskBackedVideo);
+    settings.replayRingDirectory = readString(values, L"replay.ringDirectory", settings.replayRingDirectory.wstring());
     const bool legacyLeagueKillClips =
         readBool(values, L"integrations.leagueOfLegends.autoKillClips", settings.gameIntegrations.leagueOfLegendsKillReminder);
     settings.gameIntegrations.leagueOfLegendsKillReminder =
@@ -247,6 +277,19 @@ AppSettings SettingsStore::load() const {
         app.executablePath = readString(values, prefix + L"path", {});
         app.muted = readBool(values, prefix + L"muted", true);
         settings.soundSeparationApps.push_back(std::move(app));
+    }
+    settings.autoRecordEnabled = readBool(values, L"integrations.autoRecord.enabled", settings.autoRecordEnabled);
+    const uint32_t autoRecordCount = std::min<uint32_t>(
+        readUInt(values, L"integrations.autoRecord.count", 0),
+        128);
+    settings.autoRecordApps.clear();
+    settings.autoRecordApps.reserve(autoRecordCount);
+    for (uint32_t index = 0; index < autoRecordCount; ++index) {
+        const std::wstring prefix = L"integrations.autoRecord." + std::to_wstring(index) + L".";
+        AppSettings::AutoRecordApp app;
+        app.name = readString(values, prefix + L"name", {});
+        app.executablePath = readString(values, prefix + L"path", {});
+        settings.autoRecordApps.push_back(std::move(app));
     }
     settings.startWithWindowsMinimized = readBool(values, L"general.startWithWindowsMinimized", settings.startWithWindowsMinimized);
     settings.pruneStaleMicrophoneConsentEntries =
@@ -328,6 +371,8 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"video.encoderReferenceFrames=" << normalized.video.encoderReferenceFrames << L"\n";
     output << L"replay.enabled=" << (normalized.replay.enabled ? 1 : 0) << L"\n";
     output << L"replay.seconds=" << normalized.replay.seconds << L"\n";
+    output << L"replay.diskBackedVideo=" << (normalized.replay.diskBackedVideo ? 1 : 0) << L"\n";
+    output << L"replay.ringDirectory=" << normalized.replayRingDirectory.wstring() << L"\n";
     output << L"integrations.leagueOfLegends.killReminder=" << (normalized.gameIntegrations.leagueOfLegendsKillReminder ? 1 : 0) << L"\n";
     output << L"integrations.voiceCommand=" << voiceCommandModeName(normalized.gameIntegrations.voiceCommand) << L"\n";
     output << L"integrations.discordRichPresence="
@@ -352,6 +397,14 @@ void SettingsStore::save(const AppSettings& settings) const {
         output << prefix << L"name=" << app.name << L"\n";
         output << prefix << L"path=" << app.executablePath.wstring() << L"\n";
         output << prefix << L"muted=" << (app.muted ? 1 : 0) << L"\n";
+    }
+    output << L"integrations.autoRecord.enabled=" << (normalized.autoRecordEnabled ? 1 : 0) << L"\n";
+    output << L"integrations.autoRecord.count=" << normalized.autoRecordApps.size() << L"\n";
+    for (size_t index = 0; index < normalized.autoRecordApps.size(); ++index) {
+        const auto& app = normalized.autoRecordApps[index];
+        const std::wstring prefix = L"integrations.autoRecord." + std::to_wstring(index) + L".";
+        output << prefix << L"name=" << app.name << L"\n";
+        output << prefix << L"path=" << app.executablePath.wstring() << L"\n";
     }
     output << L"general.startWithWindowsMinimized=" << (normalized.startWithWindowsMinimized ? 1 : 0) << L"\n";
     output << L"general.pruneStaleMicrophoneConsentEntries=" << (normalized.pruneStaleMicrophoneConsentEntries ? 1 : 0) << L"\n";
@@ -403,28 +456,8 @@ AppSettings sanitizeSettings(AppSettings settings) {
     settings.audioInputVolumePercent = std::clamp<uint32_t>(settings.audioInputVolumePercent, 0, 200);
     settings.audioOutputVolumePercent = std::clamp<uint32_t>(settings.audioOutputVolumePercent, 0, 200);
     settings.notificationSoundVolumePercent = std::clamp<uint32_t>(settings.notificationSoundVolumePercent, 0, 100);
-    std::vector<AppSettings::SoundSeparationApp> soundSeparationApps;
-    soundSeparationApps.reserve(settings.soundSeparationApps.size());
-    std::unordered_set<std::wstring> seenSoundSeparationPaths;
-    for (auto app : settings.soundSeparationApps) {
-        if (app.executablePath.empty()) {
-            continue;
-        }
-        app.name = trim(std::move(app.name));
-        if (app.name.empty()) {
-            app.name = app.executablePath.stem().wstring();
-        }
-        const std::wstring key = normalizedPathKey(app.executablePath);
-        if (key.empty() || seenSoundSeparationPaths.contains(key)) {
-            continue;
-        }
-        seenSoundSeparationPaths.insert(key);
-        soundSeparationApps.push_back(std::move(app));
-        if (soundSeparationApps.size() >= 128) {
-            break;
-        }
-    }
-    settings.soundSeparationApps = std::move(soundSeparationApps);
+    dedupeNamedExecutableApps(settings.soundSeparationApps);
+    dedupeNamedExecutableApps(settings.autoRecordApps);
     settings.hotkeys.startStopModifiers = supportedHotkeyModifiers(settings.hotkeys.startStopModifiers);
     settings.hotkeys.saveReplayModifiers = supportedHotkeyModifiers(settings.hotkeys.saveReplayModifiers);
     const HotkeySettings defaultHotkeys;

@@ -139,6 +139,11 @@ private:
     std::atomic<uint64_t> discardCompletedGeneration_{0};
     std::atomic<bool> durationUpdatePending_{false};
     std::atomic<bool> forceVideoHeartbeat_{false};
+    // Mirrors the active encoder's caps.effective.zeroReorderDelay (and its
+    // mere existence): written once per pipeline build/teardown, read per
+    // emitted frame by idleCoalescingAllowed without touching pipelineGpuMutex_
+    // or copying EncoderCapabilities.
+    std::atomic<bool> encoderZeroReorderDelay_{false};
 std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<uint32_t> audioInputVolumePercent_{100};
     std::atomic<bool> audioInputAutoGain_{false};

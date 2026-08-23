@@ -229,9 +229,21 @@ struct AmfEncoder::Impl {
     EncoderCapabilities caps;
     EncoderStats encoderStats;
     mutable std::mutex mutex;
+    // Lock-free mirror of encoderStats.encoderAvailable for the capture loop's
+    // per-iteration health probe (IEncoder::encoderAvailable). Written only on
+    // paths that already hold mutex, so the pair never disagrees observably.
+    std::atomic<bool> availableAtomic{false};
 
-    // Capture feeds BGRA D3D11 textures; AMF converts to NV12 internally.
-    amf::AMF_SURFACE_FORMAT inputSurfaceFormat = amf::AMF_SURFACE_BGRA;
+    void publishAvailability(bool available) {
+        encoderStats.encoderAvailable = available;
+        availableAtomic.store(available, std::memory_order_release);
+    }
+
+    // The capture scaler converts frames to NV12 (BT.709 limited) through the
+    // fixed-function video processor, which is what AMD VCN hardware natively
+    // consumes. Feeding BGRA would instead force the AMF runtime to run its own
+    // compute conversion pass on every submitted frame.
+    amf::AMF_SURFACE_FORMAT inputSurfaceFormat = amf::AMF_SURFACE_NV12;
 
     std::atomic<bool> forceKeyFrame{true};
 
@@ -404,8 +416,9 @@ struct AmfEncoder::Impl {
 
     // Pins BT.709 matrix/primaries/transfer with limited (studio) output range
     // so clips decode with identical colors regardless of driver defaults.
-    // Input properties guide the internal BGRA->NV12 conversion; output
-    // properties land in the stream VUI where the runtime supports it.
+    // Input properties describe the incoming NV12 (converted by the capture
+    // scaler's video processor, or BGRA on the fallback path - both BT.709);
+    // output properties land in the stream VUI where the runtime supports it.
     void applyColorProperties(bool beforeInit) {
         if (beforeInit) {
             if (isHevc()) {
@@ -523,7 +536,7 @@ struct AmfEncoder::Impl {
 
         // Main 8-bit only; Main10 is not configured.
         caps.tenBitHevc = false;
-        encoderStats.encoderAvailable = caps.available;
+        publishAvailability(caps.available);
     }
 
     bool encodeSizeSupported() const {
@@ -562,9 +575,11 @@ struct AmfEncoder::Impl {
         applyColorProperties(true);
 
         // Init with the actual input surface format. The capture pipeline feeds
-        // BGRA D3D11 textures; the AMF encoder performs BGRA->NV12 color
-        // conversion internally (AMF_VIDEO_ENCODER_CAP_COLOR_CONVERSION), so no
-        // separate video-processor pass is required.
+        // NV12 (BT.709 limited) textures converted by the D3D11 video processor;
+        // VCN hardware consumes NV12 natively, so the AMF runtime's internal
+        // BGRA->NV12 conversion pass is bypassed entirely. A scaler that had to
+        // fall back to BGRA at runtime switches the component format through
+        // switchInputFormat() below instead of paying the per-frame conversion.
         AMF_RESULT result = encoder->Init(inputSurfaceFormat,
                                           static_cast<amf_int32>(settings.width),
                                           static_cast<amf_int32>(settings.height));
@@ -747,7 +762,7 @@ struct AmfEncoder::Impl {
         caps.available = true;
         caps.detail = std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
                       L" Direct3D 11 session active";
-        encoderStats.encoderAvailable = true;
+        publishAvailability(true);
 
         Logger::instance().info(L"encoder",
             std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
@@ -787,10 +802,61 @@ struct AmfEncoder::Impl {
         encoderFaulted = true;
         caps.available = false;
         caps.detail = detail;
-        encoderStats.encoderAvailable = false;
+        publishAvailability(false);
         Logger::instance().error(L"encoder", detail);
         shutdownEncoder();
         return false;
+    }
+
+    // Re-creates the AMF component for a different input surface format (NV12
+    // <-> BGRA). Needed when the capture scaler's NV12 output path fails at
+    // runtime on some driver/adapter combinations and it falls back to BGRA
+    // for the rest of the session: the frames keep flowing in the new format,
+    // so the encoder must follow instead of dropping every frame until an
+    // external pipeline recreate. In-flight outputs of the old component are
+    // dropped (at most inFlightCap() frames, roughly one backlog); a forced
+    // IDR afterwards restarts the stream from a clean reference state, which
+    // is the same recovery contract as the pipeline-recreate path but without
+    // tearing down capture.
+    bool switchInputFormat(amf::AMF_SURFACE_FORMAT format) {
+        if (!factory || !context) {
+            return false;
+        }
+        Logger::instance().warning(L"encoder",
+            std::wstring(L"AMF encoder input format changed to ") +
+            (format == amf::AMF_SURFACE_NV12 ? L"NV12" : L"BGRA") +
+            L"; re-initializing the encoder component");
+        // Outputs accepted by the old component will never be produced by the
+        // new one; release their surfaces and capture leases now.
+        inFlight.clear();
+        readyPackets.clear();
+        encoder->Terminate();
+        encoder = nullptr;
+
+        inputSurfaceFormat = format;
+        const wchar_t* componentId = isHevc() ? AMFVideoEncoder_HEVC : AMFVideoEncoderVCE_AVC;
+        AMF_RESULT result = factory->CreateComponent(context, componentId, &encoder);
+        if (result != AMF_OK || !encoder) {
+            caps.detail = std::wstring(L"AMFFactory::CreateComponent(") +
+                          (isHevc() ? L"HEVC" : L"AVC") + L") failed: " + amfResultName(result);
+            Logger::instance().error(L"encoder", caps.detail);
+            return false;
+        }
+        updateCapabilities(caps.adapterName);
+
+        const EncoderEffectiveSettings effective = effectiveSettingsFor(settings);
+        const bool configured = isHevc() ? configureHevc(effective) : configureAvc(effective);
+        if (!configured || !verifyCriticalSettings()) {
+            Logger::instance().error(L"encoder",
+                std::wstring(L"AMF re-initialization after input-format change failed: ") + caps.detail);
+            return false;
+        }
+
+        decodeTimestamps.reset(reorderDelayFrames());
+        cachedParameterSets.clear();
+        consecutiveSubmitFailures = 0;
+        forceKeyFrame = true;
+        return true;
     }
 
     bool popReadyPacket(EncodedPacket& packet) {
@@ -968,6 +1034,21 @@ struct AmfEncoder::Impl {
             ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
         }
+
+        // Surface format must match what the component was initialized with.
+        // A scaler fallback to BGRA mid-session lands here once and re-creates
+        // the component for the new format instead of dropping every frame
+        // until an external recreate (see switchInputFormat). Flapping cannot
+        // occur: the sticky nv12Unavailable_ flag keeps one format per scaler
+        // session, so this fires at most once per source rebind.
+        const amf::AMF_SURFACE_FORMAT wantedFormat =
+            frame.format == DXGI_FORMAT_NV12 ? amf::AMF_SURFACE_NV12 : amf::AMF_SURFACE_BGRA;
+        if (wantedFormat != inputSurfaceFormat) {
+            if (!switchInputFormat(wantedFormat)) {
+                return fail(L"AMF encoder could not follow the capture input-format change; "
+                            L"encoder faulted so the capture pipeline can recreate it");
+            }
+        }
         // Bounded input backlog: before accepting another surface, give the
         // driver one chance to produce output. If the backlog is still full,
         // shed the incoming frame (drop-newest, matching the frame-queue
@@ -1129,7 +1210,7 @@ struct AmfEncoder::Impl {
                 L"AMF encoder did not finish flushing within " +
                 std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(kDrainTimeout).count()) +
                 L"s; capture pipeline will recreate the encoder";
-            encoderStats.encoderAvailable = false;
+            publishAvailability(false);
             Logger::instance().error(L"encoder", caps.detail);
         } else {
             // Join before anything else so the thread object can never be
@@ -1229,6 +1310,9 @@ bool AmfEncoder::initialize(D3DDevice& device, const VideoSettings& settings) {
     impl_->forceKeyFrame = true;
     impl_->caps = {};
     impl_->encoderStats = {};
+#if BACKTRACK_HAS_AMF
+    impl_->availableAtomic.store(false, std::memory_order_release);
+#endif
     impl_->caps.adapterName = device.adapterName();
     impl_->caps.backendName = L"AMF";
 #if BACKTRACK_HAS_AMF
@@ -1283,9 +1367,18 @@ void AmfEncoder::shutdown() {
     std::scoped_lock lock(impl_->mutex);
 #if BACKTRACK_HAS_AMF
     impl_->shutdownEncoder();
+    impl_->availableAtomic.store(false, std::memory_order_release);
 #endif
     impl_->caps.available = false;
     impl_->encoderStats.encoderAvailable = false;
+}
+
+bool AmfEncoder::encoderAvailable() const noexcept {
+#if BACKTRACK_HAS_AMF
+    return impl_->availableAtomic.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
 }
 
 EncoderCapabilities AmfEncoder::capabilities() const {
@@ -1299,12 +1392,13 @@ EncoderStats AmfEncoder::stats() const {
 }
 
 DXGI_FORMAT AmfEncoder::preferredInputFormat() const {
-    // AMF wraps the captured BGRA D3D11 texture directly and performs color
-    // conversion on the encoder input. This avoids a per-frame BGRA->NV12 pass
-    // through the D3D11 video processor, which fails on some AMD driver/adapter
-    // combinations (CreateVideoProcessorInputView), and matches the NVENC path
-    // so native-resolution capture is genuinely zero-copy.
-    return DXGI_FORMAT_B8G8R8A8_UNORM;
+    // AMD VCN hardware encodes NV12 natively. The capture pipeline's D3D11
+    // video processor performs the BGRA->NV12 (BT.709 limited) conversion as a
+    // fixed-function pass, so the AMF runtime no longer runs its own compute
+    // conversion on every frame. Scaler-side fallbacks cover the drivers where
+    // NV12 conversion is unavailable (copied input views; sticky BGRA fallback
+    // with a matching encoder re-initialization).
+    return DXGI_FORMAT_NV12;
 }
 
 } // namespace backtrack

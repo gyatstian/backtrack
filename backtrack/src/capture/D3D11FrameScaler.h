@@ -55,6 +55,34 @@ private:
     // so stale entries hold dead GPU surfaces in VRAM until pruned.
     void pruneStaleInputViews();
 
+    // Sticky video-processor state. The ID3D11VideoContext Set* calls below
+    // configure per-processor state that persists across blits; reissuing them
+    // every frame costs ~8 driver calls for values that only change when the
+    // processor is recreated or an input classification flips. The applied
+    // configuration is cached in vpState_ and diffed against the frame's
+    // desired state instead.
+    struct VpState {
+        // False after processor recreation until the state is (re)programmed.
+        bool valid = false;
+        bool colorSpace1Path = false; // ID3D11VideoContext1 present
+        uint32_t inputWidth = 0;
+        uint32_t inputHeight = 0;
+        uint32_t outputWidth = 0;
+        uint32_t outputHeight = 0;
+        DXGI_FORMAT inputFormat = DXGI_FORMAT_UNKNOWN;
+        DXGI_FORMAT outputFormat = DXGI_FORMAT_UNKNOWN;
+        bool hdr = false;
+        bool hdrRejected = false;
+        bool fitWithBars = false;
+        RECT sourceRect{};
+        RECT targetRect{};
+        RECT outputRect{};
+
+        bool equals(const VpState& other) const;
+    };
+
+    void applyVideoProcessorState(const VpState& state);
+
     ComPtr<ID3D11VideoDevice> videoDevice_;
     ComPtr<ID3D11VideoContext> videoContext_;
     ComPtr<ID3D11VideoContext1> videoContext1_;
@@ -77,6 +105,14 @@ private:
     uint32_t outputHeight_ = 0;
     DXGI_FORMAT outputFormat_ = DXGI_FORMAT_UNKNOWN;
     uint32_t poolSize_ = 8;
+
+    // Video-processor configuration currently programmed into processor_.
+    // Invalidated whenever the processor is recreated (releaseResources).
+    VpState vpState_;
+    // True when the state currently applied to the processor maps an HDR
+    // input color space; drives the tone-map-rejection fallback when a Blt
+    // fails under that mapping.
+    bool appliedHdrInputSpace_ = false;
 };
 
 } // namespace backtrack

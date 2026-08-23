@@ -3,8 +3,7 @@
 </div>
 
 # backtrack
-clipping software that works with both nvidia (nvenc) and amd (amf). on nvidia works without shadowplay.<br>
-the goal was to create as lightweight clipping software as possible and i did some stuff but idk if i optimized the video encoding enough (~13% video encode with gtx 1060, 1080p60 and almost lowest gpu settings)
+lightweight clipping software that works with both nvidia (nvenc) and amd (amf).<br>
 
 <div align="center">
   <img src="capture.png" alt="Screenshot" width="500">
@@ -13,11 +12,8 @@ the goal was to create as lightweight clipping software as possible and i did so
 ## amd
 i dont use amd, some features might not work. dont expect much
 
-## FAQ
-Q: how well does it work<br>
-A: it works thankyou for the qeustion
-
 ## features
+- voice commands
 - customization of the gpu/encoding settigns
 - multi-monitor support
 - library
@@ -39,7 +35,7 @@ A: it works thankyou for the qeustion
 
 - **GPU-first pipeline** - Direct3D 11 textures stay on the GPU through capture and encode. No CPU-side image conversion or readback in the capture path.
 - **Dual capture backends** - Windows Graphics Capture (WGC) first, Desktop Duplication fallback, with automatic recovery on device/access loss.
-- **Vendor-aware hardware encoding** - NVIDIA NVENC (NVIDIA Video Codec SDK) or AMD AMF (Advanced Media Framework), auto-selected by GPU vendor. Both take BGRA D3D11 textures; AMF converts to NV12 inside the encoder.
+- **Vendor-aware hardware encoding** - NVIDIA NVENC (NVIDIA Video Codec SDK) or AMD AMF (Advanced Media Framework), auto-selected by GPU vendor. NVENC takes BGRA D3D11 textures; AMF takes NV12 converted by the fixed-function D3D11 video processor.
 - **H.264 and HEVC** output, with configurable bitrate, FPS, GOP, and full encoder tuning (preset, mode, lookahead, spatial/temporal AQ, multipass, B-frames, reference frames).
 - **Instant replay** - Encoded packets held in a ring buffer; save the last N seconds on a hotkey.
 - **Audio capture** - WASAPI system loopback plus microphone, per-device selection and volume, with optional per-application sound separation (mute specific apps out of the mix).

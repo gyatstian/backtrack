@@ -22,6 +22,7 @@ public:
     void shutdown() override;
     EncoderCapabilities capabilities() const override;
     EncoderStats stats() const override;
+    bool encoderAvailable() const noexcept override;
     DXGI_FORMAT preferredInputFormat() const override;
 
 private:

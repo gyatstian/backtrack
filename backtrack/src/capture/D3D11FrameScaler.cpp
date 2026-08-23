@@ -142,66 +142,33 @@ bool D3D11FrameScaler::scale(
                             slot->renderTargetView.Get(), black);
                     }
                 }
-
-                D3D11_VIDEO_COLOR background{};
-                background.RGBA.A = 1.0f;
-                videoContext_->VideoProcessorSetOutputBackgroundColor(
-                    processor_.Get(), FALSE, &background);
-                videoContext_->VideoProcessorSetStreamFrameFormat(
-                    processor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
-                // HDR sources carry PQ (10-bit) or scRGB (FP16) content.
-                // Interpreting them as gamma-22 SDR washes out color and clips
-                // highlights; declaring the real input color space makes the
-                // video processor tone-map down to the SDR output. A rejected
-                // conversion falls back permanently to the legacy mapping so a
-                // limited processor degrades to old behavior, never to frame
-                // drops (finding 16).
-                DXGI_COLOR_SPACE_TYPE inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-                if (!hdrInputRejected_) {
-                    if (input.hdr && input.format == DXGI_FORMAT_R10G10B10A2_UNORM) {
-                        inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-                    } else if (input.format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
-                        inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
-                    }
-                }
-                const bool usedHdrInputSpace =
-                    inputColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
-                if (videoContext1_) {
-                    videoContext1_->VideoProcessorSetStreamColorSpace1(
-                        processor_.Get(),
-                        0,
-                        inputColorSpace);
-                    videoContext1_->VideoProcessorSetOutputColorSpace1(
-                        processor_.Get(),
-                        outputFormat == DXGI_FORMAT_NV12
-                            ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709
-                            : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-                } else {
-                    D3D11_VIDEO_PROCESSOR_COLOR_SPACE inputColorSpace{};
-                    inputColorSpace.RGB_Range = 0;
-                    inputColorSpace.YCbCr_Matrix = 1;
-                    videoContext_->VideoProcessorSetStreamColorSpace(
-                        processor_.Get(), 0, &inputColorSpace);
-
-                    D3D11_VIDEO_PROCESSOR_COLOR_SPACE outputColorSpace{};
-                    outputColorSpace.YCbCr_Matrix = 1;
-                    outputColorSpace.Nominal_Range =
-                        outputFormat == DXGI_FORMAT_NV12 ? 1 : 0;
-                    videoContext_->VideoProcessorSetOutputColorSpace(
-                        processor_.Get(), &outputColorSpace);
-                }
-                videoContext_->VideoProcessorSetStreamSourceRect(
-                    processor_.Get(), 0, TRUE, &sourceRect);
-                videoContext_->VideoProcessorSetStreamDestRect(
-                    processor_.Get(), 0, TRUE, &targetRect);
                 RECT outputRect{
                     0,
                     0,
                     static_cast<LONG>(outputWidth),
                     static_cast<LONG>(outputHeight),
                 };
-                videoContext_->VideoProcessorSetOutputTargetRect(
-                    processor_.Get(), TRUE, &outputRect);
+
+                // Program the processor only when the desired state differs
+                // from what is already applied: steady-state blits skip all
+                // eight driver calls (see VpState).
+                VpState desired;
+                desired.colorSpace1Path = videoContext1_ != nullptr;
+                desired.inputWidth = input.width;
+                desired.inputHeight = input.height;
+                desired.outputWidth = outputWidth;
+                desired.outputHeight = outputHeight;
+                desired.inputFormat = input.format;
+                desired.outputFormat = outputFormat;
+                desired.hdr = input.hdr;
+                desired.hdrRejected = hdrInputRejected_;
+                desired.fitWithBars = fitWithBars;
+                desired.sourceRect = sourceRect;
+                desired.targetRect = targetRect;
+                desired.outputRect = outputRect;
+                if (!vpState_.valid || !vpState_.equals(desired)) {
+                    applyVideoProcessorState(desired);
+                }
 
                 D3D11_VIDEO_PROCESSOR_STREAM stream{};
                 stream.Enable = TRUE;
@@ -210,7 +177,7 @@ bool D3D11FrameScaler::scale(
                 const HRESULT hr = videoContext_->VideoProcessorBlt(
                     processor_.Get(), slot->outputView.Get(), 0, 1, &stream);
                 if (FAILED(hr)) {
-                    if (usedHdrInputSpace && !hdrInputRejected_) {
+                    if (appliedHdrInputSpace_ && !hdrInputRejected_) {
                         hdrInputRejected_ = true;
                         hdrRejectedThisAttempt = true;
                         releaseResources();
@@ -256,6 +223,93 @@ bool D3D11FrameScaler::scale(
     return false;
 }
 
+bool D3D11FrameScaler::VpState::equals(const VpState& other) const {
+    return colorSpace1Path == other.colorSpace1Path &&
+        inputWidth == other.inputWidth &&
+        inputHeight == other.inputHeight &&
+        outputWidth == other.outputWidth &&
+        outputHeight == other.outputHeight &&
+        inputFormat == other.inputFormat &&
+        outputFormat == other.outputFormat &&
+        hdr == other.hdr &&
+        hdrRejected == other.hdrRejected &&
+        fitWithBars == other.fitWithBars &&
+        sourceRect.left == other.sourceRect.left &&
+        sourceRect.top == other.sourceRect.top &&
+        sourceRect.right == other.sourceRect.right &&
+        sourceRect.bottom == other.sourceRect.bottom &&
+        targetRect.left == other.targetRect.left &&
+        targetRect.top == other.targetRect.top &&
+        targetRect.right == other.targetRect.right &&
+        targetRect.bottom == other.targetRect.bottom &&
+        outputRect.left == other.outputRect.left &&
+        outputRect.top == other.outputRect.top &&
+        outputRect.right == other.outputRect.right &&
+        outputRect.bottom == other.outputRect.bottom;
+}
+
+void D3D11FrameScaler::applyVideoProcessorState(const VpState& state) {
+    D3D11_VIDEO_COLOR background{};
+    background.RGBA.A = 1.0f;
+    videoContext_->VideoProcessorSetOutputBackgroundColor(
+        processor_.Get(), FALSE, &background);
+    videoContext_->VideoProcessorSetStreamFrameFormat(
+        processor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+
+    // HDR sources carry PQ (10-bit) or scRGB (FP16) content.
+    // Interpreting them as gamma-22 SDR washes out color and clips
+    // highlights; declaring the real input color space makes the
+    // video processor tone-map down to the SDR output. A rejected
+    // conversion falls back permanently to the legacy mapping so a
+    // limited processor degrades to old behavior, never to frame
+    // drops (finding 16).
+    DXGI_COLOR_SPACE_TYPE inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (!state.hdrRejected) {
+        if (state.hdr && state.inputFormat == DXGI_FORMAT_R10G10B10A2_UNORM) {
+            inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        } else if (state.inputFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        }
+    }
+    appliedHdrInputSpace_ =
+        inputColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+
+    if (state.colorSpace1Path) {
+        videoContext1_->VideoProcessorSetStreamColorSpace1(
+            processor_.Get(),
+            0,
+            inputColorSpace);
+        videoContext1_->VideoProcessorSetOutputColorSpace1(
+            processor_.Get(),
+            state.outputFormat == DXGI_FORMAT_NV12
+                ? DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709
+                : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    } else {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE legacyInputColorSpace{};
+        legacyInputColorSpace.RGB_Range = 0;
+        legacyInputColorSpace.YCbCr_Matrix = 1;
+        videoContext_->VideoProcessorSetStreamColorSpace(
+            processor_.Get(), 0, &legacyInputColorSpace);
+
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE legacyOutputColorSpace{};
+        legacyOutputColorSpace.YCbCr_Matrix = 1;
+        legacyOutputColorSpace.Nominal_Range =
+            state.outputFormat == DXGI_FORMAT_NV12 ? 1 : 0;
+        videoContext_->VideoProcessorSetOutputColorSpace(
+            processor_.Get(), &legacyOutputColorSpace);
+    }
+
+    videoContext_->VideoProcessorSetStreamSourceRect(
+        processor_.Get(), 0, TRUE, &state.sourceRect);
+    videoContext_->VideoProcessorSetStreamDestRect(
+        processor_.Get(), 0, TRUE, &state.targetRect);
+    videoContext_->VideoProcessorSetOutputTargetRect(
+        processor_.Get(), TRUE, &state.outputRect);
+
+    vpState_ = state;
+    vpState_.valid = true;
+}
+
 void D3D11FrameScaler::releaseResources() {
     inputViews_.clear();
     copiedInputView_.Reset();
@@ -267,6 +321,9 @@ void D3D11FrameScaler::releaseResources() {
     videoContext1_.Reset();
     videoContext_.Reset();
     videoDevice_.Reset();
+    // The sticky state died with the processor; the next blit reprograms it.
+    vpState_ = {};
+    appliedHdrInputSpace_ = false;
     inputWidth_ = 0;
     inputHeight_ = 0;
     outputWidth_ = 0;

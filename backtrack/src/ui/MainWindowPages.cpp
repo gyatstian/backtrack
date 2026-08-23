@@ -780,8 +780,10 @@ void MainWindow::buildSettingsAppPage() {
     constexpr int kSectionGap = 18;
     int y = 128;
 
-    auto addRowLabel = [&](const wchar_t* text) {
-        addControl(L"STATIC", text, 0, kX, y + 4, kLabelWidth, 22, -1);
+    // SS_NOTIFY makes the label receive mouse messages so hovering the row
+    // label shows its help text in the status bar, not just hovering the control.
+    auto addRowLabel = [&](const wchar_t* text) -> HWND {
+        return addControl(L"STATIC", text, SS_LEFT | SS_NOTIFY, kX, y + 4, kLabelWidth, 22, -1);
     };
     auto addSection = [&](const wchar_t* text) {
         addSectionLabel(text, kX, y, 260);
@@ -790,15 +792,22 @@ void MainWindow::buildSettingsAppPage() {
     auto finishSection = [&]() {
         y += kSectionGap;
     };
+    // Registers help for both the control and its row label.
+    auto addRowHelp = [this](HWND label, HWND control, const std::wstring& text) {
+        addStatusHelp(control, text);
+        if (label) {
+            addStatusHelp(label, text);
+        }
+    };
 
     addSection(L"App");
-    addRowLabel(L"Start with Windows");
+    HWND startWithWindowsLabel = addRowLabel(L"Start with Windows");
     startWithWindowsCheck_ = addControl(L"BUTTON", L"Start minimized with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kStartWithWindowsCheckId);
     SendMessageW(startWithWindowsCheck_, BM_SETCHECK, settings_.startWithWindowsMinimized ? BST_CHECKED : BST_UNCHECKED, 0);
-    addSettingHelp(startWithWindowsCheck_, 0, 0, L"Adds Backtrack to the current user startup list and starts it minimized after Windows sign-in.");
+    addRowHelp(startWithWindowsLabel, startWithWindowsCheck_, L"Adds Backtrack to the current user startup list and starts it minimized after Windows sign-in.");
     y += kRowHeight;
 
-    addRowLabel(L"Microphone privacy");
+    HWND micPrivacyLabel = addRowLabel(L"Microphone privacy");
     pruneStaleMicrophoneConsentEntriesCheck_ = addControl(
         L"BUTTON",
         L"Clean old Backtrack entries on startup",
@@ -813,17 +822,16 @@ void MainWindow::buildSettingsAppPage() {
         BM_SETCHECK,
         settings_.pruneStaleMicrophoneConsentEntries ? BST_CHECKED : BST_UNCHECKED,
         0);
-    addSettingHelp(
+    addRowHelp(
+        micPrivacyLabel,
         pruneStaleMicrophoneConsentEntriesCheck_,
-        0,
-        0,
         L"On primary Backtrack startup, removes Windows microphone privacy entries for other backtrack.exe paths. The running executable is never removed.");
     y += kRowHeight;
 
-    addRowLabel(L"Exit to tray");
+    HWND exitToTrayLabel = addRowLabel(L"Exit to tray");
     exitToTrayCheck_ = addControl(L"BUTTON", L"Exit to tray", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kExitToTrayCheckId);
     SendMessageW(exitToTrayCheck_, BM_SETCHECK, settings_.exitToTray ? BST_CHECKED : BST_UNCHECKED, 0);
-    addSettingHelp(exitToTrayCheck_, 0, 0, L"Closing the window hides Backtrack in the tray instead of shutting down recording and replay services.");
+    addRowHelp(exitToTrayLabel, exitToTrayCheck_, L"Closing the window hides Backtrack in the tray instead of shutting down recording and replay services.");
     y += kRowHeight;
 
 }
@@ -838,12 +846,23 @@ void MainWindow::buildSettingsVideoPage() {
     constexpr int kSectionGap = 18;
     int y = 128;
 
-    auto addRowLabel = [&](const wchar_t* text) { addControl(L"STATIC", text, 0, kX, y + 4, kLabelWidth, 22, -1); };
+    // SS_NOTIFY makes the label receive mouse messages so hovering the row
+    // label shows its help text in the status bar, not just hovering the control.
+    auto addRowLabel = [&](const wchar_t* text) -> HWND {
+        return addControl(L"STATIC", text, SS_LEFT | SS_NOTIFY, kX, y + 4, kLabelWidth, 22, -1);
+    };
     auto addSection = [&](const wchar_t* text) { addSectionLabel(text, kX, y, 260); y += 36; };
     auto finishSection = [&]() { y += kSectionGap; };
+    // Registers help for both the control and its row label.
+    auto addRowHelp = [this](HWND label, HWND control, const std::wstring& text) {
+        addStatusHelp(control, text);
+        if (label) {
+            addStatusHelp(label, text);
+        }
+    };
 
     addSection(L"Quality");
-    addRowLabel(L"Resolution");
+    HWND resolutionLabel = addRowLabel(L"Resolution");
     resolutionModeCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 220, kResolutionModeComboId);
     for (const wchar_t* label : {L"240p", L"480p", L"720p", L"1080p", L"2K", L"4K", L"Custom size"}) {
         SendMessageW(resolutionModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
@@ -861,58 +880,87 @@ void MainWindow::buildSettingsVideoPage() {
         SendMessageW(resolutionModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
     }
     SendMessageW(resolutionModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.resolutionMode), 0);
-    addSettingHelp(resolutionModeCombo_, 0, 0, L"Presets scale to fixed 16:9 encode sizes. Monitor entries match that display's native size. Custom enables Width and Height.");
+    addRowHelp(resolutionLabel, resolutionModeCombo_, L"Presets scale to fixed 16:9 encode sizes. Monitor entries match that display's native size. Custom enables Width and Height.");
     y += kRowHeight;
 
     if (settings_.video.resolutionMode == ResolutionMode::Custom) {
-        addRowLabel(L"Custom size");
+        HWND customSizeLabel = addRowLabel(L"Custom size");
         addControl(L"STATIC", L"Width", 0, kControlX, y + 4, 48, 22, -1);
         widthEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.width).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX + 56, y, kNumericWidth, 24, kWidthEditId);
         addControl(L"STATIC", L"Height", 0, kControlX + 190, y + 4, 56, 22, -1);
         heightEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.height).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX + 254, y, kNumericWidth, 24, kHeightEditId);
+        addRowHelp(
+            customSizeLabel,
+            widthEdit_,
+            L"Encode size when Custom is selected (Height uses the same help). Larger frames need more VRAM and more GPU time for scaling and encoding each frame. Recommended: your monitor's native size, or 1080p on weaker GPUs.");
+        if (heightEdit_) {
+            addStatusHelp(heightEdit_, L"Encode height when Custom is selected. Larger frames need more VRAM and more GPU scaling/encode time per frame. Keep in sync with Width for the aspect ratio you want.");
+        }
         y += kRowHeight;
     }
 
-    addRowLabel(L"Framerate");
+    HWND fpsLabel = addRowLabel(L"Framerate");
     fpsEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.fps).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, kNumericWidth, 24, kFpsEditId);
-    addSettingHelp(fpsEdit_, 0, 0, L"Target recording frame rate.");
+    addRowHelp(
+        fpsLabel,
+        fpsEdit_,
+        L"Frames encoded per second. Encoder work and file size scale roughly linearly with this; 60 is a good default. If Diagnostics shows dropped frames or encode times above one frame interval, lower this before touching quality settings.");
     y += kRowHeight;
-    addRowLabel(L"Bitrate");
+    HWND bitrateLabel = addRowLabel(L"Bitrate");
     bitrateEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.bitrateKbps).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, kNumericWidth, 24, kBitrateEditId);
-    addSettingHelp(bitrateEdit_, 0, 0, L"Target video bitrate in kilobits per second.");
+    addRowHelp(
+        bitrateLabel,
+        bitrateEdit_,
+        L"Target video bitrate in kilobits per second. Higher = better quality and bigger files; direct GPU cost is small because rate control only changes quantization. Rough guide: 1080p60 ~24000, 1440p60 ~40000, 4K60 ~80000.");
     y += kRowHeight;
     finishSection();
 
     addSection(L"GPU");
-    addRowLabel(L"Adaptive GPU");
+    HWND adaptiveGpuLabel = addRowLabel(L"Adaptive GPU");
     gpuAdaptiveCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kGpuAdaptiveComboId);
     for (const wchar_t* label : {L"Disabled", L"Conservative", L"Aggressive"}) SendMessageW(gpuAdaptiveCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
     SendMessageW(gpuAdaptiveCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.gpu.adaptiveMode), 0);
+    addRowHelp(
+        adaptiveGpuLabel,
+        gpuAdaptiveCombo_,
+        L"Auto-protects the GPU when the encoder falls behind the capture rate. Conservative caps the frame queue at 4 and skips duplicate frames first. Aggressive caps it at 2 and additionally drops every other fresh frame when near-full. Disabled uses Frame queue as-is and never skips early. Recommended: Conservative; Aggressive for very weak GPUs or 4K capture.");
     y += kRowHeight;
-    addRowLabel(L"Frame queue");
+    HWND frameQueueLabel = addRowLabel(L"Frame queue");
     gpuFrameQueueLimitEdit_ = addControl(L"EDIT", std::to_wstring(settings_.gpu.frameQueueLimit).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, kNumericWidth, 24, kGpuFrameQueueLimitEditId);
+    addRowHelp(
+        frameQueueLabel,
+        gpuFrameQueueLimitEdit_,
+        L"Maximum number of captured frames buffered between the capture thread and the hardware encoder. Each slot holds one full-resolution frame texture (about 8 MB VRAM at 1080p), so higher values smooth over short encode stalls at the cost of memory. Valid range 1-8, default 4 works on almost all GPUs. Raise toward 6-8 only if Diagnostics shows drops from GPU protection with a queue that is constantly full; lower to 1-2 on very low-VRAM GPUs. Adaptive GPU can cap this value further at runtime.");
     y += kRowHeight;
-    addRowLabel(L"Idle frames");
+    HWND idleFramesLabel = addRowLabel(L"Idle frames");
     idleFrameCoalescingCheck_ = addControl(L"BUTTON", L"Lossless idle coalescing", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kIdleFrameCoalescingCheckId);
     SendMessageW(idleFrameCoalescingCheck_, BM_SETCHECK, settings_.gpu.allowIdleFrameSkipping ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(
+        idleFramesLabel,
+        idleFrameCoalescingCheck_,
+        L"When the screen has not changed, reuses the last encoded frame instead of scaling and encoding a duplicate every tick. Output stays lossless (timestamps are extended); static content saves large amounts of GPU and encoder time. Needs Zero reorder delay enabled; leave On unless troubleshooting.");
     y += kRowHeight;
     finishSection();
 
     addSection(L"Format");
-    addRowLabel(L"Codec");
+    HWND codecLabel = addRowLabel(L"Codec");
     codecCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 120, kCodecComboId);
     SendMessageW(codecCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"H.264"));
     SendMessageW(codecCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"HEVC"));
     SendMessageW(codecCombo_, CB_SETCURSEL, settings_.video.codec == VideoCodec::H264 ? 0 : 1, 0);
-    addSettingHelp(codecCombo_, 0, 0, L"Video codec for hardware encoder output. H.264 has broad compatibility; HEVC can improve quality per bit but may be less compatible.");
+    addRowHelp(codecLabel, codecCombo_, L"Video codec for hardware encoder output. H.264 has broad compatibility; HEVC can improve quality per bit but may be less compatible. Both run on the same GPU encode block, so GPU cost is similar.");
     y += kRowHeight;
 
-    addRowLabel(L"Encoder profile");
+    HWND encoderProfileLabel = addRowLabel(L"Encoder profile");
     encoderProfileCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kEncoderProfileComboId);
     for (const wchar_t* label : {L"Lowest GPU", L"Balanced", L"Custom"}) {
         SendMessageW(encoderProfileCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
     }
     SendMessageW(encoderProfileCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderProfile), 0);
+    addRowHelp(
+        encoderProfileLabel,
+        encoderProfileCombo_,
+        L"Bundled encoder configurations. Lowest GPU: preset P1, ultra-low-latency tuning, 1 reference frame - the lightest possible hardware encode. Balanced: P3, low-latency tuning, 2 reference frames - good quality with modest GPU use. Custom: exposes every knob in the Encoder section below. Recommended: Balanced for quality; Lowest GPU on laptops or while gaming on the same GPU.");
     y += kRowHeight;
 
     if (settings_.video.encoderProfile != EncoderProfile::Custom) {
@@ -921,56 +969,109 @@ void MainWindow::buildSettingsVideoPage() {
 
     finishSection();
     addSection(L"Encoder");
-    addRowLabel(L"Preset");
+    HWND presetLabel = addRowLabel(L"Preset");
     encoderPresetCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 180, kEncoderPresetComboId);
     for (const wchar_t* label : {L"P1 fastest", L"P2 faster", L"P3 fast", L"P4 medium", L"P5 slow", L"P6 slower", L"P7 slowest"}) SendMessageW(encoderPresetCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
     SendMessageW(encoderPresetCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderPreset), 0);
+    addRowHelp(
+        presetLabel,
+        encoderPresetCombo_,
+        L"NVIDIA quality/speed ladder. Higher numbers compress better per bit but spend more GPU time encoding each frame. P4 balances both; P1-P3 for high frame rates or when a game runs on the same GPU; P5-P7 only with clear GPU headroom.");
     y += kRowHeight;
-    addRowLabel(L"Tuning mode");
+    HWND tuningLabel = addRowLabel(L"Tuning mode");
     encoderModeCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 160, kEncoderModeComboId);
     for (const wchar_t* label : {L"High quality", L"Low latency", L"Ultra low latency", L"Lossless", L"Ultra high quality"}) SendMessageW(encoderModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
     SendMessageW(encoderModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderMode), 0);
+    addRowHelp(
+        tuningLabel,
+        encoderModeCombo_,
+        L"Rate-control tuning preset. High Quality favors visual fidelity; Low/Ultra Low Latency trade compression efficiency for minimal buffering delay; Lossless needs very high bitrates; Ultra High Quality maximizes fidelity at heavy GPU cost. Recommended: High Quality for recordings, Ultra Low Latency only when latency matters more than file size.");
     y += kRowHeight;
-    addRowLabel(L"Multipass");
+    HWND multipassLabel = addRowLabel(L"Multipass");
     encoderMultipassCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 110, kEncoderMultipassComboId);
     for (const wchar_t* label : {L"Disabled", L"Quarter resolution", L"Full resolution"}) SendMessageW(encoderMultipassCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
     SendMessageW(encoderMultipassCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderMultipass), 0);
+    addRowHelp(
+        multipassLabel,
+        encoderMultipassCombo_,
+        L"Extra analysis pass before final rate decisions: Quarter resolution is cheap, Full resolution most accurate bitrate targeting. Both roughly double encode time versus Disabled. Recommended: Disabled - recording does not need two-pass precision.");
     y += kRowHeight;
-    addRowLabel(L"Lookahead");
+    HWND lookaheadLabel = addRowLabel(L"Lookahead");
     encoderLookaheadCheck_ = addControl(L"BUTTON", L"Enabled", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, 120, 24, kEncoderLookaheadCheckId);
     SendMessageW(encoderLookaheadCheck_, BM_SETCHECK, settings_.video.encoderLookahead ? BST_CHECKED : BST_UNCHECKED, 0);
     addControl(L"STATIC", L"Depth", 0, kControlX + 168, y + 4, 56, 22, -1);
     encoderLookaheadDepthEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.encoderLookaheadDepth).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX + 232, y, kNumericWidth, 24, kEncoderLookaheadDepthEditId);
+    addRowHelp(
+        lookaheadLabel,
+        encoderLookaheadCheck_,
+        L"Lets the encoder inspect up to Depth future frames to place keyframes and B-frames smarter. Costs extra VRAM, latency and GPU encode time; the adaptive I/B-frame options require it. Recommended: Off for instant replay workflows; if enabled, depth 8-20 works well (max 31).");
+    if (encoderLookaheadDepthEdit_) {
+        addStatusHelp(encoderLookaheadDepthEdit_, L"How many future frames Lookahead may buffer (0-31). Higher = smarter frame decisions but more VRAM, latency and GPU work. Only used when Lookahead is enabled.");
+    }
     y += kRowHeight;
-    addRowLabel(L"Adaptive frames");
+    HWND adaptiveFramesLabel = addRowLabel(L"Adaptive frames");
     encoderAdaptiveIFramesCheck_ = addControl(L"BUTTON", L"I-frames", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, 150, 24, kEncoderAdaptiveIFramesCheckId);
     SendMessageW(encoderAdaptiveIFramesCheck_, BM_SETCHECK, settings_.video.encoderAdaptiveIFrames ? BST_CHECKED : BST_UNCHECKED, 0);
     encoderAdaptiveBFramesCheck_ = addControl(L"BUTTON", L"B-frames", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX + 188, y, 150, 24, kEncoderAdaptiveBFramesCheckId);
     SendMessageW(encoderAdaptiveBFramesCheck_, BM_SETCHECK, settings_.video.encoderAdaptiveBFrames ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(
+        adaptiveFramesLabel,
+        encoderAdaptiveIFramesCheck_,
+        L"With Lookahead active, inserts I-frames (full refreshes) or B-frames only at scene changes instead of fixed intervals - better quality per bit on gameplay cuts for a small extra GPU cost. Requires Lookahead; ignored otherwise.");
+    if (encoderAdaptiveBFramesCheck_) {
+        addStatusHelp(encoderAdaptiveBFramesCheck_, L"With Lookahead active, places B-frames adaptively at scene changes for better compression per bit. Small extra GPU cost; requires Lookahead.");
+    }
     y += kRowHeight;
-    addRowLabel(L"Spatial AQ");
+    HWND spatialAqLabel = addRowLabel(L"Spatial AQ");
     encoderSpatialAQCheck_ = addControl(L"BUTTON", L"Enabled", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, 120, 24, kEncoderSpatialAQCheckId);
     SendMessageW(encoderSpatialAQCheck_, BM_SETCHECK, settings_.video.encoderSpatialAQ ? BST_CHECKED : BST_UNCHECKED, 0);
     addControl(L"STATIC", L"Strength", 0, kControlX + 168, y + 4, 70, 22, -1);
     encoderAQStrengthEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.encoderAQStrength).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX + 244, y, kNumericWidth, 24, kEncoderAQStrengthEditId);
+    addRowHelp(
+        spatialAqLabel,
+        encoderSpatialAQCheck_,
+        L"Spatial adaptive quantization: shifts bits from flat areas to detailed areas within each frame, keeping dark/flat game scenes clean at the same bitrate. Strength is 1-15 (default 8). Minor GPU cost, usually worth enabling.");
+    if (encoderAQStrengthEdit_) {
+        addStatusHelp(encoderAQStrengthEdit_, L"Spatial AQ strength, 1-15. Default 8 balances detail boost against banding risk in gradients. Only used when Spatial AQ is enabled.");
+    }
     y += kRowHeight;
-    addRowLabel(L"Temporal AQ");
+    HWND temporalAqLabel = addRowLabel(L"Temporal AQ");
     encoderTemporalAQCheck_ = addControl(L"BUTTON", L"Enabled", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kEncoderTemporalAQCheckId);
     SendMessageW(encoderTemporalAQCheck_, BM_SETCHECK, settings_.video.encoderTemporalAQ ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(
+        temporalAqLabel,
+        encoderTemporalAQCheck_,
+        L"Like Spatial AQ but tracks motion across frames and protects newly revealed detail from being smoothed away. Minor GPU cost. Works best together with Spatial AQ on games with camera movement.");
     y += kRowHeight;
-    addRowLabel(L"B-frames");
+    HWND bFramesLabel = addRowLabel(L"B-frames");
     encoderBFramesCheck_ = addControl(L"BUTTON", L"Enabled", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kEncoderBFramesCheckId);
     SendMessageW(encoderBFramesCheck_, BM_SETCHECK, settings_.video.encoderBFrames ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(
+        bFramesLabel,
+        encoderBFramesCheck_,
+        L"Bidirectionally predicted frames improve compression noticeably at equal quality but add encode latency, VRAM use and GPU work, and some older players decode them poorly. Recommended: Off for lowest-latency clipping, On when file size matters more than latency.");
     y += kRowHeight;
-    addRowLabel(L"Keyframe sec");
+    HWND gopLabel = addRowLabel(L"Keyframe sec");
     encoderGopSecondsEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.gopSeconds).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, kNumericWidth, 24, kEncoderGopSecondsEditId);
+    addRowHelp(
+        gopLabel,
+        encoderGopSecondsEdit_,
+        L"Seconds between forced keyframes (GOP length), 1-30. Shorter intervals make clip starts/seeks cleaner and replay saves faster but grow files and lower quality per bit slightly. Default 2 s suits replay-based clipping.");
     y += kRowHeight;
-    addRowLabel(L"Reference frames");
+    HWND refFramesLabel = addRowLabel(L"Reference frames");
     encoderReferenceFramesEdit_ = addControl(L"EDIT", std::to_wstring(settings_.video.encoderReferenceFrames).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, kNumericWidth, 24, kEncoderReferenceFramesEditId);
+    addRowHelp(
+        refFramesLabel,
+        encoderReferenceFramesEdit_,
+        L"How many previous frames the encoder may reference for prediction (1-4). More references improve quality per bit but increase VRAM and encode time. The Lowest GPU profile uses 1, Balanced uses 2; go to 3-4 only with GPU headroom.");
     y += kRowHeight;
-    addRowLabel(L"Reorder delay");
+    HWND reorderLabel = addRowLabel(L"Reorder delay");
     encoderZeroReorderDelayCheck_ = addControl(L"BUTTON", L"Zero reorder delay", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kEncoderZeroReorderDelayCheckId);
     SendMessageW(encoderZeroReorderDelayCheck_, BM_SETCHECK, settings_.video.encoderZeroReorderDelay ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(
+        reorderLabel,
+        encoderZeroReorderDelayCheck_,
+        L"Streams captured frames straight into the encoder without a reorder buffer: lowest capture-to-file latency, and Lossless idle coalescing requires it. Unchecking allows classic B-frame reordering (slightly better compression, added latency). Keep On for instant replays.");
 }
 
 void MainWindow::buildSettingsCapturePage() {
@@ -984,8 +1085,10 @@ void MainWindow::buildSettingsCapturePage() {
     constexpr int kSectionGap = 18;
     int y = 128;
 
-    auto addRowLabel = [&](const wchar_t* text) {
-        addControl(L"STATIC", text, 0, kX, y + 4, kLabelWidth, 22, -1);
+    // SS_NOTIFY makes the label receive mouse messages so hovering the row
+    // label shows its help text in the status bar, not just hovering the control.
+    auto addRowLabel = [&](const wchar_t* text) -> HWND {
+        return addControl(L"STATIC", text, SS_LEFT | SS_NOTIFY, kX, y + 4, kLabelWidth, 22, -1);
     };
     auto addSection = [&](const wchar_t* text) {
         addSectionLabel(text, kX, y, 260);
@@ -994,13 +1097,21 @@ void MainWindow::buildSettingsCapturePage() {
     auto finishSection = [&]() {
         y += kSectionGap;
     };
+    // Registers help for both the control and its row label.
+    auto addRowHelp = [this](HWND label, HWND control, const std::wstring& text) {
+        addStatusHelp(control, text);
+        if (label) {
+            addStatusHelp(label, text);
+        }
+    };
 
     addSection(L"Capture");
-    addRowLabel(L"Clip folder");
+    HWND clipFolderLabel = addRowLabel(L"Clip folder");
     clipFolderEdit_ = addControl(L"EDIT", settings_.clipDirectory.wstring().c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kControlX, y, kWideControlWidth, 24, kClipFolderEditId);
     addControl(L"BUTTON", L"Browse", BS_PUSHBUTTON | WS_TABSTOP, kControlX + kWideControlWidth + 12, y - 2, 88, 30, kBrowseClipFolderButtonId);
+    addRowHelp(clipFolderLabel, clipFolderEdit_, L"Folder where finished clips are written. Pick a fast drive; slow disks can stall saving large replays while the file is finalized.");
     y += kRowHeight;
-    addRowLabel(L"Capture method");
+    HWND captureMethodLabel = addRowLabel(L"Capture method");
     captureMethodCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kCaptureMethodComboId);
     SendMessageW(captureMethodCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"WGC"));
     SendMessageW(captureMethodCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"DXGI"));
@@ -1009,29 +1120,38 @@ void MainWindow::buildSettingsCapturePage() {
         CB_SETCURSEL,
         settings_.preferredCaptureBackend == CaptureBackend::DesktopDuplication ? 1 : 0,
         0);
+    addRowHelp(
+        captureMethodLabel,
+        captureMethodCombo_,
+        L"Screen capture backend. WGC (Windows Graphics Capture) is the modern API and supports zero-copy frames into the encoder. DXGI (Desktop Duplication) is the legacy path, sometimes lighter on old systems but must copy every frame. Recommended: WGC; Backtrack falls back automatically if the selected backend fails to start.");
     y += kRowHeight;
     finishSection();
     addSection(L"Multi-monitor");
-    addRowLabel(L"Multi-monitor support");
+    HWND multiMonitorLabel = addRowLabel(L"Multi-monitor support");
     multiMonitorSupportCheck_ = addControl(L"BUTTON", L"Enable multi-monitor support", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kMultiMonitorSupportCheckId);
     SendMessageW(multiMonitorSupportCheck_, BM_SETCHECK, settings_.multiMonitorSupport ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(multiMonitorLabel, multiMonitorSupportCheck_, L"Allows capturing any connected monitor instead of a fixed one and unlocks the follow options below. Adds a brief rebind hitch when the active monitor changes.");
     y += kRowHeight;
     if (settings_.multiMonitorSupport) {
-        addRowLabel(L"Follow focused monitor");
+        HWND followFocusedLabel = addRowLabel(L"Follow focused monitor");
         followFocusedMonitorCheck_ = addControl(L"BUTTON", L"Follow focused monitor", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kFollowFocusedMonitorCheckId);
         SendMessageW(followFocusedMonitorCheck_, BM_SETCHECK, settings_.followFocusedMonitor ? BST_CHECKED : BST_UNCHECKED, 0);
+        addRowHelp(followFocusedLabel, followFocusedMonitorCheck_, L"Captures whichever monitor currently holds input focus; focus switches move the recording after a short stability delay. Small GPU cost per frame for the owned copy this uses.");
         y += kRowHeight;
-        addRowLabel(L"Follow mouse");
+        HWND followMouseLabel = addRowLabel(L"Follow mouse");
         followMouseMonitorCheck_ = addControl(L"BUTTON", L"Follow mouse", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kFollowMouseMonitorCheckId);
         SendMessageW(followMouseMonitorCheck_, BM_SETCHECK, settings_.followMouseMonitor ? BST_CHECKED : BST_UNCHECKED, 0);
+        addRowHelp(followMouseLabel, followMouseMonitorCheck_, L"The captured monitor follows the cursor position instead of keyboard focus. Requires Follow focused monitor.");
         y += kRowHeight;
-        addRowLabel(L"Stable multi-monitor frames");
+        HWND stableFramesLabel = addRowLabel(L"Stable multi-monitor frames");
         stableMultimonitorFramesCheck_ = addControl(L"BUTTON", L"Stable multi-monitor frames", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kStableMultimonitorFramesCheckId);
         SendMessageW(stableMultimonitorFramesCheck_, BM_SETCHECK, settings_.gpu.stableMultimonitorFrames ? BST_CHECKED : BST_UNCHECKED, 0);
+        addRowHelp(stableFramesLabel, stableMultimonitorFramesCheck_, L"Forces an owned copy of every frame so monitor switches never tear or flash stale colors. Costs one extra GPU copy per frame; disable only if you want absolute lowest overhead and accept switch glitches. Only applies with WGC zero-copy + Follow focused monitor.");
         y += kRowHeight;
-        addRowLabel(L"Capture cursor");
+        HWND cursorLabel = addRowLabel(L"Capture cursor");
         captureCursorCheck_ = addControl(L"BUTTON", L"Capture cursor", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kCaptureCursorCheckId);
         SendMessageW(captureCursorCheck_, BM_SETCHECK, settings_.captureCursor ? BST_CHECKED : BST_UNCHECKED, 0);
+        addRowHelp(cursorLabel, captureCursorCheck_, L"Draws the mouse cursor into recorded frames. Negligible GPU impact either way; disable for clean gameplay footage.");
     }
 }
 
@@ -1044,8 +1164,10 @@ void MainWindow::buildSettingsAudioPage() {
     constexpr int kSectionGap = 18;
     int y = 128;
 
-    auto addRowLabel = [&](const wchar_t* text) {
-        addControl(L"STATIC", text, 0, kX, y + 4, kLabelWidth, 22, -1);
+    // SS_NOTIFY makes the label receive mouse messages so hovering the row
+    // label shows its help text in the status bar, not just hovering the control.
+    auto addRowLabel = [&](const wchar_t* text) -> HWND {
+        return addControl(L"STATIC", text, SS_LEFT | SS_NOTIFY, kX, y + 4, kLabelWidth, 22, -1);
     };
     auto addSection = [&](const wchar_t* text) {
         addSectionLabel(text, kX, y, 260);
@@ -1054,12 +1176,20 @@ void MainWindow::buildSettingsAudioPage() {
     auto finishSection = [&]() {
         y += kSectionGap;
     };
+    // Registers help for both the control and its row label.
+    auto addRowHelp = [this](HWND label, HWND control, const std::wstring& text) {
+        addStatusHelp(control, text);
+        if (label) {
+            addStatusHelp(label, text);
+        }
+    };
 
     addSection(L"App");
-    addRowLabel(L"Notification volume");
+    HWND notificationVolumeLabel = addRowLabel(L"Notification volume");
     notificationSoundVolumeEdit_ = addControl(L"EDIT", std::to_wstring(settings_.notificationSoundVolumePercent).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, 96, 24, kNotificationSoundVolumeEditId);
+    addRowHelp(notificationVolumeLabel, notificationSoundVolumeEdit_, L"Volume (0-100%) of the sound played when a replay finishes saving. Affects only the notification, never recordings.");
     y += kRowHeight;
-    addRowLabel(L"Custom notification sound");
+    HWND customSoundLabel = addRowLabel(L"Custom notification sound");
     constexpr int kSoundPathWidth = kComboWidth - 188;
     customNotificationSoundEdit_ = addControl(
         L"EDIT",
@@ -1088,42 +1218,53 @@ void MainWindow::buildSettingsAudioPage() {
         72,
         30,
         kResetCustomNotificationSoundButtonId);
+    addRowHelp(customSoundLabel, customNotificationSoundEdit_, L"WAV file played instead of the built-in tone when a replay saves. Empty = built-in tone.");
     y += kRowHeight;
 
     finishSection();
     addSection(L"Devices");
-    addRowLabel(L"Output audio");
+    HWND systemAudioLabel = addRowLabel(L"Output audio");
     systemAudioCheck_ = addControl(L"BUTTON", L"Capture output audio", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kComboWidth, 24, kSystemAudioCheckId);
     SendMessageW(systemAudioCheck_, BM_SETCHECK, settings_.captureSystemAudio ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(systemAudioLabel, systemAudioCheck_, L"Records desktop/game audio as a track in clips. Disabling saves a small amount of CPU/disk but records silence for game sound.");
     y += kRowHeight;
-    addRowLabel(L"Output device");
+    HWND outputDeviceLabel = addRowLabel(L"Output device");
     outputDeviceCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kComboWidth, 180, kOutputDeviceComboId);
     y += kRowHeight;
-    addRowLabel(L"Desktop gain (%)");
+    addStatusHelp(outputDeviceCombo_, L"Which playback device is recorded as desktop audio. Leave on Default unless game audio plays through another device.");
+    if (outputDeviceLabel) {
+        addStatusHelp(outputDeviceLabel, L"Which playback device is recorded as desktop audio. Leave on Default unless game audio plays through another device.");
+    }
+    HWND outputGainLabel = addRowLabel(L"Desktop gain (%)");
     outputVolumeEdit_ = addControl(L"EDIT", std::to_wstring(settings_.audioOutputVolumePercent).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, 96, 24, kOutputVolumeEditId);
-    addSettingHelp(outputVolumeEdit_, 0, 0, L"Desktop audio gain for recordings and replays. 100% is unchanged; 0% mutes it; up to 200% may clip audio.");
+    addRowHelp(outputGainLabel, outputVolumeEdit_, L"Desktop audio gain for recordings and replays. 100% is unchanged; 0% mutes it; up to 200% may clip audio.");
     y += kRowHeight;
-    addRowLabel(L"Input audio");
+    HWND micLabel = addRowLabel(L"Input audio");
     microphoneCheck_ = addControl(L"BUTTON", L"Capture input audio", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kComboWidth, 24, kMicrophoneCheckId);
     SendMessageW(microphoneCheck_, BM_SETCHECK, settings_.captureMicrophone ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(micLabel, microphoneCheck_, L"Records your microphone as a separate track in clips. Windows shows the privacy icon while active.");
     y += kRowHeight;
-    addRowLabel(L"Input device");
+    HWND inputDeviceLabel = addRowLabel(L"Input device");
     inputDeviceCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kComboWidth, 180, kInputDeviceComboId);
     y += kRowHeight;
-    addRowLabel(L"Microphone gain (%)");
+    addStatusHelp(inputDeviceCombo_, L"Which microphone is recorded. Leave on Default unless you use a dedicated mic that is not the system default.");
+    if (inputDeviceLabel) {
+        addStatusHelp(inputDeviceLabel, L"Which microphone is recorded. Leave on Default unless you use a dedicated mic that is not the system default.");
+    }
+    HWND inputGainLabel = addRowLabel(L"Microphone gain (%)");
     inputVolumeEdit_ = addControl(L"EDIT", std::to_wstring(settings_.audioInputVolumePercent).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, 96, 24, kInputVolumeEditId);
-    addSettingHelp(inputVolumeEdit_, 0, 0, L"Manual microphone gain for recordings and replays. 100% is unchanged; 0% mutes it; up to 200% may clip audio. Raise this to make your microphone louder than desktop audio.");
+    addRowHelp(inputGainLabel, inputVolumeEdit_, L"Manual microphone gain for recordings and replays. 100% is unchanged; 0% mutes it; up to 200% may clip audio. Raise this to make your microphone louder than desktop audio.");
     y += kRowHeight;
-    addRowLabel(L"Auto mic gain");
+    HWND autoGainLabel = addRowLabel(L"Auto mic gain");
     inputAutoGainCheck_ = addControl(L"BUTTON", L"Normalize microphone volume (AGC)", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kComboWidth, 24, kInputAutoGainCheckId);
     SendMessageW(inputAutoGainCheck_, BM_SETCHECK, settings_.audioInputAutoGainEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    addSettingHelp(inputAutoGainCheck_, 0, 0, L"Automatically boosts quiet microphones to a consistent level. Applies after the manual gain above; recommended when the raw microphone level is low.");
+    addRowHelp(autoGainLabel, inputAutoGainCheck_, L"Automatically boosts quiet microphones to a consistent level. Applies after the manual gain above; recommended when the raw microphone level is low.");
     y += kRowHeight;
     loadAudioDeviceCombos();
 
     finishSection();
     addSection(L"Sound separation");
-    addRowLabel(L"Mode");
+    HWND separationModeLabel = addRowLabel(L"Mode");
     soundSeparationEnabledCheck_ = addControl(
         L"BUTTON",
         L"Enable sound separation",
@@ -1134,10 +1275,10 @@ void MainWindow::buildSettingsAudioPage() {
         24,
         kSoundSeparationEnabledCheckId);
     SendMessageW(soundSeparationEnabledCheck_, BM_SETCHECK, settings_.soundSeparationEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    addSettingHelp(soundSeparationEnabledCheck_, 0, 0, L"Turns app audio exclusion on or off. When off, Backtrack records normal system audio.");
+    addRowHelp(separationModeLabel, soundSeparationEnabledCheck_, L"Turns app audio exclusion on or off. When off, Backtrack records normal system audio.");
     y += kRowHeight;
 
-    addRowLabel(L"Active app");
+    HWND activeAppLabel = addRowLabel(L"Active app");
     soundSeparationAppCombo_ = addControl(
         WC_COMBOBOXW,
         L"",
@@ -1147,7 +1288,10 @@ void MainWindow::buildSettingsAudioPage() {
         kComboWidth,
         180,
         kSoundSeparationAppComboId);
-    addSettingHelp(soundSeparationAppCombo_, 0, 0, L"Choose a running app to add it to sound separation. Apps only affect clips while sound separation is enabled and the app row is muted.");
+    addStatusHelp(soundSeparationAppCombo_, L"Choose a running app to add it to sound separation. Apps only affect clips while sound separation is enabled and the app row is muted.");
+    if (activeAppLabel) {
+        addStatusHelp(activeAppLabel, L"Choose a running app to add it to sound separation. Apps only affect clips while sound separation is enabled and the app row is muted.");
+    }
     soundSeparationRefreshButton_ = addControl(
         L"BUTTON",
         L"Refresh",
@@ -1186,8 +1330,10 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
     constexpr int kSectionGap = 22;
     int y = 128;
 
-    auto addRowLabel = [&](const wchar_t* text) {
-        addControl(L"STATIC", text, 0, kX, y + 4, kLabelWidth, 22, -1);
+    // SS_NOTIFY makes the label receive mouse messages so hovering the row
+    // label shows its help text in the status bar, not just hovering the control.
+    auto addRowLabel = [&](const wchar_t* text) -> HWND {
+        return addControl(L"STATIC", text, SS_LEFT | SS_NOTIFY, kX, y + 4, kLabelWidth, 22, -1);
     };
     auto addSection = [&](const wchar_t* text) {
         addSectionLabel(text, kX, y, 260);
@@ -1196,9 +1342,16 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
     auto finishSection = [&]() {
         y += kSectionGap;
     };
+    // Registers help for both the control and its row label.
+    auto addRowHelp = [this](HWND label, HWND control, const std::wstring& text) {
+        addStatusHelp(control, text);
+        if (label) {
+            addStatusHelp(label, text);
+        }
+    };
 
     addSection(L"League of Legends");
-    addRowLabel(L"Kill reminder");
+    HWND killReminderLabel = addRowLabel(L"Kill reminder");
     leagueKillReminderCheck_ = addControl(
         L"BUTTON",
         L"Beep on champion kills",
@@ -1209,12 +1362,12 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         24,
         kLeagueKillReminderCheckId);
     SendMessageW(leagueKillReminderCheck_, BM_SETCHECK, settings_.gameIntegrations.leagueOfLegendsKillReminder ? BST_CHECKED : BST_UNCHECKED, 0);
-    addSettingHelp(leagueKillReminderCheck_, 0, 0, L"Polls League's local live-client API during active games. When your champion scores a kill, Backtrack beeps; if you save replay within 6 seconds, the clip is tagged as Kill clip.");
+    addRowHelp(killReminderLabel, leagueKillReminderCheck_, L"Polls League's local live-client API during active games. When your champion scores a kill, Backtrack beeps; if you save replay within 6 seconds, the clip is tagged as Kill clip.");
     y += kRowHeight;
     finishSection();
 
     addSection(L"Voice command");
-    addRowLabel(L"Trigger phrase");
+    HWND triggerPhraseLabel = addRowLabel(L"Trigger phrase");
     voiceCommandCombo_ = addControl(
         WC_COMBOBOXW,
         L"",
@@ -1232,16 +1385,15 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         CB_SETCURSEL,
         static_cast<int>(settings_.gameIntegrations.voiceCommand),
         0);
-    addSettingHelp(
+    addRowHelp(
+        triggerPhraseLabel,
         voiceCommandCombo_,
-        0,
-        0,
         L"Uses offline Windows speech recognition for one exact phrase (Backtrack clip that or Record video). Either phrase saves the current replay buffer; Record video does not start continuous recording. Audio is not uploaded or stored by Backtrack.");
     y += kRowHeight;
     finishSection();
 
     addSection(L"Discord");
-    addRowLabel(L"Rich presence");
+    HWND richPresenceLabel = addRowLabel(L"Rich presence");
     discordRichPresenceCombo_ = addControl(
         WC_COMBOBOXW,
         L"",
@@ -1259,10 +1411,9 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         CB_SETCURSEL,
         static_cast<int>(settings_.gameIntegrations.discordRichPresence),
         0);
-    addSettingHelp(
+    addRowHelp(
+        richPresenceLabel,
         discordRichPresenceCombo_,
-        0,
-        0,
         L"Shows \"Clipping <game>\" on Discord with a button leading to the github repo.");
     y += kRowHeight;
 }
@@ -1282,8 +1433,10 @@ void MainWindow::buildCapturePage() {
     constexpr int kSectionGap = 22;
     int y = 78;
 
-    auto addRowLabel = [&](const wchar_t* text) {
-        addControl(L"STATIC", text, 0, kX, y + 4, kLabelWidth, 22, -1);
+    // SS_NOTIFY makes the label receive mouse messages so hovering the row
+    // label shows its help text in the status bar, not just hovering the control.
+    auto addRowLabel = [&](const wchar_t* text) -> HWND {
+        return addControl(L"STATIC", text, SS_LEFT | SS_NOTIFY, kX, y + 4, kLabelWidth, 22, -1);
     };
     auto addSection = [&](const wchar_t* text) {
         addSectionLabel(text, kX, y, 260);
@@ -1292,11 +1445,18 @@ void MainWindow::buildCapturePage() {
     auto finishSection = [&]() {
         y += kSectionGap;
     };
+    // Registers help for both the control and its row label.
+    auto addRowHelp = [this](HWND label, HWND control, const std::wstring& text) {
+        addStatusHelp(control, text);
+        if (label) {
+            addStatusHelp(label, text);
+        }
+    };
 
     addSection(L"Recording");
-    addRowLabel(L"Hotkey");
+    HWND hotkeyLabel = addRowLabel(L"Hotkey");
     recordHotkey_ = addControl(L"EDIT", hotkeyDisplay(recordHotkeyModifiers_, recordHotkeyVirtualKey_).c_str(), WS_BORDER | ES_READONLY | ES_CENTER | WS_TABSTOP, kControlX, y, kControlWidth, 24, kRecordHotkeyId);
-    addSettingHelp(recordHotkey_, 0, 0, L"Keyboard shortcut for starting or stopping a normal recording. Focus this field and press the desired key combination.");
+    addRowHelp(hotkeyLabel, recordHotkey_, L"Keyboard shortcut for starting or stopping a normal recording. Focus this field and press the desired key combination.");
     y += kRowHeight;
 
     addRowLabel(L"Action");
@@ -1306,20 +1466,20 @@ void MainWindow::buildCapturePage() {
     finishSection();
 
     addSection(L"Replay");
-    addRowLabel(L"Buffer");
+    HWND bufferLabel = addRowLabel(L"Buffer");
     replayEnabledCheck_ = addControl(L"BUTTON", L"Enable instant replay buffer", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kReplayEnabledId);
     SendMessageW(replayEnabledCheck_, BM_SETCHECK, settings_.replay.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    addSettingHelp(replayEnabledCheck_, 0, 0, L"Keeps a rolling encoded video/audio buffer so a recent clip can be saved without re-encoding.");
+    addRowHelp(bufferLabel, replayEnabledCheck_, L"Keeps a rolling encoded video/audio buffer so a recent clip can be saved without re-encoding.");
     y += kRowHeight;
 
-    addRowLabel(L"Length seconds");
+    HWND lengthLabel = addRowLabel(L"Length seconds");
     replaySecondsEdit_ = addControl(L"EDIT", std::to_wstring(settings_.replay.seconds).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, kNumericWidth, 24, kReplaySecondsEditId);
-    addSettingHelp(replaySecondsEdit_, 0, 0, L"How many seconds of encoded packets are retained for instant replay. Longer buffers use more system memory and disk work on save, not more VRAM.");
+    addRowHelp(lengthLabel, replaySecondsEdit_, L"How many seconds of encoded packets are retained for instant replay. Longer buffers use more system memory and disk work on save, not more VRAM.");
     y += kRowHeight;
 
-    addRowLabel(L"Save hotkey");
+    HWND saveHotkeyLabel = addRowLabel(L"Save hotkey");
     replayHotkey_ = addControl(L"EDIT", hotkeyDisplay(replayHotkeyModifiers_, replayHotkeyVirtualKey_).c_str(), WS_BORDER | ES_READONLY | ES_CENTER | WS_TABSTOP, kControlX, y, kControlWidth, 24, kReplayHotkeyId);
-    addSettingHelp(replayHotkey_, 0, 0, L"Keyboard shortcut for saving the current replay buffer. Focus this field and press the desired key combination.");
+    addRowHelp(saveHotkeyLabel, replayHotkey_, L"Keyboard shortcut for saving the current replay buffer. Focus this field and press the desired key combination.");
     y += kRowHeight;
 
     addRowLabel(L"Action");

@@ -231,12 +231,30 @@ struct NvencEncoder::Impl {
     EncoderCapabilities caps;
     EncoderStats encoderStats;
     mutable std::mutex mutex;
+    // Lock-free mirror of encoderStats.encoderAvailable for the capture loop's
+    // per-iteration health probe (IEncoder::encoderAvailable). Written only on
+    // paths that already hold mutex, so the pair never disagrees observably.
+    std::atomic<bool> availableAtomic{false};
+
+    void publishAvailability(bool available) {
+        encoderStats.encoderAvailable = available;
+        availableAtomic.store(available, std::memory_order_release);
+    }
 
     struct RegisteredResource {
-        // Scaler owns these textures for its lifetime. Keeping another ComPtr here
+        // Scaler owns these textures for their lifetime. Keeping another ComPtr here
         // would pin every pool slot and permanently exhaust capture after one pass.
         ID3D11Texture2D* texture = nullptr;
         NV_ENC_REGISTERED_PTR registered = nullptr;
+        // Address binding created by nvEncMapInputResource. Valid for the whole
+        // session (the driver only requires the unmap to precede unregister /
+        // texture destruction), so it is created lazily on first use and kept:
+        // mapping/unmapping per submitted frame costs two pure driver calls
+        // that carry no information the driver does not already have. The
+        // lease pinning on PendingOutput keeps a pool slot from recycling
+        // while the encoder still reads it, exactly as before.
+        NV_ENC_INPUT_PTR mapped = nullptr;
+        NV_ENC_BUFFER_FORMAT mappedFormat = NV_ENC_BUFFER_FORMAT_UNDEFINED;
         uint64_t generation = 0;
     };
 
@@ -252,6 +270,14 @@ struct NvencEncoder::Impl {
         // can only complete once enough later frames were submitted to fill
         // the reorder pipeline; until then LOCK_BUSY is healthy, not wedged.
         uint64_t submittedFramesAtSubmission = 0;
+        // Keeps the input surface alive until its bitstream is harvested.
+        // Zero-copy capture sources (WGC) hand out textures whose pool slot
+        // recycles as soon as the frame lease is released; without pinning
+        // the lease here, a still-queued picture could reference a recycled
+        // surface and corrupt the encode. Released automatically when the
+        // pending entry is consumed (harvest/drain/shutdown).
+        std::shared_ptr<void> lease;
+        ComPtr<ID3D11Texture2D> texture;
     };
 
     // Cached codec parameter sets (SPS/PPS or VPS/SPS/PPS) captured from the
@@ -387,7 +413,7 @@ struct NvencEncoder::Impl {
         caps.maxWidth = static_cast<uint32_t>(queryCap(codecGuid(settings.codec), NV_ENC_CAPS_WIDTH_MAX));
         caps.maxHeight = static_cast<uint32_t>(queryCap(codecGuid(settings.codec), NV_ENC_CAPS_HEIGHT_MAX));
         caps.detail = caps.available ? L"NVENC Direct3D 11 session active" : caps.detail;
-        encoderStats.encoderAvailable = caps.available;
+        publishAvailability(caps.available);
     }
 
     bool initializeEncoder(ID3D11Device* device, const std::wstring& adapterName) {
@@ -553,7 +579,7 @@ struct NvencEncoder::Impl {
         return std::clamp<uint32_t>(lookaheadDelay + bFrameDelay + 4, 4, 40);
     }
 
-    NV_ENC_REGISTERED_PTR registeredResourceFor(ID3D11Texture2D* texture, NV_ENC_BUFFER_FORMAT bufferFormat) {
+    RegisteredResource* registeredResourceFor(ID3D11Texture2D* texture, NV_ENC_BUFFER_FORMAT bufferFormat) {
         const auto existing = registeredResources.find(texture);
         if (existing != registeredResources.end()) {
             // Pool resets unregister resources before destroying textures; generation
@@ -561,9 +587,10 @@ struct NvencEncoder::Impl {
             if (existing->second.generation == registrationGeneration &&
                 existing->second.texture == texture &&
                 existing->second.registered) {
-                return existing->second.registered;
+                return &existing->second;
             }
             if (existing->second.registered && session) {
+                unmapRegistered(existing->second);
                 api.nvEncUnregisterResource(session, existing->second.registered);
             }
             registeredResources.erase(existing);
@@ -597,12 +624,30 @@ struct NvencEncoder::Impl {
         cached.texture = texture;
         cached.registered = resource.registeredResource;
         cached.generation = registrationGeneration;
-        registeredResources.emplace(texture, std::move(cached));
-        return resource.registeredResource;
+        const auto [it, inserted] = registeredResources.emplace(texture, std::move(cached));
+        (void)inserted;
+        // unordered_map nodes are stable: the returned entry stays valid until
+        // it is erased (all erasure paths run under Impl::mutex, same as this
+        // call), so callers may hold the pointer across driver calls.
+        return &it->second;
+    }
+
+    // Releases the address binding of a registration. Must be called before
+    // nvEncUnregisterResource / texture destruction per the NVENC contract.
+    void unmapRegistered(RegisteredResource& entry) {
+        if (entry.mapped && session) {
+            api.nvEncUnmapInputResource(session, entry.mapped);
+        }
+        entry.mapped = nullptr;
+        entry.mappedFormat = NV_ENC_BUFFER_FORMAT_UNDEFINED;
     }
 
     void unregisterResource(ID3D11Texture2D* texture, NV_ENC_REGISTERED_PTR registered) {
         if (registered && session) {
+            const auto it = registeredResources.find(texture);
+            if (it != registeredResources.end() && it->second.registered == registered) {
+                unmapRegistered(it->second);
+            }
             api.nvEncUnregisterResource(session, registered);
         }
         registeredResources.erase(texture);
@@ -611,6 +656,10 @@ struct NvencEncoder::Impl {
     void unregisterAllResources() {
         if (session) {
             for (auto& item : registeredResources) {
+                if (item.second.mapped) {
+                    api.nvEncUnmapInputResource(session, item.second.mapped);
+                    item.second.mapped = nullptr;
+                }
                 api.nvEncUnregisterResource(session, item.second.registered);
             }
         }
@@ -633,7 +682,7 @@ struct NvencEncoder::Impl {
             inputMappingFaulted = true;
             caps.available = false;
             caps.detail = L"NVENC input mapping failed repeatedly; capture pipeline disabled encoder until restart";
-            encoderStats.encoderAvailable = false;
+            publishAvailability(false);
             Logger::instance().error(L"encoder", caps.detail);
             shutdownEncoder();
         } else if ((consecutiveMapFailures % 300) == 0) {
@@ -672,7 +721,7 @@ struct NvencEncoder::Impl {
         inputMappingFaulted = true;
         caps.available = false;
         caps.detail = detail;
-        encoderStats.encoderAvailable = false;
+        publishAvailability(false);
         Logger::instance().error(L"encoder", detail);
         shutdownEncoder();
         return false;
@@ -897,8 +946,8 @@ struct NvencEncoder::Impl {
 
         const auto start = std::chrono::steady_clock::now();
 
-        NV_ENC_REGISTERED_PTR registered = registeredResourceFor(frame.texture.Get(), expectedBufferFormat);
-        if (!registered) {
+        RegisteredResource* entry = registeredResourceFor(frame.texture.Get(), expectedBufferFormat);
+        if (!entry) {
             // Frame lost before reaching the encoder: restart the next GOP so
             // the stream never continues from a broken reference chain.
             forceKeyFrame = true;
@@ -906,25 +955,33 @@ struct NvencEncoder::Impl {
             return false;
         }
 
-        NV_ENC_MAP_INPUT_RESOURCE map{};
-        map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-        map.registeredResource = registered;
-        NVENCSTATUS status = api.nvEncMapInputResource(session, &map);
-        if (status != NV_ENC_SUCCESS) {
-            unregisterResource(frame.texture.Get(), registered);
-            registered = registeredResourceFor(frame.texture.Get(), expectedBufferFormat);
-            if (registered) {
-                map = {};
-                map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-                map.registeredResource = registered;
-                status = api.nvEncMapInputResource(session, &map);
-            }
+        // Lazy one-time map: the address binding stays valid for the whole
+        // session, so steady-state submissions skip both driver calls. A
+        // failed first map heals through a fresh register+map pair exactly as
+        // before; only repeated failures escalate (noteMapFailure).
+        if (!entry->mapped) {
+            NV_ENC_MAP_INPUT_RESOURCE map{};
+            map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+            map.registeredResource = entry->registered;
+            NVENCSTATUS status = api.nvEncMapInputResource(session, &map);
             if (status != NV_ENC_SUCCESS) {
-                forceKeyFrame = true;
-                noteMapFailure(status);
-                ++encoderStats.droppedFrames;
-                return popReadyPacket(packet);
+                unregisterResource(frame.texture.Get(), entry->registered);
+                entry = registeredResourceFor(frame.texture.Get(), expectedBufferFormat);
+                if (entry) {
+                    map = {};
+                    map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+                    map.registeredResource = entry->registered;
+                    status = api.nvEncMapInputResource(session, &map);
+                }
+                if (!entry || status != NV_ENC_SUCCESS) {
+                    forceKeyFrame = true;
+                    noteMapFailure(status);
+                    ++encoderStats.droppedFrames;
+                    return popReadyPacket(packet);
+                }
             }
+            entry->mapped = map.mappedResource;
+            entry->mappedFormat = map.mappedBufferFmt;
         }
         consecutiveMapFailures = 0;
 
@@ -946,17 +1003,16 @@ struct NvencEncoder::Impl {
         }
         if (!bitstream) {
             forceKeyFrame = true;
-            api.nvEncUnmapInputResource(session, map.mappedResource);
             ++encoderStats.droppedFrames;
             return popReadyPacket(packet);
         }
 
         NV_ENC_PIC_PARAMS pic{};
         pic.version = NV_ENC_PIC_PARAMS_VER;
-        pic.inputBuffer = map.mappedResource;
-        pic.bufferFmt = map.mappedBufferFmt == NV_ENC_BUFFER_FORMAT_UNDEFINED
+        pic.inputBuffer = entry->mapped;
+        pic.bufferFmt = entry->mappedFormat == NV_ENC_BUFFER_FORMAT_UNDEFINED
             ? expectedBufferFormat
-            : map.mappedBufferFmt;
+            : entry->mappedFormat;
         pic.inputWidth = settings.width;
         pic.inputHeight = settings.height;
         pic.outputBitstream = bitstream;
@@ -973,8 +1029,7 @@ struct NvencEncoder::Impl {
         }
 
         ++encoderStats.submittedFrames;
-        status = api.nvEncEncodePicture(session, &pic);
-        api.nvEncUnmapInputResource(session, map.mappedResource);
+        const NVENCSTATUS status = api.nvEncEncodePicture(session, &pic);
 
         PendingOutput pending;
         pending.bitstream = bitstream;
@@ -982,6 +1037,12 @@ struct NvencEncoder::Impl {
         pending.fallbackDuration100ns = static_cast<int64_t>(pic.inputDuration);
         pending.submittedAt = start;
         pending.submittedFramesAtSubmission = encoderStats.submittedFrames;
+        // Pin the input surface until the output is harvested: a zero-copy
+        // capture texture must not recycle back to its source pool while the
+        // encoder still references it (queued picture in the reorder/lookahead
+        // pipeline). Mirrors the AMF backend's in-flight lease pinning.
+        pending.lease = frame.lease;
+        pending.texture = frame.texture;
 
         if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
             Logger::instance().error(L"encoder", L"nvEncEncodePicture failed: " + nvStatusName(status));
@@ -1122,6 +1183,7 @@ bool NvencEncoder::initialize(D3DDevice& device, const VideoSettings& settings) 
     impl_->forceKeyFrame = true;
     impl_->caps = {};
     impl_->encoderStats = {};
+    impl_->availableAtomic.store(false, std::memory_order_release);
     impl_->caps.backendName = L"NVENC";
 #if BACKTRACK_HAS_NVENC
     impl_->caps.adapterName = device.adapterName();
@@ -1179,9 +1241,18 @@ void NvencEncoder::shutdown() {
     std::scoped_lock lock(impl_->mutex);
 #if BACKTRACK_HAS_NVENC
     impl_->shutdownEncoder();
+    impl_->availableAtomic.store(false, std::memory_order_release);
 #endif
     impl_->caps.available = false;
     impl_->encoderStats.encoderAvailable = false;
+}
+
+bool NvencEncoder::encoderAvailable() const noexcept {
+#if BACKTRACK_HAS_NVENC
+    return impl_->availableAtomic.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
 }
 
 EncoderCapabilities NvencEncoder::capabilities() const {

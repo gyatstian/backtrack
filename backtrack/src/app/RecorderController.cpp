@@ -1040,6 +1040,7 @@ void RecorderController::stopPipeline() {
 
     {
         std::scoped_lock gpuLock(pipelineGpuMutex_);
+        encoderZeroReorderDelay_.store(false, std::memory_order_relaxed);
         if (encoder_) {
             encoder_->shutdown();
             encoder_.reset();
@@ -1084,6 +1085,8 @@ bool RecorderController::recreateGpuPipeline(
 
     const uint64_t discardGeneration =
         discardRequestGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    // No encoder exists from here until the new one initializes successfully.
+    encoderZeroReorderDelay_.store(false, std::memory_order_relaxed);
     discardQueuedFrames_.store(true, std::memory_order_release);
     if (frameEvent_) {
         SetEvent(frameEvent_);
@@ -1165,6 +1168,9 @@ bool RecorderController::recreateGpuPipeline(
 
     forceVideoHeartbeat_ = true;
     encoder_->requestKeyFrame();
+    encoderZeroReorderDelay_.store(
+        encoder_->capabilities().effective.zeroReorderDelay,
+        std::memory_order_relaxed);
     Logger::instance().info(L"recorder",
         L"GPU pipeline ready: capture=" + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
         L", encode=" + std::to_wstring(videoSettings.width) + L"x" + std::to_wstring(videoSettings.height) +
@@ -1533,9 +1539,12 @@ void RecorderController::captureLoopImpl() {
         if (captureStallHold || captureSession != CaptureSessionState::Capturing) {
             return true;
         }
-        std::scoped_lock gpuLock(pipelineGpuMutex_);
+        // Cached mirror of "encoder_ && capabilities().effective.zeroReorderDelay",
+        // refreshed by recreateGpuPipeline/stopPipeline. The per-frame
+        // capabilities() copy (three wstrings under two mutexes) read exactly one
+        // constant-per-build bool.
         return gpuSettings.allowIdleFrameSkipping &&
-               encoder_ && encoder_->capabilities().effective.zeroReorderDelay;
+               encoderZeroReorderDelay_.load(std::memory_order_relaxed);
     };
     const auto monitorPollInterval = std::chrono::milliseconds(100);
     const auto soundSeparationPollInterval = std::chrono::seconds(2);
@@ -1543,7 +1552,12 @@ void RecorderController::captureLoopImpl() {
     const auto monitorSwitchCooldown = std::chrono::milliseconds(750);
     auto lastMonitorSwitch = SteadyClock::time_point::min();
 
-    auto emitFrame = [&](const GpuFrame& source, SteadyClock::time_point emitTime, uint32_t intervalCount) {
+    // Emits one timeline interval from the last raw source frame. Scaling
+    // happens here - at Submit time, once per encoded frame - not per acquired
+    // frame: a 144 Hz source feeding a 60 fps timeline would otherwise pay a
+    // full scale/copy for every acquire and throw most of the results away.
+    // Coalesced intervals skip the work entirely.
+    auto emitFrame = [&](const GpuFrame& rawSource, SteadyClock::time_point emitTime, uint32_t intervalCount) {
         const bool forcedHeartbeat = forceVideoHeartbeat_.exchange(false);
         // Stall/hold: suppress periodic GOP Submit of same texture (slideshow).
         // Forced heartbeat (enter hold / recover) still allowed for seekability.
@@ -1553,7 +1567,7 @@ void RecorderController::captureLoopImpl() {
             lastVideoSubmission != SteadyClock::time_point::min() &&
             emitTime - lastVideoSubmission >= keyFrameHeartbeatInterval;
         const VideoTimelineEmission emission = timelineScheduler.plan(
-            source.frameIndex,
+            rawSource.frameIndex,
             steadyTimePoint100ns(emitTime),
             intervalCount,
             idleCoalescingAllowed(),
@@ -1589,7 +1603,45 @@ void RecorderController::captureLoopImpl() {
             return;
         }
 
-        GpuFrame frame = source;
+        GpuFrame encodeFrame;
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            // Zero-copy pass-through: a WGC source hands out frames that
+            // already live in their own pool and whose lease the encoder pins
+            // until its output is harvested, so a same-format, same-size frame
+            // can skip the copy entirely. Desktop Duplication must copy: its
+            // surface is only valid between AcquireNextFrame/ReleaseFrame
+            // (released inside acquire). The multimonitor stability option
+            // also opts into an owned copy per frame.
+            //
+            // The zero-copy path hands the WGC frame itself onward; its lease
+            // stays pinned by lastFrame until this call replaces it, which is
+            // within the pool budget (see maxLeases in WgcCaptureSource).
+            const bool wgcZeroCopyEligible =
+                capture_ &&
+                capture_->backend() == CaptureBackend::WindowsGraphicsCapture &&
+                gpuSettings.wgcZeroCopy;
+            const bool forceOwnedTexture =
+                !wgcZeroCopyEligible ||
+                (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
+            if (!scaler_.scale(
+                    d3d_,
+                    rawSource,
+                    videoSettings.width,
+                    videoSettings.height,
+                    encodeFrame,
+                    captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor,
+                    forceOwnedTexture,
+                    encoderInputFormat)) {
+                ++droppedFrames_;
+                if (forcedHeartbeat) {
+                    forceVideoHeartbeat_ = true;
+                }
+                return;
+            }
+        }
+
+        GpuFrame frame = std::move(encodeFrame);
         frame.frameIndex = capturedFrames_.load();
         frame.pts100ns = emission.pts100ns;
         frame.duration100ns = emission.duration100ns;
@@ -1624,6 +1676,37 @@ void RecorderController::captureLoopImpl() {
         }
     };
 
+    // Copies lastFrame's pixels into a scaler-owned texture before the current
+    // capture source is shut down (source rebind). A raw WGC zero-copy frame
+    // would otherwise pin its Direct3D11CaptureFrame across the old source's
+    // shutdown, whose lease-drain wait can stall teardown; a DDup pool slot
+    // stays valid but is recreated with the new source anyway. One copy per
+    // rebind keeps the freeze-frame continuity that exclusive-fullscreen
+    // recovery depends on. Cheap: source switches are rare events.
+    auto privatizeLastFrame = [&]() {
+        if (!lastFrame.texture) {
+            return;
+        }
+        GpuFrame copy;
+        {
+            std::scoped_lock gpuLock(pipelineGpuMutex_);
+            const DXGI_FORMAT format =
+                lastFrame.format != DXGI_FORMAT_UNKNOWN ? lastFrame.format : DXGI_FORMAT_B8G8R8A8_UNORM;
+            if (!scaler_.scale(
+                    d3d_,
+                    lastFrame,
+                    lastFrame.width,
+                    lastFrame.height,
+                    copy,
+                    false,
+                    true,
+                    format)) {
+                return;
+            }
+        }
+        lastFrame = std::move(copy);
+    };
+
     auto resetVideoHandoff = [&]() {
         discardQueuedFrames_.store(true, std::memory_order_release);
         durationUpdatePending_.store(false, std::memory_order_release);
@@ -1655,6 +1738,10 @@ void RecorderController::captureLoopImpl() {
     auto switchCaptureTarget = [&](const CaptureTarget& target,
                                     const wchar_t* reason,
                                     bool exclusiveRecovery = false) -> bool {
+        // Detach lastFrame from the outgoing source before its shutdown: the
+        // raw frame now carries the capture-side lease (WGC Direct3D11Capture-
+        // Frame), and holding it across teardown would stall the lease drain.
+        privatizeLastFrame();
         const uint32_t targetAdapter = pipelineAdapterForTarget(target);
         if (targetAdapter != d3d_.adapterIndex()) {
             // Full device recreate invalidates lastFrame GPU resources.
@@ -1905,31 +1992,6 @@ void RecorderController::captureLoopImpl() {
                     continue;
                 }
 
-                GpuFrame encodeFrame;
-                bool scaled = false;
-                {
-                    std::scoped_lock gpuLock(pipelineGpuMutex_);
-                    // Every capture backend delivers D3D11 textures that the
-                    // scaler must copy into its own pool.
-                    const bool forceOwnedTexture =
-                        capture_ != nullptr ||
-                        (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
-                    scaled = scaler_.scale(
-                        d3d_,
-                        frame,
-                        videoSettings.width,
-                        videoSettings.height,
-                        encodeFrame,
-                        captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor,
-                        forceOwnedTexture,
-                        encoderInputFormat);
-                }
-                if (!scaled) {
-                    ++droppedFrames_;
-                    liveFramesSince = SteadyClock::time_point::min();
-                    continue;
-                }
-
                 if ((captureStallHold || captureSession != CaptureSessionState::Capturing) &&
                     (acceptFirstLiveFrameAfterTransition || sustained)) {
                     captureStallHold = false;
@@ -1946,7 +2008,12 @@ void RecorderController::captureLoopImpl() {
                     Logger::instance().info(L"recorder", L"Capture session Capturing (live frames resumed)");
                 }
 
-                lastFrame = encodeFrame;
+                // Store the raw acquired frame. Scaling is deferred to
+                // emitFrame (Submit time) so frames dropped by the emit grid
+                // never pay a scale/copy. lastFrame's lease pins its capture
+                // slot until the next accepted frame replaces it - within the
+                // pool budget sized for exactly this pin.
+                lastFrame = std::move(frame);
                 if (requestKeyFrameAfterAcceptedFrame) {
                     discardQueuedFrames_ = true;
                     {
@@ -1970,7 +2037,7 @@ void RecorderController::captureLoopImpl() {
                     // at matched 60->60. Re-locking makes output PTS track genuine
                     // delivery cadence, killing the beat.
                     //
-                    // Use encodeFrame.pts100ns (WGC SystemRelativeTime, QPC epoch == MSVC
+                    // Use lastFrame.pts100ns (WGC SystemRelativeTime, QPC epoch == MSVC
                     // steady_clock) NOT the drain wall-clock (lastSourceFrameAt): the
                     // drain instant is scheduling-jittered and only trades the structural
                     // beat for arrival jitter. The present time is the evenly-spaced clock.
@@ -1986,7 +2053,7 @@ void RecorderController::captureLoopImpl() {
                     // Only snap forward and only past the last emitted instant, so the
                     // emit timeline stays strictly monotonic (advanceVideoCadence emits
                     // at emitTime == nextEmit; a backward snap would double-emit).
-                    const auto presentInstant = steadyPointFrom100ns(encodeFrame.pts100ns);
+                    const auto presentInstant = steadyPointFrom100ns(lastFrame.pts100ns);
                     if (relockPhase &&
                         presentInstant > nextEmit &&
                         presentInstant > lastEmitTime) {
@@ -1996,15 +2063,16 @@ void RecorderController::captureLoopImpl() {
             }
         }
 
-        bool captureLost = false;
-        bool deviceRemoved = false;
-        bool encoderFaulted = false;
-        {
-            std::scoped_lock gpuLock(pipelineGpuMutex_);
-            captureLost = !capture_ || capture_->isDeviceLost();
-            deviceRemoved = d3d_.isDeviceRemoved();
-            encoderFaulted = encoder_ && !encoder_->stats().encoderAvailable;
-        }
+        // Health probes run lock-free. Every pointer read here is only ever
+        // mutated on this thread while the pipeline runs (GPU recreation and
+        // source rebinds execute on the capture thread; stopPipeline joins it
+        // before teardown), so no lock is needed for a stable view.
+        // encoderAvailable() is an atomic mirror; the previous
+        // pipelineGpuMutex_ + stats() version serialized every iteration of
+        // this loop behind in-flight encodes just to read one bool.
+        bool captureLost = !capture_ || capture_->isDeviceLost();
+        bool deviceRemoved = d3d_.isDeviceRemoved();
+        bool encoderFaulted = encoder_ && !encoder_->encoderAvailable();
 
         if (deviceRemoved || encoderFaulted) {
             CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor

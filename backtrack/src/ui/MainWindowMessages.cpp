@@ -286,7 +286,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             markSettingsDirty();
             return 0;
         }
-        if ((controlId == kGameCaptureModeComboId || controlId == kEncoderProfileComboId) && notification == CBN_SELCHANGE) {
+        if (controlId == kEncoderProfileComboId && notification == CBN_SELCHANGE) {
             stashVisibleSettings();
             rebuildSettingsCategoryBody();
             markSettingsDirty();
@@ -556,9 +556,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         {
             const HWND ctlColorTarget = reinterpret_cast<HWND>(lParam);
             COLORREF staticColor = kText;
-            if (isGameCaptureWarningLabel(ctlColorTarget)) {
-                staticColor = RGB(255, 0, 0);
-            } else if (isSoundSeparationMutedLabel(ctlColorTarget)) {
+            if (isSoundSeparationMutedLabel(ctlColorTarget)) {
                 staticColor = RGB(232, 72, 72);
             }
             SetTextColor(reinterpret_cast<HDC>(wParam), staticColor);

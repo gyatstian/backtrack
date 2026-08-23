@@ -264,14 +264,6 @@ AppSettings SettingsStore::load() const {
     settings.captureCursor = readBool(values, L"capture.cursor", settings.captureCursor);
     settings.preferredCaptureBackend = captureBackendFromName(
         readString(values, L"capture.backend", captureBackendName(settings.preferredCaptureBackend)));
-    // Game capture disabled app-wide: hidden from UI and force-off at load so
-    // stale/legacy configs (auto/on) cannot trigger DLL injection. Re-enable by
-    // restoring the parsed value below and un-#if-0 the UI in MainWindowPages.cpp.
-    (void)gameCaptureModeFromName(
-        readString(values, L"capture.gameCapture", gameCaptureModeName(settings.gameCaptureMode)));
-    settings.gameCaptureMode = GameCaptureMode::Off;
-    settings.allowAntiCheatGameCapture =
-        readBool(values, L"capture.allowAntiCheatGameCapture", settings.allowAntiCheatGameCapture);
     settings.clipDirectory = readString(values, L"clips.directory", settings.clipDirectory.wstring());
     settings.libraryGalleryView = readLibraryGalleryView(values, settings.libraryGalleryView);
     settings.hotkeys.startStopModifiers = readUInt(values, L"hotkeys.startStop.modifiers", settings.hotkeys.startStopModifiers);
@@ -373,8 +365,6 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"capture.followMouseMonitor=" << (normalized.followMouseMonitor ? 1 : 0) << L"\n";
     output << L"capture.cursor=" << (normalized.captureCursor ? 1 : 0) << L"\n";
     output << L"capture.backend=" << captureBackendName(normalized.preferredCaptureBackend) << L"\n";
-    output << L"capture.gameCapture=" << gameCaptureModeName(normalized.gameCaptureMode) << L"\n";
-    output << L"capture.allowAntiCheatGameCapture=" << (normalized.allowAntiCheatGameCapture ? 1 : 0) << L"\n";
     output << L"clips.directory=" << normalized.clipDirectory.wstring() << L"\n";
     output << L"library.viewMode=" << (normalized.libraryGalleryView ? L"gallery" : L"list") << L"\n";
     output << L"hotkeys.startStop.modifiers=" << normalized.hotkeys.startStopModifiers << L"\n";
@@ -678,8 +668,6 @@ const wchar_t* captureBackendName(CaptureBackend backend) {
         return L"wgc";
     case CaptureBackend::DesktopDuplication:
         return L"desktop-duplication";
-    case CaptureBackend::GameCapture:
-        return L"game-capture";
     }
     return L"wgc";
 }
@@ -688,32 +676,9 @@ CaptureBackend captureBackendFromName(const std::wstring& value) {
     if (value == L"desktop-duplication" || value == L"dda" || value == L"dxgi") {
         return CaptureBackend::DesktopDuplication;
     }
-    if (value == L"game-capture" || value == L"game" || value == L"present") {
-        return CaptureBackend::GameCapture;
-    }
+    // Legacy "game-capture" values fall back to WGC; the injected game-capture
+    // DLL no longer exists in the codebase.
     return CaptureBackend::WindowsGraphicsCapture;
-}
-
-const wchar_t* gameCaptureModeName(GameCaptureMode mode) {
-    switch (mode) {
-    case GameCaptureMode::Off:
-        return L"off";
-    case GameCaptureMode::On:
-        return L"on";
-    case GameCaptureMode::Auto:
-        return L"auto";
-    }
-    return L"auto";
-}
-
-GameCaptureMode gameCaptureModeFromName(const std::wstring& value) {
-    if (value == L"off" || value == L"disabled" || value == L"0") {
-        return GameCaptureMode::Off;
-    }
-    if (value == L"on" || value == L"always" || value == L"1") {
-        return GameCaptureMode::On;
-    }
-    return GameCaptureMode::Auto;
 }
 
 const wchar_t* voiceCommandModeName(GameIntegrationSettings::VoiceCommandMode mode) {

@@ -4,7 +4,6 @@
 #include "audio/AudioConvert.h"
 #include "capture/DesktopDuplicationCapture.h"
 #include "capture/WgcCaptureSource.h"
-#include "capture/game/GameCaptureSource.h"
 #include "core/Logger.h"
 #include "mux/RecoveryStore.h"
 #include "platform/Win32Util.h"
@@ -110,8 +109,6 @@ const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
         return L"Windows Graphics Capture";
     case CaptureBackend::DesktopDuplication:
         return L"Desktop Duplication";
-    case CaptureBackend::GameCapture:
-        return L"Game Capture";
     }
     return L"Unknown";
 }
@@ -875,15 +872,6 @@ std::wstring RecorderController::captureBackendStatus() const {
     return captureBackendStatus_;
 }
 
-AntiCheatKind RecorderController::consumeAntiCheatBlock() {
-    std::scoped_lock lock(captureStatusMutex_);
-    if (!captureAntiCheatBlocked_) {
-        return AntiCheatKind::None;
-    }
-    captureAntiCheatBlocked_ = false;
-    return captureAntiCheatKind_;
-}
-
 std::wstring RecorderController::lastRecordingError() const {
     std::scoped_lock lock(recordingErrorMutex_);
     return lastRecordingError_;
@@ -899,9 +887,7 @@ bool RecorderController::ensurePipeline() {
                             L", captureBackend=" +
                             (snapshot.preferredCaptureBackend == CaptureBackend::DesktopDuplication
                                  ? L"Desktop Duplication"
-                                 : snapshot.preferredCaptureBackend == CaptureBackend::GameCapture
-                                     ? L"Game Capture"
-                                     : L"WGC") +
+                                 : L"WGC") +
                             L", followFocusedMonitor=" + (snapshot.followFocusedMonitor ? L"yes" : L"no") +
                             L", followMouseMonitor=" + (snapshot.followMouseMonitor ? L"yes" : L"no") +
                             L", systemAudio=" + (snapshot.captureSystemAudio ? L"yes" : L"no") +
@@ -1188,13 +1174,7 @@ bool RecorderController::recreateGpuPipeline(
 
 bool RecorderController::createCaptureSource(
     const CaptureTarget& target,
-    bool exclusiveRecovery,
-    bool allowDesktopDuplication,
-    bool allowGameCapture,
-    bool* gameCaptureAttempted) {
-    if (gameCaptureAttempted) {
-        *gameCaptureAttempted = false;
-    }
+    bool exclusiveRecovery) {
     AppSettings snapshot = settings();
     const CaptureBackend selectedBackend = selectedBackendForSettings(snapshot);
 
@@ -1215,9 +1195,6 @@ bool RecorderController::createCaptureSource(
         capture_.reset();
     }
 
-    bool gameCapTargetDied = false;
-    bool gameCapAntiCheatBlocked = false;
-    AntiCheatKind gameCapAntiCheatKind = AntiCheatKind::None;
     auto tryInitialize = [&](std::unique_ptr<ICaptureSource> source, const wchar_t* name,
                              const CaptureTarget& initTarget) -> std::unique_ptr<ICaptureSource> {
         Logger::instance().info(L"recorder", std::wstring(L"Initializing capture source: ") + name);
@@ -1226,16 +1203,6 @@ bool RecorderController::createCaptureSource(
             return std::move(source);
         }
         Logger::instance().warning(L"recorder", std::wstring(L"Capture source initialization failed: ") + name);
-        if (source->backend() == CaptureBackend::GameCapture) {
-            auto* gc = static_cast<GameCaptureSource*>(source.get());
-            if (gc->targetProcessExited()) {
-                gameCapTargetDied = true;
-            }
-            if (gc->antiCheatBlocked()) {
-                gameCapAntiCheatBlocked = true;
-                gameCapAntiCheatKind = gc->antiCheatKind();
-            }
-        }
         source->shutdown();
         return {};
     };
@@ -1258,55 +1225,6 @@ bool RecorderController::createCaptureSource(
 
     std::unique_ptr<ICaptureSource> initialized;
 
-    // Auto Game Capture is exclusive-only. Windowed/borderless recovery must
-    // return to desktop composition so title bars and taskbar remain recorded.
-    const GameCaptureMode gameMode = snapshot.gameCaptureMode;
-    const bool tryGameCapture =
-        allowGameCapture &&
-        gameMode != GameCaptureMode::Off &&
-        (exclusiveRecovery ||
-         !allowDesktopDuplication ||
-         gameMode == GameCaptureMode::On ||
-         selectedBackend == CaptureBackend::GameCapture);
-    if (tryGameCapture) {
-        // Preserve exclusiveTargetWindow validated by the recovery state
-        // machine. monitorTarget intentionally has no window for desktop APIs.
-        CaptureTarget gameTarget = target;
-        // Automatic exclusive recovery must inject only the window validated
-        // when the capture loss occurred, never whichever app is foreground.
-        if (!gameTarget.window && !exclusiveRecovery) {
-            gameTarget.window = GetForegroundWindow();
-        }
-        if (gameTarget.window) {
-            if (gameCaptureAttempted) {
-                *gameCaptureAttempted = true;
-            }
-            initialized = tryInitialize(
-                std::make_unique<GameCaptureSource>(), L"Game Capture", gameTarget);
-        }
-    }
-
-    // GameCap-only exclusive probe: do not fall through to DXGI/WGC.
-    if (!initialized && !allowDesktopDuplication) {
-        std::scoped_lock lock(captureStatusMutex_);
-        captureBackendActive_ = false;
-        captureBackendFallbackUsed_ = false;
-        captureBackendStatus_ = L"Game capture unavailable; exclusive hold";
-        return false;
-    }
-
-    // Inject killed the game — never thrash DXGI as fake recovery.
-    if (!initialized && gameCapTargetDied && exclusiveRecovery) {
-        Logger::instance().warning(
-            L"recorder",
-            L"Game died on inject — exclusive hold, no DXGI thrash");
-        std::scoped_lock lock(captureStatusMutex_);
-        captureBackendActive_ = false;
-        captureBackendFallbackUsed_ = false;
-        captureBackendStatus_ = L"Exclusive: game died on inject (holding last frame)";
-        return false;
-    }
-
     // Respect an explicit DXGI choice before considering WGC window capture.
     // Window targeting is an optimization, not permission to override capture
     // method selected by user.
@@ -1316,15 +1234,16 @@ bool RecorderController::createCaptureSource(
             std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
     }
 
-    // Normal WGC path can target window. Exclusive recovery uses monitor DXGI
-    // only after validated Game Capture attempt.
+    // Normal WGC path can target a window. Exclusive recovery stays on the
+    // monitor: CreateForWindow against an exclusive-fullscreen surface yields
+    // zero frames.
     if (!initialized && hasWindowTarget && !exclusiveRecovery &&
         selectedBackend != CaptureBackend::DesktopDuplication) {
         initialized = tryInitialize(
             std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture (window)", windowTarget);
     }
 
-    if (!initialized && exclusiveRecovery && allowDesktopDuplication &&
+    if (!initialized && exclusiveRecovery &&
         dxgiTargetOnActiveAdapter) {
         Logger::instance().info(L"recorder", L"Attempting Desktop Duplication recovery");
         initialized = tryInitialize(
@@ -1335,13 +1254,6 @@ bool RecorderController::createCaptureSource(
         !exclusiveRecovery) {
         initialized = tryInitialize(
             std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture", monitorTarget);
-    }
-
-    if (!initialized && selectedBackend == CaptureBackend::GameCapture &&
-        dxgiTargetOnActiveAdapter &&
-        !exclusiveRecovery) {
-        initialized = tryInitialize(
-            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
     }
 
     if (!initialized && selectedBackend == CaptureBackend::DesktopDuplication) {
@@ -1377,8 +1289,8 @@ bool RecorderController::createCaptureSource(
             std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
     }
 
-    // Exclusive recovery: if GameCapture and DXGI both
-    // failed, leave capture null so the loop deep-holds lastFrame. Do not thrash WGC.
+    // Exclusive recovery: if DXGI failed, leave capture null so the loop
+    // deep-holds lastFrame. Do not thrash WGC.
 
     if (!initialized) {
         std::scoped_lock lock(captureStatusMutex_);
@@ -1399,27 +1311,13 @@ bool RecorderController::createCaptureSource(
         captureBackendFallbackUsed_ = fallbackUsed;
         captureBackendStatus_ = std::wstring(L"Selected backend: ") + captureBackendDisplayName(selectedBackend) +
             L"; active backend: " + captureBackendDisplayName(activeBackend);
-        if (gameCapAntiCheatBlocked) {
-            // Anti-cheat titles never receive the injected hook. Surface the
-            // reason explicitly so the user understands why WGC is active.
-            captureBackendStatus_ = std::wstring(L"Game Capture disabled for anti-cheat title (") +
-                antiCheatDisplayName(gameCapAntiCheatKind) +
-                L"), using " + captureBackendDisplayName(activeBackend);
-        } else if (fallbackUsed) {
+        if (fallbackUsed) {
             captureBackendStatus_ += dxgiSkippedForTarget
                 ? L" (DXGI unavailable for target adapter)"
                 : selectedBackend == CaptureBackend::DesktopDuplication
                     ? L" (fallback after DXGI failed)"
                     : L" (fallback after WGC failed)";
         }
-    }
-    {
-        // Edge-triggered latch: the observer fires the failure beep once per
-        // transition into the anti-cheat-blocked state. Re-arm when a later
-        // rebind is no longer blocked so a subsequent block beeps again.
-        std::scoped_lock lock(captureStatusMutex_);
-        captureAntiCheatBlocked_ = gameCapAntiCheatBlocked;
-        captureAntiCheatKind_ = gameCapAntiCheatBlocked ? gameCapAntiCheatKind : AntiCheatKind::None;
     }
 
     capture_ = std::move(initialized);
@@ -1550,9 +1448,9 @@ void RecorderController::captureLoopImpl() {
     bool loggedExclusiveHold = false;
     bool exclusiveBlind = false;
     // A monitor-sized borderless game remains an exclusive-cover candidate.
-    // Periodically test desktop composition without retrying Game Capture.
+    // Periodically probe desktop capture while holding so composition resume
+    // is detected without waiting for the cover geometry to change.
     bool desktopRecoveryProbe = false;
-    auto lastGameCapFailureAt = SteadyClock::time_point::min();
     auto rebindSourceBornAt = SteadyClock::time_point::min();
     // Non-exclusive soft-stall episode tracking (see kSoftStallRecreateAfterMs).
     // min() begin time means no stall is in progress; a delivered frame or any
@@ -1756,10 +1654,7 @@ void RecorderController::captureLoopImpl() {
 
     auto switchCaptureTarget = [&](const CaptureTarget& target,
                                     const wchar_t* reason,
-                                    bool exclusiveRecovery = false,
-                                    bool allowDesktopDuplication = true,
-                                    bool allowGameCapture = true,
-                                    bool* gameCaptureAttempted = nullptr) -> bool {
+                                    bool exclusiveRecovery = false) -> bool {
         const uint32_t targetAdapter = pipelineAdapterForTarget(target);
         if (targetAdapter != d3d_.adapterIndex()) {
             // Full device recreate invalidates lastFrame GPU resources.
@@ -1782,13 +1677,7 @@ void RecorderController::captureLoopImpl() {
         }
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
-            if (!createCaptureSource(
-                    target,
-                    exclusiveRecovery,
-                    allowDesktopDuplication,
-                    allowGameCapture,
-                    gameCaptureAttempted) ||
-                !capture_) {
+            if (!createCaptureSource(target, exclusiveRecovery) || !capture_) {
                 return false;
             }
             prevResolutionChanges = capture_->resolutionChangeCount();
@@ -1873,32 +1762,6 @@ void RecorderController::captureLoopImpl() {
         exclusiveCoverActive =
             foregroundWindowCoversMonitor(monitorForCaptureTarget(activeCaptureTarget_));
 
-        // Auto Game Capture has game-backbuffer semantics. Once F11 returns to
-        // windowed mode, immediately recover desktop composition instead.
-        if (captureSession == CaptureSessionState::Capturing &&
-            capture_ && capture_->backend() == CaptureBackend::GameCapture &&
-            captureSettings.gameCaptureMode == GameCaptureMode::Auto &&
-            !exclusiveCoverActive) {
-            // F11 back to windowed mode is a known source change, not a failed
-            // capture session. Swap directly instead of entering recovery hold.
-            CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
-                ? captureTargetForSettings(captureSettings)
-                : activeCaptureTarget_;
-            target.window = nullptr;
-            if (switchCaptureTarget(target, L"exclusive cover ended", false)) {
-                captureSession = CaptureSessionState::Capturing;
-                captureStallHold = true;
-                acceptFirstLiveFrameAfterTransition = true;
-                immediateRebindPending = false;
-                lastSourceFrameAt = nowLoop;
-                forceVideoHeartbeat_ = true;
-                Logger::instance().info(L"recorder",
-                    L"Fast fullscreen transition: Game Capture -> desktop capture");
-            } else {
-                enterAccessLost(L"exclusive cover ended while Game Capture active");
-            }
-        }
-
         GpuFrame frame;
         uint32_t timeoutMs = 16;
         if (lastFrame.texture) {
@@ -1967,10 +1830,7 @@ void RecorderController::captureLoopImpl() {
             // Exclusive + stall/hold/blind: desktop WGC/DXGI frames are sparse or
             // stale. Do not promote them into lastFrame (slideshow). Healthy
             // continuous desktop capture under borderless cover still encodes.
-            // GameCapture always counts as live.
-            const bool desktopBackend =
-                capture_ &&
-                capture_->backend() != CaptureBackend::GameCapture;
+            const bool desktopBackend = capture_ != nullptr;
             // WGC captures flip-model / Fullscreen Optimizations fullscreen. Unlike
             // DXGI Desktop Duplication (which can hand back stale frames under true
             // exclusive), a delivered WGC frame is proof the surface is composited
@@ -2025,8 +1885,7 @@ void RecorderController::captureLoopImpl() {
                     wgcBackend ||
                     dxgiPresentProof ||
                     desktopRecoveryProbeActive ||
-                    desktopRecoveryProbe ||
-                    (capture_ && capture_->backend() == CaptureBackend::GameCapture);
+                    desktopRecoveryProbe;
                 const bool sustained =
                     backendOkForExclusive &&
                     sustainedLiveFrameCount >= kSustainedLiveFrames &&
@@ -2050,11 +1909,10 @@ void RecorderController::captureLoopImpl() {
                 bool scaled = false;
                 {
                     std::scoped_lock gpuLock(pipelineGpuMutex_);
+                    // Every capture backend delivers D3D11 textures that the
+                    // scaler must copy into its own pool.
                     const bool forceOwnedTexture =
-                        (capture_ &&
-                         (capture_->backend() == CaptureBackend::WindowsGraphicsCapture ||
-                          capture_->backend() == CaptureBackend::DesktopDuplication ||
-                          capture_->backend() == CaptureBackend::GameCapture)) ||
+                        capture_ != nullptr ||
                         (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
                     scaled = scaler_.scale(
                         d3d_,
@@ -2118,9 +1976,9 @@ void RecorderController::captureLoopImpl() {
                     // beat for arrival jitter. The present time is the evenly-spaced clock.
                     //
                     // Scope-gated: only healthy windowed desktop capture. Exclusive-
-                    // fullscreen and GameCapture paths keep the free-running grid (their
-                    // present times are already 1:1 with vsync -- no beat to fix, and we
-                    // must not perturb the smooth path or the game-capture pipeline).
+                    // fullscreen paths keep the free-running grid (their present
+                    // times are already 1:1 with vsync -- no beat to fix, and we
+                    // must not perturb the smooth path).
                     const bool relockPhase =
                         desktopBackend &&
                         !exclusiveCoverActive &&
@@ -2218,18 +2076,14 @@ void RecorderController::captureLoopImpl() {
             }
         } else {
             // ---- Capture session state machine (exclusive-aware) ----
-            // Exclusive rebind: GameCap first; DXGI only if GameCap not just failed.
-            // GameCap death / cooldown → hold (no DXGI thrash / slideshow).
             constexpr auto kWaitStableMs = std::chrono::milliseconds(1200);
             constexpr auto kRebindCooldownMs = std::chrono::milliseconds(2500);
             constexpr auto kHoldDesktopProbeMs = std::chrono::milliseconds(2000);
             // WGC legitimately remains quiet for unchanged borderless content.
             // Require a sustained stall before treating a full-monitor window
-            // as exclusive and switching to Present-hook capture.
+            // as exclusive and entering recovery hold.
             constexpr auto kWgcStallUnderExclusiveMs = std::chrono::milliseconds(2000);
-            constexpr auto kMaxFastRebinds = 1;
             constexpr auto kExclusiveNoFrameMs = std::chrono::milliseconds(2000);
-            constexpr auto kPostCrashInjectCooldownMs = std::chrono::milliseconds(60000);
             constexpr auto kDxgiInstantDeathMs = std::chrono::milliseconds(400);
             constexpr auto kSoftStallMs = std::chrono::milliseconds(750);
             // Non-exclusive frozen-source recovery: a wedged WGC/DXGI source
@@ -2302,84 +2156,53 @@ void RecorderController::captureLoopImpl() {
                     target.window = validatedExclusiveTarget ? exclusiveTargetWindow : nullptr;
                     ++rebindAttempts;
                     lastCaptureRebindAt = nowLoop;
-                    const bool skipGameCap =
-                        lastGameCapFailureAt != SteadyClock::time_point::min() &&
-                        nowLoop - lastGameCapFailureAt < kPostCrashInjectCooldownMs;
-                    // Exclusive + GameCap just failed/cooldown: never thrash DXGI.
-                    // Exclusive + one DXGI death: also skip further DXGI.
+                    // Exclusive + one DXGI death already observed: never thrash DXGI.
                     const bool skipDxgi =
-                        validatedExclusiveTarget &&
-                        (exclusiveDxgiAttempts >= 1 ||
-                         (skipGameCap && !desktopRecoveryProbe));
+                        validatedExclusiveTarget && exclusiveDxgiAttempts >= 1;
                     Logger::instance().warning(L"recorder",
-                        L"Capture session Rebind (game/DXGI) attempt=" +
+                        L"Capture session Rebind (DXGI) attempt=" +
                         std::to_wstring(rebindAttempts) +
                         L", exclusiveCover=" + (exclusiveCoverActive ? L"yes" : L"no") +
-                        L", skipGameCap=" + (skipGameCap ? L"yes" : L"no") +
                         L", skipDxgi=" + (skipDxgi ? L"yes" : L"no"));
 
-                    bool switched = false;
-                    bool gameCaptureAttempted = false;
-                    if (skipDxgi && skipGameCap) {
-                        switched = false;
-                    } else {
-                        switched = switchCaptureTarget(
+                    const bool switched =
+                        !skipDxgi &&
+                        switchCaptureTarget(
                             target,
                             validatedExclusiveTarget
                                 ? L"exclusive capture rebind"
                                 : L"desktop capture rebind",
-                            validatedExclusiveTarget,
-                             !skipDxgi,
-                            validatedExclusiveTarget && !skipGameCap && !desktopRecoveryProbe,
-                            &gameCaptureAttempted);
-                        if (validatedExclusiveTarget && capture_ &&
-                            capture_->backend() == CaptureBackend::DesktopDuplication) {
-                            ++exclusiveDxgiAttempts;
-                        }
-                        if (validatedExclusiveTarget && gameCaptureAttempted &&
-                            (!switched ||
-                             !capture_ ||
-                             capture_->backend() != CaptureBackend::GameCapture)) {
-                            lastGameCapFailureAt = nowLoop;
-                        }
-                        if (switched &&
-                            capture_ &&
-                            capture_->backend() != CaptureBackend::GameCapture) {
-                            rebindSourceBornAt = nowLoop;
-                        }
+                            validatedExclusiveTarget);
+                    if (validatedExclusiveTarget && switched && capture_ &&
+                        capture_->backend() == CaptureBackend::DesktopDuplication) {
+                        ++exclusiveDxgiAttempts;
+                    }
+                    if (switched) {
+                        rebindSourceBornAt = nowLoop;
                     }
 
                     captureStallHold = true;
                     liveFramesSince = SteadyClock::time_point::min();
                     sustainedLiveFrameCount = 0;
                     lastSourceFrameAt = nowLoop;
-                    if (switched && immediateRebindPending) {
-                        acceptFirstLiveFrameAfterTransition = true;
-                        Logger::instance().info(L"recorder",
-                            L"Fast fullscreen transition: desktop capture -> Game Capture");
-                    }
+                    const bool fastRebind = immediateRebindPending;
                     immediateRebindPending = false;
-
-                    if (switched && capture_ &&
-                        capture_->backend() == CaptureBackend::GameCapture) {
-                        lastGameCapFailureAt = SteadyClock::time_point::min();
-                        rebindSourceBornAt = SteadyClock::time_point::min();
-                        // Stay stall-hold until sustained live frames prove health.
-                        captureSession = CaptureSessionState::Capturing;
-                    } else if (switched) {
+                    if (switched) {
+                        if (fastRebind) {
+                            acceptFirstLiveFrameAfterTransition = true;
+                            Logger::instance().info(L"recorder",
+                                L"Fast fullscreen transition: immediate Desktop Duplication rebind");
+                        }
                         // Desktop mode and provisional DXGI recovery both need
                         // sustained live frames before removing stall hold.
                         captureSession = CaptureSessionState::Capturing;
                     } else if (!validatedExclusiveTarget) {
                         // F11 or focus changed during recovery. A stale
-                        // exclusive incident must not force Game Capture/hold.
+                        // exclusive incident must not force a hold.
                         captureSession = CaptureSessionState::WaitStable;
                         accessLostAt = nowLoop;
-                    } else if (
-                        rebindAttempts >= kMaxFastRebinds || skipGameCap || skipDxgi || !switched) {
-                        enterExclusiveHold(
-                            !switched ? L"GameCap/DXGI unavailable"
-                                      : L"desktop APIs blind under exclusive");
+                    } else {
+                        enterExclusiveHold(L"desktop APIs blind under exclusive");
                     }
 
                     // Dead-target escalation (finding 18): a desktop rebind
@@ -2413,10 +2236,7 @@ void RecorderController::captureLoopImpl() {
                                         std::to_wstring(entry.index));
                                     if (switchCaptureTarget(
                                             alternate,
-                                            L"capture display lost; switched to a live display",
-                                            false,
-                                            true,
-                                            false)) {
+                                            L"capture display lost; switched to a live display")) {
                                         retargetedToAlternateMonitor = true;
                                         captureSession = CaptureSessionState::Capturing;
                                         captureStallHold = true;
@@ -2468,15 +2288,13 @@ void RecorderController::captureLoopImpl() {
                     exclusiveTargetWindow = nullptr;
                     loggedExclusiveHold = false;
                     lastCaptureRebindAt = SteadyClock::time_point::min();
-                    // Keep inject cooldown after GameCap crash; only clear on success path.
                     rebindSourceBornAt = SteadyClock::time_point::min();
                     sustainedLiveFrameCount = 0;
                     CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
                         ? captureTargetForSettings(captureSettings)
                         : activeCaptureTarget_;
                     target.window = nullptr;
-                    // Desktop only — do not inject GameCapture after alt-tab.
-                    if (switchCaptureTarget(target, L"exclusive cover ended", false)) {
+                    if (switchCaptureTarget(target, L"exclusive cover ended")) {
                         captureSession = CaptureSessionState::Capturing;
                         captureStallHold = true;
                         liveFramesSince = SteadyClock::time_point::min();
@@ -2487,8 +2305,8 @@ void RecorderController::captureLoopImpl() {
                     }
                 } else if (nowLoop - lastCaptureRebindAt >= kHoldDesktopProbeMs) {
                     // Full-monitor borderless still satisfies exclusive-cover geometry.
-                    // Probe Desktop Duplication only; Vanguard blocks Game Capture and
-                    // repeated injection attempts would not make desktop capture recover.
+                    // Probe Desktop Duplication once more; repeated identical
+                    // attempts would not make desktop capture recover.
                     exclusiveBlind = false;
                     exclusiveDxgiAttempts = 0;
                     rebindAttempts = 0;
@@ -2502,9 +2320,7 @@ void RecorderController::captureLoopImpl() {
                 !acquired && !captureLost) {
                 const auto noFrameFor = nowLoop - lastSourceFrameAt;
                 if (exclusiveCoverActive && noFrameFor >= kExclusiveNoFrameMs) {
-                    if (exclusiveBlind || exclusiveDxgiAttempts >= 1 ||
-                        (lastGameCapFailureAt != SteadyClock::time_point::min() &&
-                         nowLoop - lastGameCapFailureAt < kPostCrashInjectCooldownMs)) {
+                    if (exclusiveBlind || exclusiveDxgiAttempts >= 1) {
                         enterExclusiveHold(L"no live frames under exclusive cover");
                     } else {
                         enterAccessLost(L"no live frames under exclusive cover");
@@ -2517,10 +2333,7 @@ void RecorderController::captureLoopImpl() {
                     // source wedges without reporting device loss. Recreate
                     // the desktop capture source after the stall persists,
                     // bounded per episode and cooldown-limited.
-                    const bool desktopSourceRecoverable =
-                        capture_ &&
-                        (capture_->backend() == CaptureBackend::WindowsGraphicsCapture ||
-                         capture_->backend() == CaptureBackend::DesktopDuplication);
+                    const bool desktopSourceRecoverable = capture_ != nullptr;
                     if (softStallBeganAt == SteadyClock::time_point::min()) {
                         softStallBeganAt = nowLoop - noFrameFor;
                     }
@@ -2545,10 +2358,9 @@ void RecorderController::captureLoopImpl() {
                             L"ms without device loss; recreating capture source (attempt " +
                             std::to_wstring(softStallRecreates) + L"/" +
                             std::to_wstring(kMaxSoftStallRecreates) + L")");
-                        // Desktop backends only: never inject Game Capture from
-                        // an ambiguous stall. switchCaptureTarget discards
-                        // queued frames and arms a keyframe on the next live one.
-                        if (switchCaptureTarget(target, L"frozen source recovery", false, true, false)) {
+                        // switchCaptureTarget discards queued frames and arms
+                        // a keyframe on the next live frame.
+                        if (switchCaptureTarget(target, L"frozen source recovery")) {
                             lastSourceFrameAt = nowLoop;
                             prevCursorOnlyFrames = 0;
                         }

@@ -3,7 +3,6 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
-#include "capture/game/AntiCheatGuard.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -79,14 +78,6 @@ void MainWindow::saveLog() {
 }
 
 void MainWindow::updateStats() {
-    // Edge-triggered: fires the failure beep once per transition into the
-    // anti-cheat-blocked state. GameCapture is refused for anti-cheat titles and
-    // WGC takes over; the beep signals that the requested backend was unavailable.
-    if (const AntiCheatKind blockedKind = controller_.consumeAntiCheatBlock();
-        blockedKind != AntiCheatKind::None) {
-        playActionIndicator(MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
-    }
-
     const auto stats = controller_.stats();
     if (statsLabel_) {
         std::wstringstream stream;

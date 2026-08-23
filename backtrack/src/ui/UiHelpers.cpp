@@ -442,8 +442,6 @@ bool isSettingsControlId(int controlId) {
     case kGpuFrameQueueLimitEditId:
     case kIdleFrameCoalescingCheckId:
     case kCaptureMethodComboId:
-    case kGameCaptureModeComboId:
-    case kAllowAntiCheatGameCaptureCheckId:
     case kFollowMouseMonitorCheckId:
     case kFollowFocusedMonitorCheckId:
     case kMultiMonitorSupportCheckId:
@@ -625,8 +623,6 @@ const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
         return L"Windows Graphics Capture";
     case CaptureBackend::DesktopDuplication:
         return L"Desktop Duplication";
-    case CaptureBackend::GameCapture:
-        return L"Game Capture";
     }
     return L"Unknown";
 }

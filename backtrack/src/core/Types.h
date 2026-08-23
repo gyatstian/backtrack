@@ -33,14 +33,6 @@ enum class VideoCodec {
 enum class CaptureBackend {
     WindowsGraphicsCapture,
     DesktopDuplication,
-    GameCapture,
-};
-
-// Exclusive-fullscreen: inject Present hook when desktop APIs are blind.
-enum class GameCaptureMode {
-    Off,
-    Auto, // use when exclusive cover detected
-    On,   // always prefer game capture for focused window
 };
 
 enum class GpuVendor {
@@ -194,11 +186,6 @@ struct AppSettings {
     GameIntegrationSettings gameIntegrations;
     std::filesystem::path clipDirectory;
     CaptureBackend preferredCaptureBackend = CaptureBackend::WindowsGraphicsCapture;
-    GameCaptureMode gameCaptureMode = GameCaptureMode::Off;
-    // Advanced override: allow injecting the game-capture hook into titles
-    // protected by kernel anti-cheat (Vanguard/EAC/BattlEye). Default false so
-    // the guard fails closed and falls back to Windows Graphics Capture.
-    bool allowAntiCheatGameCapture = false;
     bool captureMicrophone = true;
     bool captureSystemAudio = true;
     std::wstring audioInputDeviceId;

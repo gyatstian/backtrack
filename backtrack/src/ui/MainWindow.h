@@ -217,7 +217,6 @@ private:
     void toggleSoundSeparationApp(size_t index);
     void removeSoundSeparationApp(size_t index);
     bool isSoundSeparationMutedLabel(HWND control) const;
-    bool isGameCaptureWarningLabel(HWND control) const;
     void updateResolutionControls();
     void updateStartupRegistration();
     void browseClipFolder();
@@ -380,8 +379,6 @@ private:
     HWND gpuFrameQueueLimitEdit_ = nullptr;
     HWND idleFrameCoalescingCheck_ = nullptr;
     HWND captureMethodCombo_ = nullptr;
-    HWND gameCaptureModeCombo_ = nullptr;
-    HWND allowAntiCheatGameCaptureCheck_ = nullptr;
     HWND stableMultimonitorFramesCheck_ = nullptr;
     HWND soundSeparationEnabledCheck_ = nullptr;
     HWND soundSeparationAppCombo_ = nullptr;

@@ -147,8 +147,6 @@ void MainWindow::rebindPageControlPointers() {
     gpuFrameQueueLimitEdit_ = nullptr;
     idleFrameCoalescingCheck_ = nullptr;
     captureMethodCombo_ = nullptr;
-    gameCaptureModeCombo_ = nullptr;
-    allowAntiCheatGameCaptureCheck_ = nullptr;
     stableMultimonitorFramesCheck_ = nullptr;
     soundSeparationEnabledCheck_ = nullptr;
     soundSeparationAppCombo_ = nullptr;
@@ -214,8 +212,6 @@ void MainWindow::rebindPageControlPointers() {
     gpuFrameQueueLimitEdit_ = child(kGpuFrameQueueLimitEditId);
     idleFrameCoalescingCheck_ = child(kIdleFrameCoalescingCheckId);
     captureMethodCombo_ = child(kCaptureMethodComboId);
-    gameCaptureModeCombo_ = child(kGameCaptureModeComboId);
-    allowAntiCheatGameCaptureCheck_ = child(kAllowAntiCheatGameCaptureCheckId);
     stableMultimonitorFramesCheck_ = child(kStableMultimonitorFramesCheckId);
     soundSeparationEnabledCheck_ = child(kSoundSeparationEnabledCheckId);
     soundSeparationAppCombo_ = child(kSoundSeparationAppComboId);
@@ -537,8 +533,6 @@ void MainWindow::clearPageControls() {
     gpuFrameQueueLimitEdit_ = nullptr;
     idleFrameCoalescingCheck_ = nullptr;
     captureMethodCombo_ = nullptr;
-    gameCaptureModeCombo_ = nullptr;
-    allowAntiCheatGameCaptureCheck_ = nullptr;
     stableMultimonitorFramesCheck_ = nullptr;
     soundSeparationEnabledCheck_ = nullptr;
     soundSeparationAppCombo_ = nullptr;
@@ -637,8 +631,6 @@ void MainWindow::clearSettingsBodyControls() {
     gpuFrameQueueLimitEdit_ = nullptr;
     idleFrameCoalescingCheck_ = nullptr;
     captureMethodCombo_ = nullptr;
-    gameCaptureModeCombo_ = nullptr;
-    allowAntiCheatGameCaptureCheck_ = nullptr;
     stableMultimonitorFramesCheck_ = nullptr;
     soundSeparationEnabledCheck_ = nullptr;
     soundSeparationAppCombo_ = nullptr;
@@ -1018,30 +1010,6 @@ void MainWindow::buildSettingsCapturePage() {
         settings_.preferredCaptureBackend == CaptureBackend::DesktopDuplication ? 1 : 0,
         0);
     y += kRowHeight;
-#if 0 // Game capture UI hidden for now; code retained. Toggle to 1 to re-enable.
-    addRowLabel(L"Game capture !!!");
-    gameCaptureModeCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kGameCaptureModeComboId);
-    addSettingHelp(gameCaptureModeCombo_, 0, 0, L"WARNING: Enabling game capture injects into the target process and will get you banned. Do not use this.");
-    SendMessageW(gameCaptureModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Off"));
-    SendMessageW(gameCaptureModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto (exclusive)"));
-    SendMessageW(gameCaptureModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Always"));
-    {
-        int sel = 1;
-        if (settings_.gameCaptureMode == GameCaptureMode::Off) {
-            sel = 0;
-        } else if (settings_.gameCaptureMode == GameCaptureMode::On) {
-            sel = 2;
-        }
-        SendMessageW(gameCaptureModeCombo_, CB_SETCURSEL, sel, 0);
-    }
-    y += kRowHeight;
-    if (settings_.gameCaptureMode != GameCaptureMode::Off) {
-        addRowLabel(L"Anti-cheat");
-        allowAntiCheatGameCaptureCheck_ = addControl(L"BUTTON", L"Allow game capture in anti-cheat titles", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kAllowAntiCheatGameCaptureCheckId);
-        SendMessageW(allowAntiCheatGameCaptureCheck_, BM_SETCHECK, settings_.allowAntiCheatGameCapture ? BST_CHECKED : BST_UNCHECKED, 0);
-        y += kRowHeight;
-    }
-#endif
     finishSection();
     addSection(L"Multi-monitor");
     addRowLabel(L"Multi-monitor support");

@@ -200,20 +200,6 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
             target.preferredCaptureBackend = CaptureBackend::DesktopDuplication;
         }
     }
-    if (gameCaptureModeCombo_) {
-        const auto selected = SendMessageW(gameCaptureModeCombo_, CB_GETCURSEL, 0, 0);
-        if (selected == 0) {
-            target.gameCaptureMode = GameCaptureMode::Off;
-        } else if (selected == 2) {
-            target.gameCaptureMode = GameCaptureMode::On;
-        } else {
-            target.gameCaptureMode = GameCaptureMode::Auto;
-        }
-    }
-    if (allowAntiCheatGameCaptureCheck_) {
-        target.allowAntiCheatGameCapture =
-            SendMessageW(allowAntiCheatGameCaptureCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
     if (stableMultimonitorFramesCheck_) {
         target.gpu.stableMultimonitorFrames =
             SendMessageW(stableMultimonitorFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -892,18 +878,6 @@ bool MainWindow::isSoundSeparationMutedLabel(HWND control) const {
     }
     return lstrcmpW(text, L"MUTED") == 0;
 }
-
-bool MainWindow::isGameCaptureWarningLabel(HWND control) const {
-    if (!control) {
-        return false;
-    }
-    wchar_t text[32]{};
-    if (GetWindowTextW(control, text, static_cast<int>(_countof(text))) <= 0) {
-        return false;
-    }
-    return lstrcmpW(text, L"Game capture !!!") == 0;
-}
-
 void MainWindow::updateStartupRegistration() {
     updateWindowsStartupRegistration(settings_.startWithWindowsMinimized);
 }

@@ -411,6 +411,9 @@ private:
     HWND outputVolumeEdit_ = nullptr;
     HWND inputVolumeEdit_ = nullptr;
     HWND inputAutoGainCheck_ = nullptr;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    HWND inputNoiseSuppressionCheck_ = nullptr;
+#endif
     HWND startWithWindowsCheck_ = nullptr;
     HWND pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     HWND exitToTrayCheck_ = nullptr;

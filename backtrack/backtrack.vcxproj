@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -73,6 +73,11 @@
     </ImportGroup>
 
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <!-- RNNoise microphone noise suppression: opt-in.
+         Build with /p:BacktrackNoiseSuppression=true -->
+    <BacktrackNoiseSuppression Condition="'$(BacktrackNoiseSuppression)'==''">false</BacktrackNoiseSuppression>
+  </PropertyGroup>
 
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -81,7 +86,7 @@
       <PreprocessorDefinitions>WIN32;_DEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;$(ProjectDir)src\third_party\rnnoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -98,7 +103,7 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;$(ProjectDir)src\third_party\rnnoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -113,7 +118,7 @@
       <PreprocessorDefinitions>_DEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;$(ProjectDir)src\third_party\rnnoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -130,7 +135,7 @@
       <PreprocessorDefinitions>NDEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\Interface;$(ProjectDir)src\third_party\rnnoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -138,9 +143,58 @@
        <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(BacktrackNoiseSuppression)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>BACKTRACK_HAS_NOISE_SUPPRESSION=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)src\third_party\rnnoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
 
   <ItemGroup>
     <ClCompile Include="src\**\*.cpp" />
+    <ClCompile Include="src\audio\RnnoiseDenoiser.cpp">
+      <ExcludedFromBuild Condition="'$(BacktrackNoiseSuppression)'!='true'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\denoise.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\rnn.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\pitch.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\kiss_fft.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\celt_lpc.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\nnet.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\nnet_default.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\parse_lpcnet_weights.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\rnnoise_data.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="src\third_party\rnnoise\src\rnnoise_tables.c" Condition="'$(BacktrackNoiseSuppression)'=='true'">
+      <LanguageStandard_C>stdc11</LanguageStandard_C>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\**\*.h" />
@@ -153,3 +207,4 @@
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
+

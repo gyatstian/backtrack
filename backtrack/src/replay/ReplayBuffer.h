@@ -93,7 +93,12 @@ private:
 
     mutable std::mutex mutex_;
     ReplaySettings settings_;
-    std::deque<std::shared_ptr<const EncodedPacket>> video_;
+    // Packets are immutable after pushVideo except for the live-tail duration
+    // extension, which mutates the newest packet in place under mutex_ (a
+    // full payload copy per emitted interval would spike allocations on
+    // static screens). saveTo snapshots meta under mutex_, so no reader ever
+    // observes the mutation unsynchronized.
+    std::deque<std::shared_ptr<EncodedPacket>> video_;
     std::deque<std::shared_ptr<const AudioPacket>> systemAudio_;
     std::deque<std::shared_ptr<const AudioPacket>> microphoneAudio_;
     size_t videoKeyFrames_ = 0;

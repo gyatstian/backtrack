@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <Windows.h>
 
@@ -23,6 +23,9 @@ constexpr int kInputDeviceComboId = 87;
     constexpr int kBrowseCustomNotificationSoundButtonId = 221;
     constexpr int kResetCustomNotificationSoundButtonId = 222;
     constexpr int kInputAutoGainCheckId = 223;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    constexpr int kInputNoiseSuppressionCheckId = 224;
+#endif
 constexpr int kEncoderPresetComboId = 90;
 constexpr int kEncoderModeComboId = 91;
 constexpr int kEncoderProfileComboId = 92;
@@ -158,3 +161,4 @@ constexpr int kGalleryThumbnailHeight = 180;
 
 } // namespace ui_ids
 } // namespace backtrack
+

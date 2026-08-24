@@ -1,4 +1,4 @@
-#include "ui/MainWindow.h"
+﻿#include "ui/MainWindow.h"
 #include "ui/UiHelpers.h"
 #include "ui/UiIds.h"
 
@@ -124,6 +124,9 @@ void MainWindow::rebindPageControlPointers() {
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
     inputAutoGainCheck_ = nullptr;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    inputNoiseSuppressionCheck_ = nullptr;
+#endif
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
@@ -195,6 +198,9 @@ void MainWindow::rebindPageControlPointers() {
     outputVolumeEdit_ = child(kOutputVolumeEditId);
     inputVolumeEdit_ = child(kInputVolumeEditId);
     inputAutoGainCheck_ = child(kInputAutoGainCheckId);
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    inputNoiseSuppressionCheck_ = child(kInputNoiseSuppressionCheckId);
+#endif
     startWithWindowsCheck_ = child(kStartWithWindowsCheckId);
     pruneStaleMicrophoneConsentEntriesCheck_ = child(kPruneStaleMicrophoneConsentEntriesCheckId);
     exitToTrayCheck_ = child(kExitToTrayCheckId);
@@ -535,6 +541,9 @@ void MainWindow::clearPageControls() {
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
     inputAutoGainCheck_ = nullptr;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    inputNoiseSuppressionCheck_ = nullptr;
+#endif
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
@@ -640,6 +649,9 @@ void MainWindow::clearSettingsBodyControls() {
     outputVolumeEdit_ = nullptr;
     inputVolumeEdit_ = nullptr;
     inputAutoGainCheck_ = nullptr;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    inputNoiseSuppressionCheck_ = nullptr;
+#endif
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
@@ -1318,6 +1330,13 @@ void MainWindow::buildSettingsAudioPage() {
     SendMessageW(inputAutoGainCheck_, BM_SETCHECK, settings_.audioInputAutoGainEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     addRowHelp(autoGainLabel, inputAutoGainCheck_, L"Automatically boosts quiet microphones to a consistent level. Applies after the manual gain above; recommended when the raw microphone level is low.");
     y += kRowHeight;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    HWND noiseSuppressionLabel = addRowLabel(L"Mic noise suppression");
+    inputNoiseSuppressionCheck_ = addControl(L"BUTTON", L"Suppress microphone noise (RNNoise)", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kComboWidth, 24, kInputNoiseSuppressionCheckId);
+    SendMessageW(inputNoiseSuppressionCheck_, BM_SETCHECK, settings_.audioInputNoiseSuppressionEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(noiseSuppressionLabel, inputNoiseSuppressionCheck_, L"Removes steady background noise such as fans and hiss from the microphone track with an RNNoise neural network. Applies before the gain options above; system audio is never processed. Adds a small CPU cost while recording.");
+    y += kRowHeight;
+#endif
     loadAudioDeviceCombos();
 
     finishSection();
@@ -1640,3 +1659,4 @@ void MainWindow::buildClipsPage() {
 }
 
 } // namespace backtrack
+

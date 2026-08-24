@@ -199,6 +199,13 @@ struct AppSettings {
     // Voice-oriented automatic gain control: normalizes quiet microphone streams
     // (like Discord's own AGC) instead of relying on a fixed manual gain.
     bool audioInputAutoGainEnabled = false;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    // RNNoise-based noise suppression on the microphone track only; system
+    // audio is never processed. Opt-in, applied live on the audio writer
+    // thread before AGC and volume. Compiled only when the vendored RNNoise
+    // library is enabled in the build (BACKTRACK_NOISE_SUPPRESSION).
+    bool audioInputNoiseSuppressionEnabled = false;
+#endif
     bool soundSeparationEnabled = false;
     struct SoundSeparationApp {
         std::wstring name;

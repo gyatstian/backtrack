@@ -364,9 +364,12 @@ bool ReplayBuffer::extendLastVideoDuration(int64_t expectedPts100ns, int64_t dur
         return false;
     }
 
-    auto extended = std::make_shared<EncodedPacket>(*video_.back());
-    extended->duration100ns = std::max(extended->duration100ns, duration100ns);
-    video_.back() = std::move(extended);
+    // Mutate in place: the packet payload is never touched after pushVideo and
+    // every reader of duration100ns (saveTo's meta snapshot, span accounting,
+    // trim) goes through mutex_, so copying the whole packet - keyframes are
+    // megabytes - per emitted interval bought nothing but allocation spikes.
+    EncodedPacket& packet = *video_.back();
+    packet.duration100ns = std::max(packet.duration100ns, duration100ns);
     return true;
 }
 

@@ -543,6 +543,9 @@ bool isSettingsControlId(int controlId) {
     case kOutputVolumeEditId:
     case kInputVolumeEditId:
     case kInputAutoGainCheckId:
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    case kInputNoiseSuppressionCheckId:
+#endif
     case kStartWithWindowsCheckId:
     case kPruneStaleMicrophoneConsentEntriesCheckId:
     case kExitToTrayCheckId:

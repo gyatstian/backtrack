@@ -45,13 +45,18 @@ public:
         return true;
     }
 
+    // Advisory depth. head_ and tail_ are read independently, so a consumer
+    // pop landing between the two loads makes the wrapped difference alias to
+    // a near-capacity or huge value. The clamp keeps callers (GPU-protection
+    // drop decisions, UI queue depth) from ever acting on a bogus size; the
+    // result remains approximate by design.
     size_t size() const {
         const auto head = head_.load(std::memory_order_acquire);
         const auto tail = tail_.load(std::memory_order_acquire);
         if (head >= tail) {
             return head - tail;
         }
-        return buffer_.size() - tail + head;
+        return std::min(buffer_.size() - tail + head, capacity());
     }
 
     size_t capacity() const {

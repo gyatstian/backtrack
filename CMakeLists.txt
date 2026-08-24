@@ -1,9 +1,34 @@
-cmake_minimum_required(VERSION 3.24)
+﻿cmake_minimum_required(VERSION 3.24)
 
-project(Backtrack VERSION 0.1.0 LANGUAGES CXX RC)
+project(Backtrack VERSION 0.1.0 LANGUAGES C CXX RC)
+
+# Vendored RNNoise (BSD-3, see backtrack/src/third_party/rnnoise/README.md),
+# used by the optional microphone noise suppression feature. Off by default;
+# when enabled it compiles as a plain C11 static library (generic scalar
+# kernels are fast enough for one mono stream, ~1% of one core).
+option(BACKTRACK_NOISE_SUPPRESSION "Include RNNoise microphone noise suppression" OFF)
 
 file(GLOB_RECURSE BACKTRACK_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/*.cpp")
+if (NOT BACKTRACK_NOISE_SUPPRESSION)
+    list(FILTER BACKTRACK_SOURCES EXCLUDE REGEX "RnnoiseDenoiser\\.cpp$")
+endif()
+
+if (BACKTRACK_NOISE_SUPPRESSION)
+    file(GLOB BACKTRACK_RNNOISE_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/third_party/rnnoise/src/*.c")
+    add_library(rnnoise STATIC ${BACKTRACK_RNNOISE_SOURCES})
+    target_compile_features(rnnoise PRIVATE c_std_11)
+    target_include_directories(rnnoise PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/third_party/rnnoise/include")
+    target_include_directories(rnnoise PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/third_party/rnnoise/src")
+    if (MSVC)
+        # Third-party C code: keep its own (benign double->float) warnings out of
+        # the app's warning budget.
+        target_compile_options(rnnoise PRIVATE /W3)
+    endif()
+endif()
 
 set(BACKTRACK_RESOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/backtrack.rc")
@@ -18,9 +43,12 @@ target_compile_definitions(Backtrack PRIVATE
     _UNICODE
     NOMINMAX
     WIN32_LEAN_AND_MEAN)
+if (BACKTRACK_NOISE_SUPPRESSION)
+    target_compile_definitions(Backtrack PRIVATE BACKTRACK_HAS_NOISE_SUPPRESSION=1)
+    target_link_libraries(Backtrack PRIVATE rnnoise)
+endif()
 
-find_path(NVENC_INCLUDE_DIR
-    NAMES nvEncodeAPI.h
+find_path(NVENC_INCLUDE_DIR    NAMES nvEncodeAPI.h
     PATHS
         "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/Interface"
         "$ENV{NV_CODEC_SDK_PATH}/Interface"
@@ -96,7 +124,7 @@ endif()
 enable_testing()
 
 function(add_backtrack_test name)
-    cmake_parse_arguments(TEST "" "" "SOURCES" ${ARGN})
+    cmake_parse_arguments(TEST "" "" "SOURCES;LIBS" ${ARGN})
     add_executable(${name} ${TEST_SOURCES})
     target_compile_features(${name} PRIVATE cxx_std_20)
     target_include_directories(${name} PRIVATE
@@ -104,6 +132,9 @@ function(add_backtrack_test name)
     # Shared sources (Logger, ReplayBuffer) use unparenthesized std::min/std::max;
     # without this the Windows.h macros break them.
     target_compile_definitions(${name} PRIVATE NOMINMAX)
+    if (TEST_LIBS)
+        target_link_libraries(${name} PRIVATE ${TEST_LIBS})
+    endif()
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -133,3 +164,14 @@ add_backtrack_test(ReplayBufferTests
         backtrack/src/mux/WavWriter.cpp
         backtrack/src/encoder/BitstreamUtils.cpp
         backtrack/src/core/Logger.cpp)
+
+if (BACKTRACK_NOISE_SUPPRESSION)
+    # AudioDenoiseTests exercises audio/RnnoiseDenoiser.cpp against the vendored
+    # rnnoise static library.
+    add_backtrack_test(AudioDenoiseTests
+        SOURCES
+            backtrack/tests/AudioDenoiseTests.cpp
+            backtrack/src/audio/RnnoiseDenoiser.cpp
+        LIBS rnnoise)
+endif()
+

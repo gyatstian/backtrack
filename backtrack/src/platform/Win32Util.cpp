@@ -177,6 +177,26 @@ std::wstring trimText(std::wstring value) {
     return value;
 }
 
+// Windows reserves these device names in every directory; creating a file
+// named "CON.mp4" or "COM1.mp4" hangs or fails opaquely. Mirrors the
+// ClipManager stem validation so clip-name sources cannot dodge it.
+bool isReservedDeviceName(const std::wstring& value) {
+    std::wstring upper = value;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towupper(ch));
+    });
+    const auto dot = upper.find(L'.');
+    if (dot != std::wstring::npos) {
+        upper.resize(dot);
+    }
+    return upper == L"CON" ||
+           upper == L"PRN" ||
+           upper == L"AUX" ||
+           upper == L"NUL" ||
+           (upper.size() == 4 && (upper.starts_with(L"COM") || upper.starts_with(L"LPT")) &&
+            upper[3] >= L'1' && upper[3] <= L'9');
+}
+
 std::wstring sanitizeFileNamePart(std::wstring value) {
     value = trimText(std::move(value));
     for (wchar_t& ch : value) {
@@ -185,8 +205,22 @@ std::wstring sanitizeFileNamePart(std::wstring value) {
             ch = L'_';
         }
     }
+    // Cap the part so "<prefix>_YYYYMMDD_HHMM.mp4" plus the muxer's temp tree
+    // still fits MAX_PATH even when a long window title is the source.
+    constexpr size_t kMaxFileNamePartLength = 48;
+    if (value.size() > kMaxFileNamePartLength) {
+        value.resize(kMaxFileNamePartLength);
+        // Never split a UTF-16 surrogate pair: a trailing lone high surrogate
+        // would be rejected by the filesystem.
+        if (value.back() >= 0xD800 && value.back() <= 0xDBFF) {
+            value.pop_back();
+        }
+    }
     while (!value.empty() && (value.back() == L'.' || value.back() == L' ')) {
         value.pop_back();
+    }
+    if (isReservedDeviceName(value)) {
+        value.insert(value.begin(), L'_');
     }
     return value;
 }

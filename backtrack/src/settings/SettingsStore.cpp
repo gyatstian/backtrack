@@ -1,4 +1,4 @@
-#include "settings/SettingsStore.h"
+﻿#include "settings/SettingsStore.h"
 
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
@@ -264,6 +264,9 @@ AppSettings SettingsStore::load() const {
     settings.audioInputVolumePercent = readUInt(values, L"audio.inputVolumePercent", settings.audioInputVolumePercent);
     settings.audioOutputVolumePercent = readUInt(values, L"audio.outputVolumePercent", settings.audioOutputVolumePercent);
     settings.audioInputAutoGainEnabled = readBool(values, L"audio.inputAutoGain", settings.audioInputAutoGainEnabled);
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    settings.audioInputNoiseSuppressionEnabled = readBool(values, L"audio.inputNoiseSuppression", settings.audioInputNoiseSuppressionEnabled);
+#endif
     settings.soundSeparationEnabled = readBool(values, L"audio.soundSeparation.enabled", settings.soundSeparationEnabled);
     const uint32_t soundSeparationCount = std::min<uint32_t>(
         readUInt(values, L"audio.soundSeparation.count", 0),
@@ -389,6 +392,9 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"audio.inputVolumePercent=" << normalized.audioInputVolumePercent << L"\n";
     output << L"audio.outputVolumePercent=" << normalized.audioOutputVolumePercent << L"\n";
     output << L"audio.inputAutoGain=" << (normalized.audioInputAutoGainEnabled ? 1 : 0) << L"\n";
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    output << L"audio.inputNoiseSuppression=" << (normalized.audioInputNoiseSuppressionEnabled ? 1 : 0) << L"\n";
+#endif
     output << L"audio.soundSeparation.enabled=" << (normalized.soundSeparationEnabled ? 1 : 0) << L"\n";
     output << L"audio.soundSeparation.count=" << normalized.soundSeparationApps.size() << L"\n";
     for (size_t index = 0; index < normalized.soundSeparationApps.size(); ++index) {
@@ -759,3 +765,4 @@ GameIntegrationSettings::DiscordRichPresenceMode discordRichPresenceModeFromName
 }
 
 } // namespace backtrack
+

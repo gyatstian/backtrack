@@ -893,9 +893,28 @@ struct AmfEncoder::Impl {
     // session - Drain already reported its own status at that point.
     bool harvestOutputs(bool waitForAll) {
         constexpr auto kIdleDrainLimit = std::chrono::seconds(5);
+        // Non-drain sweeps run on the encode path while impl_->mutex is held;
+        // a driver answering AMF_OK with buffers that never yield a packet
+        // (non-buffer Data, zero-size payload) must not be able to spin here
+        // unboundedly or stop/save/pipeline-recreate hang behind that lock.
+        constexpr auto kIdleHarvestLimit = std::chrono::milliseconds(250);
         SteadyClock::time_point lastProgress = SteadyClock::now();
 
         while (true) {
+            // Unified idle gate: progress means a packet was actually produced.
+            // Drain waits up to kIdleDrainLimit for trailing frames; a
+            // steady-state sweep must return promptly (kIdleHarvestLimit)
+            // because impl_->mutex is held throughout.
+            const auto idleLimit = waitForAll ? kIdleDrainLimit : kIdleHarvestLimit;
+            if (SteadyClock::now() - lastProgress >= idleLimit) {
+                Logger::instance().warning(L"encoder",
+                    std::wstring(waitForAll
+                        ? L"AMF encoder stopped producing output during drain"
+                        : L"AMF encoder produced no usable output within the harvest window") +
+                    L"; keeping " + std::to_wstring(readyPackets.size()) + L" harvested packet(s)");
+                break;
+            }
+
             amf::AMFDataPtr data;
             AMF_RESULT result = encoder->QueryOutput(&data);
 
@@ -909,12 +928,8 @@ struct AmfEncoder::Impl {
                 if (!waitForAll) {
                     break;
                 }
-                if (SteadyClock::now() - lastProgress >= kIdleDrainLimit) {
-                    Logger::instance().warning(L"encoder",
-                        L"AMF encoder stopped producing output during drain; keeping " +
-                        std::to_wstring(readyPackets.size()) + L" harvested packet(s)");
-                    break;
-                }
+                // The loop-top idle gate bounds this polling; sleep so waiting
+                // out a slow flush does not spin the core.
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 continue;
             }
@@ -926,8 +941,6 @@ struct AmfEncoder::Impl {
                 }
                 return fail(detail);
             }
-
-            lastProgress = SteadyClock::now();
 
             amf::AMFBufferPtr buffer(data);
             if (!buffer) {
@@ -1016,6 +1029,10 @@ struct AmfEncoder::Impl {
                 ++encoderStats.keyFrames;
             }
             readyPackets.push_back(std::move(packet));
+            // Progress means a packet was actually produced: refresh here, not
+            // on any AMF_OK response, so a driver looping on unusable buffers
+            // trips the idle bound above instead of resetting it forever.
+            lastProgress = SteadyClock::now();
 
             if (!waitForAll) {
                 // Drain everything currently ready, then return.

@@ -105,6 +105,11 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     if (inputAutoGainCheck_) {
         target.audioInputAutoGainEnabled = SendMessageW(inputAutoGainCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    if (inputNoiseSuppressionCheck_) {
+        target.audioInputNoiseSuppressionEnabled = SendMessageW(inputNoiseSuppressionCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
+#endif
     if (startWithWindowsCheck_) {
         target.startWithWindowsMinimized = SendMessageW(startWithWindowsCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }

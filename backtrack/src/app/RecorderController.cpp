@@ -2,6 +2,9 @@
 #include "app/VideoTimelineScheduler.h"
 
 #include "audio/AudioConvert.h"
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+#include "audio/RnnoiseDenoiser.h"
+#endif
 #include "capture/DesktopDuplicationCapture.h"
 #include "capture/WgcCaptureSource.h"
 #include "core/Logger.h"
@@ -456,11 +459,70 @@ void applyMicrophoneAgc(AudioPacket& packet, const AudioFormatInfo& format, Micr
     }
 }
 
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+// Noise suppression runs after canonicalization, so the packet is guaranteed
+// stereo float32 at 48 kHz; the guard keeps an unexpected format from being
+// misinterpreted. The stereo mic signal is folded to mono (channels are
+// near-identical for voice capture), denoised, and written back to both
+// channels. RNNoise consumes 480-sample frames, so a call may emit up to one
+// buffered frame more or fewer samples than it consumed: the helper resizes
+// the packet payload to match what was actually produced, and held-back
+// samples arrive in a later packet, keeping cumulative stream length exact.
+// Returns the produced mono-sample count.
+size_t applyMicrophoneNoiseSuppression(
+    AudioPacket& packet,
+    const AudioFormatInfo& format,
+    RnnoiseDenoiser& denoiser,
+    std::vector<float>& scratchMonoIn,
+    std::vector<float>& scratchMonoOut) {
+    const size_t frameCount = packet.bytes.size() / (2 * sizeof(float));
+    if (!isCanonicalAudioFormat(format) || !denoiser.valid() || frameCount == 0) {
+        static bool loggedUnsupportedOnce = false;
+        if (!loggedUnsupportedOnce && !isCanonicalAudioFormat(format)) {
+            loggedUnsupportedOnce = true;
+            Logger::instance().warning(L"recorder", L"Microphone noise suppression skipped non-canonical audio packet");
+        }
+        return frameCount; // Bypass: everything "produced" unprocessed.
+    }
+
+    scratchMonoIn.resize(frameCount);
+    const float* interleaved = reinterpret_cast<const float*>(packet.bytes.data());
+    for (size_t frame = 0; frame < frameCount; ++frame) {
+        // Average the channels: mono sources duplicate to L/R in canonical
+        // conversion, so averaging avoids a spurious +6 dB level shift.
+        scratchMonoIn[frame] = 0.5f * (interleaved[2 * frame] + interleaved[2 * frame + 1]);
+    }
+
+    // +480 lets the denoiser flush any frame buffered by an earlier odd-sized
+    // packet instead of accumulating backlog.
+    scratchMonoOut.resize(frameCount + 480);
+    const size_t produced =
+        denoiser.process(scratchMonoIn.data(), frameCount, scratchMonoOut.data(), scratchMonoOut.size());
+
+    packet.bytes.resize(produced * 2 * sizeof(float));
+    float* out = reinterpret_cast<float*>(packet.bytes.data());
+    for (size_t frame = 0; frame < produced; ++frame) {
+        out[2 * frame] = scratchMonoOut[frame];
+        out[2 * frame + 1] = scratchMonoOut[frame];
+    }
+    return produced;
+}
+#endif // BACKTRACK_HAS_NOISE_SUPPRESSION
+
 RecorderController::RecorderController()
     : frameQueue_(8),
       systemAudioQueue_(256),
       microphoneAudioQueue_(256),
-      microphoneAgc_(std::make_unique<MicrophoneAgc>()) {
+      microphoneAgc_(std::make_unique<MicrophoneAgc>())
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+      , microphoneDenoiser_(std::make_unique<RnnoiseDenoiser>()) {
+    if (!microphoneDenoiser_->valid()) {
+        // Allocation failure only; the feature stays disabled for this session.
+        Logger::instance().warning(L"recorder", L"Microphone noise suppression unavailable (RNNoise init failed)");
+    }
+#else
+    {
+#endif
     frameEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     audioEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 }
@@ -515,22 +577,28 @@ void RecorderController::waitForStartupSweep() {
 
 bool RecorderController::initialize(AppSettings settings) {
     settings = sanitizeSettings(std::move(settings));
+    AppSettings applied;
     {
         std::scoped_lock lock(stateMutex_);
         settings_ = std::move(settings);
+        applied = settings_;
         activeVideoSettings_ = settings_.video;
         activeGpuSettings_ = settings_.gpu;
         audioOutputVolumePercent_.store(settings_.audioOutputVolumePercent, std::memory_order_relaxed);
         audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
         audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
         microphoneAgcResetPending_ = true;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+        audioInputNoiseSuppression_.store(settings_.audioInputNoiseSuppressionEnabled, std::memory_order_relaxed);
+        microphoneDenoiserResetPending_ = true;
+#endif
         replay_.clear();
         replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
     }
-    Logger::instance().info(L"recorder", std::wstring(L"Recorder initialized: clips=") + settings_.clipDirectory.wstring() +
-                            L", replay=" + (settings_.replay.enabled ? L"enabled" : L"disabled") +
-                            L", fps=" + std::to_wstring(settings_.video.fps) +
-                            L", bitrateKbps=" + std::to_wstring(settings_.video.bitrateKbps));
+    Logger::instance().info(L"recorder", std::wstring(L"Recorder initialized: clips=") + applied.clipDirectory.wstring() +
+                            L", replay=" + (applied.replay.enabled ? L"enabled" : L"disabled") +
+                            L", fps=" + std::to_wstring(applied.video.fps) +
+                            L", bitrateKbps=" + std::to_wstring(applied.video.bitrateKbps));
     // Sweep crash-recovery leftovers from previous sessions in the background:
     // recover the newest valid manifest into a clip, then delete older
     // orphaned temporary data. The single-instance mutex guarantees no other
@@ -576,6 +644,10 @@ bool RecorderController::updateSettings(AppSettings settings) {
         stopPipeline();
     }
 
+    // Read under the lock: a concurrent updateSettings/initialize may be
+    // writing settings_ right now, and an unsynchronized read of a struct
+    // holding paths/wstrings is UB (torn read).
+    bool replayEnabledAfterApply = false;
     {
         std::scoped_lock lock(stateMutex_);
         const VideoSettings oldVideo = activeVideoSettings_;
@@ -586,6 +658,11 @@ bool RecorderController::updateSettings(AppSettings settings) {
         audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
         audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
         microphoneAgcResetPending_ = true;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+        audioInputNoiseSuppression_.store(settings_.audioInputNoiseSuppressionEnabled, std::memory_order_relaxed);
+        microphoneDenoiserResetPending_ = true;
+#endif
+        replayEnabledAfterApply = settings_.replay.enabled;
         replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
         // A codec/resolution/fps change makes every buffered packet's bitstream
         // incompatible with the new pipeline. Keep them and a replay save would
@@ -600,7 +677,7 @@ bool RecorderController::updateSettings(AppSettings settings) {
         }
     }
 
-    if (settings_.replay.enabled) {
+    if (replayEnabledAfterApply) {
         const bool started = ensurePipeline();
         if (!started) {
             Logger::instance().error(L"recorder", L"Could not restart capture pipeline after applying settings");
@@ -969,6 +1046,9 @@ bool RecorderController::ensurePipeline() {
     }
     if (snapshot.captureMicrophone) {
         microphoneAgcResetPending_ = true;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+        microphoneDenoiserResetPending_ = true;
+#endif
         if (!microphoneAudio_.start(AudioTrack::Microphone, snapshot.audioInputDeviceId, [this](AudioPacket&& packet) { handleAudioPacket(std::move(packet)); })) {
             Logger::instance().warning(L"recorder", L"Microphone capture did not start");
         }
@@ -2761,6 +2841,24 @@ void RecorderController::writeAudioPacket(AudioPacket&& packet) {
     if (!convertAudioPacketToCanonical(packet)) {
         return;
     }
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    if (microphoneDenoiserResetPending_.exchange(false, std::memory_order_relaxed)) {
+        microphoneDenoiser_->reset();
+    }
+    if (packet.track == AudioTrack::Microphone &&
+        audioInputNoiseSuppression_.load(std::memory_order_relaxed) &&
+        packet.format) {
+        const AudioFormatInfo format = parseAudioFormat(*packet.format);
+        const size_t produced = applyMicrophoneNoiseSuppression(
+            packet, format, *microphoneDenoiser_, microphoneDenoiseScratch_, microphoneDenoiseOutputScratch_);
+        if (produced == 0) {
+            // Everything is buffered inside the denoiser awaiting a full
+            // 480-frame; nothing to write or buffer downstream yet.
+            return;
+        }
+        packet.frameCount = static_cast<uint32_t>(produced);
+    }
+#endif
     if (microphoneAgcResetPending_.exchange(false, std::memory_order_relaxed)) {
         microphoneAgc_->reset();
     }

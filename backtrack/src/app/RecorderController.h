@@ -23,6 +23,9 @@
 namespace backtrack {
 
 class MicrophoneAgc;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+class RnnoiseDenoiser;
+#endif
 
 class RecorderController {
 public:
@@ -151,6 +154,16 @@ std::atomic<uint32_t> audioOutputVolumePercent_{100};
     // writer resets the AGC envelope on its own thread before the next packet.
     std::atomic<bool> microphoneAgcResetPending_{true};
     std::unique_ptr<MicrophoneAgc> microphoneAgc_;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    // Noise suppression mirrors the AGC pattern: an enable flag snapshot plus
+    // a reset flag consumed on the audio writer thread. The scratch buffers
+    // avoid per-packet allocations for the stereo fold-down.
+    std::atomic<bool> audioInputNoiseSuppression_{false};
+    std::atomic<bool> microphoneDenoiserResetPending_{true};
+    std::unique_ptr<RnnoiseDenoiser> microphoneDenoiser_;
+    std::vector<float> microphoneDenoiseScratch_;
+    std::vector<float> microphoneDenoiseOutputScratch_;
+#endif
     std::atomic<uint64_t> capturedFrames_{0};
     std::atomic<uint64_t> sourceFrames_{0};
     std::atomic<uint64_t> sourceFramesPerSecond_{0};

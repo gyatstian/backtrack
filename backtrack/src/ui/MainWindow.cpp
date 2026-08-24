@@ -252,6 +252,24 @@ MainWindow::~MainWindow() {
     if (tabActiveOutlinePen_) {
         DeleteObject(tabActiveOutlinePen_);
     }
+    if (muteIconPenMuted_) {
+        DeleteObject(muteIconPenMuted_);
+    }
+    if (muteIconPenNormal_) {
+        DeleteObject(muteIconPenNormal_);
+    }
+    if (muteIconPenDisabled_) {
+        DeleteObject(muteIconPenDisabled_);
+    }
+    if (muteIconBrushMuted_) {
+        DeleteObject(muteIconBrushMuted_);
+    }
+    if (muteIconBrushNormal_) {
+        DeleteObject(muteIconBrushNormal_);
+    }
+    if (muteIconBrushDisabled_) {
+        DeleteObject(muteIconBrushDisabled_);
+    }
 }
 
 bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized) {
@@ -278,6 +296,12 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     outlinePen_ = CreatePen(PS_SOLID, 1, kOutline);
     selectedOutlinePen_ = CreatePen(PS_SOLID, 1, kText);
     tabActiveOutlinePen_ = CreatePen(PS_SOLID, 1, kTabActiveOutline);
+    muteIconPenMuted_ = CreatePen(PS_SOLID, 2, kMuteIconColor);
+    muteIconPenNormal_ = CreatePen(PS_SOLID, 2, kText);
+    muteIconPenDisabled_ = CreatePen(PS_SOLID, 2, kMutedText);
+    muteIconBrushMuted_ = CreateSolidBrush(kMuteIconColor);
+    muteIconBrushNormal_ = CreateSolidBrush(kText);
+    muteIconBrushDisabled_ = CreateSolidBrush(kMutedText);
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = MainWindow::windowProc;

@@ -673,9 +673,8 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
         SelectObject(item.hDC, oldBrush);
         SelectObject(item.hDC, oldOutline);
 
-        const COLORREF iconColor = muted ? RGB(232, 72, 72) : (disabled ? kMutedText : kText);
-        HPEN iconPen = CreatePen(PS_SOLID, 2, iconColor);
-        HBRUSH iconBrush = CreateSolidBrush(iconColor);
+        const HPEN iconPen = muted ? muteIconPenMuted_ : (disabled ? muteIconPenDisabled_ : muteIconPenNormal_);
+        const HBRUSH iconBrush = muted ? muteIconBrushMuted_ : (disabled ? muteIconBrushDisabled_ : muteIconBrushNormal_);
         HGDIOBJ oldPen = SelectObject(item.hDC, iconPen);
         HGDIOBJ oldIconBrush = SelectObject(item.hDC, iconBrush);
 
@@ -697,8 +696,6 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
 
         SelectObject(item.hDC, oldIconBrush);
         SelectObject(item.hDC, oldPen);
-        DeleteObject(iconBrush);
-        DeleteObject(iconPen);
 
         if ((item.itemState & ODS_FOCUS) != 0) {
             DrawFocusRect(item.hDC, &item.rcItem);
@@ -877,7 +874,24 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             FillRect(item.hDC, &preview, editBrush_);
             const ClipThumbnail* thumbnail = clipIndex < clipThumbnails_.size() ? &clipThumbnails_[clipIndex] : nullptr;
             if (thumbnail && thumbnail->bitmap) {
-                drawBitmapFit(item.hDC, thumbnail->bitmap, preview);
+                // Tile-sized scaled copy is cached per clip; repaints (hover,
+                // selection, scroll) become plain BitBlts instead of a
+                // HALFTONE StretchBlt per tile. The thumbnailCache_ entry
+                // owns the tile copy, so write through to the entry; the slot
+                // fields are only load-time mirrors and would leave the entry
+                // pointing at freed memory if regenerated here.
+                const auto cache = thumbnailCache_.find(thumbnailCacheKey(clip.path));
+                if (cache != thumbnailCache_.end() && cache->second.bitmap) {
+                    drawBitmapFitCached(
+                        item.hDC,
+                        cache->second.bitmap,
+                        cache->second.tileBitmap,
+                        cache->second.tileWidth,
+                        cache->second.tileHeight,
+                        preview);
+                } else {
+                    drawBitmapFit(item.hDC, thumbnail->bitmap, preview);
+                }
             } else {
                 SetBkMode(item.hDC, TRANSPARENT);
                 SetTextColor(item.hDC, kMutedText);

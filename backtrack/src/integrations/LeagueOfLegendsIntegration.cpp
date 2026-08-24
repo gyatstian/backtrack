@@ -43,6 +43,13 @@ struct InternetHandle {
     InternetHandle(const InternetHandle&) = delete;
     InternetHandle& operator=(const InternetHandle&) = delete;
 
+    void reset(HINTERNET handle = nullptr) {
+        if (value) {
+            WinHttpCloseHandle(value);
+        }
+        value = handle;
+    }
+
     explicit operator bool() const {
         return value != nullptr;
     }
@@ -241,26 +248,18 @@ std::optional<double> jsonDoubleField(std::string_view object, std::string_view 
     return value;
 }
 
-std::optional<std::string> httpGet(const wchar_t* path) {
-    InternetHandle session(WinHttpOpen(
-        L"Backtrack/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0));
-    if (!session) {
-        return std::nullopt;
-    }
-
-    WinHttpSetTimeouts(session.value, 1000, 1000, 1000, 1000);
-
-    InternetHandle connection(WinHttpConnect(session.value, kHost, kPort, 0));
-    if (!connection) {
+// Polling hits the live client API twice per second; the session and
+// connection are pooled by the caller (workerLoop) so TCP/TLS setup is paid
+// once instead of on every request. The caller drops the pooled connection
+// after any failed request, so a restarted game client still gets fresh
+// transport state on the next poll.
+std::optional<std::string> httpGet(HINTERNET session, HINTERNET connection, const wchar_t* path) {
+    if (!session || !connection) {
         return std::nullopt;
     }
 
     InternetHandle request(WinHttpOpenRequest(
-        connection.value,
+        connection,
         L"GET",
         path,
         nullptr,
@@ -501,10 +500,33 @@ void LeagueOfLegendsIntegration::workerLoop() {
     int64_t lastEventId = -1;
     double lastEventTime = 0.0;
 
+    // Pooled across polls: creating a WinHTTP session + TLS connection per
+    // request (twice per second) kept the heap hot for no benefit. Both are
+    // recreated lazily when missing, and the connection is additionally
+    // dropped after any failed request so stale transport state from a
+    // restarted game client never lingers.
+    InternetHandle session;
+    InternetHandle connection;
+
     while (!stopRequested_.load(std::memory_order_acquire)) {
-        auto activePlayer = httpGet(L"/liveclientdata/activeplayer");
-        auto eventData = httpGet(L"/liveclientdata/eventdata");
+        if (!session) {
+            session.reset(WinHttpOpen(
+                L"Backtrack/1.0",
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                WINHTTP_NO_PROXY_NAME,
+                WINHTTP_NO_PROXY_BYPASS,
+                0));
+            if (session) {
+                WinHttpSetTimeouts(session.value, 1000, 1000, 1000, 1000);
+            }
+        }
+        if (session && !connection) {
+            connection.reset(WinHttpConnect(session.value, kHost, kPort, 0));
+        }
+        auto activePlayer = httpGet(session.value, connection.value, L"/liveclientdata/activeplayer");
+        auto eventData = httpGet(session.value, connection.value, L"/liveclientdata/eventdata");
         if (!activePlayer || !eventData) {
+            connection.reset();
             if (gameAvailable) {
                 Logger::instance().info(L"league", L"League of Legends live client data is no longer available");
             }

@@ -115,6 +115,92 @@ HBITMAP createScaledBitmapFromRgb32(const BYTE* pixels, LONG stride, UINT source
     return bitmap;
 }
 
+// The shell honors SIIGBF_BIGGERSIZEOK by handing back a bitmap larger than
+// requested; cached thumbnails would then pin that oversized surface for the
+// lifetime of the cache. Downscale once to fit within width x height into a
+// compact top-down 32bpp DIB (the same format loadMediaFoundationThumbnail
+// produces). Aspect ratio is preserved and tiles render through
+// drawBitmapFit's own fit-scaling anyway, so displayed pixels are unchanged.
+// Returns the original bitmap unchanged when it already fits or on any GDI
+// failure, so callers can never end up with fewer resources than before.
+HBITMAP downscaleBitmapToFit(HBITMAP bitmap, int width, int height) {
+    BITMAP info{};
+    if (!bitmap ||
+        GetObjectW(bitmap, sizeof(info), &info) != sizeof(info) ||
+        info.bmWidth <= 0 || info.bmHeight <= 0 ||
+        width <= 0 || height <= 0 ||
+        (info.bmWidth <= width && info.bmHeight <= height)) {
+        return bitmap;
+    }
+
+    const double scale = std::min(
+        static_cast<double>(width) / static_cast<double>(info.bmWidth),
+        static_cast<double>(height) / static_cast<double>(info.bmHeight));
+    const int targetWidth = std::max(1, static_cast<int>(info.bmWidth * scale));
+    const int targetHeight = std::max(1, static_cast<int>(info.bmHeight * scale));
+
+    BITMAPINFO targetInfo{};
+    targetInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    targetInfo.bmiHeader.biWidth = targetWidth;
+    targetInfo.bmiHeader.biHeight = -targetHeight;
+    targetInfo.bmiHeader.biPlanes = 1;
+    targetInfo.bmiHeader.biBitCount = 32;
+    targetInfo.bmiHeader.biCompression = BI_RGB;
+
+    void* targetBits = nullptr;
+    HBITMAP scaled = CreateDIBSection(nullptr, &targetInfo, DIB_RGB_COLORS, &targetBits, nullptr, 0);
+    if (!scaled || !targetBits) {
+        if (scaled) {
+            DeleteObject(scaled);
+        }
+        return bitmap;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    HDC targetDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
+    HDC sourceDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
+    if (!targetDc || !sourceDc) {
+        if (targetDc) {
+            DeleteDC(targetDc);
+        }
+        if (sourceDc) {
+            DeleteDC(sourceDc);
+        }
+        if (screenDc) {
+            ReleaseDC(nullptr, screenDc);
+        }
+        DeleteObject(scaled);
+        return bitmap;
+    }
+
+    HGDIOBJ oldTarget = SelectObject(targetDc, scaled);
+    HGDIOBJ oldSource = SelectObject(sourceDc, bitmap);
+    SetStretchBltMode(targetDc, HALFTONE);
+    SetBrushOrgEx(targetDc, 0, 0, nullptr);
+    StretchBlt(
+        targetDc,
+        0,
+        0,
+        targetWidth,
+        targetHeight,
+        sourceDc,
+        0,
+        0,
+        info.bmWidth,
+        info.bmHeight,
+        SRCCOPY);
+    SelectObject(targetDc, oldTarget);
+    SelectObject(sourceDc, oldSource);
+    DeleteDC(targetDc);
+    DeleteDC(sourceDc);
+    ReleaseDC(nullptr, screenDc);
+
+    // Only reached on success: replace the oversized original with the
+    // downscaled copy.
+    DeleteObject(bitmap);
+    return scaled;
+}
+
 HBITMAP loadMediaFoundationThumbnail(const std::filesystem::path& path, int width, int height) {
     ScopedMfStartup mf;
     if (!mf.started) {
@@ -326,6 +412,40 @@ bool showWindowIfHidden(HWND control) {
         return false;
     }
     ShowWindow(control, SW_SHOWNA);
+    return true;
+}
+
+bool applyWindowMoves(const std::vector<WindowMove>& moves) {
+    if (moves.empty()) {
+        return false;
+    }
+
+    HDWP defer = BeginDeferWindowPos(static_cast<int>(moves.size()));
+    if (defer) {
+        for (const auto& move : moves) {
+            defer = DeferWindowPos(
+                defer,
+                move.control,
+                nullptr,
+                move.x,
+                move.y,
+                move.width,
+                move.height,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+            if (!defer) {
+                break;
+            }
+        }
+        if (defer && EndDeferWindowPos(defer)) {
+            return true;
+        }
+    }
+
+    // Deferring failed (or EndDeferWindowPos failed); moves are idempotent, so
+    // reapplying everything directly is always correct.
+    for (const auto& move : moves) {
+        SetWindowPos(move.control, nullptr, move.x, move.y, move.width, move.height, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
     return true;
 }
 
@@ -931,7 +1051,7 @@ HBITMAP loadShellThumbnail(const std::filesystem::path& path, int width, int hei
         hr = factory->GetImage(size, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK, &bitmap);
         factory->Release();
         if (SUCCEEDED(hr) && bitmap) {
-            return bitmap;
+            return downscaleBitmapToFit(bitmap, width, height);
         }
         if (bitmap) {
             DeleteObject(bitmap);
@@ -977,6 +1097,146 @@ void drawBitmapFit(HDC dc, HBITMAP bitmap, const RECT& target) {
     StretchBlt(dc, x, y, drawWidth, drawHeight, memoryDc, 0, 0, info.bmWidth, info.bmHeight, SRCCOPY);
     SelectObject(memoryDc, oldBitmap);
     DeleteDC(memoryDc);
+}
+
+namespace {
+
+// Scales bitmap to exactly width x height with the same HALFTONE quality
+// drawBitmapFit uses, into a compact top-down 32bpp DIB. Returns nullptr on
+// any failure; the source bitmap is left untouched either way.
+HBITMAP scaleBitmapToSizeHalftone(HBITMAP bitmap, int width, int height) {
+    BITMAP info{};
+    if (!bitmap ||
+        GetObjectW(bitmap, sizeof(info), &info) != sizeof(info) ||
+        info.bmWidth <= 0 || info.bmHeight <= 0 ||
+        width <= 0 || height <= 0) {
+        return nullptr;
+    }
+
+    BITMAPINFO targetInfo{};
+    targetInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    targetInfo.bmiHeader.biWidth = width;
+    targetInfo.bmiHeader.biHeight = -height;
+    targetInfo.bmiHeader.biPlanes = 1;
+    targetInfo.bmiHeader.biBitCount = 32;
+    targetInfo.bmiHeader.biCompression = BI_RGB;
+
+    void* targetBits = nullptr;
+    HBITMAP scaled = CreateDIBSection(nullptr, &targetInfo, DIB_RGB_COLORS, &targetBits, nullptr, 0);
+    if (!scaled || !targetBits) {
+        if (scaled) {
+            DeleteObject(scaled);
+        }
+        return nullptr;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    HDC targetDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
+    HDC sourceDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
+    if (!targetDc || !sourceDc) {
+        if (targetDc) {
+            DeleteDC(targetDc);
+        }
+        if (sourceDc) {
+            DeleteDC(sourceDc);
+        }
+        if (screenDc) {
+            ReleaseDC(nullptr, screenDc);
+        }
+        DeleteObject(scaled);
+        return nullptr;
+    }
+
+    HGDIOBJ oldTarget = SelectObject(targetDc, scaled);
+    HGDIOBJ oldSource = SelectObject(sourceDc, bitmap);
+    SetStretchBltMode(targetDc, HALFTONE);
+    SetBrushOrgEx(targetDc, 0, 0, nullptr);
+    StretchBlt(
+        targetDc,
+        0,
+        0,
+        width,
+        height,
+        sourceDc,
+        0,
+        0,
+        info.bmWidth,
+        info.bmHeight,
+        SRCCOPY);
+    SelectObject(targetDc, oldTarget);
+    SelectObject(sourceDc, oldSource);
+    DeleteDC(targetDc);
+    DeleteDC(sourceDc);
+    ReleaseDC(nullptr, screenDc);
+    return scaled;
+}
+
+} // namespace
+
+void drawBitmapFitCached(
+    HDC dc,
+    HBITMAP bitmap,
+    HBITMAP& scaledBitmap,
+    int& scaledWidth,
+    int& scaledHeight,
+    const RECT& target) {
+    if (!bitmap) {
+        return;
+    }
+
+    BITMAP info{};
+    if (GetObjectW(bitmap, sizeof(info), &info) != sizeof(info) || info.bmWidth <= 0 || info.bmHeight <= 0) {
+        return;
+    }
+
+    // Identical fit math to drawBitmapFit so cached and uncached paths place
+    // pixels at exactly the same position and size.
+    const int targetWidth = std::max(1, static_cast<int>(target.right - target.left));
+    const int targetHeight = std::max(1, static_cast<int>(target.bottom - target.top));
+    const double scale = std::min(
+        static_cast<double>(targetWidth) / static_cast<double>(info.bmWidth),
+        static_cast<double>(targetHeight) / static_cast<double>(info.bmHeight));
+    const int drawWidth = std::max(1, static_cast<int>(info.bmWidth * scale));
+    const int drawHeight = std::max(1, static_cast<int>(info.bmHeight * scale));
+    const int x = target.left + (targetWidth - drawWidth) / 2;
+    const int y = target.top + (targetHeight - drawHeight) / 2;
+
+    auto blitCached = [&]() -> bool {
+        HDC memoryDc = CreateCompatibleDC(dc);
+        if (!memoryDc) {
+            return false;
+        }
+        HGDIOBJ oldBitmap = SelectObject(memoryDc, scaledBitmap);
+        if (!oldBitmap) {
+            // Stale/invalid cached bitmap: fall through to drawBitmapFit
+            // instead of blitting from the DC's default 1x1 mono bitmap.
+            DeleteDC(memoryDc);
+            return false;
+        }
+        BitBlt(dc, x, y, drawWidth, drawHeight, memoryDc, 0, 0, SRCCOPY);
+        SelectObject(memoryDc, oldBitmap);
+        DeleteDC(memoryDc);
+        return true;
+    };
+
+    if (scaledBitmap && scaledWidth == drawWidth && scaledHeight == drawHeight) {
+        if (blitCached()) {
+            return;
+        }
+    } else if (HBITMAP scaled = scaleBitmapToSizeHalftone(bitmap, drawWidth, drawHeight)) {
+        if (scaledBitmap) {
+            DeleteObject(scaledBitmap);
+        }
+        scaledBitmap = scaled;
+        scaledWidth = drawWidth;
+        scaledHeight = drawHeight;
+        if (blitCached()) {
+            return;
+        }
+    }
+
+    // Cache unavailable or GDI failure: previous behavior, identical output.
+    drawBitmapFit(dc, bitmap, target);
 }
 
 int galleryItemHeightForWidth(int listWidth) {

@@ -409,6 +409,7 @@ void MainWindow::switchPage(Page page) {
     page_ = page;
     clearButtonHover();
     hoveredHelpControl_ = nullptr;
+    hoverStickyStatusHeight_ = 0;
     clipListWheelRemainder_ = 0;
     loadPageCache(page_);
 
@@ -496,6 +497,7 @@ void MainWindow::clearPageControls() {
     layoutItems_.clear();
     statusHelpTexts_.clear();
     hoveredHelpControl_ = nullptr;
+    hoverStickyStatusHeight_ = 0;
     clearButtonHover();
     saveSettingsButton_ = nullptr;
     startStopButton_ = nullptr;
@@ -615,6 +617,7 @@ void MainWindow::clearSettingsBodyControls() {
     layoutItems_ = std::move(keptLayout);
     statusHelpTexts_ = std::move(keptHelp);
     hoveredHelpControl_ = nullptr;
+    hoverStickyStatusHeight_ = 0;
     clearButtonHover();
 
     bitrateEdit_ = nullptr;

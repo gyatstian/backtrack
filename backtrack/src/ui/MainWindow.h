@@ -93,10 +93,24 @@ private:
         int windowHeight = 0;
         Kind kind = Kind::Content;
         bool sectionHeading = false;
+        // Last client-space rect applied to the control by layoutCurrentPage().
+        // Compared against the computed rect so wheel scrolling does not pay a
+        // GetWindowRect+MapWindowPoints round trip per control per tick. Lives
+        // inside LayoutItem so it is discarded together with the controls it
+        // describes whenever a page is rebuilt.
+        RECT placed{};
+        bool placedValid = false;
     };
 
     struct ClipThumbnail {
         HBITMAP bitmap = nullptr;
+        // Load-time mirrors of the matching thumbnailCache_ entry's tile copy
+        // (see ThumbnailCacheEntry::tileBitmap). Non-owning and not used for
+        // drawing: paint code resolves the owning entry directly so the tile
+        // cache is regenerated on exactly one owner.
+        HBITMAP tileBitmap = nullptr;
+        int tileWidth = 0;
+        int tileHeight = 0;
         bool loading = false;
         bool unavailable = false;
     };
@@ -105,6 +119,13 @@ private:
         std::filesystem::file_time_type modifiedTime{};
         uintmax_t bytes = 0;
         HBITMAP bitmap = nullptr;
+        // Pre-scaled copy at the size last shown in a Gallery tile. Scaling a
+        // 320x180 thumbnail with StretchBlt(HALFTONE) per tile per paint is
+        // expensive; scale once here, then plain BitBlt. Regenerated whenever
+        // the drawn size changes (window resize).
+        HBITMAP tileBitmap = nullptr;
+        int tileWidth = 0;
+        int tileHeight = 0;
         bool unavailable = false;
     };
 
@@ -334,6 +355,15 @@ private:
     HPEN outlinePen_ = nullptr;
     HPEN selectedOutlinePen_ = nullptr;
     HPEN tabActiveOutlinePen_ = nullptr;
+    // Cached pens/brushes for the sound-separation mute button icon, one per
+    // state (muted / normal / disabled). Previously created and deleted on
+    // every owner-draw paint.
+    HPEN muteIconPenMuted_ = nullptr;
+    HPEN muteIconPenNormal_ = nullptr;
+    HPEN muteIconPenDisabled_ = nullptr;
+    HBRUSH muteIconBrushMuted_ = nullptr;
+    HBRUSH muteIconBrushNormal_ = nullptr;
+    HBRUSH muteIconBrushDisabled_ = nullptr;
     Page page_ = Page::Capture;
     SettingsCategory settingsCategory_ = SettingsCategory::App;
     std::array<PageCache, 4> pageCaches_{};
@@ -432,6 +462,11 @@ private:
     std::filesystem::path clipDragPath_;
     std::wstring statusText_ = L"Ready";
     std::wstring displayedStatusText_;
+    // Status-bar height held onto while a help text is hovered. Moving the
+    // mouse across controls whose help texts wrap differently must not run a
+    // full window relayout per hover change: the height only grows while the
+    // hover session lasts and shrinks back when the pointer leaves.
+    int hoverStickyStatusHeight_ = 0;
     // Current audio-liveness warning (empty when healthy). Appended to the
     // status bar text by currentStatusDisplayText().
     std::wstring audioLivenessWarning_;

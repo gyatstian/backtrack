@@ -30,22 +30,6 @@ i dont use amd, some features might not work. dont expect much
 - Clips: `%USERPROFILE%\Videos\Backtrack`
 - Settings/logs: `%LOCALAPPDATA%\Backtrack`
 
-## for anyone that actually cares about the other things (ai generated, im not writing allat myself):
-## Features
-
-- **GPU-first pipeline** - Direct3D 11 textures stay on the GPU through capture and encode. No CPU-side image conversion or readback in the capture path.
-- **Dual capture backends** - Windows Graphics Capture (WGC) first, Desktop Duplication fallback, with automatic recovery on device/access loss.
-- **Vendor-aware hardware encoding** - NVIDIA NVENC (NVIDIA Video Codec SDK) or AMD AMF (Advanced Media Framework), auto-selected by GPU vendor. NVENC takes BGRA D3D11 textures; AMF takes NV12 converted by the fixed-function D3D11 video processor.
-- **H.264 and HEVC** output, with configurable bitrate, FPS, GOP, and full encoder tuning (preset, mode, lookahead, spatial/temporal AQ, multipass, B-frames, reference frames).
-- **Instant replay** - Encoded packets held in a ring buffer; save the last N seconds on a hotkey.
-- **Audio capture** - WASAPI system loopback plus microphone, per-device selection and volume, with optional per-application sound separation (mute specific apps out of the mix).
-- **Resolution scaling** - Native or fixed modes (240p through 4K) plus custom, scaled on the GPU.
-- **Multi-monitor** - Pick a monitor, or follow the focused/mouse monitor.
-- **GPU protection** - Adaptive frame-queue limits and idle-frame coalescing to prioritize game frame time.
-- **League of Legends kill reminder** - Polls the local Live Client Data API and flags kills for a replay reminder.
-- **Native MP4 muxing** via Windows Media Foundation.
-- **Native Win32 UI** with Capture, Library, Settings, and Diagnostics pages, clip management (rename, delete, favorite, gallery/list views, thumbnails), configurable hotkeys, system tray, and start-with-Windows support.
-
 ## Repository Layout
 
 ```text
@@ -64,9 +48,6 @@ backtrack/src/settings       Lightweight persisted settings
 backtrack/src/ui             Native Windows UI
 backtrack/src/Interface      NVENC headers and bundled AMD AMF headers
 backtrack/tests              Video timeline scheduler unit tests
-docs/architecture.md         Pipeline diagram and zero-copy notes
-docs/gpu-optimization.md     GPU protection and adaptive queue notes
-docs/profiling.md            Low-CPU profiling checklist
 ```
 
 ## Dependencies

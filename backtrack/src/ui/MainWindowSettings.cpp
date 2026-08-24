@@ -467,7 +467,22 @@ void MainWindow::applyStatusText(const std::wstring& status) {
     GetClientRect(window_, &client);
     const int contentWidth = std::max(1, static_cast<int>(client.right - client.left) - kOuterMargin * 2);
     const int previousHeight = statusHeightForText(contentWidth, displayedStatusText_);
-    const int nextHeight = statusHeightForText(contentWidth, status);
+    int nextHeight = statusHeightForText(contentWidth, status);
+
+    // Hover-driven help texts wrap to different heights; resizing (and thus a
+    // full relayout) on every hover change stutters while the mouse sweeps a
+    // column of controls. Keep the tallest height seen during this hover
+    // session instead: growing still happens immediately (so nothing clips),
+    // shrinking is deferred until the pointer leaves the help control.
+    if (hoveredHelpControl_) {
+        if (hoverStickyStatusHeight_ <= 0) {
+            hoverStickyStatusHeight_ = previousHeight;
+        }
+        nextHeight = std::max(nextHeight, hoverStickyStatusHeight_);
+        hoverStickyStatusHeight_ = nextHeight;
+    } else {
+        hoverStickyStatusHeight_ = 0;
+    }
 
     SetWindowTextW(status_, status.c_str());
     displayedStatusText_ = status;
@@ -479,7 +494,13 @@ void MainWindow::applyStatusText(const std::wstring& status) {
 }
 
 int MainWindow::statusHeightForWidth(int width) const {
-    return statusHeightForText(width, currentStatusDisplayText());
+    int height = statusHeightForText(width, currentStatusDisplayText());
+    // Keep other layout passes consistent with the sticky hover height so a
+    // resize mid-hover does not shrink the bar under the wrapped help text.
+    if (hoveredHelpControl_ && hoverStickyStatusHeight_ > 0) {
+        height = std::max(height, hoverStickyStatusHeight_);
+    }
+    return height;
 }
 
 std::wstring MainWindow::currentStatusDisplayText() const {

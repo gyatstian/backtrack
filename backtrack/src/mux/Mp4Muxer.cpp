@@ -639,7 +639,12 @@ std::filesystem::path Mp4Muxer::finalize() {
         inputs.videoPath = videoPath_;
         inputs.systemAudioPath = systemAudio_.writer.dataBytes() > 0 ? systemAudio_.writer.path() : std::filesystem::path();
         inputs.microphoneAudioPath = microphoneAudio_.writer.dataBytes() > 0 ? microphoneAudio_.writer.path() : std::filesystem::path();
-        inputs.videoSamples = videoSamples_;
+        // Transfer ownership instead of copying: the sample table scales with
+        // recording length and is only needed for this final mux pass. The
+        // muxer is inactive from here on, so nothing else reads videoSamples_.
+        inputs.videoSamples = std::move(videoSamples_);
+        videoSamples_.clear();
+        videoSamples_.shrink_to_fit();
         inputs.codec = settings_.codec;
         inputs.fps = settings_.fps;
         inputs.width = settings_.width;
@@ -725,6 +730,10 @@ void Mp4Muxer::abort() {
         systemAudio_.writer.close();
         microphoneAudio_.writer.close();
         pendingAudio_.clear();
+        // Release the per-recording sample table here too so an aborted
+        // recording does not pin its memory until the next startRecording().
+        videoSamples_.clear();
+        videoSamples_.shrink_to_fit();
     }
     if (!tempDirectory.empty()) {
         std::error_code cleanupError;

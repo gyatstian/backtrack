@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace backtrack {
@@ -27,12 +28,26 @@ public:
     bool addTag(const std::filesystem::path& path, const std::wstring& tag) const;
 
 private:
+    struct DurationCacheEntry {
+        uintmax_t bytes = 0;
+        std::filesystem::file_time_type modifiedTime{};
+        uint64_t duration100ns = 0;
+    };
+
     bool isManagedClipPath(const std::filesystem::path& path) const;
     std::filesystem::path favoriteMarker(const std::filesystem::path& path) const;
     std::filesystem::path tagFile(const std::filesystem::path& path) const;
     std::vector<std::wstring> readTags(const std::filesystem::path& path) const;
+    // Shell property reads are slow (per-file COM handler open), so durations
+    // are cached per file identity (size + modified time). listClips() runs on
+    // the UI thread only, so no locking is needed.
+    uint64_t cachedMediaDuration(
+        const std::filesystem::path& path,
+        uintmax_t bytes,
+        std::filesystem::file_time_type modifiedTime) const;
 
     std::filesystem::path directory_;
+    mutable std::unordered_map<std::wstring, DurationCacheEntry> durationCache_;
 };
 
 } // namespace backtrack

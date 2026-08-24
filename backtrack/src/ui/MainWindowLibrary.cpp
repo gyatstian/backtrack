@@ -48,6 +48,12 @@ void MainWindow::setLibraryViewMode(LibraryViewMode mode) {
     if (clipList_) {
         setListItemHeightIfChanged(clipList_, clipListItemHeight_, mode == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);
         refreshClips();
+        // Gallery placement moves controls directly without updating
+        // LayoutItem::placed; stale entries would make the next list layout
+        // believe the gallery geometry is already applied and skip the moves.
+        for (auto& item : layoutItems_) {
+            item.placedValid = false;
+        }
         layoutCurrentPage();
         InvalidateRect(clipList_, nullptr, FALSE);
     }
@@ -68,6 +74,9 @@ void MainWindow::releaseClipThumbnailCache() {
         if (entry.bitmap) {
             DeleteObject(entry.bitmap);
         }
+        if (entry.tileBitmap) {
+            DeleteObject(entry.tileBitmap);
+        }
     }
     thumbnailCache_.clear();
 }
@@ -87,16 +96,21 @@ void MainWindow::pruneClipThumbnailCache() {
         if (it->second.bitmap) {
             DeleteObject(it->second.bitmap);
         }
+        if (it->second.tileBitmap) {
+            DeleteObject(it->second.tileBitmap);
+        }
         it = thumbnailCache_.erase(it);
     }
 }
 
 void MainWindow::loadClipThumbnails() {
     clearClipThumbnails();
+    // Prune before the Gallery check so deleted/renamed clips release their
+    // cached bitmaps regardless of the active library view mode.
+    pruneClipThumbnailCache();
     if (libraryViewMode_ != LibraryViewMode::Gallery) {
         return;
     }
-    pruneClipThumbnailCache();
     clipThumbnails_.resize(clips_.size());
 
     std::deque<ThumbnailRequest> requests;
@@ -109,11 +123,17 @@ void MainWindow::loadClipThumbnails() {
             auto& entry = cache->second;
             if (entry.bytes == clip.bytes && entry.modifiedTime == clip.modifiedTime) {
                 clipThumbnails_[index].bitmap = entry.bitmap;
+                clipThumbnails_[index].tileBitmap = entry.tileBitmap;
+                clipThumbnails_[index].tileWidth = entry.tileWidth;
+                clipThumbnails_[index].tileHeight = entry.tileHeight;
                 clipThumbnails_[index].unavailable = entry.unavailable;
                 continue;
             }
             if (entry.bitmap) {
                 DeleteObject(entry.bitmap);
+            }
+            if (entry.tileBitmap) {
+                DeleteObject(entry.tileBitmap);
             }
             thumbnailCache_.erase(cache);
         }
@@ -270,6 +290,14 @@ void MainWindow::handleClipThumbnailReady(ThumbnailResult& result) {
     if (entry.bitmap && entry.bitmap != result.bitmap) {
         DeleteObject(entry.bitmap);
     }
+    if (entry.tileBitmap) {
+        // Tile copies are derived from the base bitmap; the new bitmap needs a
+        // fresh one at whatever size is drawn next.
+        DeleteObject(entry.tileBitmap);
+        entry.tileBitmap = nullptr;
+        entry.tileWidth = 0;
+        entry.tileHeight = 0;
+    }
     entry.modifiedTime = result.modifiedTime;
     entry.bytes = result.bytes;
     entry.bitmap = result.bitmap;
@@ -278,6 +306,9 @@ void MainWindow::handleClipThumbnailReady(ThumbnailResult& result) {
 
     auto& slot = clipThumbnails_[result.clipIndex];
     slot.bitmap = entry.bitmap;
+    slot.tileBitmap = entry.tileBitmap;
+    slot.tileWidth = entry.tileWidth;
+    slot.tileHeight = entry.tileHeight;
     slot.loading = false;
     slot.unavailable = entry.unavailable;
 

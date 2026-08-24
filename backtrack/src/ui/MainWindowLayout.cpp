@@ -223,21 +223,22 @@ bool MainWindow::layoutCurrentPage() {
         HWND control = nullptr;
         RECT rect{};
         int windowHeight = 0;
+        LayoutItem* source = nullptr;
     };
     std::vector<Placement> placements;
     int contentBottom = kLayoutPadding;
-    std::vector<const LayoutItem*> footers;
+    std::vector<LayoutItem*> footers;
 
     auto scaleValue = [](int value, int target, int source) {
         return source > 0 ? MulDiv(value, target, source) : value;
     };
-    auto addPlacement = [&](const LayoutItem& item, int x, int y, int width, int height) {
+    auto addPlacement = [&](LayoutItem& item, int x, int y, int width, int height) {
         RECT rect{x, y, x + width, y + height};
         const int windowHeight = item.windowHeight > 0 ? item.windowHeight : height;
-        placements.push_back(Placement{item.control, rect, windowHeight});
+        placements.push_back(Placement{item.control, rect, windowHeight, &item});
         contentBottom = std::max(contentBottom, static_cast<int>(rect.bottom));
     };
-    auto placeInColumn = [&](const LayoutItem& item, int group, int xOrigin, int columnWidth, int yOffset) {
+    auto placeInColumn = [&](LayoutItem& item, int group, int xOrigin, int columnWidth, int yOffset) {
         const Bounds& bounds = groups[group];
         const int itemLeft = static_cast<int>(item.design.left);
         const int itemTop = static_cast<int>(item.design.top);
@@ -257,11 +258,21 @@ bool MainWindow::layoutCurrentPage() {
         const int tabCount = static_cast<int>(settingsCategoryButtons_.size());
         const int totalGap = kSettingsCategoryTabGap * (tabCount - 1);
         const int tabWidth = std::max(1, (viewportWidth - kLayoutPadding * 2 - totalGap) / tabCount);
+        // Tabs are registered in layoutItems_ like any other control (they are
+        // merely excluded from content scaling), so reuse their placed cache
+        // instead of pushing an unconditional move on every layout tick.
+        auto placedCacheFor = [this](HWND control) -> LayoutItem* {
+            const auto found = std::find_if(
+                layoutItems_.begin(),
+                layoutItems_.end(),
+                [control](const LayoutItem& item) { return item.control == control; });
+            return found != layoutItems_.end() ? &*found : nullptr;
+        };
         int x = kLayoutPadding;
         for (HWND button : settingsCategoryButtons_) {
             if (button) {
                 RECT rect{x, kLayoutPadding, x + tabWidth, kLayoutPadding + kSettingsCategoryTabHeight};
-                placements.push_back(Placement{button, rect, kSettingsCategoryTabHeight});
+                placements.push_back(Placement{button, rect, kSettingsCategoryTabHeight, placedCacheFor(button)});
                 contentBottom = std::max(contentBottom, static_cast<int>(rect.bottom));
             }
             x += tabWidth + kSettingsCategoryTabGap;
@@ -270,7 +281,7 @@ bool MainWindow::layoutCurrentPage() {
 
     if (twoColumns) {
         const int columnWidth = std::max(80, (viewportWidth - kLayoutPadding * 2 - kLayoutColumnGap) / 2);
-        for (const auto& item : layoutItems_) {
+        for (auto& item : layoutItems_) {
             if (!item.control || isSettingsCategoryTab(item.control)) {
                 continue;
             }
@@ -298,7 +309,7 @@ bool MainWindow::layoutCurrentPage() {
             const int sourceHeight = std::max(1, bounds.bottom - bounds.top);
             int groupBottom = nextTop;
 
-            for (const auto& item : layoutItems_) {
+            for (auto& item : layoutItems_) {
                 if (!item.control ||
                     item.kind == LayoutItem::Kind::Footer ||
                     isSettingsCategoryTab(item.control) ||
@@ -320,7 +331,7 @@ bool MainWindow::layoutCurrentPage() {
             contentBottom = std::max(contentBottom, groupBottom);
         }
 
-        for (const auto& item : layoutItems_) {
+        for (auto& item : layoutItems_) {
             if (!item.control || isSettingsCategoryTab(item.control) || item.kind != LayoutItem::Kind::Footer) {
                 continue;
             }
@@ -408,23 +419,50 @@ bool MainWindow::layoutCurrentPage() {
     SetScrollInfo(pageHost_, SB_VERT, &scroll, TRUE);
     ShowScrollBar(pageHost_, SB_VERT, pageContentHeight_ > viewportHeight);
 
-    bool changed = false;
+    // Collect the moves that actually change a control's rect (comparing
+    // against the last-applied rect instead of querying GetWindowRect per
+    // control) and apply them in one deferred batch. Wheel scrolling calls
+    // this on every tick, so both halves matter.
+    std::vector<WindowMove> moves;
+    moves.reserve(placements.size() + footers.size());
     for (const auto& placement : placements) {
-        changed = moveWindowIfChanged(
-            placement.control,
-            placement.rect.left,
-            placement.rect.top - pageScrollY_,
-            placement.rect.right - placement.rect.left,
-            placement.windowHeight) || changed;
+        const int x = placement.rect.left;
+        const int y = placement.rect.top - pageScrollY_;
+        const int width = placement.rect.right - placement.rect.left;
+        const int height = placement.windowHeight;
+        LayoutItem* cached = placement.source;
+        if (cached &&
+            cached->placedValid &&
+            cached->placed.left == x &&
+            cached->placed.top == y &&
+            cached->placed.right - cached->placed.left == width &&
+            cached->placed.bottom - cached->placed.top == height) {
+            continue;
+        }
+        if (cached) {
+            cached->placed = RECT{x, y, x + width, y + height};
+            cached->placedValid = true;
+        }
+        moves.push_back(WindowMove{placement.control, x, y, width, height});
     }
-    for (const auto* footer : footers) {
+    for (auto* footer : footers) {
         const int designWidth = static_cast<int>(footer->design.right - footer->design.left);
         const int height = std::max(1, footer->windowHeight > 0
             ? footer->windowHeight
             : static_cast<int>(footer->design.bottom - footer->design.top));
         const int width = std::min(std::max(120, designWidth), std::max(1, viewportWidth - kLayoutPadding * 2));
         const int y = std::max(kLayoutPadding, viewportHeight - kLayoutPadding - height);
-        changed = moveWindowIfChanged(footer->control, kLayoutPadding, y, width, height) || changed;
+        const bool footerUnchanged =
+            footer->placedValid &&
+            footer->placed.left == kLayoutPadding &&
+            footer->placed.top == y &&
+            footer->placed.right - footer->placed.left == width &&
+            footer->placed.bottom - footer->placed.top == height;
+        if (!footerUnchanged) {
+            footer->placed = RECT{kLayoutPadding, y, kLayoutPadding + width, y + height};
+            footer->placedValid = true;
+            moves.push_back(WindowMove{footer->control, kLayoutPadding, y, width, height});
+        }
         // Sticky footer overlaps scrolled content; keep it above sibling controls
         // so its border/text is not clipped by controls drawn on top.
         if (footer->control && IsWindowVisible(footer->control)) {
@@ -432,6 +470,8 @@ bool MainWindow::layoutCurrentPage() {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
+
+    bool changed = applyWindowMoves(moves);
     if (changed) {
         InvalidateRect(pageHost_, nullptr, FALSE);
     }
@@ -450,7 +490,11 @@ void MainWindow::scrollPageTo(int position) {
     if (clamped != pageScrollY_) {
         pageScrollY_ = clamped;
         if (layoutCurrentPage()) {
-            redrawWindowAndChildren(pageHost_, true);
+            // No RDW_UPDATENOW here: scrolling arrives in rapid bursts (wheel,
+            // scrollbar drag) and a forced synchronous repaint per tick queues
+            // back-to-back full paints. Let WM_PAINT coalesce instead; one-shot
+            // callers such as tab switches keep their own synchronous redraw.
+            redrawWindowAndChildren(pageHost_, false);
         }
     }
 }

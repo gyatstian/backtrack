@@ -7,6 +7,7 @@
 #include <fstream>
 #include <propsys.h>
 #include <shobjidl.h>
+#include <unordered_set>
 #include <wrl/client.h>
 
 namespace backtrack {
@@ -18,8 +19,12 @@ constexpr PROPERTYKEY kPkeyMediaDuration = {
     3};
 
 uint64_t readMediaDuration(const std::filesystem::path& path) {
+    // Duration needs the MP4 property handler, which parses the moov atom and
+    // is therefore classified as a slow handler: GPS_FASTPROPERTIESONLY would
+    // skip it entirely and always report zero. Slowness is mitigated by
+    // cachedMediaDuration(), so only ask for best-effort values here.
     Microsoft::WRL::ComPtr<IPropertyStore> store;
-    if (FAILED(SHGetPropertyStoreFromParsingName(path.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(&store)))) {
+    if (FAILED(SHGetPropertyStoreFromParsingName(path.c_str(), nullptr, GPS_BESTEFFORT, IID_PPV_ARGS(&store)))) {
         return 0;
     }
 
@@ -137,6 +142,7 @@ void ClipManager::setDirectory(std::filesystem::path directory) {
 
 std::vector<ClipInfo> ClipManager::listClips() const {
     std::vector<ClipInfo> clips;
+    std::unordered_set<std::wstring> liveDurationKeys;
     std::error_code error;
     if (directory_.empty() || !std::filesystem::exists(directory_, error)) {
         if (error) {
@@ -181,10 +187,11 @@ std::vector<ClipInfo> ClipManager::listClips() const {
             if (info.bytes == 0) {
                 continue;
             }
-            info.duration100ns = readMediaDuration(path);
+            info.duration100ns = cachedMediaDuration(path, info.bytes, info.modifiedTime);
             info.favorite = std::filesystem::exists(favoriteMarker(path), error);
             error = {};
             info.tags = readTags(path);
+            liveDurationKeys.insert(normalizedPathText(path));
             clips.push_back(std::move(info));
         }
         if (error) {
@@ -200,6 +207,16 @@ std::vector<ClipInfo> ClipManager::listClips() const {
     }
     error = {};
 
+    // Drop cache entries for clips that no longer exist so the cache cannot
+    // grow without bound across deletions/renames.
+    for (auto it = durationCache_.begin(); it != durationCache_.end();) {
+        if (liveDurationKeys.contains(it->first)) {
+            ++it;
+        } else {
+            it = durationCache_.erase(it);
+        }
+    }
+
     std::sort(clips.begin(), clips.end(), [](const ClipInfo& left, const ClipInfo& right) {
         if (left.modifiedTime != right.modifiedTime) {
             return left.modifiedTime > right.modifiedTime;
@@ -207,6 +224,21 @@ std::vector<ClipInfo> ClipManager::listClips() const {
         return left.path.filename().wstring() > right.path.filename().wstring();
     });
     return clips;
+}
+
+uint64_t ClipManager::cachedMediaDuration(
+    const std::filesystem::path& path,
+    uintmax_t bytes,
+    std::filesystem::file_time_type modifiedTime) const {
+    const auto key = normalizedPathText(path);
+    if (const auto found = durationCache_.find(key); found != durationCache_.end()) {
+        if (found->second.bytes == bytes && found->second.modifiedTime == modifiedTime) {
+            return found->second.duration100ns;
+        }
+    }
+    const uint64_t duration = readMediaDuration(path);
+    durationCache_[key] = DurationCacheEntry{bytes, modifiedTime, duration};
+    return duration;
 }
 
 bool ClipManager::removeClip(const std::filesystem::path& path) const {

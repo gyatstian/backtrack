@@ -31,6 +31,11 @@ constexpr int kOpcodeClose = 2;
 constexpr int kMaxDiscordPipeIndex = 9;
 constexpr auto kReconnectInterval = std::chrono::seconds(5);
 constexpr auto kActivityUpdateInterval = std::chrono::seconds(15);
+// Inbound frames are small JSON documents (handshake replies, nonce acks).
+// The length field is read raw off the pipe; a corrupt or hostile value must
+// not be trusted to size an allocation. Frames larger than this were never
+// meaningful, so treat them as a lost connection instead of allocating.
+constexpr uint32_t kMaxInboundFrameBytes = 64 * 1024;
 
 std::string jsonEscape(const std::string& value) {
     std::string out;
@@ -308,6 +313,12 @@ bool DiscordRichPresence::drainInbox() {
         uint32_t length = 0;
         std::memcpy(&opcode, header, sizeof(opcode));
         std::memcpy(&length, header + 4, sizeof(length));
+
+        if (length > kMaxInboundFrameBytes) {
+            Logger::instance().warning(L"discord",
+                L"Discord IPC frame declares oversized length " + std::to_wstring(length) + L"; dropping connection");
+            return false;
+        }
 
         std::string payload(length, '\0');
         if (!payload.empty()) {

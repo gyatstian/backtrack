@@ -20,6 +20,21 @@ void redrawWindowAndChildren(HWND window, bool updateNow = false);
 bool moveWindowIfChanged(HWND control, int x, int y, int width, int height);
 bool showWindowIfHidden(HWND control);
 bool setListItemHeightIfChanged(HWND list, int& cachedHeight, int height);
+
+// One child-window reposition. Used with applyWindowMoves().
+struct WindowMove {
+    HWND control = nullptr;
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+// Applies a batch of moves in one DeferWindowPos sequence so relayouts cost
+// one layout pass instead of one internal layout per SetWindowPos. Falls back
+// to individual SetWindowPos calls if deferring fails; moves are idempotent,
+// so the fallback is always safe.
+bool applyWindowMoves(const std::vector<WindowMove>& moves);
 uint32_t readUIntControl(HWND control, uint32_t fallback);
 std::wstring bytesToText(uintmax_t bytes);
 bool isButtonId(WPARAM id);
@@ -55,6 +70,17 @@ std::wstring appNameFromPath(const std::filesystem::path& path);
 HICON loadExecutableIcon(const std::filesystem::path& path);
 HBITMAP loadShellThumbnail(const std::filesystem::path& path, int width, int height);
 void drawBitmapFit(HDC dc, HBITMAP bitmap, const RECT& target);
+// drawBitmapFit with a caller-owned cache of the scaled copy: the first call
+// for a given target size scales once (same HALFTONE mode as drawBitmapFit),
+// later calls with an unchanged size plain BitBlt the cached copy. On any GDI
+// failure it falls back to drawBitmapFit, so output is never worse.
+void drawBitmapFitCached(
+    HDC dc,
+    HBITMAP bitmap,
+    HBITMAP& scaledBitmap,
+    int& scaledWidth,
+    int& scaledHeight,
+    const RECT& target);
 int galleryItemHeightForWidth(int listWidth);
 bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height);
 

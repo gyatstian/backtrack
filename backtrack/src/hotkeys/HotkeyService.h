@@ -13,6 +13,11 @@ public:
     static constexpr int kStartStopId = 1001;
     static constexpr int kSaveReplayId = 1002;
 
+    HotkeyService() = default;
+    // The hook proc dereferences activeService_ on every keystroke, so a
+    // destroyed service must never leave the static pointing at it.
+    ~HotkeyService();
+
     bool registerHotkeys(HWND window, const HotkeySettings& settings);
     void unregisterHotkeys(HWND window);
     bool shouldHandleHotkeyMessage(int id, LPARAM lParam) const;

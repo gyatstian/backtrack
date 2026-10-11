@@ -311,6 +311,10 @@ void D3D11FrameScaler::applyVideoProcessorState(const VpState& state) {
 }
 
 void D3D11FrameScaler::releaseResources() {
+    // Every path into here destroys the output pool, including the failure
+    // paths, so the bump is unconditional: consumers watch poolGeneration()
+    // and drop the registrations they made against these textures.
+    ++poolGeneration_;
     inputViews_.clear();
     copiedInputView_.Reset();
     copiedInputTexture_.Reset();
@@ -335,6 +339,10 @@ void D3D11FrameScaler::reset() {
     releaseResources();
     useCopiedInput_ = false;
     nv12Unavailable_ = false;
+}
+
+uint64_t D3D11FrameScaler::poolGeneration() const {
+    return poolGeneration_;
 }
 
 void D3D11FrameScaler::setPoolSize(uint32_t poolSize) {

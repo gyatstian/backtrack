@@ -68,15 +68,19 @@ Application::Application()
 }
 
 int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
-    auto settings = settingsStore_.load();
-    settingsStore_.save(settings);
-
+    // Arbitrate before any settings I/O. save() is atomic, so it cannot damage
+    // the live file; the mutex is here because the losing launch must not load
+    // and save it at all - two processes normalizing the same file concurrently
+    // can still race on the swap.
     HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, kBacktrackSingleInstanceMutexName);
     if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
         requestExistingInstanceActivation();
         CloseHandle(instanceMutex);
         return 0;
     }
+
+    auto settings = settingsStore_.load();
+    settingsStore_.save(settings);
 
     Logger::instance().initialize(localAppDataPath() / L"logs" / L"backtrack.log");
     Logger::instance().setMinLevel(settings.logLevel);

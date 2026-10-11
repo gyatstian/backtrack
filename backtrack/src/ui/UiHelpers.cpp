@@ -2,6 +2,7 @@
 
 #include "core/Logger.h"
 #include "core/Types.h"
+#include "platform/Win32Util.h"
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -345,16 +346,6 @@ std::wstring readText(HWND control) {
     return value;
 }
 
-std::wstring trimText(std::wstring value) {
-    while (!value.empty() && iswspace(value.front())) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() && iswspace(value.back())) {
-        value.pop_back();
-    }
-    return value;
-}
-
 bool setText(HWND control, const std::wstring& value) {
     if (!control) {
         return false;
@@ -507,6 +498,7 @@ bool isButtonId(WPARAM id) {
            controlId == kFavoriteClipButtonId ||
            controlId == kClipListViewButtonId ||
            controlId == kClipGalleryViewButtonId ||
+           controlId == kOpenLogFolderButtonId ||
            controlId == kSaveLogButtonId ||
            controlId == kUpdateButtonId;
 }
@@ -549,6 +541,7 @@ bool isSettingsControlId(int controlId) {
     case kStartWithWindowsCheckId:
     case kPruneStaleMicrophoneConsentEntriesCheckId:
     case kExitToTrayCheckId:
+    case kCheckForUpdatesCheckId:
     case kNotificationSoundVolumeEditId:
     case kCustomNotificationSoundEditId:
     case kEncoderPresetComboId:
@@ -565,6 +558,7 @@ bool isSettingsControlId(int controlId) {
     case kBitrateEditId:
     case kCodecComboId:
     case kClipFolderEditId:
+    case kOrganizeClipsByGameCheckId:
     case kRecordHotkeyId:
     case kEncoderAdaptiveIFramesCheckId:
     case kEncoderZeroReorderDelayCheckId:
@@ -582,11 +576,13 @@ bool isSettingsControlId(int controlId) {
     case kReplayEnabledId:
     case kReplaySecondsEditId:
     case kReplayDiskBackedCheckId:
+    case kReplayDiskBackedAudioCheckId:
     case kReplayRingDirEditId:
     case kReplayHotkeyId:
     case kLeagueKillReminderCheckId:
     case kVoiceCommandComboId:
     case kDiscordRichPresenceComboId:
+    case kDiscordPresenceTimerComboId:
     case kSoundSeparationEnabledCheckId:
     case kAutoRecordEnabledCheckId:
         return true;
@@ -660,37 +656,6 @@ bool isModifierKey(WPARAM key) {
     return key == VK_CONTROL || key == VK_LCONTROL || key == VK_RCONTROL ||
            key == VK_MENU || key == VK_LMENU || key == VK_RMENU ||
            key == VK_SHIFT || key == VK_LSHIFT || key == VK_RSHIFT;
-}
-
-bool isSafeBareHotkey(uint32_t virtualKey) {
-    return (virtualKey >= VK_F1 && virtualKey <= VK_F24) ||
-           virtualKey == VK_PAUSE ||
-           virtualKey == VK_SNAPSHOT ||
-           virtualKey == VK_MEDIA_PLAY_PAUSE ||
-           virtualKey == VK_MEDIA_STOP ||
-           virtualKey == VK_MEDIA_NEXT_TRACK ||
-           virtualKey == VK_MEDIA_PREV_TRACK;
-}
-
-uint32_t supportedHotkeyModifiers(uint32_t modifiers) {
-    return modifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT);
-}
-
-bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey) {
-    if (virtualKey == 0) {
-        return true;
-    }
-    if (virtualKey > 0xfe) {
-        return false;
-    }
-    modifiers = supportedHotkeyModifiers(modifiers);
-    if (modifiers == 0) {
-        return isSafeBareHotkey(virtualKey);
-    }
-    if (isSafeBareHotkey(virtualKey)) {
-        return true;
-    }
-    return (modifiers & (MOD_CONTROL | MOD_ALT)) != 0;
 }
 
 uint32_t currentModifierState() {
@@ -1014,15 +979,6 @@ std::wstring thumbnailCacheKey(const std::filesystem::path& path) {
     return value;
 }
 
-std::wstring executableKey(const std::filesystem::path& path) {
-    std::wstring value = path.wstring();
-    std::replace(value.begin(), value.end(), L'/', L'\\');
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(towlower(ch));
-    });
-    return value;
-}
-
 std::wstring appNameFromPath(const std::filesystem::path& path) {
     std::wstring name = path.stem().wstring();
     return name.empty() ? path.filename().wstring() : name;
@@ -1249,38 +1205,6 @@ int galleryItemHeightForWidth(int listWidth) {
     const int tileWidth = std::max(1, (listWidth - gap * (kGalleryClipColumns + 1)) / kGalleryClipColumns);
     const int previewHeight = std::max(96, tileWidth * 9 / 16);
     return std::max(kGalleryClipMinimumItemHeight, verticalPadding + previewHeight + textHeight);
-}
-
-bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height) {
-    switch (mode) {
-    case ResolutionMode::P240:
-        width = 426;
-        height = 240;
-        return true;
-    case ResolutionMode::P480:
-        width = 854;
-        height = 480;
-        return true;
-    case ResolutionMode::P720:
-        width = 1280;
-        height = 720;
-        return true;
-    case ResolutionMode::P1080:
-        width = 1920;
-        height = 1080;
-        return true;
-    case ResolutionMode::P2K:
-        width = 2560;
-        height = 1440;
-        return true;
-    case ResolutionMode::P4K:
-        width = 3840;
-        height = 2160;
-        return true;
-    case ResolutionMode::Custom:
-        break;
-    }
-    return false;
 }
 
 ScopedRedrawLock::ScopedRedrawLock(HWND window)

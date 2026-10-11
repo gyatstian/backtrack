@@ -95,12 +95,15 @@ void MainWindow::rebindPageControlPointers() {
     codecCombo_ = nullptr;
     recordHotkey_ = nullptr;
     clipFolderEdit_ = nullptr;
+    organizeClipsByGameCheck_ = nullptr;
     replayEnabledCheck_ = nullptr;
     replaySecondsEdit_ = nullptr;
     replayDiskBackedCheck_ = nullptr;
+    replayDiskBackedAudioCheck_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
+    discordPresenceTimerCombo_ = nullptr;
     statsLabel_ = nullptr;
     capsLabel_ = nullptr;
     diagnosticLogLabel_ = nullptr;
@@ -109,6 +112,7 @@ void MainWindow::rebindPageControlPointers() {
     galleryViewButton_ = nullptr;
     settingsCategoryButtons_.clear();
     renameEdit_ = nullptr;
+    renameEditButton_ = nullptr;
     fpsEdit_ = nullptr;
     resolutionModeCombo_ = nullptr;
     widthEdit_ = nullptr;
@@ -130,6 +134,7 @@ void MainWindow::rebindPageControlPointers() {
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
+    checkForUpdatesCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
     customNotificationSoundEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
@@ -158,6 +163,7 @@ void MainWindow::rebindPageControlPointers() {
     soundSeparationManualButton_ = nullptr;
     voiceCommandCombo_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
+    discordPresenceTimerCombo_ = nullptr;
     autoRecordEnabledCheck_ = nullptr;
     autoRecordAppCombo_ = nullptr;
     autoRecordRefreshButton_ = nullptr;
@@ -177,12 +183,14 @@ void MainWindow::rebindPageControlPointers() {
     replayEnabledCheck_ = child(kReplayEnabledId);
     replaySecondsEdit_ = child(kReplaySecondsEditId);
     replayDiskBackedCheck_ = child(kReplayDiskBackedCheckId);
+    replayDiskBackedAudioCheck_ = child(kReplayDiskBackedAudioCheckId);
     replayRingDirEdit_ = child(kReplayRingDirEditId);
     replayHotkey_ = child(kReplayHotkeyId);
     saveSettingsButton_ = child(kSaveSettingsButtonId);
     bitrateEdit_ = child(kBitrateEditId);
     codecCombo_ = child(kCodecComboId);
     clipFolderEdit_ = child(kClipFolderEditId);
+    organizeClipsByGameCheck_ = child(kOrganizeClipsByGameCheckId);
     fpsEdit_ = child(kFpsEditId);
     resolutionModeCombo_ = child(kResolutionModeComboId);
     widthEdit_ = child(kWidthEditId);
@@ -204,6 +212,7 @@ void MainWindow::rebindPageControlPointers() {
     startWithWindowsCheck_ = child(kStartWithWindowsCheckId);
     pruneStaleMicrophoneConsentEntriesCheck_ = child(kPruneStaleMicrophoneConsentEntriesCheckId);
     exitToTrayCheck_ = child(kExitToTrayCheckId);
+    checkForUpdatesCheck_ = child(kCheckForUpdatesCheckId);
     notificationSoundVolumeEdit_ = child(kNotificationSoundVolumeEditId);
     customNotificationSoundEdit_ = child(kCustomNotificationSoundEditId);
     encoderPresetCombo_ = child(kEncoderPresetComboId);
@@ -233,6 +242,7 @@ void MainWindow::rebindPageControlPointers() {
     leagueKillReminderCheck_ = child(kLeagueKillReminderCheckId);
     voiceCommandCombo_ = child(kVoiceCommandComboId);
     discordRichPresenceCombo_ = child(kDiscordRichPresenceComboId);
+    discordPresenceTimerCombo_ = child(kDiscordPresenceTimerComboId);
     autoRecordEnabledCheck_ = child(kAutoRecordEnabledCheckId);
     autoRecordAppCombo_ = child(kAutoRecordAppComboId);
     autoRecordRefreshButton_ = child(kAutoRecordRefreshButtonId);
@@ -244,6 +254,7 @@ void MainWindow::rebindPageControlPointers() {
     listViewButton_ = child(kClipListViewButtonId);
     galleryViewButton_ = child(kClipGalleryViewButtonId);
     renameEdit_ = child(kRenameEditId);
+    renameEditButton_ = child(kRenameClipButtonId);
 
     for (int index = 0; index < kSettingsCategoryCount; ++index) {
         HWND button = child(kSettingsCategoryButtonBaseId + index);
@@ -326,7 +337,6 @@ void MainWindow::updateTabChrome() {
         if (!button) {
             continue;
         }
-        const bool selected = index == static_cast<size_t>(page_);
         const bool dirtySettings = settingsDirty_ && index == static_cast<size_t>(Page::Settings);
         std::wstring label;
         switch (static_cast<Page>(index)) {
@@ -346,7 +356,6 @@ void MainWindow::updateTabChrome() {
         setText(button, label);
         EnableWindow(button, TRUE);
         InvalidateRect(button, nullptr, FALSE);
-        (void)selected;
     }
 }
 
@@ -511,13 +520,16 @@ void MainWindow::clearPageControls() {
     codecCombo_ = nullptr;
     recordHotkey_ = nullptr;
     clipFolderEdit_ = nullptr;
+    organizeClipsByGameCheck_ = nullptr;
     replayEnabledCheck_ = nullptr;
     replaySecondsEdit_ = nullptr;
     replayDiskBackedCheck_ = nullptr;
+    replayDiskBackedAudioCheck_ = nullptr;
     replayRingDirEdit_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
+    discordPresenceTimerCombo_ = nullptr;
     statsLabel_ = nullptr;
     capsLabel_ = nullptr;
     diagnosticLogLabel_ = nullptr;
@@ -526,6 +538,7 @@ void MainWindow::clearPageControls() {
     galleryViewButton_ = nullptr;
     settingsCategoryButtons_.clear();
     renameEdit_ = nullptr;
+    renameEditButton_ = nullptr;
     selectedClipIndex_ = static_cast<size_t>(-1);
     fpsEdit_ = nullptr;
     resolutionModeCombo_ = nullptr;
@@ -548,6 +561,7 @@ void MainWindow::clearPageControls() {
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
+    checkForUpdatesCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
     customNotificationSoundEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
@@ -633,6 +647,7 @@ void MainWindow::clearSettingsBodyControls() {
     bitrateEdit_ = nullptr;
     codecCombo_ = nullptr;
     clipFolderEdit_ = nullptr;
+    organizeClipsByGameCheck_ = nullptr;
     // Replay-family controls belong to category bodies (disk-backed toggle and
     // ring folder live on Capture, voice commands on Game integrations). They
     // were missing here, so after leaving such a category the pointers stayed
@@ -643,11 +658,13 @@ void MainWindow::clearSettingsBodyControls() {
     replayEnabledCheck_ = nullptr;
     replaySecondsEdit_ = nullptr;
     replayDiskBackedCheck_ = nullptr;
+    replayDiskBackedAudioCheck_ = nullptr;
     replayRingDirEdit_ = nullptr;
     replayHotkey_ = nullptr;
     voiceCommandCombo_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
+    discordPresenceTimerCombo_ = nullptr;
     fpsEdit_ = nullptr;
     resolutionModeCombo_ = nullptr;
     widthEdit_ = nullptr;
@@ -669,6 +686,7 @@ void MainWindow::clearSettingsBodyControls() {
     startWithWindowsCheck_ = nullptr;
     pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     exitToTrayCheck_ = nullptr;
+    checkForUpdatesCheck_ = nullptr;
     notificationSoundVolumeEdit_ = nullptr;
     customNotificationSoundEdit_ = nullptr;
     encoderPresetCombo_ = nullptr;
@@ -904,6 +922,11 @@ void MainWindow::buildSettingsAppPage() {
     addRowHelp(exitToTrayLabel, exitToTrayCheck_, L"Closing the window hides Backtrack in the tray instead of shutting down recording and replay services.");
     y += kRowHeight;
 
+    HWND updatesLabel = addRowLabel(L"Updates");
+    checkForUpdatesCheck_ = addControl(L"BUTTON", L"Check for updates on startup", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kControlWidth, 24, kCheckForUpdatesCheckId);
+    SendMessageW(checkForUpdatesCheck_, BM_SETCHECK, settings_.checkForUpdates ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(updatesLabel, checkForUpdatesCheck_, L"Once per launch, asks GitHub for the newest Backtrack release and offers it from the tray. Turn off to stop Backtrack making that request at all.");
+    y += kRowHeight;
 }
 
 void MainWindow::buildSettingsVideoPage() {
@@ -1181,6 +1204,11 @@ void MainWindow::buildSettingsCapturePage() {
     addControl(L"BUTTON", L"Browse", BS_PUSHBUTTON | WS_TABSTOP, kControlX + kWideControlWidth + 12, y - 2, 88, 30, kBrowseClipFolderButtonId);
     addRowHelp(clipFolderLabel, clipFolderEdit_, L"Folder where finished clips are written. Pick a fast drive; slow disks can stall saving large replays while the file is finalized.");
     y += kRowHeight;
+    HWND gameFoldersLabel = addRowLabel(L"Game folders");
+    organizeClipsByGameCheck_ = addControl(L"BUTTON", L"Save each game in its own folder", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kWideControlWidth, 24, kOrganizeClipsByGameCheckId);
+    SendMessageW(organizeClipsByGameCheck_, BM_SETCHECK, settings_.organizeClipsByGame ? BST_CHECKED : BST_UNCHECKED, 0);
+    addRowHelp(gameFoldersLabel, organizeClipsByGameCheck_, L"When on, each replay is saved inside a folder named after the game it was clipped from; the folder is created when missing. When off, all clips land directly in the clip folder above.");
+    y += kRowHeight;
     HWND captureMethodLabel = addRowLabel(L"Capture method");
     captureMethodCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kCaptureMethodComboId);
     SendMessageW(captureMethodCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"WGC"));
@@ -1196,19 +1224,30 @@ void MainWindow::buildSettingsCapturePage() {
         L"Screen capture backend. WGC (Windows Graphics Capture) is the modern API and supports zero-copy frames into the encoder. DXGI (Desktop Duplication) is the legacy path, sometimes lighter on old systems but must copy every frame. Recommended: WGC; Backtrack falls back automatically if the selected backend fails to start.");
     y += kRowHeight;
     HWND diskBackedLabel = addRowLabel(L"Buffer on disk");
-    replayDiskBackedCheck_ = addControl(L"BUTTON", L"Keep replay video in a disk ring instead of RAM", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, kWideControlWidth, 24, kReplayDiskBackedCheckId);
+    replayDiskBackedCheck_ = addControl(L"BUTTON", L"Video", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX, y, 140, 24, kReplayDiskBackedCheckId);
     SendMessageW(replayDiskBackedCheck_, BM_SETCHECK, settings_.replay.diskBackedVideo ? BST_CHECKED : BST_UNCHECKED, 0);
-    addRowHelp(diskBackedLabel, replayDiskBackedCheck_,
-        L"Stores encoded replay video in a fixed-size ring file instead of system memory. "
-        L"Cuts buffer memory usage to almost zero; audio stays in memory. Changing this clears the current replay buffer. "
-        L"Pick the folder below to keep the continuous writes off a game drive, e.g. on an SSD.");
+    replayDiskBackedAudioCheck_ = addControl(L"BUTTON", L"Sound", BS_AUTOCHECKBOX | WS_TABSTOP, kControlX + 150, y, 140, 24, kReplayDiskBackedAudioCheckId);
+    SendMessageW(replayDiskBackedAudioCheck_, BM_SETCHECK, settings_.replay.diskBackedAudio ? BST_CHECKED : BST_UNCHECKED, 0);
+    // The checkboxes reflect the settings, which stay on across a fallback, so say
+    // so here rather than letting a ticked box imply the track is on disk.
+    std::wstring diskBackedHelp =
+        L"Stores encoded replay video and/or sound in fixed-size ring files instead of system memory. "
+        L"Cuts replay buffer memory usage to almost zero. Changing a checkbox clears that track's buffered replay. "
+        L"Changing the buffer length below does not. "
+        L"Pick the folder below to keep the continuous writes off a game drive, e.g. on an SSD. "
+        L"If the folder cannot be used, that track falls back to memory and the Diagnostics page says so.";
+    if (const std::wstring fallback = trimText(controller_.replayStorageFallback()); !fallback.empty()) {
+        diskBackedHelp += L"  Currently: " + fallback;
+    }
+    addRowHelp(diskBackedLabel, replayDiskBackedCheck_, diskBackedHelp);
+    addStatusHelp(replayDiskBackedAudioCheck_, diskBackedHelp);
     y += kRowHeight;
-    if (settings_.replay.diskBackedVideo) {
+    if (settings_.replay.diskBackedVideo || settings_.replay.diskBackedAudio) {
         HWND ringDirLabel = addRowLabel(L"Buffer folder");
         replayRingDirEdit_ = addControl(L"EDIT", settings_.replayRingDirectory.wstring().c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kControlX, y, kWideControlWidth - 100, 24, kReplayRingDirEditId);
         addControl(L"BUTTON", L"Browse", BS_PUSHBUTTON | WS_TABSTOP, kControlX + kWideControlWidth - 88, y - 2, 88, 30, kBrowseRingDirButtonId);
         addRowHelp(ringDirLabel, replayRingDirEdit_,
-            L"Where the ring file lives while this option is enabled. Leave empty to follow the clip library folder "
+            L"Where the ring files live while either option above is enabled. Leave empty to follow the clip library folder "
             L"(currently " + settings_.clipDirectory.wstring() + L"). "
             L"A fast SSD is recommended when gaming on an HDD; avoid cloud-synced folders. Changing it clears the current replay buffer.");
         y += kRowHeight;
@@ -1397,7 +1436,7 @@ void MainWindow::buildSettingsAudioPage() {
         88,
         30,
         kSoundSeparationRefreshButtonId);
-    addSettingHelp(soundSeparationRefreshButton_, 0, 0, L"Scans audio sessions and visible running apps, then updates the app list.");
+    addStatusHelp(soundSeparationRefreshButton_, L"Scans audio sessions and visible running apps, then updates the app list.");
     soundSeparationManualButton_ = addControl(
         L"BUTTON",
         L"Manual",
@@ -1407,7 +1446,7 @@ void MainWindow::buildSettingsAudioPage() {
         88,
         30,
         kSoundSeparationManualButtonId);
-    addSettingHelp(soundSeparationManualButton_, 0, 0, L"Select an executable manually when the app is not currently producing audio.");
+    addStatusHelp(soundSeparationManualButton_, L"Select an executable manually when the app is not currently producing audio.");
     y += kRowHeight;
 
     addRowLabel(L"Selected apps");
@@ -1512,6 +1551,31 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         discordRichPresenceCombo_,
         L"Shows \"Clipping <game>\" on Discord with a button leading to the github repo.");
     y += kRowHeight;
+    if (settings_.gameIntegrations.discordRichPresence !=
+        GameIntegrationSettings::DiscordRichPresenceMode::Off) {
+        HWND presenceTimerLabel = addRowLabel(L"Elapsed timer");
+        discordPresenceTimerCombo_ = addControl(
+            WC_COMBOBOXW,
+            L"",
+            CBS_DROPDOWNLIST | WS_TABSTOP,
+            kControlX,
+            y,
+            kControlWidth,
+            120,
+            kDiscordPresenceTimerComboId);
+        SendMessageW(discordPresenceTimerCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Reset timer on app switch"));
+        SendMessageW(discordPresenceTimerCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Keep timer running"));
+        SendMessageW(
+            discordPresenceTimerCombo_,
+            CB_SETCURSEL,
+            settings_.gameIntegrations.discordRichPresenceResetTimerOnSwitch ? 0 : 1,
+            0);
+        addRowHelp(
+            presenceTimerLabel,
+            discordPresenceTimerCombo_,
+            L"Whether the Discord elapsed timer restarts when the foreground app changes. Reset starts it over on every switch; Keep lets one timer run until Rich presence is turned off.");
+        y += kRowHeight;
+    }
     finishSection();
 
     addSection(L"Auto record");
@@ -1555,7 +1619,7 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         88,
         30,
         kAutoRecordRefreshButtonId);
-    addSettingHelp(autoRecordRefreshButton_, 0, 0, L"Scans visible running apps, then updates the app list.");
+    addStatusHelp(autoRecordRefreshButton_, L"Scans visible running apps, then updates the app list.");
     autoRecordManualButton_ = addControl(
         L"BUTTON",
         L"Manual",
@@ -1565,7 +1629,7 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         88,
         30,
         kAutoRecordManualButtonId);
-    addSettingHelp(autoRecordManualButton_, 0, 0, L"Select an executable manually when the app is not currently running.");
+    addStatusHelp(autoRecordManualButton_, L"Select an executable manually when the app is not currently running.");
     y += kRowHeight;
 
     addRowLabel(L"Selected apps");
@@ -1670,6 +1734,8 @@ void MainWindow::buildClipsPage() {
     listViewButton_ = addControl(L"BUTTON", L"List", BS_PUSHBUTTON | WS_TABSTOP, 628, 76, 76, 28, kClipListViewButtonId);
     galleryViewButton_ = addControl(L"BUTTON", L"Gallery", BS_PUSHBUTTON | WS_TABSTOP, 712, 76, 76, 28, kClipGalleryViewButtonId);
     clipList_ = addControl(L"LISTBOX", L"", WS_BORDER | LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP, 44, 112, 780, 370, kClipListId);
+    renameEdit_ = addControl(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 44, 508, 340, 24, kRenameEditId);
+    renameEditButton_ = addControl(L"BUTTON", L"Rename", BS_PUSHBUTTON | WS_TABSTOP, 392, 506, 86, 28, kRenameClipButtonId);
     setListItemHeightIfChanged(clipList_, clipListItemHeight_, libraryViewMode_ == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);
     if (clipList_) {
         SetWindowSubclass(clipList_, clipListSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));

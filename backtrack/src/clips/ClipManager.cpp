@@ -201,11 +201,36 @@ std::vector<ClipInfo> ClipManager::listClips() const {
     };
 
     appendDirectoryClips(directory_);
-    const auto organizedDirectory = directory_ / L"clips";
-    if (std::filesystem::is_directory(organizedDirectory, error)) {
-        appendDirectoryClips(organizedDirectory);
+    // Per-game subfolders (and the legacy clips/ directory): one level deep,
+    // skipping dot-directories like .backtrack_tmp whose staged .publish.mp4
+    // files are not finished clips.
+    std::filesystem::directory_iterator rootIterator(directory_, error);
+    const std::filesystem::directory_iterator rootEnd;
+    if (error) {
+        Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        error = {};
+    } else {
+        for (; rootIterator != rootEnd; rootIterator.increment(error)) {
+            if (error) {
+                error = {};
+                continue;
+            }
+            const auto& entry = *rootIterator;
+            const std::wstring fileName = entry.path().filename().wstring();
+            if (fileName.empty() || fileName.front() == L'.') {
+                continue;
+            }
+            if (!entry.is_directory(error) || error) {
+                error = {};
+                continue;
+            }
+            appendDirectoryClips(entry.path());
+        }
+        if (error) {
+            Logger::instance().warning(L"clips", L"Could not finish enumerating clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            error = {};
+        }
     }
-    error = {};
 
     // Drop cache entries for clips that no longer exist so the cache cannot
     // grow without bound across deletions/renames.

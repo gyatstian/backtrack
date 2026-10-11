@@ -7,10 +7,12 @@
 #include <dxgi1_6.h>
 #include <shlobj.h>
 #include <timeapi.h>
+#include <winver.h>
 #include <wrl/client.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cwchar>
 #include <cwctype>
 #include <iomanip>
 #include <sstream>
@@ -167,14 +169,61 @@ std::wstring processImagePath(DWORD processId) {
     return buffer;
 }
 
-std::wstring trimText(std::wstring value) {
-    while (!value.empty() && iswspace(value.front())) {
-        value.erase(value.begin());
+// Chromium forks often keep the upstream executable name (chrome.exe) while
+// branding the version resource (FileDescription "Helium"), so the exe stem
+// misnames them. Prefer the version resource's friendly name when present.
+std::wstring versionResourceString(const BYTE* versionData, WORD language, WORD codePage,
+    const wchar_t* valueName) {
+    wchar_t subBlock[128]{};
+    std::swprintf(subBlock, _countof(subBlock), L"\\StringFileInfo\\%04x%04x\\%s",
+        language, codePage, valueName);
+    LPVOID value = nullptr;
+    UINT length = 0;
+    if (!VerQueryValueW(versionData, subBlock, &value, &length) || !value || length == 0) {
+        return {};
     }
-    while (!value.empty() && iswspace(value.back())) {
-        value.pop_back();
+    const auto* text = static_cast<const wchar_t*>(value);
+    return trimText(std::wstring(text, wcsnlen(text, length)));
+}
+
+std::wstring friendlyNameForImagePath(const std::wstring& imagePath) {
+    if (imagePath.empty()) {
+        return {};
     }
-    return value;
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(imagePath.c_str(), &ignored);
+    if (size == 0 || size > 1024 * 1024) {
+        return {};
+    }
+    std::vector<BYTE> versionData(size);
+    if (!GetFileVersionInfoW(imagePath.c_str(), 0, size, versionData.data())) {
+        return {};
+    }
+    WORD language = 0x0409;
+    WORD codePage = 0x04B0;
+    struct LangAndCodePage {
+        WORD language;
+        WORD codePage;
+    };
+    LPVOID translation = nullptr;
+    UINT translationBytes = 0;
+    if (VerQueryValueW(versionData.data(), L"\\VarFileInfo\\Translation",
+            &translation, &translationBytes) &&
+        translation && translationBytes >= sizeof(LangAndCodePage)) {
+        const auto* first = static_cast<const LangAndCodePage*>(translation);
+        language = first->language;
+        codePage = first->codePage;
+    }
+    for (const wchar_t* valueName : {L"FileDescription", L"ProductName"}) {
+        std::wstring name = versionResourceString(versionData.data(), language, codePage, valueName);
+        if (name.empty() && (language != 0x0409 || codePage != 0x04B0)) {
+            name = versionResourceString(versionData.data(), 0x0409, 0x04B0, valueName);
+        }
+        if (!name.empty()) {
+            return name;
+        }
+    }
+    return {};
 }
 
 // Windows reserves these device names in every directory; creating a file
@@ -270,7 +319,11 @@ std::wstring foregroundApplicationName() {
         return {};
     }
 
-    std::wstring name = std::filesystem::path(processImagePath(processId)).stem().wstring();
+    const std::wstring imagePath = processImagePath(processId);
+    std::wstring name = friendlyNameForImagePath(imagePath);
+    if (name.empty() && !imagePath.empty()) {
+        name = std::filesystem::path(imagePath).stem().wstring();
+    }
     if (name.empty()) {
         const int titleLength = GetWindowTextLengthW(foreground);
         if (titleLength > 0) {
@@ -430,10 +483,6 @@ std::wstring moduleFilePath() {
     }
     buffer.resize(size);
     return buffer;
-}
-
-std::wstring moduleDirectory() {
-    return std::filesystem::path(moduleFilePath()).parent_path().wstring();
 }
 
 bool updateWindowsStartupRegistration(bool enabled) {

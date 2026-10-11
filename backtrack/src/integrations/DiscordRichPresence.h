@@ -23,9 +23,8 @@ public:
     DiscordRichPresence(const DiscordRichPresence&) = delete;
     DiscordRichPresence& operator=(const DiscordRichPresence&) = delete;
 
-    void start(GameIntegrationSettings::DiscordRichPresenceMode mode);
+    void start(GameIntegrationSettings::DiscordRichPresenceMode mode, bool resetTimerOnSwitch);
     void stop();
-    bool running() const;
 
 private:
     void workerLoop();
@@ -34,14 +33,14 @@ private:
     bool handshake();
     bool sendFrame(int opcode, const std::string& payload);
     bool drainInbox();
-    bool updateActivity(const std::string& gameName);
+    bool updateActivity(const std::string& gameName, long long startUnixSeconds);
 
     mutable std::mutex mutex_;
     std::thread worker_;
     std::atomic<bool> stopRequested_{false};
-    std::atomic<bool> running_{false};
     std::atomic<GameIntegrationSettings::DiscordRichPresenceMode> mode_{
         GameIntegrationSettings::DiscordRichPresenceMode::Off};
+    std::atomic<bool> resetTimerOnSwitch_{true};
     void* pipe_ = nullptr;
 };
 

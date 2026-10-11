@@ -53,6 +53,9 @@ BOOL WINAPI consoleCtrlHandler(DWORD controlType) {
     case CTRL_SHUTDOWN_EVENT:
     case CTRL_LOGOFF_EVENT:
         backtrack::WasapiCapture::emergencyRestoreSessionMutes();
+        // Console control events terminate through the default handler, which
+        // does not run Logger's destructor. Flush so buffered lines survive.
+        backtrack::Logger::instance().flush();
         break;
     default:
         break;

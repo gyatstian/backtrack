@@ -250,7 +250,6 @@ struct AmfEncoder::Impl {
     struct PendingInput {
         amf::AMFSurfacePtr surface;
         std::shared_ptr<void> lease;
-        ComPtr<ID3D11Texture2D> texture;
         int64_t fallbackPts100ns = 0;
         int64_t fallbackDuration100ns = 0;
         std::chrono::steady_clock::time_point submittedAt;
@@ -871,10 +870,10 @@ struct AmfEncoder::Impl {
     // Prepends cached parameter sets to a keyframe packet that lacks them so
     // every replay cut point is self-contained (see cachedParameterSets).
     void ensureKeyFrameCarriesHeaders(EncodedPacket& packet) {
-        if (bitstreamContainsParameterSets(settings.codec, packet.bytes)) {
+        if (!packet.keyFrame || bitstreamContainsParameterSets(settings.codec, packet.bytes)) {
             return;
         }
-        if (!packet.keyFrame || cachedParameterSets.empty()) {
+        if (cachedParameterSets.empty()) {
             return;
         }
         std::vector<uint8_t> withHeaders;
@@ -1179,7 +1178,6 @@ struct AmfEncoder::Impl {
         PendingInput pending;
         pending.surface = surface;
         pending.lease = frame.lease;
-        pending.texture = frame.texture;
         pending.fallbackPts100ns = frame.pts100ns;
         pending.fallbackDuration100ns = duration100ns;
         pending.submittedAt = start;
@@ -1338,6 +1336,9 @@ bool AmfEncoder::initialize(D3DDevice& device, const VideoSettings& settings) {
     impl_->consecutiveSubmitFailures = 0;
     const bool initialized = impl_->initializeEncoder(device.device(), device.adapterName());
     if (!initialized) {
+        // RecorderController's own failure line carries no reason, so this is the
+        // only place the actionable detail reaches the log.
+        Logger::instance().error(L"encoder", impl_->caps.detail);
         impl_->shutdownEncoder();
     }
     return initialized;

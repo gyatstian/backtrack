@@ -146,6 +146,8 @@ bool MainWindow::layoutCurrentPage() {
         move(GetDlgItem(pageHost_, kRefreshClipsButtonId), actionsLeft + (actionButtonWidth + actionGap) * 2, yTitle - 2, actionButtonWidth, controlHeight);
         move(listViewButton_, viewButtonsLeft, yTitle - 2, buttonWidth, controlHeight);
         move(galleryViewButton_, kLayoutPadding + contentWidth - buttonWidth, yTitle - 2, buttonWidth, controlHeight);
+        move(renameEditButton_, kLayoutPadding + contentWidth - buttonWidth, yToolbar - 2, buttonWidth, controlHeight);
+        move(renameEdit_, kLayoutPadding, yToolbar, contentWidth - buttonWidth - actionGap, controlHeight);
 
         listChanged = setListItemHeightIfChanged(clipList_, clipListItemHeight_, galleryItemHeight);
         move(clipList_, kLayoutPadding, listTop, listWidth, listHeight);
@@ -289,7 +291,7 @@ bool MainWindow::layoutCurrentPage() {
                 footers.push_back(&item);
                 continue;
             }
-            const int group = item.kind == LayoutItem::Kind::Footer ? 0 : groupFor(item.design);
+            const int group = groupFor(item.design);
             placeInColumn(
                 item,
                 group,

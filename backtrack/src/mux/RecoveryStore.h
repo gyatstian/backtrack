@@ -14,6 +14,11 @@ namespace RecoveryStore {
 // the same file.
 inline constexpr wchar_t kRecoveryManifestName[] = L"recovery.tsv";
 
+// Forces a written file's cached bytes out to the medium before a rename
+// publishes it. Shared with the muxer's staged MP4 publish; win32Error carries
+// the Win32 reason so a sharing violation stays distinguishable from a full disk.
+bool flushFileToDisk(const std::filesystem::path& path, DWORD& win32Error);
+
 // Writes the complete manifest (header, sample count, all sample lines) used
 // for post-failure recovery.
 bool writeManifest(const MuxedInputs& inputs, const std::filesystem::path& tempDirectory);

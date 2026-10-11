@@ -280,6 +280,14 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             markSettingsDirty();
             return 0;
         }
+        if (controlId == kDiscordRichPresenceComboId && notification == CBN_SELCHANGE) {
+            // The elapsed-timer row only exists while presence is on; the
+            // rebuild reveals or removes it exactly like multi-monitor does.
+            stashVisibleSettings();
+            rebuildSettingsCategoryBody();
+            markSettingsDirty();
+            return 0;
+        }
         if (controlId == kMultiMonitorSupportCheckId && notification == BN_CLICKED) {
             stashVisibleSettings();
             rebuildSettingsCategoryBody();
@@ -312,7 +320,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             removeSoundSeparationApp(soundSeparationIndexFromButtonId(controlId, kSoundSeparationRemoveButtonBaseId));
             return 0;
         }
-        if (controlId == kReplayDiskBackedCheckId && notification == BN_CLICKED) {
+        if ((controlId == kReplayDiskBackedCheckId || controlId == kReplayDiskBackedAudioCheckId) && notification == BN_CLICKED) {
             // The ring-folder row only exists while the toggle is on; the
             // rebuild reveals or removes it exactly like multi-monitor does.
             stashVisibleSettings();
@@ -404,6 +412,11 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                     settings_.logLevel = static_cast<LogLevel>(selection);
                     Logger::instance().setMinLevel(settings_.logLevel);
                     settingsStore_.save(settings_);
+                    // Same immediate-save contract as the Library view buttons:
+                    // the write is the save, so it becomes the dirty-check
+                    // baseline. Without this the tab stays dirty forever for a
+                    // value already on disk.
+                    savedSettings_ = settings_;
                     Logger::instance().info(L"ui", std::wstring(L"Log level changed to ") + logLevelName(settings_.logLevel));
                     setStatus(std::wstring(L"Log level: ") + logLevelName(settings_.logLevel));
                 }
@@ -836,9 +849,6 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
     if (libraryViewMode_ == LibraryViewMode::Gallery && !emptyState) {
         FillRect(item.hDC, &item.rcItem, editBrush_);
 
-        const int rowWidth = std::max(1, static_cast<int>(item.rcItem.right - item.rcItem.left));
-        const int gap = 8;
-        const int tileWidth = std::max(1, (rowWidth - gap * (kGalleryClipColumns + 1)) / kGalleryClipColumns);
         for (int column = 0; column < kGalleryClipColumns; ++column) {
             const size_t clipIndex = static_cast<size_t>(item.itemID) * kGalleryClipColumns + static_cast<size_t>(column);
             if (clipIndex >= clips_.size()) {
@@ -846,12 +856,7 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             }
 
             const auto& clip = clips_[clipIndex];
-            RECT tile{
-                item.rcItem.left + gap + column * (tileWidth + gap),
-                item.rcItem.top + gap,
-                item.rcItem.left + gap + column * (tileWidth + gap) + tileWidth,
-                item.rcItem.bottom - gap,
-            };
+            const RECT tile = galleryTileRect(item.rcItem, column);
             const bool selected = selectedClipIndex_ == clipIndex || ((item.itemState & ODS_SELECTED) != 0 && selectedClipIndex_ >= clips_.size() && column == 0);
             const COLORREF text = clip.favorite ? kFavoriteText : kText;
 

@@ -59,11 +59,11 @@ bool nalUnitIsParameterSet(VideoCodec codec, const uint8_t* header) {
 }
 
 // Walks every NAL unit and invokes the predicate with a pointer to the NAL
-// header byte(s). Handles both Annex B start-code framing and length-prefixed
-// framing; stops at the first predicate hit.
+// header byte(s). Both hardware backends emit Annex B start-code framing and
+// no other caller exists, so that is the only framing; stops at the first
+// predicate hit.
 template <typename Predicate>
 bool scanNalUnits(VideoCodec codec, const std::vector<uint8_t>& bytes, Predicate&& predicate) {
-    // Annex B pass.
     for (size_t offset = 0; offset + 3 <= bytes.size(); ++offset) {
         const size_t startCodeSize = annexBStartCodeSize(bytes, offset);
         if (startCodeSize == 0) {
@@ -74,23 +74,6 @@ bool scanNalUnits(VideoCodec codec, const std::vector<uint8_t>& bytes, Predicate
             return true;
         }
         offset = nalOffset;
-    }
-    // Length-prefixed pass.
-    size_t offset = 0;
-    while (offset + 4 <= bytes.size()) {
-        const uint32_t nalSize =
-            (static_cast<uint32_t>(bytes[offset]) << 24) |
-            (static_cast<uint32_t>(bytes[offset + 1]) << 16) |
-            (static_cast<uint32_t>(bytes[offset + 2]) << 8) |
-            static_cast<uint32_t>(bytes[offset + 3]);
-        const size_t nalOffset = offset + 4;
-        if (nalSize == 0 || nalSize > bytes.size() - nalOffset) {
-            break;
-        }
-        if (predicate(bytes.data() + nalOffset)) {
-            return true;
-        }
-        offset = nalOffset + nalSize;
     }
     return false;
 }
@@ -153,6 +136,14 @@ bool extractParameterSets(
                 break;
             }
             ++end;
+        }
+        if (end + 3 > bytes.size()) {
+            // The scan can only stop on a start code, which needs a third byte
+            // to prove itself, so a NAL running to the last byte leaves `end`
+            // short of it. The result is cached as the replay's codec header
+            // and prepended to every cut, so those 2 missing bytes would be a
+            // PPS stripped of its trailing bits on an undecodable first frame.
+            end = bytes.size();
         }
         if (nalUnitIsParameterSet(codec, bytes.data() + nalOffset)) {
             out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset),

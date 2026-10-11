@@ -107,8 +107,10 @@ void Logger::writeLine(const std::wstring& text) {
         recentLines_.pop_front();
     }
     if (stream_.is_open()) {
+        // No per-line flush: it holds the global mutex across a disk write, so log
+        // spam stalls the capture and encode threads. Lines reach disk when the
+        // stream buffer fills, on Logger::flush(), or when the process exits.
         stream_ << wideToUtf8(text);
-        stream_.flush();
     }
     OutputDebugStringW(text.c_str());
 }
@@ -134,11 +136,16 @@ void Logger::write(LogLevel level, const wchar_t* subsystem, const std::wstring&
     constexpr size_t kMaxPerWindow = 3;
 
     const auto now = std::chrono::steady_clock::now();
-    const bool throttleable = level != LogLevel::Error && minLevel_ > LogLevel::Debug;
+    // Gate on level only. A minLevel_ condition here made the default Debug
+    // configuration skip throttling entirely, so hot loops were never collapsed.
+    const bool throttleable = level != LogLevel::Error;
 
     if (throttleable) {
         // Bound memory: messages with embedded values (PIDs, dimensions) create
         // distinct keys, so prune entries whose window has long since expired.
+        // shortcut: 512 is a prune trigger, not a hard cap, so a burst of
+        // distinct messages can exceed it until their windows age out; raise it if
+        // that ever matters, the map holds one small RateState per live text.
         constexpr size_t kMaxRateEntries = 512;
         if (rateStates_.size() > kMaxRateEntries) {
             for (auto it = rateStates_.begin(); it != rateStates_.end();) {

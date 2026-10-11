@@ -139,10 +139,11 @@ struct VideoSettings {
 struct ReplaySettings {
     uint32_t seconds = 120;
     bool enabled = true;
-    // Opt-in: buffer encoded video packets in a fixed-capacity on-disk ring
-    // file instead of process RAM. Audio stays memory-resident. When false
-    // the replay buffer behaves exactly as before.
+    // Opt-in: buffer encoded replay video and/or sound in fixed-capacity
+    // on-disk ring files instead of process RAM. When false the replay buffer
+    // behaves exactly as before.
     bool diskBackedVideo = false;
+    bool diskBackedAudio = false;
     bool operator==(const ReplaySettings&) const = default;
 };
 
@@ -179,6 +180,10 @@ struct GameIntegrationSettings {
     bool leagueOfLegendsKillReminder = false;
     VoiceCommandMode voiceCommand = VoiceCommandMode::Disabled;
     DiscordRichPresenceMode discordRichPresence = DiscordRichPresenceMode::Off;
+    // Elapsed-timer policy for the Discord activity: reset the start timestamp
+    // on every foreground-app switch (previous behavior) or keep one running
+    // timer for the whole presence session.
+    bool discordRichPresenceResetTimerOnSwitch = true;
     bool operator==(const GameIntegrationSettings&) const = default;
 };
 
@@ -189,6 +194,10 @@ struct AppSettings {
     HotkeySettings hotkeys;
     GameIntegrationSettings gameIntegrations;
     std::filesystem::path clipDirectory;
+    // When true, each replay is saved inside a folder named after the game it
+    // was clipped from (created when missing) instead of directly in
+    // clipDirectory. Manual recordings always stay in clipDirectory.
+    bool organizeClipsByGame = false;
     CaptureBackend preferredCaptureBackend = CaptureBackend::WindowsGraphicsCapture;
     bool captureMicrophone = true;
     bool captureSystemAudio = true;
@@ -223,13 +232,16 @@ struct AppSettings {
         bool operator==(const AutoRecordApp&) const = default;
     };
     std::vector<AutoRecordApp> autoRecordApps;
-    // Optional override for where the disk-backed replay ring file lives.
+    // Optional override for where the disk-backed replay ring files live.
     // Empty = next to the clip library (clipDirectory). Useful to keep the
     // continuous ring writes off a game HDD, e.g. on an SSD.
     std::filesystem::path replayRingDirectory;
     bool startWithWindowsMinimized = false;
     bool pruneStaleMicrophoneConsentEntries = false;
     bool exitToTray = false;
+    // Asks GitHub for the latest release once per launch. Default on keeps the
+    // existing update prompt; turning it off stops the outbound request.
+    bool checkForUpdates = true;
     uint32_t notificationSoundVolumePercent = 100;
     // Empty = built-in success tone. Used when a replay saves successfully.
     std::filesystem::path customNotificationSoundPath;
@@ -352,6 +364,9 @@ struct RecordingStats {
     uint64_t coalescedIdleIntervals = 0;
     uint64_t droppedFrames = 0;
     uint64_t gpuProtectionDrops = 0;
+    // Frames the encode queue refused because it was full (encoder
+    // backpressure), not because of the GPU-protection heuristic.
+    uint64_t frameQueueDrops = 0;
     uint64_t idleFrameSkips = 0;
     uint64_t cursorOnlyFrames = 0;
     uint64_t systemAudioQueueDrops = 0;

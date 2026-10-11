@@ -4,7 +4,9 @@
 #include <avrt.h>
 #include <dxgi.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cwctype>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -83,7 +85,6 @@ HANDLE createHighResolutionWaitableTimer();
 // false if the timer was unusable (caller should fall back).
 bool waitHighResolution(HANDLE timer, uint32_t timeoutMs);
 std::wstring moduleFilePath();
-std::wstring moduleDirectory();
 bool updateWindowsStartupRegistration(bool enabled);
 void pruneStaleMicrophoneConsentEntries();
 HMONITOR monitorFromIndex(uint32_t index);
@@ -106,5 +107,33 @@ bool dxgiAdapterSupportsHardwareEncode(uint32_t adapterIndex);
 // Returns preferred adapter when it can encode, otherwise first supported one.
 uint32_t dxgiHardwareEncoderAdapterOr(uint32_t preferredAdapterIndex);
 UINT backtrackActivationMessage();
+
+// Strips leading and trailing whitespace. Inline rather than exported:
+// SettingsClipGuardTests links SettingsStore.cpp without Win32Util.cpp (DXGI,
+// avrt, winmm), and an out-of-line definition would drag that in for a one-liner.
+inline std::wstring trimText(std::wstring value) {
+    while (!value.empty() && iswspace(value.front())) {
+        value.erase(value.begin());
+    }
+    while (!value.empty() && iswspace(value.back())) {
+        value.pop_back();
+    }
+    return value;
+}
+
+// Case- and separator-insensitive executable path key. The sound-separation
+// mute list is keyed by it on both sides - WasapiCapture keys the live session,
+// RecorderController and the UI key the user's request - so those keys must
+// match. Changing what this normalizes silently stops muting, with no error
+// logged. Do not "improve" it (env expansion, 8.3 names) without changing every
+// key at once.
+inline std::wstring normalizedPathKey(const std::filesystem::path& path) {
+    std::wstring value = path.wstring();
+    std::replace(value.begin(), value.end(), L'/', L'\\');
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towlower(ch));
+    });
+    return value;
+}
 
 } // namespace backtrack

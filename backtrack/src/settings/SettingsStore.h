@@ -20,6 +20,13 @@ private:
 };
 
 AppSettings sanitizeSettings(AppSettings settings);
+
+// Hotkey safety is defined here, not in the UI, because sanitizeSettings is the
+// authority: the UI must reject exactly the hotkeys a load would reset.
+uint32_t supportedHotkeyModifiers(uint32_t modifiers);
+bool isSafeBareHotkey(uint32_t virtualKey);
+bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey);
+
 const wchar_t* codecName(VideoCodec codec);
 VideoCodec codecFromName(const std::wstring& value);
 const wchar_t* resolutionModeName(ResolutionMode mode);

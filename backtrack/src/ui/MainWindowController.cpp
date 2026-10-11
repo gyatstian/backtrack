@@ -83,7 +83,9 @@ void MainWindow::updateGameIntegrations() {
     }
     if (current.gameIntegrations.discordRichPresence !=
         GameIntegrationSettings::DiscordRichPresenceMode::Off) {
-        discordRichPresence_.start(current.gameIntegrations.discordRichPresence);
+        discordRichPresence_.start(
+            current.gameIntegrations.discordRichPresence,
+            current.gameIntegrations.discordRichPresenceResetTimerOnSwitch);
     } else {
         discordRichPresence_.stop();
     }
@@ -120,10 +122,10 @@ std::optional<std::wstring> MainWindow::runningAutoRecordAppName() const {
     std::unordered_set<std::wstring> keys;
     keys.reserve(settings_.autoRecordApps.size());
     for (const auto& app : settings_.autoRecordApps) {
-        keys.insert(executableKey(app.executablePath));
+        keys.insert(normalizedPathKey(app.executablePath));
     }
     for (const auto& open : WasapiCapture::enumerateOpenApps()) {
-        if (keys.contains(executableKey(open.executablePath))) {
+        if (keys.contains(normalizedPathKey(open.executablePath))) {
             return open.name.empty() ? std::optional<std::wstring>(appNameFromPath(open.executablePath))
                                      : std::optional<std::wstring>(open.name);
         }

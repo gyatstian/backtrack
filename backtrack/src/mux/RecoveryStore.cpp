@@ -86,17 +86,46 @@ bool parseUInt32Strict(const std::string& text, uint32_t& value) {
     return true;
 }
 
-// Forces cached file data out to the medium so a rename published right after
-// cannot point at bytes still sitting in volatile cache during a power loss.
-bool flushFileToDisk(const std::filesystem::path& path) {
-    const HANDLE handle = CreateFileW(
-        path.c_str(), FILE_WRITE_DATA, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return false;
+// Bounded retry budget for the two publishes that can lose a race with
+// antivirus or the search indexer: the staged MP4 and the recovery manifest.
+// Both files are written and flushed to disk by then, so a sharing violation is
+// transient and waiting out the scanner's handle is the whole fix. One quick
+// retry was too thin against it: four attempts over roughly two seconds with
+// growing backoff.
+constexpr int kPublishAttempts = 4;
+constexpr std::chrono::milliseconds kPublishBackoffMs[] = {
+    std::chrono::milliseconds(300),
+    std::chrono::milliseconds(600),
+    std::chrono::milliseconds(1200)};
+
+// Retrying the manifest publish is what keeps a scanner from costing the user a
+// complete recording: saveTo has already verified every elementary-stream write
+// by this point, so a lost race over recovery.tsv must not be reported as a
+// write failure. Any other error is left alone - a full disk or a denied folder
+// will not clear, and the caller needs to see it as a genuine write failure.
+bool publishWithRetry(const std::filesystem::path& source, const std::filesystem::path& destination) {
+    for (int attempt = 1;; ++attempt) {
+        if (MoveFileExW(
+                source.c_str(),
+                destination.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            return true;
+        }
+        const DWORD error = GetLastError();
+        // ERROR_ACCESS_DENIED is the one a held-open destination actually
+        // produces: MoveFileExW reports 5 here, not ERROR_SHARING_VIOLATION, and
+        // only with FILE_SHARE_DELETE absent on the holder. Retrying without it
+        // meant this budget never engaged for the scanner race it exists for.
+        // A genuinely denied folder also returns 5 and now costs the full
+        // backoff before failing, which is the price of not special-casing it.
+        if (attempt >= kPublishAttempts ||
+            (error != ERROR_SHARING_VIOLATION &&
+             error != ERROR_LOCK_VIOLATION &&
+             error != ERROR_ACCESS_DENIED)) {
+            return false;
+        }
+        std::this_thread::sleep_for(kPublishBackoffMs[attempt - 1]);
     }
-    const bool flushed = FlushFileBuffers(handle);
-    CloseHandle(handle);
-    return flushed;
 }
 
 std::filesystem::path uniqueRecoveredOutputPath(const std::filesystem::path& clipDirectory, const std::wstring& stem) {
@@ -313,6 +342,25 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
 
 } // namespace
 
+// Forces cached file data out to the medium so a rename published right after
+// cannot point at bytes still sitting in volatile cache during a power loss.
+// win32Error distinguishes a sharing violation (a scanner holds the file) from
+// a full disk or a denied write; callers retry the first and surface the rest.
+bool flushFileToDisk(const std::filesystem::path& path, DWORD& win32Error) {
+    const HANDLE handle = CreateFileW(
+        path.c_str(), FILE_WRITE_DATA, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        win32Error = GetLastError();
+        return false;
+    }
+    const bool flushed = FlushFileBuffers(handle);
+    if (!flushed) {
+        win32Error = GetLastError();
+    }
+    CloseHandle(handle);
+    return flushed;
+}
+
 void writeManifestHeader(std::ostream& stream, const MuxedInputs& partialInputs) {
     stream << "backtrack-recovery-v1\n";
     stream << "codec\t" << codecText(partialInputs.codec) << "\n";
@@ -382,16 +430,16 @@ bool writeManifest(const MuxedInputs& inputs, const std::filesystem::path& tempD
         }
     }
 
-    if (!flushFileToDisk(tempPath)) {
-        Logger::instance().warning(L"mux", L"Could not flush recording recovery manifest: " + tempPath.wstring());
+    DWORD flushError = ERROR_SUCCESS;
+    if (!flushFileToDisk(tempPath, flushError)) {
+        Logger::instance().warning(L"mux",
+            L"Could not flush recording recovery manifest: " + tempPath.wstring() +
+            L" (Win32 error " + std::to_wstring(flushError) + L")");
         std::error_code removeError;
         std::filesystem::remove(tempPath, removeError);
         return false;
     }
-    if (!MoveFileExW(
-            tempPath.c_str(),
-            manifestPath.c_str(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    if (!publishWithRetry(tempPath, manifestPath)) {
         Logger::instance().warning(L"mux",
             L"Could not publish recording recovery manifest: " + manifestPath.wstring() +
             L" (Win32 error " + std::to_wstring(GetLastError()) + L")");
@@ -440,17 +488,8 @@ bool muxToMp4WithRetry(
     const MuxedInputs& inputs,
     const std::filesystem::path& outputPath,
     std::wstring* errorDetail) {
-    // Antivirus scanners and search indexers routinely hold a freshly written
-    // file open for one to two seconds, which fails the staging-file creation
-    // or the final publish with ERROR_SHARING_VIOLATION. One quick retry was
-    // too thin against that. Bounded budget: four attempts over roughly two
-    // seconds with growing backoff.
-    constexpr int kMaxAttempts = 4;
-    constexpr std::chrono::milliseconds kBackoffMs[] = {
-        std::chrono::milliseconds(300),
-        std::chrono::milliseconds(600),
-        std::chrono::milliseconds(1200)};
-
+    // Same budget as the manifest publish (kPublishAttempts): a scanner holding
+    // the staged name routinely releases it within a second or two.
     std::wstring lastDetail;
     unsigned stagingVariant = 0;
     for (int attempt = 1;; ++attempt) {
@@ -458,7 +497,7 @@ bool muxToMp4WithRetry(
         if (Mp4Muxer::muxToMp4(inputs, outputPath, &lastDetail, stagingVariant, &win32Error)) {
             return true;
         }
-        if (attempt >= kMaxAttempts) {
+        if (attempt >= kPublishAttempts) {
             break;
         }
 
@@ -472,9 +511,10 @@ bool muxToMp4WithRetry(
         }
         Logger::instance().warning(L"mux",
             L"Native MP4 mux failed on attempt " + std::to_wstring(attempt) + L"/" +
-            std::to_wstring(kMaxAttempts) + L"; retrying in " +
-            std::to_wstring(kBackoffMs[attempt - 1].count()) + L"ms: " + outputPath.wstring());
-        std::this_thread::sleep_for(kBackoffMs[attempt - 1]);
+            std::to_wstring(kPublishAttempts) + L"; retrying in " +
+            std::to_wstring(kPublishBackoffMs[attempt - 1].count()) + L"ms: " +
+            outputPath.wstring());
+        std::this_thread::sleep_for(kPublishBackoffMs[attempt - 1]);
     }
 
     if (errorDetail) {

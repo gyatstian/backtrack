@@ -120,6 +120,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     if (exitToTrayCheck_) {
         target.exitToTray = SendMessageW(exitToTrayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
+    if (checkForUpdatesCheck_) {
+        target.checkForUpdates = SendMessageW(checkForUpdatesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
     if (notificationSoundVolumeEdit_) {
         target.notificationSoundVolumePercent =
             readUIntControl(notificationSoundVolumeEdit_, target.notificationSoundVolumePercent);
@@ -219,8 +222,42 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.replay.diskBackedVideo =
             SendMessageW(replayDiskBackedCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
+    if (replayDiskBackedAudioCheck_) {
+        target.replay.diskBackedAudio =
+            SendMessageW(replayDiskBackedAudioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
     if (replayRingDirEdit_) {
-        target.replayRingDirectory = trimText(readText(replayRingDirEdit_));
+        const auto folder = trimText(readText(replayRingDirEdit_));
+        // Validated like clipDirectory, and for the same reason: an unusable
+        // ring folder otherwise reaches ReplayBuffer::openRingLocked, which
+        // degrades to RAM buffering and leaves the checkbox looking healthy.
+        // Only checked while the feature is on - unchecking it tears this row
+        // down, and failing a save over a folder that is about to be unused
+        // would be wrong. The path is always stored, so re-checking restores it.
+        if (!folder.empty() && (target.replay.diskBackedVideo || target.replay.diskBackedAudio)) {
+            // Dirty detection re-reads this per keystroke and only compares
+            // values, so the filesystem check belongs to the save path alone.
+            if (allowFilesystemEffects) {
+                std::error_code folderError;
+                const std::filesystem::path folderPath(folder);
+                if (std::filesystem::exists(folderPath, folderError) && !std::filesystem::is_directory(folderPath, folderError)) {
+                    setStatus(L"Replay buffer folder must be a folder, not a file");
+                    return false;
+                }
+                if (folderError) {
+                    setStatus(L"Replay buffer folder could not be checked");
+                    return false;
+                }
+                // Create it now so the first encode push does not discover an
+                // unwritable location after the session is already running.
+                std::filesystem::create_directories(folderPath, folderError);
+                if (folderError) {
+                    setStatus(L"Replay buffer folder could not be created");
+                    return false;
+                }
+            }
+        }
+        target.replayRingDirectory = folder;
     }
     if (leagueKillReminderCheck_) {
         target.gameIntegrations.leagueOfLegendsKillReminder =
@@ -244,6 +281,12 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
                 static_cast<GameIntegrationSettings::DiscordRichPresenceMode>(selected);
         }
     }
+    if (discordPresenceTimerCombo_) {
+        const LRESULT selected = SendMessageW(discordPresenceTimerCombo_, CB_GETCURSEL, 0, 0);
+        if (selected == 0 || selected == 1) {
+            target.gameIntegrations.discordRichPresenceResetTimerOnSwitch = (selected == 0);
+        }
+    }
     if (soundSeparationEnabledCheck_) {
         target.soundSeparationEnabled = SendMessageW(soundSeparationEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
@@ -257,32 +300,35 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     }
     if (clipFolderEdit_) {
         const auto folder = trimText(readText(clipFolderEdit_));
+        // Stored even when empty, like the ring folder, so clearing the box is
+        // a visible edit; sanitizeSettings turns the empty value back into
+        // defaultClipDirectory() on save.
         if (!folder.empty()) {
-            std::error_code folderError;
-            const std::filesystem::path folderPath(folder);
-            if (std::filesystem::exists(folderPath, folderError) && !std::filesystem::is_directory(folderPath, folderError)) {
-                setStatus(L"Clip folder must be a folder, not a file");
-                return false;
-            }
-            if (folderError) {
-                if (allowFilesystemEffects) {
+            // Same as the ring folder above: the dirty pass only compares the
+            // text, so it must not stat the path on every keystroke.
+            if (allowFilesystemEffects) {
+                std::error_code folderError;
+                const std::filesystem::path folderPath(folder);
+                if (std::filesystem::exists(folderPath, folderError) && !std::filesystem::is_directory(folderPath, folderError)) {
+                    setStatus(L"Clip folder must be a folder, not a file");
+                    return false;
+                }
+                if (folderError) {
                     setStatus(L"Clip folder could not be checked");
                     return false;
                 }
-                // During dirty-detection we only compare values; a transient
-                // stat failure should not block the diff. Accept the text.
-                target.clipDirectory = folder;
-            } else {
-                if (allowFilesystemEffects) {
-                    std::filesystem::create_directories(folderPath, folderError);
-                    if (folderError) {
-                        setStatus(L"Clip folder could not be created");
-                        return false;
-                    }
+                std::filesystem::create_directories(folderPath, folderError);
+                if (folderError) {
+                    setStatus(L"Clip folder could not be created");
+                    return false;
                 }
-                target.clipDirectory = folder;
             }
         }
+        target.clipDirectory = folder;
+    }
+    if (organizeClipsByGameCheck_) {
+        target.organizeClipsByGame =
+            SendMessageW(organizeClipsByGameCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     target.libraryGalleryView = libraryViewMode_ == LibraryViewMode::Gallery;
     return true;
@@ -427,12 +473,6 @@ bool MainWindow::promptSaveSettingsIfDirty(bool allowCancel) {
     return false;
 }
 
-void MainWindow::addSettingHelp(HWND control, int x, int y, const std::wstring& text) {
-    (void)x;
-    (void)y;
-    addStatusHelp(control, text);
-}
-
 void MainWindow::addStatusHelp(HWND control, const std::wstring& text) {
     if (control && !text.empty()) {
         statusHelpTexts_[control] = text;
@@ -555,39 +595,6 @@ int MainWindow::statusHeightForText(int width, const std::wstring& text) const {
     return std::max(kStatusMinHeight, static_cast<int>(rect.bottom - rect.top) + 8);
 }
 
-void MainWindow::updateResolutionControls() {
-    if (!resolutionModeCombo_) {
-        return;
-    }
-
-    const auto selected = SendMessageW(resolutionModeCombo_, CB_GETCURSEL, 0, 0);
-    // Monitor entries (selected >= preset count) are resolution shortcuts that
-    // persist as Custom, so treat anything outside the preset range as Custom.
-    const ResolutionMode mode =
-        selected >= 0 && selected <= static_cast<LRESULT>(ResolutionMode::Custom)
-            ? static_cast<ResolutionMode>(selected)
-            : ResolutionMode::Custom;
-
-    uint32_t presetWidth = 0;
-    uint32_t presetHeight = 0;
-    if (resolutionPresetSize(mode, presetWidth, presetHeight)) {
-        setText(widthEdit_, std::to_wstring(presetWidth));
-        setText(heightEdit_, std::to_wstring(presetHeight));
-    }
-
-    const bool followFocusedMonitor =
-        followFocusedMonitorCheck_ && SendMessageW(followFocusedMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    if (followMouseMonitorCheck_) {
-        EnableWindow(followMouseMonitorCheck_, followFocusedMonitor ? TRUE : FALSE);
-        if (!followFocusedMonitor) {
-            SendMessageW(followMouseMonitorCheck_, BM_SETCHECK, BST_UNCHECKED, 0);
-        }
-    }
-    const BOOL editableSize = (mode == ResolutionMode::Custom) ? TRUE : FALSE;
-    EnableWindow(widthEdit_, editableSize);
-    EnableWindow(heightEdit_, editableSize);
-}
-
 void MainWindow::loadAudioDeviceCombos() {
     outputDevices_ = WasapiCapture::enumerateDevices(AudioTrack::System);
     inputDevices_ = WasapiCapture::enumerateDevices(AudioTrack::Microphone);
@@ -617,7 +624,7 @@ void MainWindow::refreshSoundSeparationApps() {
     std::map<std::wstring, AudioSessionAppInfo> appsByPath;
     auto addApps = [&](std::vector<AudioSessionAppInfo> apps) {
         for (auto& app : apps) {
-            const std::wstring key = executableKey(app.executablePath);
+            const std::wstring key = normalizedPathKey(app.executablePath);
             if (key.empty() || appsByPath.contains(key)) {
                 continue;
             }
@@ -726,9 +733,9 @@ void MainWindow::addSoundSeparationApp(std::wstring name, std::filesystem::path 
         return;
     }
 
-    const std::wstring key = executableKey(executablePath);
+    const std::wstring key = normalizedPathKey(executablePath);
     for (auto& app : settings_.soundSeparationApps) {
-        if (executableKey(app.executablePath) == key) {
+        if (normalizedPathKey(app.executablePath) == key) {
             app.muted = true;
             if (app.name.empty()) {
                 app.name = name.empty() ? appNameFromPath(executablePath) : std::move(name);
@@ -786,7 +793,7 @@ void MainWindow::rebuildSoundSeparationRows() {
             kMicSize,
             kMicSize,
             kSoundSeparationMuteButtonBaseId + static_cast<int>(index));
-        addSettingHelp(row.micButton, 0, 0, app.muted ? L"Unmute this app in future clips." : L"Mute this app in future clips.");
+        addStatusHelp(row.micButton, app.muted ? L"Unmute this app in future clips." : L"Mute this app in future clips.");
 
         row.iconControl = addControl(
             L"STATIC",
@@ -812,7 +819,7 @@ void MainWindow::rebuildSoundSeparationRows() {
             kNameWidth,
             22,
             -1);
-        addSettingHelp(row.nameLabel, 0, 0, app.executablePath.wstring());
+        addStatusHelp(row.nameLabel, app.executablePath.wstring());
 
         row.mutedLabel = addControl(
             L"STATIC",
@@ -833,7 +840,7 @@ void MainWindow::rebuildSoundSeparationRows() {
             kRemoveWidth,
             30,
             kSoundSeparationRemoveButtonBaseId + static_cast<int>(index));
-        addSettingHelp(row.removeButton, 0, 0, L"Remove this app from sound separation.");
+        addStatusHelp(row.removeButton, L"Remove this app from sound separation.");
 
         soundSeparationRows_.push_back(row);
         y += kRowHeight;
@@ -954,7 +961,7 @@ void MainWindow::rebuildAutoRecordRows() {
             kNameWidth,
             22,
             -1);
-        addSettingHelp(row.nameLabel, 0, 0, app.executablePath.wstring());
+        addStatusHelp(row.nameLabel, app.executablePath.wstring());
 
         row.removeButton = addControl(
             L"BUTTON",
@@ -965,7 +972,7 @@ void MainWindow::rebuildAutoRecordRows() {
             kRemoveWidth,
             30,
             kAutoRecordRemoveButtonBaseId + static_cast<int>(index));
-        addSettingHelp(row.removeButton, 0, 0, L"Remove this app from auto record.");
+        addStatusHelp(row.removeButton, L"Remove this app from auto record.");
 
         autoRecordRows_.push_back(row);
         y += kRowHeight;
@@ -1118,9 +1125,9 @@ void MainWindow::addAutoRecordApp(std::wstring name, std::filesystem::path execu
         return;
     }
 
-    const std::wstring key = executableKey(executablePath);
+    const std::wstring key = normalizedPathKey(executablePath);
     for (const auto& existing : settings_.autoRecordApps) {
-        if (executableKey(existing.executablePath) == key) {
+        if (normalizedPathKey(existing.executablePath) == key) {
             rebuildAutoRecordRows();
             markSettingsDirty();
             setStatus(L"App already listed");
@@ -1180,7 +1187,7 @@ void MainWindow::browseRingDirectory() {
     BROWSEINFOW browse{};
     browse.hwndOwner = window_;
     browse.pszDisplayName = displayName;
-    browse.lpszTitle = L"Choose where the replay ring file is kept";
+    browse.lpszTitle = L"Choose where the replay ring files are kept";
     browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
 
     PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);

@@ -23,21 +23,38 @@ the lock-free queue used between threads, and the app version constant.
   non-comparable member silently breaks "unsaved changes" detection.
 - Defaults live in the struct definition, once. `SettingsStore` reads and writes
   values; it does not carry a second copy of the defaults.
-- Adding a setting is a five-place edit, all in one change: the field in
-  `Types.h`, a `Name`/`FromName` pair in `settings/SettingsStore.h`, the parse
-  and serialize branches in `SettingsStore.cpp`, a clamp in `sanitizeSettings`,
-  and the control plus its id in `ui`. Conditional fields are wrapped in
-  `#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION` at every one of those five places.
+- Adding a setting is one change across five sites: the field in `Types.h`, the
+  parse branch and the serialize branch in `SettingsStore.cpp`, the id in
+  `ui/UiIds.h`, and the control plus its read in `ui` (`UiHelpers.cpp` also
+  needs the id in `isSettingsControlId` or the page never goes dirty). An
+  enum-valued setting also needs a `Name` / `FromName` pair in
+  `settings/SettingsStore.h`; a value that can be out of range also needs a
+  clamp in `sanitizeSettings`. A field behind `BACKTRACK_HAS_NOISE_SUPPRESSION`
+  is wrapped in that `#ifdef` at every site that touches it.
+- `kHundredNanosecondsPerSecond` and `secondsTo100ns` are the only conversion
+  helpers. Timestamps are signed 100 ns units and may legitimately be zero or
+  negative, so nothing in this folder may use a sentinel value; see
+  `src/AGENTS.md` for the boundary rule.
 - `Logger` is a process singleton, safe from any thread. `initialize` once at
-  startup, then `setMinLevel`. It keeps both a file and a bounded
-  `recentLines` deque for the Diagnostics page, and rate-limits per message
-  text in a rolling window. Flush before any fatal exit.
+  startup, then `setMinLevel`; it renames any previous log to `<path>.old` and
+  clears the rate-limit and recent-line state. It keeps both a file and a
+  200-line `recentLines` deque for the Diagnostics page. Rate limiting is keyed
+  on the message text alone: level, subsystem, and thread id are recorded for
+  the summary line but are not part of the key, so the same text from two
+  callers shares one budget of 3 lines per rolling 10 s window, and what was
+  suppressed surfaces as a single `(rate limited N occurrences ...)` line when
+  the window rolls over. `Error` is never throttled. The file stream is
+  buffered, not flushed per line; flush before any fatal exit.
 - `SpscQueue<T>` is header-only and lock-free with exactly one producer and one
-  consumer. `tryPush` drops the newest item when full and `tryPop` returns
-  false when empty; callers must count the difference. `size()` is advisory
-  only. `resetCapacity` is legal only when both ends are stopped.
-- `AppVersion.h`'s `kCurrentAppVersion` is not referenced by any source today.
-  Update it when release versioning comes back; do not add a second version
+  consumer. `tryPush` returns false when full and leaves the caller's item
+  untouched, so the overflow policy belongs to the caller, which must count it;
+  `tryPop` returns false when empty. `size()` is advisory and clamped, never
+  exact. `resetCapacity` is legal only when both ends are stopped; `clear`
+  moves the consumer's index, so it needs the consumer stopped too.
+- `AppVersion.h`'s `kCurrentAppVersion` is the app's only version string;
+  `MainWindow::startUpdateCheck` compares it against the latest GitHub release.
+  The check is opt-out: `AppSettings::checkForUpdates` (default on) gates it in
+  `MainWindow::create`. Update the version there; do not add a second version
   string elsewhere.
 
 ## Work Guidance
@@ -51,10 +68,11 @@ the lock-free queue used between threads, and the app version constant.
 
 ## Verification
 
-No test covers this folder directly; `Logger.cpp` is linked into
-`AudioConvertTests` and `ReplayBufferTests`, so a build of those suites is the
-practical check. `ReplayBufferTests` exercises `SpscQueue` transitively through
-the pipeline it links.
+No suite covers `SpscQueue.h` or `AppVersion.h`: the queue's only user is
+`RecorderController`, which no test links. `Logger.cpp` is linked into
+`AudioConvertTests`, `ReplayBufferTests`, and `SettingsClipGuardTests`, so
+building those three is the practical check for this folder; `Types.h` and
+`AppVersion.h` are compile-checked by whichever of them include them.
 
 ## Child DOX Index
 

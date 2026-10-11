@@ -26,6 +26,9 @@ constexpr wchar_t kHost[] = L"127.0.0.1";
 constexpr INTERNET_PORT kPort = 2999;
 constexpr auto kPollInterval = std::chrono::milliseconds(1000);
 constexpr auto kUnavailablePollInterval = std::chrono::milliseconds(2500);
+// 4 MiB dwarfs any real Live Client Data payload, so reaching the cap means
+// something other than the game client owns port 2999.
+constexpr size_t kMaxResponseBytes = 4 * 1024 * 1024;
 
 struct InternetHandle {
     HINTERNET value = nullptr;
@@ -304,6 +307,9 @@ std::optional<std::string> httpGet(HINTERNET session, HINTERNET connection, cons
         if (available == 0) {
             break;
         }
+        if (body.size() + available > kMaxResponseBytes) {
+            return std::nullopt;
+        }
         const size_t offset = body.size();
         body.resize(offset + available);
         DWORD read = 0;
@@ -380,18 +386,8 @@ std::vector<LiveEvent> parseEvents(std::string_view json) {
     return events;
 }
 
-std::wstring trimName(std::wstring value) {
-    while (!value.empty() && iswspace(value.front())) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() && iswspace(value.back())) {
-        value.pop_back();
-    }
-    return value;
-}
-
 std::wstring normalizedName(std::wstring value) {
-    value = trimName(std::move(value));
+    value = trimText(std::move(value));
     std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
         return static_cast<wchar_t>(towlower(ch));
     });
@@ -409,7 +405,7 @@ void addCandidateName(std::vector<std::wstring>& names, std::wstring name) {
 
     const auto tagSeparator = name.find(L'#');
     if (tagSeparator != std::wstring::npos) {
-        std::wstring withoutTag = trimName(name.substr(0, tagSeparator));
+        std::wstring withoutTag = trimText(name.substr(0, tagSeparator));
         if (!withoutTag.empty() && std::find(names.begin(), names.end(), withoutTag) == names.end()) {
             names.push_back(std::move(withoutTag));
         }
@@ -483,102 +479,108 @@ void LeagueOfLegendsIntegration::stop() {
     if (worker.joinable()) {
         worker.join();
     }
-    running_ = false;
-}
-
-bool LeagueOfLegendsIntegration::running() const {
-    return running_.load(std::memory_order_acquire);
 }
 
 void LeagueOfLegendsIntegration::workerLoop() {
     setThreadDescriptionSafe(L"Backtrack League integration");
-    running_ = true;
     Logger::instance().info(L"league", L"League of Legends integration started");
 
-    bool gameAvailable = false;
-    bool baselineReady = false;
-    int64_t lastEventId = -1;
-    double lastEventTime = 0.0;
+    try {
+        bool gameAvailable = false;
+        bool baselineReady = false;
+        int64_t lastEventId = -1;
+        double lastEventTime = 0.0;
 
-    // Pooled across polls: creating a WinHTTP session + TLS connection per
-    // request (twice per second) kept the heap hot for no benefit. Both are
-    // recreated lazily when missing, and the connection is additionally
-    // dropped after any failed request so stale transport state from a
-    // restarted game client never lingers.
-    InternetHandle session;
-    InternetHandle connection;
+        // Pooled across polls: creating a WinHTTP session + TLS connection per
+        // request (twice per second) kept the heap hot for no benefit. Both are
+        // recreated lazily when missing, and the connection is additionally
+        // dropped after any failed request so stale transport state from a
+        // restarted game client never lingers.
+        InternetHandle session;
+        InternetHandle connection;
 
-    while (!stopRequested_.load(std::memory_order_acquire)) {
-        if (!session) {
-            session.reset(WinHttpOpen(
-                L"Backtrack/1.0",
-                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                WINHTTP_NO_PROXY_NAME,
-                WINHTTP_NO_PROXY_BYPASS,
-                0));
-            if (session) {
-                WinHttpSetTimeouts(session.value, 1000, 1000, 1000, 1000);
-            }
-        }
-        if (session && !connection) {
-            connection.reset(WinHttpConnect(session.value, kHost, kPort, 0));
-        }
-        auto activePlayer = httpGet(session.value, connection.value, L"/liveclientdata/activeplayer");
-        auto eventData = httpGet(session.value, connection.value, L"/liveclientdata/eventdata");
-        if (!activePlayer || !eventData) {
-            connection.reset();
-            if (gameAvailable) {
-                Logger::instance().info(L"league", L"League of Legends live client data is no longer available");
-            }
-            gameAvailable = false;
-            baselineReady = false;
-            lastEventId = -1;
-            lastEventTime = 0.0;
-            sleepUntilNextPoll(stopRequested_, kUnavailablePollInterval);
-            continue;
-        }
-
-        const auto names = activePlayerNames(*activePlayer);
-        const auto events = parseEvents(*eventData);
-        int64_t maxEventId = lastEventId;
-        double maxEventTime = lastEventTime;
-        for (const auto& event : events) {
-            maxEventId = std::max(maxEventId, event.eventId);
-            maxEventTime = std::max(maxEventTime, event.eventTime);
-        }
-
-        if (!gameAvailable) {
-            Logger::instance().info(L"league", L"League of Legends live client data detected");
-        }
-        gameAvailable = true;
-
-        if (!baselineReady || maxEventId < lastEventId || maxEventTime + 0.001 < lastEventTime) {
-            lastEventId = maxEventId;
-            lastEventTime = maxEventTime;
-            baselineReady = true;
-            sleepUntilNextPoll(stopRequested_, kPollInterval);
-            continue;
-        }
-
-        for (const auto& event : events) {
-            if (!isNewEvent(event, lastEventId, lastEventTime)) {
-                continue;
-            }
-            if (isActivePlayerKill(event, names)) {
-                Logger::instance().info(L"league", L"League of Legends kill detected for clip reminder");
-                if (killCallback_) {
-                    killCallback_();
+        while (!stopRequested_.load(std::memory_order_acquire)) {
+            if (!session) {
+                // Loopback must never leave the machine; a system proxy or VPN would
+                // otherwise turn every poll into a remote connection failure.
+                session.reset(WinHttpOpen(
+                    L"Backtrack/1.0",
+                    WINHTTP_ACCESS_TYPE_NO_PROXY,
+                    WINHTTP_NO_PROXY_NAME,
+                    WINHTTP_NO_PROXY_BYPASS,
+                    0));
+                if (session) {
+                    WinHttpSetTimeouts(session.value, 1000, 1000, 1000, 1000);
                 }
             }
-        }
+            if (session && !connection) {
+                connection.reset(WinHttpConnect(session.value, kHost, kPort, 0));
+            }
+            auto activePlayer = httpGet(session.value, connection.value, L"/liveclientdata/activeplayer");
+            // activeplayer is the liveness probe, so when it fails the client is
+            // gone: skip the request that would be a guaranteed connection failure.
+            auto eventData = activePlayer
+                ? httpGet(session.value, connection.value, L"/liveclientdata/eventdata")
+                : std::nullopt;
+            if (!activePlayer || !eventData) {
+                connection.reset();
+                if (gameAvailable) {
+                    Logger::instance().info(L"league", L"League of Legends live client data is no longer available");
+                }
+                gameAvailable = false;
+                baselineReady = false;
+                lastEventId = -1;
+                lastEventTime = 0.0;
+                sleepUntilNextPoll(stopRequested_, kUnavailablePollInterval);
+                continue;
+            }
 
-        lastEventId = maxEventId;
-        lastEventTime = maxEventTime;
-        sleepUntilNextPoll(stopRequested_, kPollInterval);
+            const auto names = activePlayerNames(*activePlayer);
+            const auto events = parseEvents(*eventData);
+            int64_t maxEventId = lastEventId;
+            double maxEventTime = lastEventTime;
+            for (const auto& event : events) {
+                maxEventId = std::max(maxEventId, event.eventId);
+                maxEventTime = std::max(maxEventTime, event.eventTime);
+            }
+
+            if (!gameAvailable) {
+                Logger::instance().info(L"league", L"League of Legends live client data detected");
+            }
+            gameAvailable = true;
+
+            if (!baselineReady || maxEventId < lastEventId || maxEventTime + 0.001 < lastEventTime) {
+                lastEventId = maxEventId;
+                lastEventTime = maxEventTime;
+                baselineReady = true;
+                sleepUntilNextPoll(stopRequested_, kPollInterval);
+                continue;
+            }
+
+            for (const auto& event : events) {
+                if (!isNewEvent(event, lastEventId, lastEventTime)) {
+                    continue;
+                }
+                if (isActivePlayerKill(event, names)) {
+                    Logger::instance().info(L"league", L"League of Legends kill detected for clip reminder");
+                    if (killCallback_) {
+                        killCallback_();
+                    }
+                }
+            }
+
+            lastEventId = maxEventId;
+            lastEventTime = maxEventTime;
+            sleepUntilNextPoll(stopRequested_, kPollInterval);
+        }
+    } catch (const std::exception& error) {
+        Logger::instance().warning(L"league",
+            std::wstring(L"League of Legends kill reminder disabled by an unexpected error: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().warning(L"league", L"League of Legends kill reminder disabled by an unknown error");
     }
 
     Logger::instance().info(L"league", L"League of Legends integration stopped");
-    running_ = false;
 }
 
 } // namespace backtrack

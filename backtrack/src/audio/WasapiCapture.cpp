@@ -46,16 +46,6 @@ WaveFormatBlob copyWaveFormat(WAVEFORMATEX* format) {
     return blob;
 }
 
-std::wstring trimText(std::wstring value) {
-    while (!value.empty() && iswspace(value.front())) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() && iswspace(value.back())) {
-        value.pop_back();
-    }
-    return value;
-}
-
 const wchar_t* trackName(AudioTrack track) {
     switch (track) {
     case AudioTrack::System:
@@ -149,15 +139,6 @@ struct WaveFormatDeleter {
         CoTaskMemFree(format);
     }
 };
-
-std::wstring normalizedPathKey(const std::filesystem::path& path) {
-    std::wstring value = path.wstring();
-    std::replace(value.begin(), value.end(), L'/', L'\\');
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(towlower(ch));
-    });
-    return value;
-}
 
 std::filesystem::path processImagePath(DWORD processId) {
     if (processId == 0) {
@@ -577,6 +558,15 @@ void WasapiCapture::emergencyRestoreSessionMutes() noexcept {
     if (!lock.owns_lock()) {
         return;
     }
+    // COM is per-thread and none of the threads that reach here have it: the
+    // console control handler runs on an OS-created thread, the SEH filter and
+    // the terminate handler on whatever faulted. Un-initialized, the SetMute
+    // below fails with CO_E_NOTINITIALIZED and the discarded HRESULT hides it,
+    // leaving the application muted with only the next launch's sweep to undo
+    // it. A mismatched apartment (RPC_E_CHANGED_MODE) is still a usable COM
+    // thread, so the result is deliberately not checked. The destructor only
+    // balances this call, which makes it safe on the crash path.
+    ScopedComInitialization com(COINIT_MULTITHREADED);
     for (auto& entry : g_sessionMutes) {
         if (entry.volume) {
             try {
@@ -628,11 +618,6 @@ void WasapiCapture::restoreOrphanedSessionMutes() {
             }
         }
     }
-    // Consume the journal regardless of the restore outcome below: entries
-    // for dead processes are no-ops, and re-running them later could clobber
-    // mute changes the user made since the crash.
-    std::filesystem::remove(journalPath, error);
-
     ScopedComInitialization com(COINIT_MULTITHREADED);
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))) || !enumerator) {
@@ -723,6 +708,20 @@ void WasapiCapture::restoreOrphanedSessionMutes() {
                 orphans.erase(orphan);
             }
         }
+    }
+
+    // Consumed only after a sweep actually ran: the enumeration failures above
+    // return early, and entries the loop could not reach are rewritten, not dropped.
+    if (orphans.empty()) {
+        std::filesystem::remove(journalPath, error);
+    } else {
+        std::string unresolved;
+        for (const OrphanedMute& orphan : orphans) {
+            unresolved += std::to_string(orphan.processId) + '\t' + (orphan.previousMute ? '1' : '0') + '\t' +
+                          wideToUtf8(orphan.pathKey) + '\n';
+        }
+        std::scoped_lock lock(g_sessionMuteMutex);
+        writeSessionMuteJournalLocked(unresolved);
     }
 
     Logger::instance().info(L"audio",
@@ -847,9 +846,18 @@ uint32_t WasapiCapture::applySessionMutesForExecutables(const std::vector<std::w
             entry.volume = std::move(volume);
             g_sessionMutes.push_back(std::move(entry));
             alreadyMuted.insert(processId);
+            // Journal this mute before walking the next session: a kill inside
+            // the walk is precisely what the journal exists for, and the lock
+            // the crash path try_locks is held across the whole enumeration, so
+            // there is no second chance to record it. Unchanged content
+            // short-circuits the write, so this costs one small file per newly
+            // muted session and nothing on the no-op sweeps after it.
+            persistSessionMutesLocked();
         }
     }
 
+    // Covers the stale-entry removals above, which unmute sessions too. No-op
+    // when the loop already persisted this exact content.
     persistSessionMutesLocked();
     return static_cast<uint32_t>(g_sessionMutes.size());
 }

@@ -113,7 +113,6 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     nextCursorOnlyFrameAt_ = {};
     poolExhaustionDrops_ = 0;
     haveContent_ = false;
-    havePresentedContent_ = false;
     frameHeld_ = false;
     lastLoggedAcquireHr_ = S_OK;
     suppressedAcquireLogs_ = 0;
@@ -306,9 +305,6 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         std::scoped_lock lock(device_->immediateContextMutex());
         device_->context()->CopyResource(desktopCopy_.Get(), acquiredTexture.Get());
         haveContent_ = true;
-        if (frameInfo.LastPresentTime.QuadPart != 0) {
-            havePresentedContent_ = true;
-        }
     }
 
     releaseHeldFrame();
@@ -373,7 +369,6 @@ void DesktopDuplicationCapture::shutdown() {
     releaseHeldFrame();
     duplication_.Reset();
     haveContent_ = false;
-    havePresentedContent_ = false;
     frameHeld_ = false;
     deviceLost_ = true;
     hdrActive_ = false;
@@ -409,7 +404,6 @@ bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t heigh
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
     haveContent_ = false;
-    havePresentedContent_ = false;
     poolExhaustionDrops_ = 0;
     poolSize = std::clamp<uint32_t>(poolSize, kMinPoolSize, kMaxPoolSize);
 

@@ -224,7 +224,6 @@ private:
     void markSettingsDirty();
     void clearSettingsDirty();
     bool promptSaveSettingsIfDirty(bool allowCancel);
-    void addSettingHelp(HWND control, int x, int y, const std::wstring& text);
     void addStatusHelp(HWND control, const std::wstring& text);
     void updateStatusHelp(HWND hoveredControl);
     void applyStatusText(const std::wstring& status);
@@ -255,7 +254,6 @@ private:
     void destroyAutoRecordRows();
     void releaseAutoRecordRowIcons();
     void removeAutoRecordApp(size_t index);
-    void updateResolutionControls();
     void updateStartupRegistration();
     void browseClipFolder();
     void browseRingDirectory();
@@ -266,6 +264,7 @@ private:
     // recording receives no packets from an enabled audio input (>2s).
     void updateAudioLivenessWarning(const RecordingStats& stats);
     void refreshClips();
+    void populateClipListRows();
     void setLibraryViewMode(LibraryViewMode mode);
     void clearClipThumbnails();
     void releaseClipThumbnailCache();
@@ -277,6 +276,11 @@ private:
     void handleClipThumbnailReady(ThumbnailResult& result);
     size_t clipIndexFromListItem(UINT itemId) const;
     size_t clipIndexAtPoint(POINT point) const;
+    size_t clipIndexForPath(const std::filesystem::path& path) const;
+    // Gallery tile geometry. The painter and the hit test both go through
+    // these so a click can never land on a different tile than the one drawn.
+    static RECT galleryTileRect(const RECT& row, int column);
+    static int galleryTileColumnAt(const RECT& row, int x);
     void updateGallerySelectionFromCursor();
     void armClipDrag(POINT point);
     void beginClipDrag();
@@ -374,14 +378,17 @@ private:
     HWND codecCombo_ = nullptr;
     HWND recordHotkey_ = nullptr;
     HWND clipFolderEdit_ = nullptr;
+    HWND organizeClipsByGameCheck_ = nullptr;
     HWND replayEnabledCheck_ = nullptr;
     HWND replaySecondsEdit_ = nullptr;
     HWND replayDiskBackedCheck_ = nullptr;
+    HWND replayDiskBackedAudioCheck_ = nullptr;
     HWND replayRingDirEdit_ = nullptr;
     HWND replayHotkey_ = nullptr;
     HWND leagueKillReminderCheck_ = nullptr;
     HWND voiceCommandCombo_ = nullptr;
     HWND discordRichPresenceCombo_ = nullptr;
+    HWND discordPresenceTimerCombo_ = nullptr;
     HWND statsLabel_ = nullptr;
     HWND capsLabel_ = nullptr;
     HWND diagnosticLogLabel_ = nullptr;
@@ -389,6 +396,7 @@ private:
     HWND listViewButton_ = nullptr;
     HWND galleryViewButton_ = nullptr;
     HWND renameEdit_ = nullptr;
+    HWND renameEditButton_ = nullptr;
     HWND fpsEdit_ = nullptr;
     HWND resolutionModeCombo_ = nullptr;
     // Number of preset items (P240..Custom) that precede the monitor entries in
@@ -417,6 +425,7 @@ private:
     HWND startWithWindowsCheck_ = nullptr;
     HWND pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
     HWND exitToTrayCheck_ = nullptr;
+    HWND checkForUpdatesCheck_ = nullptr;
     HWND notificationSoundVolumeEdit_ = nullptr;
     HWND customNotificationSoundEdit_ = nullptr;
     HWND encoderPresetCombo_ = nullptr;

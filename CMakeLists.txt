@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.24)
 
 project(Backtrack VERSION 0.1.0 LANGUAGES C CXX RC)
 
@@ -36,6 +36,15 @@ set(BACKTRACK_RESOURCES
 add_executable(Backtrack WIN32 ${BACKTRACK_SOURCES} ${BACKTRACK_RESOURCES})
 
 target_compile_features(Backtrack PRIVATE cxx_std_20)
+# backtrack.vcxproj compiles these sources at Level3. MSVC's default is /W1, so
+# without this every /W2+ diagnostic is invisible in the build that runs ctest.
+target_compile_options(Backtrack PRIVATE /W3)
+# /wd4996, and only 4996. The SDK's sphelper.h calls the deprecated
+# GetVersionExW on our behalf from voice/VoiceCommandService.cpp; we neither own
+# that header nor can drop it without losing ISpVoice. backtrack.vcxproj
+# disables the same single diagnostic so the two definitions stay equivalent in
+# effect. Every other warning keeps the full budget.
+target_compile_options(Backtrack PRIVATE /wd4996)
 target_include_directories(Backtrack PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src")
 target_compile_definitions(Backtrack PRIVATE
@@ -89,6 +98,7 @@ endif()
 
 target_link_libraries(Backtrack PRIVATE
     d3d11
+    d3dcompiler
     dxgi
     dxguid
     mfplat
@@ -110,6 +120,7 @@ target_link_libraries(Backtrack PRIVATE
     uuid
     winmm
     winhttp
+    version
     sapi
     psapi)
 
@@ -127,6 +138,9 @@ function(add_backtrack_test name)
     cmake_parse_arguments(TEST "" "" "SOURCES;LIBS" ${ARGN})
     add_executable(${name} ${TEST_SOURCES})
     target_compile_features(${name} PRIVATE cxx_std_20)
+    # Same budget as the app target and backtrack.vcxproj: the suites compile the
+    # production sources, so a /W1 build here hides exactly what the gate must catch.
+    target_compile_options(${name} PRIVATE /W3)
     target_include_directories(${name} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src")
     # Shared sources (Logger, ReplayBuffer) use unparenthesized std::min/std::max;
@@ -141,6 +155,17 @@ endfunction()
 # VideoTimelineScheduler is header-only: the test alone is sufficient.
 add_backtrack_test(VideoTimelineSchedulerTests
     SOURCES backtrack/tests/VideoTimelineSchedulerTests.cpp)
+
+# DecodeOrderTimestamps is header-only too, but it logs through core/Logger.cpp
+# when its desync watchdog fires, so that is the one source it needs.
+add_backtrack_test(DecodeOrderTimestampsTests
+    SOURCES
+        backtrack/tests/DecodeOrderTimestampsTests.cpp
+        backtrack/src/core/Logger.cpp)
+
+# SpscQueue is header-only with no project includes at all.
+add_backtrack_test(SpscQueueTests
+    SOURCES backtrack/tests/SpscQueueTests.cpp)
 
 # AudioConvertTests exercises audio/AudioConvert.cpp, which logs via core/Logger.cpp.
 add_backtrack_test(AudioConvertTests
@@ -164,6 +189,24 @@ add_backtrack_test(ReplayBufferTests
         backtrack/src/mux/WavWriter.cpp
         backtrack/src/encoder/BitstreamUtils.cpp
         backtrack/src/core/Logger.cpp)
+
+# SettingsClipGuardTests covers the two functions that stand between a bad
+# settings file and a broken encoder config, and a malformed path and a deleted
+# user file. The parse path is the other half of that boundary: every key
+# falling back, the comment and repetition rules, the legacy key spellings, and
+# a full save()/load() round trip. ClipManager's path gate is private, so it is
+# exercised through the destructive operations it guards. SettingsStore.cpp only
+# needs defaultClipDirectory() from platform/Win32Util.cpp, which the test stubs
+# to keep Win32Util (and its DXGI/avrt/winmm deps) out of the suite. propsys is
+# the only non-default link library, for the shell property reads ClipManager
+# does.
+add_backtrack_test(SettingsClipGuardTests
+    SOURCES
+        backtrack/tests/SettingsClipGuardTests.cpp
+        backtrack/src/settings/SettingsStore.cpp
+        backtrack/src/clips/ClipManager.cpp
+        backtrack/src/core/Logger.cpp
+    LIBS propsys)
 
 if (BACKTRACK_NOISE_SUPPRESSION)
     # AudioDenoiseTests exercises audio/RnnoiseDenoiser.cpp against the vendored

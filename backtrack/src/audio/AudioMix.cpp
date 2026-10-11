@@ -234,7 +234,9 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
     if (!writer.open(mixedPath, pcm16StereoFormat(kMuxAudioSampleRate))) {
         Logger::instance().warning(L"audio", L"Could not create mixed audio stream for MP4 mux: " + mixedPath.wstring());
         mixedPath.clear();
-        return true;
+        // Same rule as the failed write below: the source WAVs were readable, so
+        // a create that fails here is the disk, not a reason to save video only.
+        return false;
     }
 
     constexpr uint64_t kChunkFrames = 4096;

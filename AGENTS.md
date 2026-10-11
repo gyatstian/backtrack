@@ -1,5 +1,8 @@
 # DOX framework
 
+- DOX is highly performant AGENTS.md hierarchy installed here
+- Agent must follow DOX instructions across any edits
+
 ## Project
 
 ### Purpose
@@ -50,7 +53,7 @@ RNNoise.
 ### Verification
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 18 2026" -A x64
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release
 ```
@@ -58,6 +61,26 @@ ctest --test-dir build -C Release
 MSBuild path: `MSBuild.exe backtrack.slnx /p:Configuration=Release
 /p:Platform=x64 /m`. There is no CI; a green local build plus `ctest` is the
 gate.
+
+Toolchain, verified on 2026-10-11: the only installed Visual Studio is Build
+Tools 2022 (17.14, channel `VisualStudio.17.Release`), so the generator is
+`"Visual Studio 17 2022"`. `cmake` is not on `PATH`; it ships inside the
+install at `Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`
+under `%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools`, or use
+`LaunchDevCmd.bat`. The app target needs the `C++ ATL for latest v143 build
+tools` component: `voice/VoiceCommandService.cpp` includes `<sapi.h>`, whose
+`sphelper.h` includes `atlbase.h`. Without ATL installed the test targets still
+build and pass, but the app fails with `C1083 atlbase.h not found`.
+
+`backtrack.vcxproj` pins `PlatformToolset` to `v143` to match that install. Do
+not raise it from a machine with a newer Visual Studio; the vcxproj is the only
+build definition that names a toolset, and CMake picks up whatever is installed.
+
+Build directories are generated output and do not survive a move: `build/`
+(CMake) and `x64/` plus `backtrack/x64/` (MSBuild output and intermediates)
+all record absolute paths. A copied or renamed checkout must delete `build/`
+before configuring, or CMake aborts with "the current CMakeCache.txt directory
+... is different than the directory ... where CMakeCache.txt was created".
 
 ## Core Contract
 
@@ -143,9 +166,9 @@ When the user requests a durable behavior change, record it here or in the relev
 
 Rules that reach every domain, so they are not repeated in the children:
 
-- Only the build files define `UNICODE`, `_UNICODE`, `NOMINMAX`,
+- The build files own the value of `UNICODE`, `_UNICODE`, `NOMINMAX`,
   `WIN32_LEAN_AND_MEAN`, `BACKTRACK_HAS_NVENC`, `BACKTRACK_HAS_AMF`, and
-  `BACKTRACK_HAS_NOISE_SUPPRESSION`.
+  `BACKTRACK_HAS_NOISE_SUPPRESSION`. Never set one of them from source.
 - Vendor runtimes load from System32 at runtime and are never linked.
 - The README is user documentation. Keep it consistent with a source domain when
   a user-visible default, path, or feature changes.

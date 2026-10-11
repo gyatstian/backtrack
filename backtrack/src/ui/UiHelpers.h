@@ -14,7 +14,6 @@ namespace backtrack {
 using namespace ui_ids;
 
 std::wstring readText(HWND control);
-std::wstring trimText(std::wstring value);
 bool setText(HWND control, const std::wstring& value);
 void redrawWindowAndChildren(HWND window, bool updateNow = false);
 bool moveWindowIfChanged(HWND control, int x, int y, int width, int height);
@@ -48,9 +47,6 @@ std::wstring tagsToText(const std::vector<std::wstring>& tags);
 int comboIndexForDevice(const std::vector<AudioDeviceInfo>& devices, const std::wstring& selectedId);
 std::wstring selectedDeviceId(HWND combo, const std::vector<AudioDeviceInfo>& devices);
 bool isModifierKey(WPARAM key);
-bool isSafeBareHotkey(uint32_t virtualKey);
-uint32_t supportedHotkeyModifiers(uint32_t modifiers);
-bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey);
 uint32_t currentModifierState();
 bool isControlDown();
 bool shellExecuteSucceeded(HINSTANCE result);
@@ -65,7 +61,6 @@ void playActionIndicator(
     uint32_t volumePercent = 100,
     const std::filesystem::path& customSuccessSoundPath = {});
 std::wstring thumbnailCacheKey(const std::filesystem::path& path);
-std::wstring executableKey(const std::filesystem::path& path);
 std::wstring appNameFromPath(const std::filesystem::path& path);
 HICON loadExecutableIcon(const std::filesystem::path& path);
 HBITMAP loadShellThumbnail(const std::filesystem::path& path, int width, int height);
@@ -82,7 +77,6 @@ void drawBitmapFitCached(
     int& scaledHeight,
     const RECT& target);
 int galleryItemHeightForWidth(int listWidth);
-bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height);
 
 class ScopedRedrawLock {
 public:

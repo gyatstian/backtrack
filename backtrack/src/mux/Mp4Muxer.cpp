@@ -132,21 +132,6 @@ bool ensureFreeDiskSpaceForMux(
     return false;
 }
 
-bool flushFileToDisk(const std::filesystem::path& path, DWORD& win32Error) {
-    const HANDLE handle = CreateFileW(
-        path.c_str(), FILE_WRITE_DATA, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        win32Error = GetLastError();
-        return false;
-    }
-    const bool flushed = FlushFileBuffers(handle);
-    if (!flushed) {
-        win32Error = GetLastError();
-    }
-    CloseHandle(handle);
-    return flushed;
-}
-
 struct ScopedComInitialization {
     ScopedComInitialization()
         : result(CoInitializeEx(nullptr, COINIT_MULTITHREADED)),
@@ -355,9 +340,16 @@ bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInpu
         sample->SetSampleTime(videoSample.pts100ns - timeBase);
         if (hasDecodeTimestamps) {
             const int64_t dts = videoSample.hasDts ? videoSample.dts100ns : videoSample.pts100ns;
+            const int64_t dtsOffset = dts - timeBase;
+            // Decode order keeps every offset non-negative, so this is a no-op on
+            // valid input; it only stops a corrupt DTS wrapping to a huge delta.
+            if (dtsOffset < 0) {
+                Logger::instance().warning(L"mux",
+                    L"Video sample decode timestamp precedes the mux time base; clamped to the base");
+            }
             sample->SetUINT64(
                 MFSampleExtension_DecodeTimestamp,
-                static_cast<UINT64>(dts - timeBase));
+                static_cast<UINT64>(std::max<int64_t>(dtsOffset, 0)));
         }
         sample->SetSampleDuration(videoSample.duration100ns > 0
             ? videoSample.duration100ns
@@ -643,8 +635,6 @@ std::filesystem::path Mp4Muxer::finalize() {
         // recording length and is only needed for this final mux pass. The
         // muxer is inactive from here on, so nothing else reads videoSamples_.
         inputs.videoSamples = std::move(videoSamples_);
-        videoSamples_.clear();
-        videoSamples_.shrink_to_fit();
         inputs.codec = settings_.codec;
         inputs.fps = settings_.fps;
         inputs.width = settings_.width;
@@ -753,11 +743,6 @@ bool Mp4Muxer::active() const {
 uint64_t Mp4Muxer::videoPacketCount() const {
     std::scoped_lock lock(mutex_);
     return videoPackets_;
-}
-
-uint64_t Mp4Muxer::videoByteCount() const {
-    std::scoped_lock lock(mutex_);
-    return videoBytes_;
 }
 
 std::wstring Mp4Muxer::lastError() const {
@@ -1079,7 +1064,7 @@ bool Mp4Muxer::muxToMp4(
     writer.Reset();
 
     DWORD flushError = ERROR_SUCCESS;
-    if (!flushFileToDisk(stagingPath, flushError)) {
+    if (!RecoveryStore::flushFileToDisk(stagingPath, flushError)) {
         if (win32Error) {
             *win32Error = flushError;
         }

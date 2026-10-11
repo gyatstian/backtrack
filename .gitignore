@@ -4,6 +4,7 @@ build-rnnoise-on/
 build/
 out/
 build-new/
+build-verify/
 **/x64/
 *.user
 *.log

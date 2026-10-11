@@ -21,9 +21,6 @@ public:
     uint64_t cursorOnlyFrames() const override { return cursorOnlyFrames_; }
     void setCursorCaptureEnabled(bool enabled) override { captureCursor_ = enabled; }
 
-    // True after at least one frame with a desktop present (not cursor-only).
-    bool hasPresentedContent() const { return havePresentedContent_; }
-
 private:
     struct TextureSlot {
         ComPtr<ID3D11Texture2D> texture;
@@ -60,7 +57,6 @@ private:
     bool hdrActive_ = false;
     bool deviceLost_ = false;
     bool haveContent_ = false;
-    bool havePresentedContent_ = false;
     bool frameHeld_ = false;
 
     // Rate-limit repeated acquire failure logs.

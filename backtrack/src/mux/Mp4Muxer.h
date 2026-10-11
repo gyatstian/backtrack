@@ -47,7 +47,6 @@ public:
     void abort();
     bool active() const;
     uint64_t videoPacketCount() const;
-    uint64_t videoByteCount() const;
     std::wstring lastError() const;
     const std::filesystem::path& outputPath() const { return outputPath_; }
 

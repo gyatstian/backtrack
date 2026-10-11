@@ -16,15 +16,20 @@ linked, and no source file lives in this folder.
 - Do not edit, reformat, or "fix" anything in this folder. Upstream headers carry
   their own licenses (NVIDIA Video Codec SDK, AMD AMF Apache/MIT) and must stay
   byte-identical to what was vendored so a later upgrade is a clean replacement.
-- `nvEncodeAPI.h`, `nvcuvid.h`, and `cuviddec.h` are the NVIDIA Video Codec SDK.
-  These are the only files that may legitimately be absent; the build then sets
-  `BACKTRACK_HAS_NVENC=0` and the NVENC backend compiles to a stub. Do not add a
-  stub header to make the build succeed artificially, and do not commit a copy
-  that is not licensed for redistribution.
+- The build detects exactly two headers: `nvEncodeAPI.h` (vendored NVENC API
+  13.0) and `AMF/core/Factory.h` (vendored AMF 1.5.2). CMake resolves them with
+  `find_path`, the vcxproj with `Exists()` on the same two paths under
+  `src\Interface`, and each sets `BACKTRACK_HAS_NVENC` / `BACKTRACK_HAS_AMF` so
+  a missing one compiles the backend to a stub instead of failing the build.
+  `nvcuvid.h` and `cuviddec.h` are vendored from the same NVIDIA SDK but
+  nothing includes them; removing them flips nothing. Do not add a stub header
+  to make the build succeed artificially, and do not commit a copy that is not
+  licensed for redistribution.
 - `AMF/` is the bundled AMD AMF public headers (Apache/MIT, headers only), so the
-  AMD path builds with no external download. `AMF_SDK_PATH` can point the build
-  at a different copy; when it does, the parent directory is added to the include
-  path because these headers use `AMF/...` prefixes.
+  AMD path builds with no external download. CMake resolves it through
+  `AMF_SDK_PATH` and adds the *parent* of the resolved directory to the include
+  path, because the headers use `AMF/...` prefixes. The vcxproj has no such
+  knob; it always builds against the vendored copy.
 - Include paths for these headers come only from the build files. A source file
   must never include an SDK header directly outside of `src/encoder`.
 
@@ -37,9 +42,12 @@ linked, and no source file lives in this folder.
 
 ## Verification
 
-Build with the headers present (default) and with `AMF_SDK_PATH` pointed
-elsewhere or `NV_CODEC_SDK_PATH` unset, and confirm the compile flags flip to
-`BACKTRACK_HAS_AMF=0` / `BACKTRACK_HAS_NVENC=0` and the app still starts.
+The vendored copies are searched first, so `NV_CODEC_SDK_PATH` /
+`AMF_SDK_PATH` cannot flip the flags while they are present. To exercise the
+stub side, move the vendored files out of `src\Interface` (CMake) or build with
+`/p:BacktrackNvencHeaders=0 /p:BacktrackAmfHeaders=0` (MSBuild), then confirm
+the build still succeeds and the app starts with both backends reported
+unavailable.
 
 ## Child DOX Index
 

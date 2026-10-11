@@ -3,6 +3,7 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
+#include "core/AppVersion.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -65,12 +66,27 @@ void MainWindow::saveLog() {
     }
 
     std::error_code copyError;
+    // Copy to a sibling temp and rename over the target. copy_file opens the
+    // destination with CREATE_ALWAYS, so a copy that dies partway (disk full,
+    // antivirus lock) would leave a previously good log truncated. The rename
+    // is what actually replaces the destination, and it is the user's own file
+    // from the dialog above, so destroying it on failure loses the attachment
+    // they were about to send with a bug report.
+    const std::filesystem::path destination(fileName);
+    const std::filesystem::path staging = destination.wstring() + L".tmp";
     std::filesystem::copy_file(
         source,
-        std::filesystem::path(fileName),
+        staging,
         std::filesystem::copy_options::overwrite_existing,
         copyError);
+    if (!copyError) {
+        std::filesystem::rename(staging, destination, copyError);
+    }
     if (copyError) {
+        // Leave the previous file intact; the status line is the only feedback
+        // the user gets that the copy did not land.
+        std::error_code cleanupError;
+        std::filesystem::remove(staging, cleanupError);
         setStatus(L"Could not save log: " + utf8ToWide(copyError.message()));
         return;
     }
@@ -81,6 +97,9 @@ void MainWindow::updateStats() {
     const auto stats = controller_.stats();
     if (statsLabel_) {
         std::wstringstream stream;
+        // Build identity first: a diagnostics screenshot or "Save Log" copy is
+        // useless for triage without it.
+        stream << L"Backtrack " << kCurrentAppVersion << L"\r\n";
         stream << L"Recording: " << (stats.recording ? L"yes" : L"no") << L"\r\n";
         stream << L"Replay buffer: " << (stats.replayEnabled ? L"enabled" : L"disabled") << L"\r\n";
         stream << L"Selected backend: " << captureBackendDisplayName(stats.selectedCaptureBackend) << L"\r\n";
@@ -108,6 +127,7 @@ void MainWindow::updateStats() {
         stream << L"Coalesced idle intervals: " << stats.coalescedIdleIntervals << L"\r\n";
         stream << L"Dropped frames: " << stats.droppedFrames + stats.encoder.droppedFrames << L"\r\n";
         stream << L"GPU protection drops: " << stats.gpuProtectionDrops << L"\r\n";
+        stream << L"Frame queue drops: " << stats.frameQueueDrops << L"\r\n";
         stream << L"Cursor-only desktop frames: " << stats.cursorOnlyFrames << L"\r\n";
         stream << L"System audio queue drops: " << stats.systemAudioQueueDrops << L"\r\n";
         stream << L"Microphone audio queue drops: " << stats.microphoneAudioQueueDrops << L"\r\n";
@@ -136,6 +156,12 @@ void MainWindow::updateStats() {
         stream << L"Voice accepted/rejected: " << voiceStats.accepted << L"/" << voiceStats.rejected << L"\r\n";
         if (const std::wstring saveFailure = trimText(controller_.lastRecordingError()); !saveFailure.empty()) {
             stream << L"Last save failure: " << saveFailure << L"\r\n";
+        }
+        // The disk-ring checkboxes stay checked when a ring cannot be used, so
+        // this line is the only place the user learns replay video/audio is
+        // really sitting in RAM.
+        if (const std::wstring storageFallback = trimText(controller_.replayStorageFallback()); !storageFallback.empty()) {
+            stream << L"Replay storage: " << storageFallback << L"\r\n";
         }
         stream << L"Average encode: " << stats.encoder.averageEncodeMs << L" ms";
         setText(statsLabel_, stream.str());

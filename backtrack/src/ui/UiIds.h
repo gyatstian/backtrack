@@ -5,7 +5,6 @@
 namespace backtrack {
 namespace ui_ids {
 
-constexpr int kTabId = 10;
 constexpr int kTabButtonBaseId = 20;
 constexpr int kStatusId = 11;
 constexpr int kFpsEditId = 80;
@@ -43,6 +42,7 @@ constexpr int kStartStopButtonId = 103;
 constexpr int kSaveSettingsButtonId = 104;
 constexpr int kClipFolderEditId = 105;
 constexpr int kBrowseClipFolderButtonId = 106;
+constexpr int kOrganizeClipsByGameCheckId = 239;
 constexpr int kRecordHotkeyId = 107;
 constexpr int kEncoderAdaptiveIFramesCheckId = 108;
 constexpr int kEncoderZeroReorderDelayCheckId = 109;
@@ -65,6 +65,7 @@ constexpr int kReplaySecondsEditId = 202;
 constexpr int kSaveReplayButtonId = 203;
 constexpr int kReplayHotkeyId = 204;
 constexpr int kReplayDiskBackedCheckId = 230;
+constexpr int kReplayDiskBackedAudioCheckId = 240;
 constexpr int kReplayRingDirEditId = 231;
 constexpr int kBrowseRingDirButtonId = 232;
 constexpr int kSoundSeparationAppComboId = 205;
@@ -75,10 +76,12 @@ constexpr int kAutoRecordEnabledCheckId = 233;
 constexpr int kAutoRecordAppComboId = 234;
 constexpr int kAutoRecordRefreshButtonId = 235;
 constexpr int kAutoRecordManualButtonId = 236;
+constexpr int kCheckForUpdatesCheckId = 237;
 constexpr int kRecoverFailedRecordingButtonId = 209;
 constexpr int kLeagueKillReminderCheckId = 210;
 constexpr int kVoiceCommandComboId = 218;
 constexpr int kDiscordRichPresenceComboId = 219;
+constexpr int kDiscordPresenceTimerComboId = 238;
 constexpr int kPruneStaleMicrophoneConsentEntriesCheckId = 214;
 constexpr int kStatsLabelId = 301;
 constexpr int kCapsLabelId = 302;
@@ -155,6 +158,9 @@ constexpr COLORREF kMuteIconColor = RGB(232, 72, 72);
 constexpr COLORREF kSaveButton = RGB(10, 9, 8);
 constexpr int kListClipItemHeight = 30;
 constexpr int kGalleryClipColumns = 3;
+// Gap around and between gallery tiles, in client pixels. Shared by the tile
+// painter and the gallery hit test so a click cannot resolve to another tile.
+constexpr int kGalleryTileGap = 8;
 constexpr int kGalleryClipMinimumItemHeight = 220;
 constexpr int kGalleryThumbnailWidth = 320;
 constexpr int kGalleryThumbnailHeight = 180;

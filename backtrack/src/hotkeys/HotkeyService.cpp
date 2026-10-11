@@ -82,6 +82,12 @@ uint32_t supportedHookModifiers(uint32_t modifiers) {
 
 HotkeyService* HotkeyService::activeService_ = nullptr;
 
+HotkeyService::~HotkeyService() {
+    if (activeService_ == this) {
+        activeService_ = nullptr;
+    }
+}
+
 bool HotkeyService::registerHotkeys(HWND window, const HotkeySettings& settings) {
     unregisterHotkeys(window);
     lastErrorMessage_.clear();
@@ -97,6 +103,9 @@ bool HotkeyService::registerHotkeys(HWND window, const HotkeySettings& settings)
     bool hookOk = true;
     const bool wantsHook = settings.startStopVirtualKey != 0 || settings.saveReplayVirtualKey != 0;
     if (wantsHook) {
+        // Installed unconditionally, not as a RegisterHotKey fallback: a
+        // fullscreen game or anti-cheat can break the low-level hook chain, so
+        // RegisterHotKey is not reliably the redundant one of the two.
         activeService_ = this;
         keyboardHook_ = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardHookProc, GetModuleHandleW(nullptr), 0);
         if (!keyboardHook_) {

@@ -277,7 +277,6 @@ struct NvencEncoder::Impl {
         // surface and corrupt the encode. Released automatically when the
         // pending entry is consumed (harvest/drain/shutdown).
         std::shared_ptr<void> lease;
-        ComPtr<ID3D11Texture2D> texture;
     };
 
     // Cached codec parameter sets (SPS/PPS or VPS/SPS/PPS) captured from the
@@ -626,6 +625,12 @@ struct NvencEncoder::Impl {
         cached.generation = registrationGeneration;
         const auto [it, inserted] = registeredResources.emplace(texture, std::move(cached));
         (void)inserted;
+        // Every input texture comes from a fixed capture or scaler pool, so this
+        // count only grows while those pools live. Logged because the bound
+        // those pools impose is otherwise invisible from the encode side.
+        Logger::instance().debug(L"encoder",
+            L"NVENC registered input resources: " +
+            std::to_wstring(registeredResources.size()));
         // unordered_map nodes are stable: the returned entry stays valid until
         // it is erased (all erasure paths run under Impl::mutex, same as this
         // call), so callers may hold the pointer across driver calls.
@@ -672,6 +677,31 @@ struct NvencEncoder::Impl {
         }
         consecutiveRegisterFailures = 0;
         consecutiveMapFailures = 0;
+    }
+
+    // Unmapping and unregistering a resource a queued picture still points at
+    // is an NVENC contract violation, so a pool rebuild has to let those
+    // pictures finish first. An EOS picture flushes the reorder pipeline
+    // without needing new input; the encoder guide documents EOS as repeatable
+    // within one session, and the next encodeFrame simply continues on it.
+    // Harvested packets stay in readyPackets: the next encodeFrame pops them,
+    // and the pipeline-stop drain flushes whatever is left.
+    void flushAndUnregisterResources() {
+        if (!session || pendingOutputs.empty()) {
+            unregisterAllResources();
+            return;
+        }
+        NV_ENC_PIC_PARAMS pic{};
+        pic.version = NV_ENC_PIC_PARAMS_VER;
+        pic.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+        const NVENCSTATUS status = api.nvEncEncodePicture(session, &pic);
+        if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
+            Logger::instance().warning(L"encoder",
+                L"NVENC flush before input reset failed: " + nvStatusName(status));
+        }
+        readyOutputCount = pendingOutputs.size();
+        harvestPendingOutputs(true);
+        unregisterAllResources();
     }
 
     void noteMapFailure(NVENCSTATUS status) {
@@ -1042,7 +1072,6 @@ struct NvencEncoder::Impl {
         // encoder still references it (queued picture in the reorder/lookahead
         // pipeline). Mirrors the AMF backend's in-flight lease pinning.
         pending.lease = frame.lease;
-        pending.texture = frame.texture;
 
         if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
             Logger::instance().error(L"encoder", L"nvEncEncodePicture failed: " + nvStatusName(status));
@@ -1203,17 +1232,13 @@ bool NvencEncoder::initialize(D3DDevice& device, const VideoSettings& settings) 
 }
 
 void NvencEncoder::requestKeyFrame() {
-#if BACKTRACK_HAS_NVENC
     impl_->forceKeyFrame = true;
-#else
-    impl_->forceKeyFrame = true;
-#endif
 }
 
 void NvencEncoder::resetInputResources() {
     std::scoped_lock lock(impl_->mutex);
 #if BACKTRACK_HAS_NVENC
-    impl_->unregisterAllResources();
+    impl_->flushAndUnregisterResources();
 #endif
 }
 

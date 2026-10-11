@@ -46,16 +46,21 @@ public:
     AppSettings settings() const;
     std::wstring captureBackendStatus() const;
     std::wstring lastRecordingError() const;
+    // Non-empty when disk-backed replay buffering could not be used and replay
+    // video is in RAM instead. The setting stays checked, so this is the only
+    // place the user can learn the buffer silently changed backend.
+    std::wstring replayStorageFallback() const;
 
 private:
     bool ensurePipeline();
     void stopPipeline();
     // Runs RecoveryStore::sweepOrphanedRecoveryData on a worker thread so the
     // main window appears immediately even when a crashed session left a large
-    // recording to remux. startRecording/saveReplay/recoverFailedRecording/
-    // shutdown wait for it first: the sweep reads and deletes recovery data,
-    // so it must never overlap code that stages new recovery state or muxes
-    // from it.
+    // recording to remux. It also clears a leftover replay ring folder, which
+    // the recovery sweep does not cover. startRecording/saveReplay/
+    // recoverFailedRecording/shutdown wait for it first: the sweep reads and
+    // deletes recovery data, so it must never overlap code that stages new
+    // recovery state or muxes from it.
     void beginStartupSweep();
     void waitForStartupSweep();
     bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason, uint32_t adapterIndex);
@@ -84,7 +89,7 @@ private:
     // running and replay is enabled. Reads lastEncodedVideoPts100ns_ against
     // the steady clock; no recovery logic. Safe to call from stats().
     void detectVideoPipelineStall() const;
-    std::filesystem::path nextClipPath(const wchar_t* prefix) const;
+    std::filesystem::path nextClipPath(const wchar_t* prefix, bool organizeIntoSubfolder) const;
     void setLastRecordingError(std::wstring error);
 
     mutable std::mutex stateMutex_;
@@ -106,9 +111,17 @@ private:
     std::wstring captureBackendStatus_ = L"Capture backend has not started";
     D3D11FrameScaler scaler_;
     std::unique_ptr<IEncoder> encoder_;
-    // Read and updated while pipelineGpuMutex_ is held; preserves diagnostics during contention.
-    mutable EncoderCapabilities lastEncoderCapabilities_;
-    mutable EncoderStats lastEncoderStats_;
+    // Published under pipelineGpuMutex_, read through atomic<shared_ptr>
+    // without it: the UI thread and the controller worker thread both call
+    // stats()/encoderCapabilities(), so the contended read must never touch a
+    // member another caller can be assigning. EncoderCapabilities owns three
+    // std::wstrings, so an unlocked member copy tears a buffer rather than
+    // merely going stale. Seeded with an empty snapshot so the first read,
+    // before any publish, is never null.
+    mutable std::atomic<std::shared_ptr<const EncoderCapabilities>> lastEncoderCapabilities_{
+        std::make_shared<const EncoderCapabilities>()};
+    mutable std::atomic<std::shared_ptr<const EncoderStats>> lastEncoderStats_{
+        std::make_shared<const EncoderStats>()};
     Mp4Muxer muxer_;
     ReplayBuffer replay_;
     WasapiCapture systemAudio_;
@@ -116,7 +129,6 @@ private:
 
     mutable std::mutex systemAudioCaptureMutex_;
     std::vector<std::wstring> systemAudioMutedExecutableKeys_;
-    bool systemAudioSessionMutesActive_ = false;
     mutable std::mutex recordingErrorMutex_;
     std::wstring lastRecordingError_;
 
@@ -152,7 +164,7 @@ private:
     // emitted frame by idleCoalescingAllowed without touching pipelineGpuMutex_
     // or copying EncoderCapabilities.
     std::atomic<bool> encoderZeroReorderDelay_{false};
-std::atomic<uint32_t> audioOutputVolumePercent_{100};
+    std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<uint32_t> audioInputVolumePercent_{100};
     std::atomic<bool> audioInputAutoGain_{false};
     // Set when the microphone stream restarts or AGC is toggled; the audio
@@ -178,6 +190,7 @@ std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<uint64_t> coalescedIdleIntervals_{0};
     std::atomic<uint64_t> droppedFrames_{0};
     std::atomic<uint64_t> gpuProtectionDrops_{0};
+    std::atomic<uint64_t> frameQueueDrops_{0};
     std::atomic<uint64_t> idleFrameSkips_{0};
     std::atomic<uint64_t> cursorOnlyFrames_{0};
     std::atomic<uint64_t> systemAudioQueueDrops_{0};

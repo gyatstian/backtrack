@@ -16,7 +16,6 @@ public:
 
     void start();
     void stop();
-    bool running() const;
 
 private:
     void workerLoop();
@@ -25,7 +24,6 @@ private:
     mutable std::mutex mutex_;
     std::thread worker_;
     std::atomic<bool> stopRequested_{false};
-    std::atomic<bool> running_{false};
 };
 
 } // namespace backtrack

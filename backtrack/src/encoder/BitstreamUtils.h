@@ -7,8 +7,8 @@
 
 namespace backtrack {
 
-// Scans an encoded video bitstream (Annex B start codes or length-prefixed
-// NAL units). Shared by all hardware encoders.
+// Scans an encoded video bitstream (Annex B start-code framing). Shared by all
+// hardware encoders.
 
 // True when the bitstream contains an IDR (or HEVC BLA/IDR) picture. Only
 // such frames are safe replay cut points: a plain I or CRA frame may leave

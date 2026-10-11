@@ -21,13 +21,15 @@ every child shares.
   `dts100ns`, `duration100ns`. Convert from `std::chrono` with
   `kHundredNanosecondsPerSecond` (core/Types.h). Milliseconds exist only inside
   a Win32 timeout call.
-- PTS is the authoritative timeline anchor. DTS is present only when the encoder
-  emitted B-frames and is always paired with an explicit `hasDts` flag, because
-  zero and negative timestamps are legal values and no sentinel exists.
+- PTS is the authoritative timeline anchor. Both encoders emit `dts100ns` on
+  every packet, always paired with an explicit `hasDts` flag, and DTS equals
+  PTS when nothing reorders. Zero and negative timestamps are legal values and
+  no sentinel exists, so validity comes from the flag alone.
 - All logging goes through `core/Logger.h` with a subsystem label
-  (`Logger::instance().info(L"mux", ...)`). The logger rate-limits repeated
-  message text, so a hot loop can log unconditionally; do not add your own
-  suppression unless the message text itself varies per event.
+  (`Logger::instance().info(L"mux", ...)`). The logger spends at most 3 lines
+  per 10 s per distinct message text - the key is the text alone, shared across
+  levels, subsystems and threads - and never throttles `Error`. Vary the text
+  when every event matters; do not add your own suppression state.
 - Long-lived Win32 or SDK handles live behind a `struct Impl` +
   `std::unique_ptr` so headers stay cheap to include (see `WgcCaptureSource`,
   `NvencEncoder`, `AmfEncoder`).

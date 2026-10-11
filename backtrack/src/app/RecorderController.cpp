@@ -11,6 +11,7 @@
 #include "mux/RecoveryStore.h"
 #include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
+#include "ui/UiHelpers.h"
 
 #include <mmreg.h>
 
@@ -29,6 +30,13 @@
 namespace backtrack {
 
 namespace {
+
+// How long a pipeline worker may take to reach a checkpoint that the caller can
+// observe, before the caller gives up on it and carries on. Applies to waits that
+// have an abort path (recreateGpuPipeline's encode-loop discard). The stop path's
+// thread joins deliberately do NOT use it: std::thread::join has no timed form and
+// abandoning a wedged vendor call would destroy the user's clip.
+constexpr auto kGpuPipelineStopTimeout = std::chrono::seconds(30);
 
 int64_t steadyNow100ns() {
     return std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
@@ -119,21 +127,22 @@ uint64_t replayRingCapacityBytesFor(const AppSettings& settings) {
     return std::clamp<uint64_t>(withHeadroom, kMinCapacityBytes, kMaxCapacityBytes);
 }
 
+// Audio ring capacity: one replay window of two PCM tracks (system +
+// microphone) at 48 kHz stereo 16-bit, doubled for headroom. Ignored unless
+// replay.diskBackedAudio is enabled.
+uint64_t replayAudioRingCapacityBytesFor(const AppSettings& settings) {
+    constexpr uint64_t kMinAudioCapacityBytes = 1024ull * 1024;
+    constexpr uint64_t kMaxAudioCapacityBytes = 4ull * 1024 * 1024 * 1024;
+    constexpr uint64_t kBytesPerSecond = 768000;
+    const uint64_t windowSeconds = std::max<uint32_t>(1, settings.replay.seconds);
+    return std::clamp<uint64_t>(windowSeconds * kBytesPerSecond, kMinAudioCapacityBytes, kMaxAudioCapacityBytes);
+}
+
 // Ring storage location: explicit override when set, otherwise next to the
 // clip library. Keeping this resolution here means ReplayBuffer stays agnostic
 // of where the user wants the file.
 std::filesystem::path replayRingDirectoryFor(const AppSettings& settings) {
     return settings.replayRingDirectory.empty() ? settings.clipDirectory : settings.replayRingDirectory;
-}
-
-const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
-    switch (backend) {
-    case CaptureBackend::WindowsGraphicsCapture:
-        return L"Windows Graphics Capture";
-    case CaptureBackend::DesktopDuplication:
-        return L"Desktop Duplication";
-    }
-    return L"Unknown";
 }
 
 CaptureBackend selectedBackendForSettings(const AppSettings& settings) {
@@ -145,15 +154,6 @@ VideoSettings activeVideoSettingsFor(const AppSettings& settings) {
     active.width = evenEncodeDimension(active.width);
     active.height = evenEncodeDimension(active.height);
     return active;
-}
-
-std::wstring normalizedExecutableKey(const std::filesystem::path& path) {
-    std::wstring value = path.wstring();
-    std::replace(value.begin(), value.end(), L'/', L'\\');
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(towlower(ch));
-    });
-    return value;
 }
 
 enum class OutputNameReservation {
@@ -196,7 +196,7 @@ std::vector<std::wstring> mutedSoundSeparationExecutableKeys(const AppSettings& 
         if (!app.muted || app.executablePath.empty()) {
             continue;
         }
-        const std::wstring key = normalizedExecutableKey(app.executablePath);
+        const std::wstring key = normalizedPathKey(app.executablePath);
         if (!key.empty()) {
             keys.push_back(key);
         }
@@ -551,9 +551,17 @@ void RecorderController::beginStartupSweep() {
     }
     // Capture the path: a settings change must not redirect the running sweep.
     const std::filesystem::path clipDirectory = settings().clipDirectory;
+    // Also captured for the same reason. Only swept when disk backing is off:
+    // an enabled ring is truncated and reused by openRingLocked on the next
+    // configure, so there is nothing to reclaim and nothing is open to race.
+    const std::filesystem::path ringDirectory = replayRingDirectoryFor(settings());
+    const bool sweepOrphanedRing = !settings().replay.diskBackedVideo && !settings().replay.diskBackedAudio;
     Logger::instance().info(L"app", L"Startup recovery sweep started in background");
-    startupSweepThread_ = std::thread([clipDirectory]() {
+    startupSweepThread_ = std::thread([clipDirectory, ringDirectory, sweepOrphanedRing]() {
         try {
+            if (sweepOrphanedRing) {
+                ReplayBuffer::removeOrphanedRing(ringDirectory);
+            }
             RecoveryStore::sweepOrphanedRecoveryData(clipDirectory);
         } catch (const std::exception& error) {
             Logger::instance().warning(L"app", std::wstring(L"Startup recovery sweep failed: ") + utf8ToWide(error.what()));
@@ -593,7 +601,7 @@ bool RecorderController::initialize(AppSettings settings) {
         microphoneDenoiserResetPending_ = true;
 #endif
         replay_.clear();
-        replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
+        replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_), replayAudioRingCapacityBytesFor(settings_));
     }
     Logger::instance().info(L"recorder", std::wstring(L"Recorder initialized: clips=") + applied.clipDirectory.wstring() +
                             L", replay=" + (applied.replay.enabled ? L"enabled" : L"disabled") +
@@ -627,8 +635,9 @@ bool RecorderController::updateSettings(AppSettings settings) {
                 return true;
             }
         }
-        // A change confined to replay.* (e.g. toggling the disk↔RAM buffering
-        // backend, or the replay window) does not touch video/audio/GPU state,
+        // A change confined to replay.* or the ring folder (e.g. toggling the
+        // disk↔RAM buffering backend, or the replay window) does not touch
+        // video/audio/GPU state,
         // so apply it in place instead of stopping and restarting the capture
         // pipeline. The full stop path below joins pipeline threads that can be
         // wedged on a stalled GPU/NVENC; avoiding it here keeps a pure replay
@@ -636,14 +645,17 @@ bool RecorderController::updateSettings(AppSettings settings) {
         // later controller action) until the app restarts.
         AppSettings currentNoReplay = currentWithoutVoice;
         currentNoReplay.replay = {};
+        currentNoReplay.replayRingDirectory.clear();
         AppSettings incomingNoReplay = settings;
         incomingNoReplay.replay = {};
+        incomingNoReplay.replayRingDirectory.clear();
         if (currentNoReplay == incomingNoReplay &&
             currentWithoutVoice.replay.enabled == settings.replay.enabled &&
             pipelineRunning_.load()) {
             settings_.gameIntegrations.voiceCommand = settings.gameIntegrations.voiceCommand;
             settings_.replay = settings.replay;
-            replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
+            settings_.replayRingDirectory = settings.replayRingDirectory;
+            replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_), replayAudioRingCapacityBytesFor(settings_));
             Logger::instance().info(L"recorder",
                 L"Replay buffer settings changed; reconfigured the buffer in place without restarting capture pipeline");
             return true;
@@ -684,7 +696,7 @@ bool RecorderController::updateSettings(AppSettings settings) {
         microphoneDenoiserResetPending_ = true;
 #endif
         replayEnabledAfterApply = settings_.replay.enabled;
-        replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
+        replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_), replayAudioRingCapacityBytesFor(settings_));
         // A codec/resolution/fps change makes every buffered packet's bitstream
         // incompatible with the new pipeline. Keep them and a replay save would
         // mix two SPS/PPS worlds into one clip. Drop the buffer so the timeline
@@ -726,7 +738,7 @@ bool RecorderController::startRecording() {
         return false;
     }
 
-    const auto output = nextClipPath(L"recording");
+    const auto output = nextClipPath(L"recording", false);
     VideoSettings videoSettings;
     {
         std::scoped_lock lock(stateMutex_);
@@ -919,7 +931,9 @@ std::filesystem::path RecorderController::saveReplay() {
         }
     }
     const std::wstring gameName = foregroundApplicationName();
-    const auto output = nextClipPath(gameName.empty() ? L"replay" : gameName.c_str());
+    const auto output = nextClipPath(
+        gameName.empty() ? L"replay" : gameName.c_str(),
+        settings().organizeClipsByGame && !gameName.empty());
     VideoSettings videoSettings;
     {
         std::scoped_lock lock(stateMutex_);
@@ -969,6 +983,7 @@ RecordingStats RecorderController::stats() const {
     stats.coalescedIdleIntervals = coalescedIdleIntervals_.load();
     stats.droppedFrames = droppedFrames_.load();
     stats.gpuProtectionDrops = gpuProtectionDrops_.load();
+    stats.frameQueueDrops = frameQueueDrops_.load();
     stats.idleFrameSkips = idleFrameSkips_.load();
     stats.cursorOnlyFrames = cursorOnlyFrames_.load();
     stats.systemAudioQueueDrops = systemAudioQueueDrops_.load();
@@ -994,13 +1009,15 @@ RecordingStats RecorderController::stats() const {
     stats.encodeWidth = encodeWidth_.load();
     stats.encodeHeight = encodeHeight_.load();
     {
-        // Diagnostics refreshes on the UI thread. GPU recovery can hold this lock
-        // while WGC waits for outstanding frame leases, so never block UI for it.
+        // Diagnostics refreshes on the UI thread and on the controller worker
+        // thread, so the unlocked read below can race a publish. GPU recovery can
+        // hold this lock while WGC waits for outstanding frame leases, so never
+        // block UI for it either: the snapshot pointer is the only handoff.
         std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
         if (gpuLock.owns_lock() && encoder_) {
-            lastEncoderStats_ = encoder_->stats();
+            lastEncoderStats_.store(std::make_shared<const EncoderStats>(encoder_->stats()));
         }
-        stats.encoder = lastEncoderStats_;
+        stats.encoder = *lastEncoderStats_.load();
     }
     stats.encoder.queueDepth = static_cast<uint32_t>(frameQueue_.size());
     detectVideoPipelineStall();
@@ -1055,9 +1072,10 @@ EncoderCapabilities RecorderController::encoderCapabilities() const {
     // See stats(): reporting must not wait for GPU teardown or recreation.
     std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
     if (gpuLock.owns_lock() && encoder_) {
-        lastEncoderCapabilities_ = encoder_->capabilities();
+        lastEncoderCapabilities_.store(
+            std::make_shared<const EncoderCapabilities>(encoder_->capabilities()));
     }
-    return lastEncoderCapabilities_;
+    return *lastEncoderCapabilities_.load();
 }
 
 AppSettings RecorderController::settings() const {
@@ -1073,6 +1091,10 @@ std::wstring RecorderController::captureBackendStatus() const {
 std::wstring RecorderController::lastRecordingError() const {
     std::scoped_lock lock(recordingErrorMutex_);
     return lastRecordingError_;
+}
+
+std::wstring RecorderController::replayStorageFallback() const {
+    return replay_.storageFallbackReason();
 }
 
 bool RecorderController::ensurePipeline() {
@@ -1112,7 +1134,7 @@ bool RecorderController::ensurePipeline() {
     const uint32_t sourceWidth = captureWidth_.load();
     const uint32_t sourceHeight = captureHeight_.load();
 
-    replay_.configure(snapshot.replay, replayRingDirectoryFor(snapshot), replayRingCapacityBytesFor(snapshot));
+    replay_.configure(snapshot.replay, replayRingDirectoryFor(snapshot), replayRingCapacityBytesFor(snapshot), replayAudioRingCapacityBytesFor(snapshot));
     stopRequested_ = false;
     discardQueuedFrames_ = false;
     durationUpdatePending_ = false;
@@ -1131,6 +1153,7 @@ bool RecorderController::ensurePipeline() {
     coalescedIdleIntervals_ = 0;
     droppedFrames_ = 0;
     gpuProtectionDrops_ = 0;
+    frameQueueDrops_ = 0;
     idleFrameSkips_ = 0;
     cursorOnlyFrames_ = 0;
     systemAudioQueueDrops_ = 0;
@@ -1179,17 +1202,26 @@ void RecorderController::stopPipeline() {
     // Drain (not discard) the remaining queue: encodeLoop exits only after the
     // queue is empty, so queued frames still reach replay and the recording
     // instead of silently vanishing on settings switches / shutdown.
-    systemAudio_.stop();
-    microphoneAudio_.stop();
-    Logger::instance().info(L"recorder", L"Capture/encode pipeline audio stopped; joining video workers");
     if (frameEvent_) {
         SetEvent(frameEvent_);
     }
+    // Join the capture worker BEFORE stopping audio. Its 2 s sound-separation
+    // poll restarts system audio through refreshSystemAudioCapture, and
+    // WasapiCapture::start/stop share one unsynchronized std::thread - stopping
+    // audio here while the loop is inside start() races on that object. The loop
+    // exits on stopRequested_ alone; nothing below needs audio already stopped.
     if (captureThread_.joinable()) {
         Logger::instance().info(L"recorder", L"Waiting for capture worker to stop");
         captureThread_.join();
         Logger::instance().info(L"recorder", L"Capture worker stopped");
     }
+    // Both joins are unbounded on purpose. A worker wedged inside a vendor call
+    // (NVENC submit, WGC session close, a synchronous ring write) cannot be
+    // abandoned: detaching would let it touch RecorderController after the
+    // object dies, and terminating would throw away the user's clip.
+    // std::thread::join has no timed form and kGpuPipelineStopTimeout does not
+    // apply to a thread that must not be left running, so the info line above is
+    // the diagnostic: a real hang ends the log at "Waiting for <worker>".
     if (encodeThread_.joinable()) {
         Logger::instance().info(L"recorder", L"Waiting for encode worker to stop");
         encodeThread_.join();
@@ -1197,17 +1229,21 @@ void RecorderController::stopPipeline() {
     }
     Logger::instance().debug(L"recorder", L"Capture/encode threads joined");
 
+    systemAudio_.stop();
+    microphoneAudio_.stop();
+    Logger::instance().info(L"recorder", L"Capture/encode pipeline audio stopped");
     if (audioEvent_) {
         SetEvent(audioEvent_);
     }
     if (audioThread_.joinable()) {
+        Logger::instance().info(L"recorder", L"Waiting for audio writer to stop");
         audioThread_.join();
+        Logger::instance().info(L"recorder", L"Audio writer stopped");
     }
     WasapiCapture::clearSessionMutes();
     {
         std::scoped_lock lock(systemAudioCaptureMutex_);
         systemAudioMutedExecutableKeys_.clear();
-        systemAudioSessionMutesActive_ = false;
     }
     // Drop any remaining GpuFrame leases before capture shutdown so WGC
     // Direct3D11CaptureFrame refs are released first.
@@ -1229,6 +1265,7 @@ void RecorderController::stopPipeline() {
         L", capture drops=" + std::to_wstring(finalStats.droppedFrames) +
         L", GPU protection drops=" +
         std::to_wstring(finalStats.gpuProtectionDrops) +
+        L", frame queue drops=" + std::to_wstring(finalStats.frameQueueDrops) +
         L", NVENC submissions=" +
         std::to_wstring(finalStats.encoder.submittedFrames) +
         L", encoded frames=" +
@@ -1297,9 +1334,21 @@ bool RecorderController::recreateGpuPipeline(
     if (encodeThread_.joinable()) {
         Logger::instance().debug(L"recorder", L"GPU recreate waiting for encode-loop frame discard");
         std::unique_lock discardLock(frameDiscardMutex_);
-        frameDiscardComplete_.wait(discardLock, [this, discardGeneration] {
-            return discardCompletedGeneration_.load(std::memory_order_acquire) >= discardGeneration;
-        });
+        // The encode loop reaches its loop top within one 16 ms wait, so this
+        // deadline only trips when it is wedged inside a vendor call or a
+        // synchronous ring write. Aborting the recreate keeps the capture loop
+        // responsive and leaves the thread untouched for the later join.
+        if (!frameDiscardComplete_.wait_for(
+                discardLock,
+                kGpuPipelineStopTimeout,
+                [this, discardGeneration] {
+                    return discardCompletedGeneration_.load(std::memory_order_acquire) >= discardGeneration;
+                })) {
+            Logger::instance().error(
+                L"recorder",
+                L"GPU recreate timed out waiting for the encode loop to discard queued frames");
+            return false;
+        }
         Logger::instance().debug(L"recorder", L"GPU recreate encode-loop discard complete");
     } else {
         // Settings/stop path already joined encodeThread_; drop any leftover frames.
@@ -1825,7 +1874,8 @@ void RecorderController::captureLoopImpl() {
             const bool forceOwnedTexture =
                 !wgcZeroCopyEligible ||
                 (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
-            if (!scaler_.scale(
+            const uint64_t poolGeneration = scaler_.poolGeneration();
+            const bool scaled = scaler_.scale(
                     d3d_,
                     rawSource,
                     videoSettings.width,
@@ -1833,7 +1883,15 @@ void RecorderController::captureLoopImpl() {
                     encodeFrame,
                     captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor,
                     forceOwnedTexture,
-                    encoderInputFormat)) {
+                    encoderInputFormat);
+            if (scaler_.poolGeneration() != poolGeneration && encoder_) {
+                // The scaler tore down its output pool. The encoder's
+                // registered-input table still points at those textures and the
+                // driver reuses the freed addresses, so every registration is
+                // stale from here on.
+                encoder_->resetInputResources();
+            }
+            if (!scaled) {
                 ++droppedFrames_;
                 if (forcedHeartbeat) {
                     forceVideoHeartbeat_ = true;
@@ -1854,13 +1912,23 @@ void RecorderController::captureLoopImpl() {
                 encoder_->requestKeyFrame();
             }
         }
-        if (shouldDropForGpuProtection(emission.duplicateFrame, gpuSettings) ||
-            !frameQueue_.tryPush(std::move(frame))) {
+        if (shouldDropForGpuProtection(emission.duplicateFrame, gpuSettings)) {
             if (forcedHeartbeat) {
                 forceVideoHeartbeat_ = true;
             }
             ++droppedFrames_;
             ++gpuProtectionDrops_;
+            return;
+        }
+        if (!frameQueue_.tryPush(std::move(frame))) {
+            // Encoder backpressure, not the heuristic above: the queue filled
+            // between its depth check and this push. Merging the two branches
+            // back with || would bill the GPU protection for every stall.
+            if (forcedHeartbeat) {
+                forceVideoHeartbeat_ = true;
+            }
+            ++droppedFrames_;
+            ++frameQueueDrops_;
             return;
         }
         timelineScheduler.acceptSubmission(emission);
@@ -1889,11 +1957,13 @@ void RecorderController::captureLoopImpl() {
             return;
         }
         GpuFrame copy;
+        bool scaled = false;
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
             const DXGI_FORMAT format =
                 lastFrame.format != DXGI_FORMAT_UNKNOWN ? lastFrame.format : DXGI_FORMAT_B8G8R8A8_UNORM;
-            if (!scaler_.scale(
+            const uint64_t poolGeneration = scaler_.poolGeneration();
+            scaled = scaler_.scale(
                     d3d_,
                     lastFrame,
                     lastFrame.width,
@@ -1901,9 +1971,21 @@ void RecorderController::captureLoopImpl() {
                     copy,
                     false,
                     true,
-                    format)) {
-                return;
+                    format);
+            if (scaler_.poolGeneration() != poolGeneration && encoder_) {
+                // Same dangling-registration hazard as the capture loop: this
+                // copy path can reconfigure the pool at the frame's own size.
+                encoder_->resetInputResources();
             }
+        }
+        if (!scaled) {
+            // No scaler-owned copy means lastFrame still holds the raw WGC
+            // zero-copy lease, and switchCaptureTarget shuts the source down
+            // next - a shutdown that drains leases waits on exactly this one,
+            // and only a later successful capture could release it. Drop the
+            // frame here instead: one lost freeze frame beats a stalled rebind.
+            lastFrame = {};
+            return;
         }
         lastFrame = std::move(copy);
     };
@@ -3023,8 +3105,7 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) 
     if (systemAudio_.running() && !keysChanged) {
         // Re-apply session mutes so newly started muted apps get silenced.
         if (!mutedKeys.empty()) {
-            const uint32_t mutedCount = WasapiCapture::applySessionMutesForExecutables(mutedKeys);
-            systemAudioSessionMutesActive_ = mutedCount > 0;
+            WasapiCapture::applySessionMutesForExecutables(mutedKeys);
         }
         return;
     }
@@ -3034,10 +3115,8 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) 
 
     if (mutedKeys.empty()) {
         WasapiCapture::clearSessionMutes();
-        systemAudioSessionMutesActive_ = false;
     } else {
         const uint32_t mutedCount = WasapiCapture::applySessionMutesForExecutables(mutedKeys);
-        systemAudioSessionMutesActive_ = mutedCount > 0;
         Logger::instance().info(L"recorder",
             L"Sound separation muting " + std::to_wstring(mutedCount) +
             L" audio session(s) across " + std::to_wstring(mutedKeys.size()) + L" executable(s)");
@@ -3053,14 +3132,27 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) 
     if (!started) {
         Logger::instance().warning(L"recorder", L"System audio capture did not start");
         WasapiCapture::clearSessionMutes();
-        systemAudioSessionMutesActive_ = false;
         systemAudioMutedExecutableKeys_.clear();
     }
 }
 
-std::filesystem::path RecorderController::nextClipPath(const wchar_t* prefix) const {
+std::filesystem::path RecorderController::nextClipPath(const wchar_t* prefix, bool organizeIntoSubfolder) const {
     const auto snapshot = settings();
-    const std::filesystem::path initial = snapshot.clipDirectory / makeTimestampedFileName(prefix, L".mp4");
+    // Per-game folders reuse the already filename-sanitized clip prefix, so no
+    // further scrubbing is needed. Created here because the reservation below
+    // (CREATE_NEW) fails when the parent does not exist yet.
+    std::filesystem::path directory = snapshot.clipDirectory;
+    if (organizeIntoSubfolder && prefix != nullptr && *prefix != L'\0') {
+        std::error_code directoryError;
+        std::filesystem::create_directories(snapshot.clipDirectory / prefix, directoryError);
+        if (directoryError) {
+            Logger::instance().warning(L"recorder", std::wstring(L"Could not create game clip folder, saving to the clip folder instead: ") +
+                                       (snapshot.clipDirectory / prefix).wstring());
+        } else {
+            directory /= prefix;
+        }
+    }
+    const std::filesystem::path initial = directory / makeTimestampedFileName(prefix, L".mp4");
     if (reserveClipOutputName(initial) == OutputNameReservation::Reserved) {
         return initial;
     }
@@ -3074,7 +3166,7 @@ std::filesystem::path RecorderController::nextClipPath(const wchar_t* prefix) co
 
     const std::wstring stem = initial.stem().wstring();
     for (uint32_t suffix = 2; suffix < 1000; ++suffix) {
-        const auto candidate = snapshot.clipDirectory / (stem + L"_" + std::to_wstring(suffix) + L".mp4");
+        const auto candidate = directory / (stem + L"_" + std::to_wstring(suffix) + L".mp4");
         if (reserveClipOutputName(candidate) == OutputNameReservation::Reserved) {
             return candidate;
         }
@@ -3084,7 +3176,7 @@ std::filesystem::path RecorderController::nextClipPath(const wchar_t* prefix) co
         }
     }
 
-    return snapshot.clipDirectory /
+    return directory /
            (stem + L"_" + std::to_wstring(GetTickCount64()) + L".mp4");
 }
 

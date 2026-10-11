@@ -22,6 +22,11 @@ public:
         bool fitWithBars = false,
         bool forceOutputTexture = false,
         DXGI_FORMAT preferredOutputFormat = DXGI_FORMAT_B8G8R8A8_UNORM);
+    // Bumped by every output-pool teardown (reconfigure, reset, setPoolSize).
+    // A change across a scale() call means the pool was rebuilt, so any GPU
+    // registration the consumer still holds for those textures is dangling and
+    // must be dropped before the new pool is consumed.
+    uint64_t poolGeneration() const;
     void setPoolSize(uint32_t poolSize);
     void reset();
 
@@ -105,6 +110,7 @@ private:
     uint32_t outputHeight_ = 0;
     DXGI_FORMAT outputFormat_ = DXGI_FORMAT_UNKNOWN;
     uint32_t poolSize_ = 8;
+    uint64_t poolGeneration_ = 0;
 
     // Video-processor configuration currently programmed into processor_.
     // Invalidated whenever the processor is recreated (releaseResources).

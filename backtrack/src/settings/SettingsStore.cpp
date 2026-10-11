@@ -1,4 +1,4 @@
-﻿#include "settings/SettingsStore.h"
+#include "settings/SettingsStore.h"
 
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
@@ -14,16 +14,6 @@
 namespace backtrack {
 
 namespace {
-
-std::wstring trim(std::wstring value) {
-    while (!value.empty() && iswspace(value.front())) {
-        value.erase(value.begin());
-    }
-    while (!value.empty() && iswspace(value.back())) {
-        value.pop_back();
-    }
-    return value;
-}
 
 uint32_t readUInt(const std::map<std::wstring, std::wstring>& values, const std::wstring& key, uint32_t fallback) {
     const auto it = values.find(key);
@@ -43,15 +33,6 @@ uint32_t readUInt(const std::map<std::wstring, std::wstring>& values, const std:
     } catch (...) {
         return fallback;
     }
-}
-
-std::wstring normalizedPathKey(const std::filesystem::path& path) {
-    std::wstring value = path.wstring();
-    std::replace(value.begin(), value.end(), L'/', L'\\');
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(towlower(ch));
-    });
-    return value;
 }
 
 bool readBool(const std::map<std::wstring, std::wstring>& values, const std::wstring& key, bool fallback) {
@@ -80,46 +61,20 @@ std::wstring readString(const std::map<std::wstring, std::wstring>& values, cons
 bool readLibraryGalleryView(const std::map<std::wstring, std::wstring>& values, bool fallback) {
     const auto modeIt = values.find(L"library.viewMode");
     if (modeIt != values.end()) {
-        const auto& mode = modeIt->second;
-        if (mode == L"gallery" || mode == L"Gallery" || mode == L"GALLERY") {
+        // Case-insensitive like readBool, because the user's capitalization is
+        // not a reason to drop a gallery view back to the default.
+        std::wstring mode = modeIt->second;
+        std::transform(mode.begin(), mode.end(), mode.begin(), [](wchar_t ch) {
+            return static_cast<wchar_t>(towlower(ch));
+        });
+        if (mode == L"gallery") {
             return true;
         }
-        if (mode == L"list" || mode == L"List" || mode == L"LIST") {
+        if (mode == L"list") {
             return false;
         }
     }
     return readBool(values, L"library.galleryView", fallback);
-}
-
-uint32_t supportedHotkeyModifiers(uint32_t modifiers) {
-    return modifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT);
-}
-
-bool isSafeBareHotkey(uint32_t virtualKey) {
-    return (virtualKey >= VK_F1 && virtualKey <= VK_F24) ||
-           virtualKey == VK_PAUSE ||
-           virtualKey == VK_SNAPSHOT ||
-           virtualKey == VK_MEDIA_PLAY_PAUSE ||
-           virtualKey == VK_MEDIA_STOP ||
-           virtualKey == VK_MEDIA_NEXT_TRACK ||
-           virtualKey == VK_MEDIA_PREV_TRACK;
-}
-
-bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey) {
-    if (virtualKey == 0) {
-        return true;
-    }
-    if (virtualKey > 0xfe) {
-        return false;
-    }
-    modifiers = supportedHotkeyModifiers(modifiers);
-    if (modifiers == 0) {
-        return isSafeBareHotkey(virtualKey);
-    }
-    if (isSafeBareHotkey(virtualKey)) {
-        return true;
-    }
-    return (modifiers & (MOD_CONTROL | MOD_ALT)) != 0;
 }
 
 uint32_t clampEven(uint32_t value, uint32_t minimum, uint32_t maximum) {
@@ -138,7 +93,7 @@ void dedupeNamedExecutableApps(std::vector<App>& apps) {
         if (app.executablePath.empty()) {
             continue;
         }
-        app.name = trim(std::move(app.name));
+        app.name = trimText(std::move(app.name));
         if (app.name.empty()) {
             app.name = app.executablePath.stem().wstring();
         }
@@ -189,6 +144,39 @@ bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height
 
 } // namespace
 
+// Hotkey safety is defined here because sanitizeSettings is the authority; the
+// UI calls these instead of keeping its own copy that could drift from it.
+uint32_t supportedHotkeyModifiers(uint32_t modifiers) {
+    return modifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT);
+}
+
+bool isSafeBareHotkey(uint32_t virtualKey) {
+    return (virtualKey >= VK_F1 && virtualKey <= VK_F24) ||
+           virtualKey == VK_PAUSE ||
+           virtualKey == VK_SNAPSHOT ||
+           virtualKey == VK_MEDIA_PLAY_PAUSE ||
+           virtualKey == VK_MEDIA_STOP ||
+           virtualKey == VK_MEDIA_NEXT_TRACK ||
+           virtualKey == VK_MEDIA_PREV_TRACK;
+}
+
+bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey) {
+    if (virtualKey == 0) {
+        return true;
+    }
+    if (virtualKey > 0xfe) {
+        return false;
+    }
+    modifiers = supportedHotkeyModifiers(modifiers);
+    if (modifiers == 0) {
+        return isSafeBareHotkey(virtualKey);
+    }
+    if (isSafeBareHotkey(virtualKey)) {
+        return true;
+    }
+    return (modifiers & (MOD_CONTROL | MOD_ALT)) != 0;
+}
+
 SettingsStore::SettingsStore(std::filesystem::path path)
     : path_(std::move(path)) {
 }
@@ -210,7 +198,7 @@ AppSettings SettingsStore::load() const {
             rawLine.pop_back();
         }
         line = utf8ToWide(rawLine);
-        line = trim(line);
+        line = trimText(line);
         if (line.empty() || line.front() == L'#') {
             continue;
         }
@@ -218,7 +206,7 @@ AppSettings SettingsStore::load() const {
         if (pos == std::wstring::npos) {
             continue;
         }
-        values[trim(line.substr(0, pos))] = trim(line.substr(pos + 1));
+        values[trimText(line.substr(0, pos))] = trimText(line.substr(pos + 1));
     }
 
     settings.video.width = readUInt(values, L"video.width", settings.video.width);
@@ -245,6 +233,7 @@ AppSettings SettingsStore::load() const {
     settings.replay.enabled = readBool(values, L"replay.enabled", settings.replay.enabled);
     settings.replay.seconds = readUInt(values, L"replay.seconds", settings.replay.seconds);
     settings.replay.diskBackedVideo = readBool(values, L"replay.diskBackedVideo", settings.replay.diskBackedVideo);
+    settings.replay.diskBackedAudio = readBool(values, L"replay.diskBackedAudio", settings.replay.diskBackedAudio);
     settings.replayRingDirectory = readString(values, L"replay.ringDirectory", settings.replayRingDirectory.wstring());
     const bool legacyLeagueKillClips =
         readBool(values, L"integrations.leagueOfLegends.autoKillClips", settings.gameIntegrations.leagueOfLegendsKillReminder);
@@ -298,19 +287,21 @@ AppSettings SettingsStore::load() const {
     settings.pruneStaleMicrophoneConsentEntries =
         readBool(values, L"general.pruneStaleMicrophoneConsentEntries", settings.pruneStaleMicrophoneConsentEntries);
     settings.exitToTray = readBool(values, L"general.exitToTray", settings.exitToTray);
+    settings.checkForUpdates = readBool(values, L"general.checkForUpdates", settings.checkForUpdates);
     settings.logLevel = logLevelFromName(readString(values, L"diagnostics.logLevel", logLevelName(settings.logLevel)), settings.logLevel);
     settings.notificationSoundVolumePercent =
         readUInt(values, L"general.notificationSoundVolumePercent", settings.notificationSoundVolumePercent);
     settings.customNotificationSoundPath =
         readString(values, L"general.customNotificationSoundPath", settings.customNotificationSoundPath.wstring());
     settings.monitorIndex = readUInt(values, L"capture.monitorIndex", settings.monitorIndex);
-    settings.multiMonitorSupport = readBool(values, L"capture.multiMonitorSupport", settings.followFocusedMonitor);
+    settings.multiMonitorSupport = readBool(values, L"capture.multiMonitorSupport", settings.multiMonitorSupport);
     settings.followFocusedMonitor = readBool(values, L"capture.followFocusedMonitor", settings.followFocusedMonitor);
     settings.followMouseMonitor = readBool(values, L"capture.followMouseMonitor", settings.followMouseMonitor);
     settings.captureCursor = readBool(values, L"capture.cursor", settings.captureCursor);
     settings.preferredCaptureBackend = captureBackendFromName(
         readString(values, L"capture.backend", captureBackendName(settings.preferredCaptureBackend)));
     settings.clipDirectory = readString(values, L"clips.directory", settings.clipDirectory.wstring());
+    settings.organizeClipsByGame = readBool(values, L"clips.organizeByGame", settings.organizeClipsByGame);
     settings.libraryGalleryView = readLibraryGalleryView(values, settings.libraryGalleryView);
     settings.hotkeys.startStopModifiers = readUInt(values, L"hotkeys.startStop.modifiers", settings.hotkeys.startStopModifiers);
     settings.hotkeys.startStopVirtualKey = readUInt(values, L"hotkeys.startStop.vk", settings.hotkeys.startStopVirtualKey);
@@ -334,6 +325,10 @@ AppSettings SettingsStore::load() const {
             settings.gameIntegrations.discordRichPresence = discordRichPresenceModeFromName(raw);
         }
     }
+    settings.gameIntegrations.discordRichPresenceResetTimerOnSwitch = readBool(
+        values,
+        L"integrations.discordRichPresenceResetTimerOnSwitch",
+        settings.gameIntegrations.discordRichPresenceResetTimerOnSwitch);
 
     return sanitizeSettings(settings);
 }
@@ -375,11 +370,14 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"replay.enabled=" << (normalized.replay.enabled ? 1 : 0) << L"\n";
     output << L"replay.seconds=" << normalized.replay.seconds << L"\n";
     output << L"replay.diskBackedVideo=" << (normalized.replay.diskBackedVideo ? 1 : 0) << L"\n";
+    output << L"replay.diskBackedAudio=" << (normalized.replay.diskBackedAudio ? 1 : 0) << L"\n";
     output << L"replay.ringDirectory=" << normalized.replayRingDirectory.wstring() << L"\n";
     output << L"integrations.leagueOfLegends.killReminder=" << (normalized.gameIntegrations.leagueOfLegendsKillReminder ? 1 : 0) << L"\n";
     output << L"integrations.voiceCommand=" << voiceCommandModeName(normalized.gameIntegrations.voiceCommand) << L"\n";
     output << L"integrations.discordRichPresence="
            << discordRichPresenceModeName(normalized.gameIntegrations.discordRichPresence) << L"\n";
+    output << L"integrations.discordRichPresenceResetTimerOnSwitch="
+           << (normalized.gameIntegrations.discordRichPresenceResetTimerOnSwitch ? 1 : 0) << L"\n";
     output << L"gpu.adaptiveMode=" << gpuAdaptiveModeName(normalized.gpu.adaptiveMode) << L"\n";
     output << L"gpu.wgcZeroCopy=" << (normalized.gpu.wgcZeroCopy ? 1 : 0) << L"\n";
     output << L"gpu.frameQueueLimit=" << normalized.gpu.frameQueueLimit << L"\n";
@@ -415,6 +413,7 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"general.startWithWindowsMinimized=" << (normalized.startWithWindowsMinimized ? 1 : 0) << L"\n";
     output << L"general.pruneStaleMicrophoneConsentEntries=" << (normalized.pruneStaleMicrophoneConsentEntries ? 1 : 0) << L"\n";
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
+    output << L"general.checkForUpdates=" << (normalized.checkForUpdates ? 1 : 0) << L"\n";
     output << L"diagnostics.logLevel=" << logLevelName(normalized.logLevel) << L"\n";
     output << L"general.notificationSoundVolumePercent=" << normalized.notificationSoundVolumePercent << L"\n";
     output << L"general.customNotificationSoundPath=" << normalized.customNotificationSoundPath.wstring() << L"\n";
@@ -425,20 +424,51 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"capture.cursor=" << (normalized.captureCursor ? 1 : 0) << L"\n";
     output << L"capture.backend=" << captureBackendName(normalized.preferredCaptureBackend) << L"\n";
     output << L"clips.directory=" << normalized.clipDirectory.wstring() << L"\n";
+    output << L"clips.organizeByGame=" << (normalized.organizeClipsByGame ? 1 : 0) << L"\n";
     output << L"library.viewMode=" << (normalized.libraryGalleryView ? L"gallery" : L"list") << L"\n";
     output << L"hotkeys.startStop.modifiers=" << normalized.hotkeys.startStopModifiers << L"\n";
     output << L"hotkeys.startStop.vk=" << normalized.hotkeys.startStopVirtualKey << L"\n";
     output << L"hotkeys.saveReplay.modifiers=" << normalized.hotkeys.saveReplayModifiers << L"\n";
     output << L"hotkeys.saveReplay.vk=" << normalized.hotkeys.saveReplayVirtualKey << L"\n";
 
-    std::ofstream file(path_, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        Logger::instance().error(L"settings", L"Could not open settings file for writing: " + path_.wstring());
-        return;
+    // Stage the rewrite in a sibling temp file and swap it over the live one,
+    // the way the recovery manifest and the session-mute journal are published.
+    // Truncating settings.ini in place means a full disk or a lock from a sync
+    // client zeroes it before the first byte is written, and the next load then
+    // silently falls back to defaults for every key the partial file lost. A
+    // process killed between the write and the rename only leaves the temp
+    // file, which the next save truncates and reuses.
+    const std::filesystem::path tempPath = path_.wstring() + L".tmp";
+    {
+        std::ofstream file(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) {
+            Logger::instance().error(L"settings", L"Could not open settings temp file for writing: " + tempPath.wstring());
+            return;
+        }
+        file << wideToUtf8(output.str());
+        // A buffered write can pass and still fail on the way to the disk.
+        file.flush();
+        if (!file) {
+            Logger::instance().error(L"settings", L"Could not write settings temp file: " + tempPath.wstring());
+            file.close();
+            std::error_code removeError;
+            std::filesystem::remove(tempPath, removeError);
+            return;
+        }
     }
-    file << wideToUtf8(output.str());
-    if (!file) {
-        Logger::instance().error(L"settings", L"Could not write settings file: " + path_.wstring());
+
+    // MSVC implements std::filesystem::rename as
+    // MoveFileEx(MOVEFILE_REPLACE_EXISTING), so the live file is replaced
+    // rather than making this fail because settings.ini already exists. This is
+    // the only point at which the live file is touched, and it cannot damage
+    // what is already there.
+    std::error_code replaceError;
+    std::filesystem::rename(tempPath, path_, replaceError);
+    if (replaceError) {
+        Logger::instance().error(L"settings", L"Could not replace settings file, previous settings kept: " +
+            path_.wstring() + L" (Win32 error " + std::to_wstring(replaceError.value()) + L")");
+        std::error_code removeError;
+        std::filesystem::remove(tempPath, removeError);
     }
 }
 

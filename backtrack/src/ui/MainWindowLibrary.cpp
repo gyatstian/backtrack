@@ -33,6 +33,34 @@
 #include <utility>
 
 namespace backtrack {
+
+namespace {
+
+int galleryTileWidth(const RECT& row) {
+    const int rowWidth = std::max(1, static_cast<int>(row.right - row.left));
+    return std::max(1, (rowWidth - kGalleryTileGap * (kGalleryClipColumns + 1)) / kGalleryClipColumns);
+}
+
+} // namespace
+
+RECT MainWindow::galleryTileRect(const RECT& row, int column) {
+    const int tileWidth = galleryTileWidth(row);
+    const int left = static_cast<int>(row.left) + kGalleryTileGap + column * (tileWidth + kGalleryTileGap);
+    return RECT{
+        left,
+        static_cast<int>(row.top) + kGalleryTileGap,
+        left + tileWidth,
+        static_cast<int>(row.bottom) - kGalleryTileGap};
+}
+
+int MainWindow::galleryTileColumnAt(const RECT& row, int x) {
+    const int offset = x - static_cast<int>(row.left) - kGalleryTileGap;
+    // A gap belongs to the tile on its left, so every point in the row resolves
+    // to the tile the painter drew there instead of the next column.
+    const int column = offset < 0 ? 0 : offset / (galleryTileWidth(row) + kGalleryTileGap);
+    return std::clamp(column, 0, kGalleryClipColumns - 1);
+}
+
 void MainWindow::setLibraryViewMode(LibraryViewMode mode) {
     if (libraryViewMode_ == mode && clipList_) {
         return;
@@ -349,11 +377,13 @@ size_t MainWindow::clipIndexAtPoint(POINT point) const {
         return clipIndexFromListItem(static_cast<UINT>(row));
     }
 
-    RECT client{};
-    GetClientRect(clipList_, &client);
-    const int width = std::max(1, static_cast<int>(client.right - client.left));
-    const int columnWidth = std::max(1, width / kGalleryClipColumns);
-    const int column = std::clamp(static_cast<int>(point.x / columnWidth), 0, kGalleryClipColumns - 1);
+    // Same rect the painter used for this row, not the client rect: the tile
+    // geometry below is only correct for the row it was drawn into.
+    RECT rowRect{};
+    if (SendMessageW(clipList_, LB_GETITEMRECT, static_cast<WPARAM>(row), reinterpret_cast<LPARAM>(&rowRect)) == LB_ERR) {
+        GetClientRect(clipList_, &rowRect);
+    }
+    const int column = galleryTileColumnAt(rowRect, static_cast<int>(point.x));
     const size_t index = static_cast<size_t>(row) * kGalleryClipColumns + static_cast<size_t>(column);
     return index < clips_.size() ? index : static_cast<size_t>(-1);
 }
@@ -480,12 +510,33 @@ void MainWindow::refreshClips() {
     clips_ = clipManager_.listClips();
     selectedClipIndex_ = static_cast<size_t>(-1);
     loadClipThumbnails();
+    populateClipListRows();
+    if (clips_.empty()) {
+        setText(renameEdit_, L"");
+        setStatus(L"No clips found");
+        return;
+    }
+
+    Logger::instance().info(L"ui", L"Library refreshed: " + std::to_wstring(clips_.size()) + L" clips in " + controller_.settings().clipDirectory.wstring());
+    std::wstring status = std::to_wstring(clips_.size()) + (clips_.size() == 1 ? L" clip found" : L" clips found");
+    const bool loadingPreviews = std::any_of(clipThumbnails_.begin(), clipThumbnails_.end(), [](const ClipThumbnail& thumbnail) {
+        return thumbnail.loading;
+    });
+    if (loadingPreviews) {
+        status += L"; loading previews";
+    }
+    setStatus(status);
+}
+
+void MainWindow::populateClipListRows() {
+    if (!clipList_) {
+        return;
+    }
+
     ScopedRedrawLock redraw(clipList_);
     SendMessageW(clipList_, LB_RESETCONTENT, 0, 0);
     if (clips_.empty()) {
         SendMessageW(clipList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"No clips yet"));
-        setText(renameEdit_, L"");
-        setStatus(L"No clips found");
         return;
     }
 
@@ -511,15 +562,12 @@ void MainWindow::refreshClips() {
             }
         }
     }
-    Logger::instance().info(L"ui", L"Library refreshed: " + std::to_wstring(clips_.size()) + L" clips in " + controller_.settings().clipDirectory.wstring());
-    std::wstring status = std::to_wstring(clips_.size()) + (clips_.size() == 1 ? L" clip found" : L" clips found");
-    const bool loadingPreviews = std::any_of(clipThumbnails_.begin(), clipThumbnails_.end(), [](const ClipThumbnail& thumbnail) {
-        return thumbnail.loading;
-    });
-    if (loadingPreviews) {
-        status += L"; loading previews";
+
+    if (selectedClipIndex_ < clips_.size()) {
+        SendMessageW(clipList_, LB_SETCURSEL,
+            static_cast<WPARAM>(libraryViewMode_ == LibraryViewMode::Gallery ? selectedClipIndex_ / kGalleryClipColumns : selectedClipIndex_), 0);
     }
-    setStatus(status);
+    InvalidateRect(clipList_, nullptr, FALSE);
 }
 
 void MainWindow::onClipSelectionChanged() {
@@ -558,6 +606,14 @@ void MainWindow::openSelectedClip() {
     }
 }
 
+size_t MainWindow::clipIndexForPath(const std::filesystem::path& path) const {
+    const auto found = std::find_if(clips_.begin(), clips_.end(), [&path](const ClipInfo& clip) {
+        return clip.path == path;
+    });
+    // Not found yields clips_.size(), which every caller treats as "no entry".
+    return static_cast<size_t>(found - clips_.begin());
+}
+
 void MainWindow::deleteSelectedClip() {
     const auto path = selectedClipPath();
     if (path.empty()) {
@@ -574,7 +630,22 @@ void MainWindow::deleteSelectedClip() {
 
     if (clipManager_.removeClip(path)) {
         Logger::instance().info(L"ui", std::wstring(L"Deleted clip from library: ") + path.wstring());
-        refreshClips();
+        // Drop the entry instead of rescanning: a full rescan is a folder walk
+        // plus a shell property read per clip, which is what makes a
+        // single-clip action freeze the window.
+        const size_t index = clipIndexForPath(path);
+        if (index < clips_.size()) {
+            clips_.erase(clips_.begin() + static_cast<std::ptrdiff_t>(index));
+            if (index < clipThumbnails_.size()) {
+                clipThumbnails_.erase(clipThumbnails_.begin() + static_cast<std::ptrdiff_t>(index));
+            }
+        }
+        selectedClipIndex_ = static_cast<size_t>(-1);
+        // Releases the deleted clip's cached bitmaps and drops any thumbnail
+        // still in flight for the shifted indices.
+        loadClipThumbnails();
+        populateClipListRows();
+        setText(renameEdit_, L"");
         setStatus(L"Clip deleted");
     } else {
         Logger::instance().warning(L"ui", std::wstring(L"Clip delete failed from library: ") + path.wstring());
@@ -596,7 +667,32 @@ void MainWindow::renameSelectedClip() {
 
     if (clipManager_.renameClip(path, newName)) {
         Logger::instance().info(L"ui", std::wstring(L"Renamed clip from library: ") + path.wstring() + L" -> " + newName);
-        refreshClips();
+        // Same rule as delete: patch the loaded entry instead of rescanning. A
+        // rename touches neither the media nor its sidecars, so size, duration,
+        // favorite and tags on the entry are still true and must be carried
+        // over rather than re-read.
+        const size_t index = clipIndexForPath(path);
+        if (index < clips_.size()) {
+            const std::filesystem::path renamed =
+                path.parent_path() / (newName + path.extension().wstring());
+            clips_[index].path = renamed;
+            // A rename preserves the file's modified time but changes its name,
+            // and the list orders by modified time then filename. Without this
+            // re-sort a clip that ties on modified time would sit wherever the
+            // old name left it instead of where listClips() puts it. This
+            // mirrors the comparator there and must stay in step with it.
+            std::stable_sort(clips_.begin(), clips_.end(), [](const ClipInfo& left, const ClipInfo& right) {
+                if (left.modifiedTime != right.modifiedTime) {
+                    return left.modifiedTime > right.modifiedTime;
+                }
+                return left.path.filename().wstring() > right.path.filename().wstring();
+            });
+            selectedClipIndex_ = clipIndexForPath(renamed);
+            // Drops the thumbnail cached under the old path and any request
+            // still in flight for the shifted indices.
+            loadClipThumbnails();
+            populateClipListRows();
+        }
         setStatus(L"Clip renamed");
     } else {
         Logger::instance().warning(L"ui", std::wstring(L"Clip rename failed from library: ") + path.wstring() + L" -> " + newName);
@@ -616,7 +712,14 @@ void MainWindow::toggleSelectedFavorite() {
         !favoriteError;
     if (clipManager_.setFavorite(path, !currentlyFavorite)) {
         Logger::instance().info(L"ui", std::wstring(currentlyFavorite ? L"Removed favorite marker from clip: " : L"Marked clip as favorite: ") + path.wstring());
-        refreshClips();
+        // The marker file is the only thing that changed: the clip's own name,
+        // size and modified time are untouched, so the loaded list is already
+        // in the order a rescan would produce. Flip the entry and repaint.
+        const size_t index = clipIndexForPath(path);
+        if (index < clips_.size()) {
+            clips_[index].favorite = !currentlyFavorite;
+        }
+        populateClipListRows();
         setStatus(currentlyFavorite ? L"Favorite removed" : L"Clip favorited");
     } else {
         Logger::instance().warning(L"ui", std::wstring(L"Favorite update failed for clip: ") + path.wstring());

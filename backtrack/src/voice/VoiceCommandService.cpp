@@ -117,6 +117,12 @@ void VoiceCommandService::run(VoiceCommandMode mode) {
             hr = recognizer->SetInput(audio.Get(), TRUE);
         }
     }
+    // stop() clears enabled_ before it signals stopEvent_, so this catches a stop
+    // that landed while SAPI was opening the microphone.
+    if (!enabled_.load()) {
+        CoUninitialize();
+        return;
+    }
     if (SUCCEEDED(hr)) {
         hr = recognizer->CreateRecoContext(&context);
     }

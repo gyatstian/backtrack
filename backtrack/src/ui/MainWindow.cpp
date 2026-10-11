@@ -115,8 +115,11 @@ std::optional<std::wstring> latestReleaseVersionFromJson(std::string_view json) 
 }
 
 std::optional<std::wstring> fetchLatestReleaseVersion() {
+    // Carries the real build so a triage log identifies the version that made
+    // the request; a literal here drifts from kCurrentAppVersion on release.
+    const std::wstring userAgent = std::wstring(L"Backtrack/") + std::wstring(kCurrentAppVersion);
     InternetHandle session(WinHttpOpen(
-        L"Backtrack/1.0.5",
+        userAgent.c_str(),
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -144,11 +147,11 @@ std::optional<std::wstring> fetchLatestReleaseVersion() {
         return std::nullopt;
     }
 
-    constexpr wchar_t kHeaders[] =
-        L"User-Agent: Backtrack/1.0.5\r\n"
+    const std::wstring headers =
+        L"User-Agent: " + userAgent + L"\r\n"
         L"Accept: application/vnd.github+json\r\n"
         L"X-GitHub-Api-Version: 2022-11-28\r\n";
-    if (!WinHttpSendRequest(request.value, kHeaders, static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
+    if (!WinHttpSendRequest(request.value, headers.c_str(), static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request.value, nullptr)) {
         return std::nullopt;
     }
@@ -273,6 +276,10 @@ MainWindow::~MainWindow() {
 }
 
 bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized) {
+    // First log line the UI owns: a posted support log must name the build that
+    // produced it even when the update check never runs.
+    Logger::instance().info(L"ui", std::wstring(L"Backtrack ") + std::wstring(kCurrentAppVersion));
+
     INITCOMMONCONTROLSEX commonControls{};
     commonControls.dwSize = sizeof(commonControls);
     commonControls.dwICC = ICC_TAB_CLASSES | ICC_STANDARD_CLASSES | ICC_LISTVIEW_CLASSES | ICC_WIN95_CLASSES;
@@ -403,7 +410,9 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
     if (!SetTimer(window_, kAutoRecordTimerId, kAutoRecordPollMs, nullptr)) {
         Logger::instance().warning(L"ui", L"Could not create the auto record timer");
     }
-    startUpdateCheck();
+    if (settings_.checkForUpdates) {
+        startUpdateCheck();
+    }
     if (settings_.replay.enabled) {
         setStatus(L"Starting replay buffer...");
     }

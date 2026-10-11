@@ -815,6 +815,14 @@ int64_t ReplayBuffer::videoSpan100ns() const {
     return std::max<int64_t>(0, newestVideoEndPts - (*firstKeyFrame)->pts100ns);
 }
 
+int64_t ReplayBuffer::newestVideoPts100ns() const {
+    std::scoped_lock lock(mutex_);
+    if (videoBackend_ == VideoBackend::Disk) {
+        return diskVideo_.empty() ? 0 : diskVideo_.back().meta.pts100ns;
+    }
+    return video_.empty() ? 0 : video_.back()->pts100ns;
+}
+
 void ReplayBuffer::trimLocked() {
     if (videoBackend_ == VideoBackend::Disk) {
         // An active save pins the buffered refs: age-based eviction here

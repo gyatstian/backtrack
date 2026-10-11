@@ -68,26 +68,29 @@ void MainWindow::requestSaveReplay(const wchar_t* source) {
 }
 
 void MainWindow::updateGameIntegrations() {
-    settings_ = controller_.settings();
-    savedSettings_ = settings_;
+    // Snapshot only: assigning settings_/savedSettings_ here would clobber
+    // unsaved edits stashed in settings_ and reset the dirty-detection
+    // baseline whenever an action completes while the user is mid-edit.
+    // applyVisibleSettings already keeps both in sync on Save.
+    const AppSettings current = controller_.settings();
     const bool leagueEnabled =
-        settings_.replay.enabled &&
-        settings_.gameIntegrations.leagueOfLegendsKillReminder;
+        current.replay.enabled &&
+        current.gameIntegrations.leagueOfLegendsKillReminder;
     if (leagueEnabled) {
         leagueIntegration_.start();
     } else {
         leagueIntegration_.stop();
     }
-    if (settings_.gameIntegrations.discordRichPresence !=
+    if (current.gameIntegrations.discordRichPresence !=
         GameIntegrationSettings::DiscordRichPresenceMode::Off) {
-        discordRichPresence_.start(settings_.gameIntegrations.discordRichPresence);
+        discordRichPresence_.start(current.gameIntegrations.discordRichPresence);
     } else {
         discordRichPresence_.stop();
     }
     voiceCommandService_.configure(
         window_,
-        settings_.gameIntegrations.voiceCommand,
-        settings_.replay.enabled);
+        current.gameIntegrations.voiceCommand,
+        current.replay.enabled);
 }
 
 void MainWindow::stopGameIntegrations() {
@@ -97,15 +100,16 @@ void MainWindow::stopGameIntegrations() {
 }
 
 void MainWindow::handleLeagueKillDetected() {
-    settings_ = controller_.settings();
-    savedSettings_ = settings_;
-    if (!settings_.replay.enabled || !settings_.gameIntegrations.leagueOfLegendsKillReminder) {
+    // Snapshot for the gate/volume readout; never overwrite the user's
+    // in-memory settings from the controller mid-edit (see updateGameIntegrations).
+    const AppSettings current = controller_.settings();
+    if (!current.replay.enabled || !current.gameIntegrations.leagueOfLegendsKillReminder) {
         return;
     }
 
     killClipTagDeadline_ = SteadyClock::now() + std::chrono::seconds(6);
     Logger::instance().info(L"ui", L"League of Legends kill reminder triggered; replay saves are taggable for 6 seconds");
-    playActionIndicator(MB_ICONASTERISK, settings_.notificationSoundVolumePercent);
+    playActionIndicator(MB_ICONASTERISK, current.notificationSoundVolumePercent);
     setStatus(L"Kill detected; press replay hotkey within 6 seconds to tag it");
 }
 

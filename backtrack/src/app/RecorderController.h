@@ -79,6 +79,11 @@ private:
     void handleAudioPacket(AudioPacket&& packet);
     void writeAudioPacket(AudioPacket&& packet);
     void refreshSystemAudioCapture(const AppSettings& settings);
+    // Diagnostics-only watchdog: warns (once per stall episode) when the
+    // capture/encode pipeline stops producing encoded video while it should be
+    // running and replay is enabled. Reads lastEncodedVideoPts100ns_ against
+    // the steady clock; no recovery logic. Safe to call from stats().
+    void detectVideoPipelineStall() const;
     std::filesystem::path nextClipPath(const wchar_t* prefix) const;
     void setLastRecordingError(std::wstring error);
 
@@ -185,6 +190,12 @@ std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<int64_t> microphoneAudioLastPacketAt100ns_{0};
     std::atomic<int64_t> lastEncodedVideoPts100ns_{0};
     std::atomic<int64_t> videoTimelineEndPts100ns_{0};
+    // Pipeline-stall watchdog (diagnostics only). Tracks the newest encoded
+    // video PTS so stats() can warn when a capture/encode pipeline that should
+    // be running stops advancing (frozen GPU/NVENC). mutable/inline so the
+    // const stats() path can observe and update it.
+    mutable std::atomic<int64_t> videoStallSeenPts100ns_{0};
+    mutable std::atomic<bool> videoStallWarningActive_{false};
     std::atomic<uint32_t> captureWidth_{0};
     std::atomic<uint32_t> captureHeight_{0};
     std::atomic<uint32_t> encodeWidth_{0};

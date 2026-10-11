@@ -40,7 +40,10 @@ void MainWindow::setLibraryViewMode(LibraryViewMode mode) {
     libraryViewMode_ = mode;
     selectedClipIndex_ = static_cast<size_t>(-1);
     clipListWheelRemainder_ = 0;
-    settings_ = controller_.settings();
+    // Persist the view flag against the in-memory settings, never against
+    // controller_.settings(): during a pending ApplySettings the controller
+    // still holds pre-save values, and saving them here used to revert the
+    // settings file the user had just written.
     settings_.libraryGalleryView = mode == LibraryViewMode::Gallery;
     settingsStore_.save(settings_);
     savedSettings_ = settings_;

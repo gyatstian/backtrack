@@ -627,6 +627,27 @@ bool RecorderController::updateSettings(AppSettings settings) {
                 return true;
             }
         }
+        // A change confined to replay.* (e.g. toggling the disk↔RAM buffering
+        // backend, or the replay window) does not touch video/audio/GPU state,
+        // so apply it in place instead of stopping and restarting the capture
+        // pipeline. The full stop path below joins pipeline threads that can be
+        // wedged on a stalled GPU/NVENC; avoiding it here keeps a pure replay
+        // setting change from hanging updateSettings (and thereby blocking every
+        // later controller action) until the app restarts.
+        AppSettings currentNoReplay = currentWithoutVoice;
+        currentNoReplay.replay = {};
+        AppSettings incomingNoReplay = settings;
+        incomingNoReplay.replay = {};
+        if (currentNoReplay == incomingNoReplay &&
+            currentWithoutVoice.replay.enabled == settings.replay.enabled &&
+            pipelineRunning_.load()) {
+            settings_.gameIntegrations.voiceCommand = settings.gameIntegrations.voiceCommand;
+            settings_.replay = settings.replay;
+            replay_.configure(settings_.replay, replayRingDirectoryFor(settings_), replayRingCapacityBytesFor(settings_));
+            Logger::instance().info(L"recorder",
+                L"Replay buffer settings changed; reconfigured the buffer in place without restarting capture pipeline");
+            return true;
+        }
     }
     if (startReplayPipeline) {
         Logger::instance().info(L"recorder",
@@ -814,18 +835,45 @@ std::filesystem::path RecorderController::saveReplay() {
     // this much muxable video before saving. For short windows demand a healthy
     // fraction (the first keyframe can sit inside the window, so a full window
     // may be unreachable); for long windows keep the 2-second minimum.
-    const int64_t replayWindow100ns =
-        secondsTo100ns(std::max<uint32_t>(1, settings().replay.seconds));
+    const int64_t playbackWindow100ns = secondsTo100ns(
+        std::max<uint32_t>(1, settings().replay.seconds));
     const int64_t minReplayVideo100ns = std::min<int64_t>(
         2 * kHundredNanosecondsPerSecond,
-        std::max<int64_t>(kHundredNanosecondsPerSecond / 2, (replayWindow100ns * 2) / 3));
-    // Buffer already has enough video: mux without restarting capture (avoids
-    // WGC recreate hangs and is unnecessary work when pipeline is already warm).
-    if (replay_.videoKeyFrameCount() == 0 || replay_.videoSpan100ns() < minReplayVideo100ns) {
-        Logger::instance().info(L"recorder",
-            L"Replay save has no buffered keyframe or too little video (span=" +
-            std::to_wstring(replay_.videoSpan100ns() / kHundredNanosecondsPerSecond) +
-            L"s); ensuring pipeline and requesting IDR");
+        std::max<int64_t>(kHundredNanosecondsPerSecond / 2, (playbackWindow100ns * 2) / 3));
+    // A buffer whose newest packet stopped advancing means the capture/encode
+    // pipeline stalled (frozen GPU/NVENC). Trim keeps it passing the span gate
+    // because heartbeats keep emitting with advancing timestamps, so a save
+    // would mux the last real frame from before the stall. Treat a buffer
+    // older than the window plus a few GOPs as needing a fresh keyframe.
+    const int64_t freshnessSlack100ns = 3 * secondsTo100ns(
+        std::max<uint32_t>(1, settings().video.gopSeconds));
+    const int64_t staleWindow100ns = playbackWindow100ns + freshnessSlack100ns;
+    auto bufferedVideoStale = [&]() {
+        const int64_t newestPts = replay_.newestVideoPts100ns();
+        return newestPts > 0 &&
+               steadyNow100ns() - newestPts > staleWindow100ns;
+    };
+    const bool needsIdrRefresh = bufferedVideoStale();
+    const bool bufferHasEnoughVideo =
+        replay_.videoKeyFrameCount() > 0 &&
+        replay_.videoSpan100ns() >= minReplayVideo100ns;
+    // Buffer already has enough video and is fresh: mux without restarting
+    // capture (avoids WGC recreate hangs and is unnecessary work when pipeline
+    // is already warm).
+    if (bufferHasEnoughVideo && !needsIdrRefresh) {
+        Logger::instance().debug(L"recorder", L"Replay save using existing buffer; pipeline ensure skipped");
+    } else {
+        if (needsIdrRefresh) {
+            Logger::instance().warning(L"recorder",
+                L"Replay buffered video is stale (newest packet is " +
+                std::to_wstring((steadyNow100ns() - replay_.newestVideoPts100ns()) / kHundredNanosecondsPerSecond) +
+                L"s old); ensuring pipeline and requesting a fresh IDR");
+        } else {
+            Logger::instance().info(L"recorder",
+                L"Replay save has no buffered keyframe or too little video (span=" +
+                std::to_wstring(replay_.videoSpan100ns() / kHundredNanosecondsPerSecond) +
+                L"s); ensuring pipeline and requesting IDR");
+        }
         if (!ensurePipeline()) {
             const std::wstring detail = L"capture pipeline could not be started";
             Logger::instance().error(L"recorder", L"Replay could not be saved because the " + detail);
@@ -838,7 +886,8 @@ std::filesystem::path RecorderController::saveReplay() {
         forceVideoHeartbeat_ = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (replay_.videoKeyFrameCount() == 0 ||
-               replay_.videoSpan100ns() < minReplayVideo100ns) {
+               replay_.videoSpan100ns() < minReplayVideo100ns ||
+               bufferedVideoStale()) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
@@ -859,8 +908,15 @@ std::filesystem::path RecorderController::saveReplay() {
             setLastRecordingError(detail);
             return {};
         }
-    } else {
-        Logger::instance().debug(L"recorder", L"Replay save using existing buffer; pipeline ensure skipped");
+        if (bufferedVideoStale()) {
+            const std::wstring detail =
+                L"capture pipeline stalled; buffered video is " +
+                std::to_wstring((steadyNow100ns() - replay_.newestVideoPts100ns()) / kHundredNanosecondsPerSecond) +
+                L"s old and no fresh keyframe arrived";
+            Logger::instance().error(L"recorder", L"Replay save aborted: " + detail);
+            setLastRecordingError(detail);
+            return {};
+        }
     }
     const std::wstring gameName = foregroundApplicationName();
     const auto output = nextClipPath(gameName.empty() ? L"replay" : gameName.c_str());
@@ -947,7 +1003,52 @@ RecordingStats RecorderController::stats() const {
         stats.encoder = lastEncoderStats_;
     }
     stats.encoder.queueDepth = static_cast<uint32_t>(frameQueue_.size());
+    detectVideoPipelineStall();
     return stats;
+}
+
+void RecorderController::detectVideoPipelineStall() const {
+    if (!pipelineRunning_.load() || stopRequested_.load() || !settings().replay.enabled) {
+        videoStallWarningActive_.store(false, std::memory_order_relaxed);
+        videoStallSeenPts100ns_.store(0, std::memory_order_relaxed);
+        return;
+    }
+    const int64_t newestPts = lastEncodedVideoPts100ns_.load(std::memory_order_acquire);
+    if (newestPts <= 0) {
+        // Pipeline just (re)started: no encoded packet yet, cannot judge.
+        videoStallWarningActive_.store(false, std::memory_order_relaxed);
+        videoStallSeenPts100ns_.store(0, std::memory_order_relaxed);
+        return;
+    }
+    const int64_t seenPts = videoStallSeenPts100ns_.load(std::memory_order_relaxed);
+    if (seenPts > 0 && newestPts > seenPts) {
+        // A new encoded packet arrived: any prior stall episode is over, so a
+        // later stall warns again instead of staying silent.
+        videoStallWarningActive_.store(false, std::memory_order_relaxed);
+    }
+    videoStallSeenPts100ns_.store(newestPts, std::memory_order_relaxed);
+
+    const int64_t idleAge100ns = steadyNow100ns() - newestPts;
+    // Heartbeats re-encode a frame every GOP, so a live-but-idle pipeline
+    // advances newestPts within one GOP; only a real stall lets it age past
+    // several GOPs. Threshold is at least 10s to avoid false alarms on a slow
+    // heartbeat interval while still catching a wedged capture/encoder.
+    const int64_t stallThreshold100ns = std::max<int64_t>(
+        10 * kHundredNanosecondsPerSecond,
+        3 * secondsTo100ns(std::max<uint32_t>(1, settings().video.gopSeconds)));
+    if (idleAge100ns < stallThreshold100ns) {
+        return;
+    }
+    if (videoStallWarningActive_.load(std::memory_order_acq_rel)) {
+        return;
+    }
+    videoStallWarningActive_.store(true, std::memory_order_release);
+    Logger::instance().warning(L"recorder",
+        L"Capture/encode pipeline appears stalled: no new video packet for " +
+        std::to_wstring(idleAge100ns / kHundredNanosecondsPerSecond) +
+        L"s (threshold " +
+        std::to_wstring(stallThreshold100ns / kHundredNanosecondsPerSecond) +
+        L"s); replay buffer is no longer advancing");
 }
 
 EncoderCapabilities RecorderController::encoderCapabilities() const {

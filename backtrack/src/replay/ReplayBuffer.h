@@ -38,6 +38,11 @@ public:
     // Duration (100ns) of muxable video currently buffered, from the first
     // buffered keyframe to the newest packet end. 0 when empty or keyframe-less.
     int64_t videoSpan100ns() const;
+    // PTS (100ns) of the newest buffered video packet, or 0 when empty. Lets a
+    // caller (saveReplay) detect a buffer whose content stopped advancing from
+    // a stalled capture/encode pipeline; PTS-age trim alone cannot (heartbeats
+    // keep emitting with advancing timestamps while the pipeline is idle).
+    int64_t newestVideoPts100ns() const;
 
 private:
     // Metadata view of one buffered video packet; identical for both backends

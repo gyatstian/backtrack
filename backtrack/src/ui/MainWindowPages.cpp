@@ -514,6 +514,7 @@ void MainWindow::clearPageControls() {
     replayEnabledCheck_ = nullptr;
     replaySecondsEdit_ = nullptr;
     replayDiskBackedCheck_ = nullptr;
+    replayRingDirEdit_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
@@ -632,6 +633,19 @@ void MainWindow::clearSettingsBodyControls() {
     bitrateEdit_ = nullptr;
     codecCombo_ = nullptr;
     clipFolderEdit_ = nullptr;
+    // Replay-family controls belong to category bodies (disk-backed toggle and
+    // ring folder live on Capture, voice commands on Game integrations). They
+    // were missing here, so after leaving such a category the pointers stayed
+    // dangling and the next stashVisibleSettings() read dead HWNDs
+    // (BM_GETCHECK -> 0), silently flipping settings like "buffer on disk"
+    // back to off before the body was rebuilt.
+    recordHotkey_ = nullptr;
+    replayEnabledCheck_ = nullptr;
+    replaySecondsEdit_ = nullptr;
+    replayDiskBackedCheck_ = nullptr;
+    replayRingDirEdit_ = nullptr;
+    replayHotkey_ = nullptr;
+    voiceCommandCombo_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
     fpsEdit_ = nullptr;
@@ -754,7 +768,12 @@ HWND MainWindow::addSectionLabel(const wchar_t* text, int x, int y, int width) {
 }
 
 void MainWindow::buildSettingsPage() {
-    if (!settingsDirty_) {
+    // Re-sync from the recorder only when its state is trustworthy: right
+    // after Save the ApplySettings action is still queued/running on the
+    // worker thread, so controller_.settings() can lag behind what the user
+    // just saved. Pulling then would render stale values (e.g. an unchecked
+    // "buffer on disk") and poison the dirty-detection baseline.
+    if (!settingsDirty_ && !controllerActionPending_.load()) {
         settings_ = controller_.settings();
         savedSettings_ = settings_;
     }
@@ -1557,7 +1576,8 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
 }
 
 void MainWindow::buildCapturePage() {
-    if (!settingsDirty_) {
+    // Same pending-action guard as buildSettingsPage above.
+    if (!settingsDirty_ && !controllerActionPending_.load()) {
         settings_ = controller_.settings();
         savedSettings_ = settings_;
     }

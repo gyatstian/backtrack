@@ -733,6 +733,48 @@ void testDiskBackedMatchesRamBackend() {
     std::filesystem::remove_all(storageRoot, error);
 }
 
+void testNewestVideoPtsRam() {
+    ReplayBuffer buffer;
+    buffer.configure(settings(10));
+    expect(buffer.newestVideoPts100ns() == 0, "empty RAM buffer reported a newest PTS");
+    for (int64_t pts = 0; pts < 12; ++pts) {
+        buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, (pts % 2) == 0));
+    }
+    expect(buffer.newestVideoPts100ns() == 11 * kSecond100ns,
+        "newest PTS does not match the newest buffered RAM packet");
+    // Live-tail extension mutates duration, not PTS.
+    buffer.extendLastVideoDuration(11 * kSecond100ns, 3 * kSecond100ns);
+    expect(buffer.newestVideoPts100ns() == 11 * kSecond100ns,
+        "newest PTS changed on a live-tail extension");
+    buffer.clear();
+    expect(buffer.newestVideoPts100ns() == 0, "clear did not reset newest PTS");
+}
+
+void testNewestVideoPtsDiskAndBackendSwitch() {
+    const auto storageRoot = testOutputDir() / L"newest_pts_disk";
+    std::error_code error;
+    std::filesystem::remove_all(storageRoot, error);
+    std::filesystem::create_directories(storageRoot, error);
+
+    ReplaySettings diskSettings = settings(10);
+    diskSettings.diskBackedVideo = true;
+    ReplayBuffer buffer;
+    buffer.configure(diskSettings, storageRoot, 8ull * 1024 * 1024);
+    expect(buffer.newestVideoPts100ns() == 0, "empty disk buffer reported a newest PTS");
+    for (int64_t pts = 0; pts < 6; ++pts) {
+        buffer.pushVideo(makeVideoPayload(pts * kSecond100ns, kSecond100ns, pts == 0, 0x60, 1024));
+    }
+    expect(buffer.newestVideoPts100ns() == 5 * kSecond100ns,
+        "disk buffer newest PTS does not match the newest packet");
+
+    // A backend switch to RAM clears the on-disk buffered video (its bytes are
+    // unreadable in the new backend), so the newest-PTS getter reports empty.
+    buffer.configure(settings(10), storageRoot, 8ull * 1024 * 1024);
+    expect(buffer.newestVideoPts100ns() == 0,
+        "backend switch did not clear the buffered video PTS");
+    std::filesystem::remove_all(storageRoot, error);
+}
+
 } // namespace
 
 int main() {
@@ -752,6 +794,8 @@ int main() {
         testRecoveryStillRejectsDamagedMetadata();
         testDiskBackedRingRoundTripAndWrap();
         testDiskBackedMatchesRamBackend();
+        testNewestVideoPtsRam();
+        testNewestVideoPtsDiskAndBackendSwitch();
         std::cout << "ReplayBuffer tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 namespace backtrack {
@@ -72,7 +73,8 @@ public:
         uint32_t intervalCount,
         bool allowIdleCoalescing,
         bool forcedHeartbeat,
-        bool periodicHeartbeat) const {
+        bool periodicHeartbeat,
+        int64_t maxCoalescedDuration100ns = (std::numeric_limits<int64_t>::max)()) const {
         VideoTimelineEmission emission;
         emission.duplicateFrame = haveLastSubmittedFrame_ && sourceFrameIndex == lastSubmittedSourceFrameIndex_;
         emission.requestKeyFrame = forcedHeartbeat || periodicHeartbeat;
@@ -84,9 +86,12 @@ public:
         if (emission.duplicateFrame && allowIdleCoalescing && !emission.requestKeyFrame) {
             emission.action = VideoTimelineAction::Coalesce;
             emission.coalescedFramePts100ns = lastSubmittedPts100ns_;
-            emission.coalescedFrameDuration100ns = std::max<int64_t>(
-                nominalFrameDuration100ns_,
-                emitPts100ns + emission.duration100ns - lastSubmittedPts100ns_);
+            // Cap hold-stretched durations at one heartbeat so a day-long freeze never becomes a day-long sample.
+            emission.coalescedFrameDuration100ns = std::min<int64_t>(
+                maxCoalescedDuration100ns,
+                std::max<int64_t>(
+                    nominalFrameDuration100ns_,
+                    emitPts100ns + emission.duration100ns - lastSubmittedPts100ns_));
             return emission;
         }
 
@@ -96,9 +101,11 @@ public:
         emission.action = VideoTimelineAction::Submit;
         if (haveLastSubmittedFrame_) {
             emission.previousFramePts100ns = lastSubmittedPts100ns_;
-            emission.previousFrameDuration100ns = std::max<int64_t>(
-                nominalFrameDuration100ns_,
-                emitPts100ns - lastSubmittedPts100ns_);
+            emission.previousFrameDuration100ns = std::min<int64_t>(
+                maxCoalescedDuration100ns,
+                std::max<int64_t>(
+                    nominalFrameDuration100ns_,
+                    emitPts100ns - lastSubmittedPts100ns_));
         }
         return emission;
     }

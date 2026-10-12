@@ -29,9 +29,13 @@ Windows startup registration, microphone privacy cleanup, and the constants
   changes which monitor the user's setting means.
 - `enumerateMonitors` reports native pixel size and the primary flag. It does not
   apply a scaling factor; do not add one here.
-- `monitorHasAdvancedColor` is best effort and returns false when the output
-  cannot be resolved. Callers treat SDR as the safe default, which is why it
+- `monitorHasAdvancedColor` is best effort: true only for
+  `DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020` (PQ) or
+  `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709` (linear scRGB), false when the
+  output cannot be resolved (no `IDXGIOutput6`, failed `GetDesc1`, anything
+  else). Callers treat SDR as the safe default, which is why it
   must never be allowed to report HDR optimistically.
+  `DesktopDuplicationCapture::queryAdvancedColor` uses the same predicate.
 - `dxgiOutputForMonitor` searches every adapter, and the returned
   `DxgiOutputLocation` names the adapter a D3D device must be created on for
   Desktop Duplication to work. Adapter choice is not interchangeable with the

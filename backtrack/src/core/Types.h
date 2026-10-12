@@ -139,11 +139,11 @@ struct VideoSettings {
 struct ReplaySettings {
     uint32_t seconds = 120;
     bool enabled = true;
-    // Opt-in: buffer encoded replay video and/or sound in fixed-capacity
+    // Default on: buffer encoded replay video and/or sound in fixed-capacity
     // on-disk ring files instead of process RAM. When false the replay buffer
-    // behaves exactly as before.
-    bool diskBackedVideo = false;
-    bool diskBackedAudio = false;
+    // stays fully in memory.
+    bool diskBackedVideo = true;
+    bool diskBackedAudio = true;
     bool operator==(const ReplaySettings&) const = default;
 };
 
@@ -284,9 +284,10 @@ struct GpuFrame {
     uint32_t width = 0;
     uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
-    // True when the source surface carries PQ (ST.2084) encoded HDR content
-    // (advanced color active on the output). The scaler tone-maps such frames
-    // to SDR before encoding; 8-bit SDR sources leave it false.
+    // True when the source surface carries HDR content: PQ (ST.2084) 10-bit or
+    // linear scRGB FP16 while advanced color is active on the output. The
+    // scaler tone-maps such frames to SDR before encoding; 8-bit SDR sources
+    // leave it false.
     bool hdr = false;
 };
 
@@ -355,6 +356,12 @@ struct RecordingStats {
     bool captureBackendActive = false;
     bool captureBackendFallbackUsed = false;
     std::wstring captureBackendStatus;
+    // HDR telemetry (diagnostics only, lock-free mirrors). hdrActive follows
+    // the last acquired frame's GpuFrame::hdr flag (tone-map path live);
+    // hdrRejected means the monitor reports advanced color but no HDR frame
+    // was observed (WGC/SDR interpretation of an HDR desktop).
+    bool hdrActive = false;
+    bool hdrRejected = false;
     uint64_t capturedFrames = 0;
     uint64_t sourceFrames = 0;
     uint64_t sourceFramesPerSecond = 0;

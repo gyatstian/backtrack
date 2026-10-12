@@ -88,9 +88,9 @@ void testEveryKeyFallsBackToItsDefault() {
     expect(loaded.replay.seconds == defaults.replay.seconds,
         "a missing replay window did not fall back to the default");
     // A settings file from before the Sound checkbox has no audio key and
-    // must keep buffering sound in memory rather than failing the load.
+    // must fall back to the default rather than failing the load.
     expect(loaded.replay.diskBackedAudio == defaults.replay.diskBackedAudio,
-        "a missing sound disk-backing key did not fall back to memory");
+        "a missing sound disk-backing key did not fall back to the default");
     expect(loaded.captureMicrophone == defaults.captureMicrophone,
         "a missing microphone key did not fall back to the default");
     expect(loaded.logLevel == defaults.logLevel,

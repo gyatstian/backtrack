@@ -218,6 +218,43 @@ void testStallHoldPreferCoalesceOverSlideshow() {
     expect(after.action == VideoTimelineAction::Coalesce, "post-heartbeat stall hold did not resume coalesce");
 }
 
+void testDayHoldCoalescingIsCapped() {
+    // Same source frame held for a day (exclusive-fullscreen freeze): uncapped,
+    // the coalesced sample stretches a day. The 7th plan arg caps it at one
+    // heartbeat; the default preserves the old uncapped behavior.
+    VideoTimelineScheduler scheduler(kFrameDuration100ns);
+    constexpr int64_t startPts = 300'000'000;
+    constexpr int64_t kDay100ns = int64_t{86400} * 10'000'000;
+    constexpr int64_t kHeartbeat100ns = 2 * 10'000'000; // one GOP at the default gopSeconds
+
+    const auto first = scheduler.plan(7, startPts, 1, true, false, false);
+    expect(first.action == VideoTimelineAction::Submit, "first source frame was not submitted");
+    scheduler.acceptSubmission(first);
+
+    // Healthy gap with the cap in place is untouched.
+    const auto healthy = scheduler.plan(7, startPts + kFrameDuration100ns, 1, true, false, false, kHeartbeat100ns);
+    expect(healthy.action == VideoTimelineAction::Coalesce, "healthy idle duplicate was submitted");
+    expect(healthy.coalescedFrameDuration100ns == 2 * kFrameDuration100ns,
+        "the coalesce cap changed a healthy idle duration");
+
+    const auto held = scheduler.plan(7, startPts + kDay100ns, 1, true, false, false, kHeartbeat100ns);
+    expect(held.action == VideoTimelineAction::Coalesce, "day-long hold was submitted to the encoder");
+    expect(held.coalescedFrameDuration100ns == kHeartbeat100ns,
+        "day-long hold did not saturate the coalesce cap");
+
+    // The next distinct frame closes the gap through previousFrameDuration: capped too.
+    const auto next =
+        scheduler.plan(8, startPts + kDay100ns + kFrameDuration100ns, 1, true, false, false, kHeartbeat100ns);
+    expect(next.action == VideoTimelineAction::Submit, "distinct frame after a day-long hold was coalesced");
+    expect(next.previousFrameDuration100ns == kHeartbeat100ns,
+        "day-long hold stretched the preceding sample past one heartbeat");
+
+    // Default (no cap arg) preserves the old uncapped behavior for existing callers.
+    const auto uncapped = scheduler.plan(7, startPts + kDay100ns, 1, true, false, false);
+    expect(uncapped.coalescedFrameDuration100ns > kHeartbeat100ns,
+        "default plan unexpectedly capped a day-long hold");
+}
+
 } // namespace
 
 int main() {
@@ -230,6 +267,7 @@ int main() {
         testResetAndCoalescingGate();
         testCoalesceGapRecoveredByNextSubmit();
         testStallHoldPreferCoalesceOverSlideshow();
+        testDayHoldCoalescingIsCapped();
         std::cout << "VideoTimelineScheduler tests passed\n";
         return 0;
     } catch (const std::exception& error) {

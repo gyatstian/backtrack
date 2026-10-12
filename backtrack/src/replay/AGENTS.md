@@ -3,8 +3,8 @@
 ## Purpose
 
 The rolling buffer a replay save cuts from. Video and sound each have two
-interchangeable backends, process memory by default and a fixed-capacity ring
-file on disk when the user opts in per track (`replay_video.bin` and
+interchangeable backends, a fixed-capacity ring file on disk by default and
+process memory when the user opts out per track (`replay_video.bin` and
 `replay_audio.bin` in the same folder).
 
 ## Ownership

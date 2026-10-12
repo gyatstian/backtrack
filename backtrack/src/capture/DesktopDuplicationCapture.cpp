@@ -25,12 +25,15 @@ uint32_t captureTexturePoolSize(const AppSettings& settings) {
 // SV_VertexID (no vertex/index buffers) and positions it using a clip-space
 // rect supplied through the constant buffer. The pixel shader samples cursor
 // and persistent desktop, handling normal alpha and AND/XOR cursor semantics.
+// hdrBypass stays linear on HDR targets: 8-bit quantize plus the 0.5 selector
+// thresholds clip and band PQ/scRGB highlights, so monochrome keeps AND/XOR in
+// linear and everything else falls back to plain alpha blend.
 constexpr char kCursorShaderHlsl[] =
     "cbuffer Params : register(b0) {\n"
     "    float4 rect;\n" // x = leftNdc, y = topNdc, z = widthNdc, w = heightNdc
     "    float2 desktopSize;\n"
     "    uint shapeType;\n"
-    "    float padding;\n"
+    "    uint hdrBypass;\n"
     "};\n"
     "struct VOut {\n"
     "    float4 pos : SV_Position;\n"
@@ -49,6 +52,13 @@ constexpr char kCursorShaderHlsl[] =
     "float4 PSMain(VOut input) : SV_Target {\n"
     "    float4 cursor = gCursor.Sample(gSmp, input.uv);\n"
     "    float4 desktop = gDesktop.Load(int3(int2(input.pos.xy), 0));\n"
+    "    if (hdrBypass != 0) {\n"
+    "        if (shapeType == 1) {\n"
+    "            float3 kept = desktop.rgb * cursor.r;\n"
+    "            return float4(lerp(kept, 1.0f - kept, cursor.g), 1.0f);\n"
+    "        }\n"
+    "        return float4(lerp(desktop.rgb, cursor.rgb, cursor.a), 1.0f);\n"
+    "    }\n"
     "    if (shapeType == 1) {\n"
     "        uint3 screen = (uint3)round(saturate(desktop.rgb) * 255.0f);\n"
     "        uint andMask = cursor.r >= 0.5f ? 255u : 0u;\n"
@@ -103,11 +113,45 @@ void DesktopDuplicationCapture::markLost(const wchar_t* reason, HRESULT hr) {
     frameHeld_ = false;
 }
 
+bool DesktopDuplicationCapture::queryAdvancedColor() {
+    if (colorProbe_) {
+        DXGI_OUTPUT_DESC1 desc1{};
+        if (SUCCEEDED(colorProbe_->GetDesc1(&desc1))) {
+            // Same predicate as monitorHasAdvancedColor: PQ or scRGB.
+            return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        }
+        return hdrActive_; // transient failure: hold the last state, never flap.
+    }
+    return monitorHasAdvancedColor(monitor_);
+}
+
+void DesktopDuplicationCapture::applyHdrState(bool advanced) {
+    if (advanced == hdrActive_) {
+        return;
+    }
+    hdrActive_ = advanced;
+    ++hdrChangeCount_;
+    // A color-space flip changes frame interpretation like a resize does; the
+    // app already opens a new GOP whenever resolutionChangeCount advances.
+    ++resolutionChanges_;
+    Logger::instance().warning(L"capture",
+        advanced ? L"Desktop Duplication HDR turned on; flagging HDR frames"
+                 : L"Desktop Duplication HDR turned off; flagging SDR frames");
+}
+
 bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings& settings, const CaptureTarget& target) {
     device_ = &device;
     deviceLost_ = false;
     frameIndex_ = 0;
     cursorOnlyFrames_ = 0;
+    resolutionChanges_ = 0;
+    hdrChangeCount_ = 0;
+    hdrActive_ = false;
+    colorProbe_.Reset();
+    pool_.clear();
+    desktopCopy_.Reset();
+    desktopCopySrv_.Reset();
     cursorOnlyFrameInterval_ = std::chrono::nanoseconds(
         1'000'000'000 / std::max<uint32_t>(1, settings.video.fps));
     nextCursorOnlyFrameAt_ = {};
@@ -169,7 +213,11 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     }
     width_ = static_cast<uint32_t>(outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left);
     height_ = static_cast<uint32_t>(outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top);
-    hdrActive_ = monitorHasAdvancedColor(monitor);
+    // Cache the output for cheap per-frame HDR polling (GetDesc1 needs no
+    // factory walk). Failure is non-fatal: queries fall back to
+    // monitorHasAdvancedColor.
+    output.As(&colorProbe_);
+    hdrActive_ = queryAdvancedColor();
 
     ComPtr<IDXGIOutput1> output1;
     hr = output.As(&output1);
@@ -204,9 +252,9 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     frameHeld_ = false;
 
     poolSize_ = captureTexturePoolSize(settings);
-    if (!createTexturePool(width_, height_, format_, poolSize_)) {
-        return false;
-    }
+    // The pool stays empty until the first acquired surface reveals its real
+    // format; eagerly creating BGRA here forces a recreate on every HDR start.
+    lastHdrPollAt_ = std::chrono::steady_clock::now();
 
     Logger::instance().info(L"capture",
         L"Desktop Duplication initialized at " + std::to_wstring(width_) + L"x" + std::to_wstring(height_) +
@@ -217,6 +265,15 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
 bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeoutMs) {
     if (deviceLost_ || !duplication_) {
         return false;
+    }
+
+    // HDR can toggle without a mode/format change, so re-poll cheaply (cached
+    // output, at most 1 Hz) instead of trusting the init-time flag.
+    const auto hdrPollNow = std::chrono::steady_clock::now();
+    if (lastHdrPollAt_.time_since_epoch().count() == 0 ||
+        hdrPollNow - lastHdrPollAt_ >= std::chrono::seconds(1)) {
+        lastHdrPollAt_ = hdrPollNow;
+        applyHdrState(queryAdvancedColor());
     }
 
     // DXGI requires ReleaseFrame before the next AcquireNextFrame.
@@ -258,7 +315,18 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
 
     D3D11_TEXTURE2D_DESC acquiredDesc{};
     acquiredTexture->GetDesc(&acquiredDesc);
-    if (acquiredDesc.Width != width_ || acquiredDesc.Height != height_ || acquiredDesc.Format != format_) {
+    if (pool_.empty()) {
+        // First frame sizes the pool to the real surface format, so an HDR
+        // session never pays a BGRA recreate and drops nothing to get there.
+        width_ = acquiredDesc.Width;
+        height_ = acquiredDesc.Height;
+        format_ = acquiredDesc.Format;
+        applyHdrState(queryAdvancedColor());
+        if (!createTexturePool(width_, height_, format_, poolSize_)) {
+            markLost(L"Texture pool create failed", E_FAIL);
+            return false;
+        }
+    } else if (acquiredDesc.Width != width_ || acquiredDesc.Height != height_ || acquiredDesc.Format != format_) {
         Logger::instance().info(L"capture",
             L"Capture surface changed to " + std::to_wstring(acquiredDesc.Width) + L"x" +
             std::to_wstring(acquiredDesc.Height) + L"; recreating texture pool");
@@ -267,11 +335,14 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         format_ = acquiredDesc.Format;
         // A display-mode switch is also when HDR can toggle; refresh the flag
         // so frames carry the correct color-space hint.
-        hdrActive_ = monitorHasAdvancedColor(monitor_);
+        applyHdrState(queryAdvancedColor());
         if (!createTexturePool(width_, height_, format_, poolSize_)) {
             markLost(L"Texture pool recreate failed", E_FAIL);
             return false;
         }
+        // In-place resize/format switch opens a new GOP via the app's
+        // existing resolutionChangeCount hook.
+        ++resolutionChanges_;
     }
 
     const bool cursorUpdated = captureCursor_ && frameInfo.LastMouseUpdateTime.QuadPart != 0;
@@ -372,6 +443,8 @@ void DesktopDuplicationCapture::shutdown() {
     frameHeld_ = false;
     deviceLost_ = true;
     hdrActive_ = false;
+    colorProbe_.Reset();
+    lastHdrPollAt_ = {};
     monitor_ = nullptr;
     pool_.clear();
     desktopCopy_.Reset();
@@ -696,9 +769,10 @@ void DesktopDuplicationCapture::compositeCursor(const std::shared_ptr<TextureSlo
         float rect[4];
         float desktopSize[2];
         uint32_t shapeType;
-        float padding;
+        uint32_t hdrBypass; // 1 on R10/R16F targets: shader stays linear, skips 8-bit quantize
     } constants{{leftNdc, topNdc, widthNdc, heightNdc}, {static_cast<float>(width_), static_cast<float>(height_)},
-        cursorShapeType_, 0.0f};
+        cursorShapeType_,
+        (format_ == DXGI_FORMAT_R10G10B10A2_UNORM || format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 1u : 0u};
     ctx->UpdateSubresource(cursorConstantBuffer_.Get(), 0, nullptr, &constants, 0, 0);
 
     D3D11_VIEWPORT viewport{};

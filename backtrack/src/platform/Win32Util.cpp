@@ -698,7 +698,10 @@ bool monitorHasAdvancedColor(HMONITOR monitor) {
             if (FAILED(output6->GetDesc1(&desc1))) {
                 return false;
             }
-            return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            // PQ (ST.2084) and linear scRGB both mean the compositor hands out
+            // HDR surfaces; anything else (or an unresolvable output) is SDR.
+            return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
         }
     }
     return false;

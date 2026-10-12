@@ -29,6 +29,8 @@ public:
     uint64_t poolGeneration() const;
     void setPoolSize(uint32_t poolSize);
     void reset();
+    bool hdrInputRejected() const;
+    bool hdrMappingActive() const;
 
 private:
     struct TextureSlot {
@@ -41,6 +43,7 @@ private:
         D3DDevice& device,
         uint32_t inputWidth,
         uint32_t inputHeight,
+        DXGI_FORMAT inputFormat,
         uint32_t outputWidth,
         uint32_t outputHeight,
         DXGI_FORMAT outputFormat);
@@ -106,6 +109,7 @@ private:
     bool hdrInputRejected_ = false;
     uint32_t inputWidth_ = 0;
     uint32_t inputHeight_ = 0;
+    DXGI_FORMAT inputFormat_ = DXGI_FORMAT_UNKNOWN;
     uint32_t outputWidth_ = 0;
     uint32_t outputHeight_ = 0;
     DXGI_FORMAT outputFormat_ = DXGI_FORMAT_UNKNOWN;

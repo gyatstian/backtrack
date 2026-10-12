@@ -3,6 +3,8 @@
 #include "capture/D3DDevice.h"
 #include "capture/ICaptureSource.h"
 
+#include <dxgi1_6.h>
+
 #include <chrono>
 #include <memory>
 #include <vector>
@@ -19,6 +21,9 @@ public:
     uint32_t width() const override { return width_; }
     uint32_t height() const override { return height_; }
     uint64_t cursorOnlyFrames() const override { return cursorOnlyFrames_; }
+    uint64_t resolutionChangeCount() const override { return resolutionChanges_; }
+    uint64_t hdrChangeCount() const { return hdrChangeCount_; }
+    bool hdrActive() const { return hdrActive_; }
     void setCursorCaptureEnabled(bool enabled) override { captureCursor_ = enabled; }
 
 private:
@@ -29,6 +34,8 @@ private:
 
     std::shared_ptr<TextureSlot> acquireSlot();
     bool createTexturePool(uint32_t width, uint32_t height, DXGI_FORMAT format, uint32_t poolSize);
+    bool queryAdvancedColor();
+    void applyHdrState(bool advanced);
     void markLost(const wchar_t* reason, HRESULT hr);
     void releaseHeldFrame();
     void logAcquireFailureOnce(const wchar_t* reason, HRESULT hr);
@@ -42,6 +49,7 @@ private:
     D3DDevice* device_ = nullptr;
     HMONITOR monitor_ = nullptr;
     ComPtr<IDXGIOutputDuplication> duplication_;
+    ComPtr<IDXGIOutput6> colorProbe_; // cached HDR state source; GetDesc1 is cheap, no factory walk
     std::vector<std::shared_ptr<TextureSlot>> pool_;
     uint64_t poolExhaustionDrops_ = 0;
     uint64_t frameIndex_ = 0;
@@ -55,6 +63,9 @@ private:
     // Advanced color (HDR/PQ) is active on the captured output. Frames are
     // flagged so the scaler tone-maps them to SDR before encoding.
     bool hdrActive_ = false;
+    uint64_t hdrChangeCount_ = 0;
+    uint64_t resolutionChanges_ = 0;
+    std::chrono::steady_clock::time_point lastHdrPollAt_{};
     bool deviceLost_ = false;
     bool haveContent_ = false;
     bool frameHeld_ = false;

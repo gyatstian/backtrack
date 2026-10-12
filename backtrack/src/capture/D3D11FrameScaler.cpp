@@ -16,6 +16,13 @@ bool shouldLogRepeatedDrop(uint64_t& count) {
     return count == 1 || (count % 300) == 0;
 }
 
+// Only a refusal of the HDR color space latches the sticky SDR fallback.
+// Anything else under an HDR mapping (device loss, timeout, ...) is
+// transient: the next HDR frame retries tone-mapping.
+bool isHdrRejectionHr(HRESULT hr) {
+    return hr == E_INVALIDARG || hr == DXGI_ERROR_UNSUPPORTED;
+}
+
 } // namespace
 
 bool D3D11FrameScaler::scale(
@@ -38,7 +45,8 @@ bool D3D11FrameScaler::scale(
             ? DXGI_FORMAT_B8G8R8A8_UNORM
             : preferredOutputFormat;
 
-    for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+    // Budget: initial attempt + NV12->BGRA fallback + HDR-rejection retry.
+    for (uint32_t attempt = 0; attempt < 3; ++attempt) {
         if (sizeMatches && input.format == outputFormat) {
             if (!forceOutputTexture) {
                 output = input;
@@ -79,6 +87,7 @@ bool D3D11FrameScaler::scale(
                 device,
                 input.width,
                 input.height,
+                input.format,
                 outputWidth,
                 outputHeight,
                 outputFormat)) {
@@ -177,7 +186,7 @@ bool D3D11FrameScaler::scale(
                 const HRESULT hr = videoContext_->VideoProcessorBlt(
                     processor_.Get(), slot->outputView.Get(), 0, 1, &stream);
                 if (FAILED(hr)) {
-                    if (appliedHdrInputSpace_ && !hdrInputRejected_) {
+                    if (appliedHdrInputSpace_ && !hdrInputRejected_ && isHdrRejectionHr(hr)) {
                         hdrInputRejected_ = true;
                         hdrRejectedThisAttempt = true;
                         releaseResources();
@@ -202,11 +211,11 @@ bool D3D11FrameScaler::scale(
         }
 
         // An HDR color-space rejection is not an NV12-path failure: the
-        // processor accepted RGB→NV12 and only refused tone-mapping. The
-        // sticky SDR mapping above applies from the next frame on, so keep
-        // NV12 instead of permanently degrading this session to BGRA.
+        // processor accepted RGB→NV12 and only refused tone-mapping. Retry
+        // this frame under the sticky SDR mapping instead of dropping it,
+        // and keep NV12 instead of permanently degrading to BGRA.
         if (hdrRejectedThisAttempt) {
-            return false;
+            continue;
         }
 
         if (!conversionFailed || outputFormat != DXGI_FORMAT_NV12) {
@@ -267,7 +276,7 @@ void D3D11FrameScaler::applyVideoProcessorState(const VpState& state) {
     if (!state.hdrRejected) {
         if (state.hdr && state.inputFormat == DXGI_FORMAT_R10G10B10A2_UNORM) {
             inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
-        } else if (state.inputFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+        } else if (state.hdr && state.inputFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) {
             inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
         }
     }
@@ -330,6 +339,7 @@ void D3D11FrameScaler::releaseResources() {
     appliedHdrInputSpace_ = false;
     inputWidth_ = 0;
     inputHeight_ = 0;
+    inputFormat_ = DXGI_FORMAT_UNKNOWN;
     outputWidth_ = 0;
     outputHeight_ = 0;
     outputFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -339,6 +349,15 @@ void D3D11FrameScaler::reset() {
     releaseResources();
     useCopiedInput_ = false;
     nv12Unavailable_ = false;
+    hdrInputRejected_ = false;
+}
+
+bool D3D11FrameScaler::hdrInputRejected() const {
+    return hdrInputRejected_;
+}
+
+bool D3D11FrameScaler::hdrMappingActive() const {
+    return appliedHdrInputSpace_;
 }
 
 uint64_t D3D11FrameScaler::poolGeneration() const {
@@ -359,12 +378,14 @@ bool D3D11FrameScaler::ensureInitialized(
     D3DDevice& device,
     uint32_t inputWidth,
     uint32_t inputHeight,
+    DXGI_FORMAT inputFormat,
     uint32_t outputWidth,
     uint32_t outputHeight,
     DXGI_FORMAT outputFormat) {
     if (processor_ &&
         inputWidth_ == inputWidth &&
         inputHeight_ == inputHeight &&
+        inputFormat_ == inputFormat &&
         outputWidth_ == outputWidth &&
         outputHeight_ == outputHeight &&
         outputFormat_ == outputFormat) {
@@ -461,6 +482,7 @@ bool D3D11FrameScaler::ensureInitialized(
 
     inputWidth_ = inputWidth;
     inputHeight_ = inputHeight;
+    inputFormat_ = inputFormat;
     outputWidth_ = outputWidth;
     outputHeight_ = outputHeight;
     outputFormat_ = outputFormat;
@@ -517,6 +539,7 @@ bool D3D11FrameScaler::ensureCopyPool(
 
     inputWidth_ = width;
     inputHeight_ = height;
+    inputFormat_ = format;
     outputWidth_ = width;
     outputHeight_ = height;
     outputFormat_ = format;
@@ -603,6 +626,19 @@ void D3D11FrameScaler::pruneStaleInputViews() {
 ID3D11VideoProcessorInputView* D3D11FrameScaler::copiedInputViewFor(
     D3DDevice& device,
     ID3D11Texture2D* texture) {
+    if (copiedInputTexture_) {
+        // PQ<->scRGB switches reuse this path at the same resolution, and
+        // CopyResource needs identical formats: rebuild the copy texture
+        // instead of copying across formats.
+        D3D11_TEXTURE2D_DESC sourceDesc{};
+        texture->GetDesc(&sourceDesc);
+        D3D11_TEXTURE2D_DESC copyDesc{};
+        copiedInputTexture_->GetDesc(&copyDesc);
+        if (copyDesc.Format != sourceDesc.Format) {
+            copiedInputView_.Reset();
+            copiedInputTexture_.Reset();
+        }
+    }
     if (!copiedInputTexture_) {
         D3D11_TEXTURE2D_DESC sourceDesc{};
         texture->GetDesc(&sourceDesc);

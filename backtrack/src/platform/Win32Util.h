@@ -91,7 +91,7 @@ HMONITOR monitorFromIndex(uint32_t index);
 // Enumerates active displays with native pixel size and primary flag.
 std::vector<MonitorEnumEntry> enumerateMonitors();
 // True when the output driving this monitor reports advanced color active
-// (HDR with ST.2084/PQ transfer). Best-effort: returns false on legacy
+// (HDR: ST.2084/PQ or linear scRGB). Best-effort: returns false on legacy
 // systems or when the output cannot be resolved, so callers treat SDR as the
 // safe default.
 bool monitorHasAdvancedColor(HMONITOR monitor);

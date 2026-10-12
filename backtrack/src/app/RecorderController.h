@@ -213,6 +213,11 @@ private:
     std::atomic<uint32_t> captureHeight_{0};
     std::atomic<uint32_t> encodeWidth_{0};
     std::atomic<uint32_t> encodeHeight_{0};
+    // HDR telemetry mirrors (see RecordingStats::hdrActive/hdrRejected).
+    // hdrMonitorActive_ is written on pipeline (re)build; hdrActive_ follows
+    // the last acquired frame. Both read lock-free from stats().
+    std::atomic<bool> hdrActive_{false};
+    std::atomic<bool> hdrMonitorActive_{false};
 };
 
 } // namespace backtrack

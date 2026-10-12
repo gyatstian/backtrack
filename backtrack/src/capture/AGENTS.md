@@ -47,9 +47,11 @@ GPU scaler that converts frames to whatever the active encoder wants.
   or `R16G16B16A16_FLOAT` (scRGB). The scaler declares that input color space so
   the video processor tone-maps to the SDR output. Every other frame, including
   every WGC frame, leaves it false.
-- `resolutionChangeCount()` advances when a source handles a resolution change
-  without a rebind (the WGC `FramePool.Recreate` path). The capture loop then
-  requests an encoder keyframe so a size jump never lands mid-GOP.
+- `resolutionChangeCount()` advances when a source handles a change without a
+  rebind: the WGC `FramePool.Recreate` path on a display-mode change, and
+  `DesktopDuplicationCapture` on an HDR flip (`applyHdrState`) or a pool
+  recreate (size/format switch). The capture loop then requests an encoder
+  keyframe so the jump never lands mid-GOP.
 - Cursor capture is per source, not shared. WGC delegates to the session
   (`IsCursorCaptureEnabled`), and `setCursorCaptureEnabled` re-applies it to the
   live session without a rebind. Desktop Duplication composites the pointer
@@ -57,6 +59,10 @@ GPU scaler that converts frames to whatever the active encoder wants.
   AND/XOR and alpha-XOR paths monochrome and masked-color shapes need - which is
   why its pool slots carry `D3D11_BIND_RENDER_TARGET`; its
   `setCursorCaptureEnabled` only flips a flag the next acquired frame reads.
+  The cursor shader's `hdrBypass` stays 0 on 8-bit targets (legacy quantize +
+  0.5-selector paths for monochrome shapes) and 1 on `R10G10B10A2_UNORM` /
+  `R16G16B16A16_FLOAT` targets, where blending stays linear so PQ/scRGB
+  highlights neither clip nor band.
 - `D3DDevice` owns the adapter selection and reports the vendor the encoder
   factory keys off. Its `immediateContextMutex()` must be held by every caller
   issuing immediate-context work; teardown and recreation are serialized
@@ -72,6 +78,23 @@ GPU scaler that converts frames to whatever the active encoder wants.
   `CreateVideoProcessorInputView` rejects the capture surface. That copy is
   created with `BindFlags = 0`: a SHADER_RESOURCE flag makes the call fail with
   `E_INVALIDARG` on strict drivers.
+- The HDR latch is narrow and self-healing. Only `E_INVALIDARG` /
+  `DXGI_ERROR_UNSUPPORTED` under an applied HDR input space sets
+  `hdrInputRejected_` (`isHdrRejectionHr`); any other failure under that mapping
+  is transient and retries tone-mapping on the next HDR frame. A latched frame
+  retries in-call under the SDR mapping instead of dropping, keeping NV12
+  instead of degrading to BGRA. `inputFormat_` is tracked in
+  `ensureInitialized` / `ensureCopyPool`, and the copied input texture is
+  rebuilt when the source format changes (PQ<->scRGB reuse the copy path at the
+  same resolution). `hdrInputRejected()` / `hdrMappingActive()` expose the latch
+  and the applied mapping; both are read by `app` only under
+  `pipelineGpuMutex_`, which also guards every mutation.
+- Desktop Duplication polls HDR state at most once per second through its cached
+  `IDXGIOutput6` (`colorProbe_`, no factory walk; falls back to
+  `monitorHasAdvancedColor` when the probe is gone). `hdrActive()` /
+  `hdrChangeCount()` expose the state; the pool stays empty until the first
+  acquired surface reveals its real format, so an HDR session never pays a BGRA
+  recreate to get there.
 - The scaler prunes cached input views whose texture is otherwise unreferenced.
   Views pin their texture, so a missed prune holds GPU memory.
 - Textures come from fixed pools: both capture pools are
@@ -104,7 +127,8 @@ GPU scaler that converts frames to whatever the active encoder wants.
 ## Verification
 
 No dedicated test suite. Build Release, then confirm the Diagnostics page
-reports the expected selected and active capture backend, capture size, dropped
+reports the expected selected and active capture backend, the HDR line
+(active / rejected / SDR), capture size, dropped
 frames, and cursor-only desktop frames on a machine with a hardware encoder.
 
 ## Child DOX Index

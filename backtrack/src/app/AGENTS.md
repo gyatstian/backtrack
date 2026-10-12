@@ -77,6 +77,23 @@ frame-cadence logic.
   drains, and only a later successful capture could release it, so holding it
   across the swap stalls the capture thread. Losing one freeze frame beats a
   stalled rebind.
+- HDR capture is automatic, never a setting. `createCaptureSource` prefers
+  Desktop Duplication on an advanced-color monitor (WGC stays fixed-BGRA and
+  leans on DWM pre-tonemap, which washes out); WGC remains the fallback when DD
+  is unavailable or fails, and `exclusiveRecovery` keeps its monitor-only DD
+  path untouched. The capture loop watches every acquired frame's `hdr` flag
+  and format: a flip opens a new GOP (`requestKeyFrame` plus an `L"app"` log
+  line) so whitened frames never stretch into a running GOP. A DD-side HDR flip
+  also bumps `resolutionChangeCount`, which the existing resize hook turns into
+  the same keyframe.
+- `RecordingStats::hdrActive` / `hdrRejected` are lock-free mirrors for the
+  Diagnostics page. `hdrMonitorActive_` caches the `monitorHasAdvancedColor`
+  probe at source creation; `hdrActive_` follows the last acquired frame's
+  `GpuFrame::hdr`. `stats()` ORs the scaler's sticky rejection - read inside
+  the existing `try_to_lock` won-lock scope, race-free because the scaler is
+  only touched under `pipelineGpuMutex_` - gated on live HDR input so a stale
+  latch cannot paint SDR content as rejected, with the monitor-probe-no-frame
+  case covering WGC/SDR interpretation.
 - `stats()` and `encoderCapabilities()` run on two threads at once - the UI
   thread (diagnostics timer, page refresh) and the controller worker thread
   `MainWindow` uses for blocking actions - and must never block on
@@ -144,7 +161,8 @@ frame-cadence logic.
 
 - `VideoTimelineSchedulerTests` (CTest `VideoTimelineSchedulerTests`, also
   compilable standalone) covers cadence collapse, coalescing, and duration
-  math. Extend it for any scheduler change.
+  math, including the `maxCoalescedDuration100ns` cap on held-frame durations.
+  Extend it for any scheduler change.
 - Everything else in this folder is verified by building and by exercising the
   pipeline in the app; the Diagnostics page reports the counters above.
 

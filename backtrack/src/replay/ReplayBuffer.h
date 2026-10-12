@@ -195,6 +195,9 @@ private:
     std::deque<std::shared_ptr<const AudioPacket>> microphoneAudio_;
     size_t videoKeyFrames_ = 0;
     int64_t lastSaveEndPts100ns_ = 0;
+    // GOP most recently seen by saveTo (VideoSettings is save-scoped), so
+    // videoSpan100ns can mirror the save window cut. Default matches VideoSettings.
+    uint32_t lastGopSeconds_ = 2;
     // Codec parameter sets (SPS/PPS or VPS/SPS/PPS) captured from the first
     // buffered packet that carried them. Prepended to a replay cut when its
     // start packet lacks headers, so a clip never begins with an IDR that no

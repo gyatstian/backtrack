@@ -67,6 +67,22 @@ private:
 // timeline instead of inflating the temporary WAV.
 constexpr int64_t kMaxSilenceGapFill100ns = 10 * kHundredNanosecondsPerSecond;
 
+// Single-sample duration ceiling: storage-level backstop for wall-clock
+// durations from coalesced hold intervals. Covers the largest healthy
+// heartbeat (30 s max GOP plus low-fps coalesce slop) yet stays ~1400x below
+// a day-long exclusive-fullscreen hold.
+constexpr int64_t kMaxSingleVideoDuration100ns = 60 * kHundredNanosecondsPerSecond;
+
+int64_t clampSingleVideoDuration100ns(int64_t duration100ns) {
+    return duration100ns > kMaxSingleVideoDuration100ns ? kMaxSingleVideoDuration100ns : duration100ns;
+}
+
+// One GOP of tolerance: a cut may start up to a GOP before the window so the
+// clip still begins at a keyframe.
+int64_t gopTolerance100ns(uint32_t gopSeconds) {
+    return secondsTo100ns((std::max<uint32_t>)(1, gopSeconds));
+}
+
 // Writes the buffered packets onto one shared-timeline WAV. Returns false
 // when a write to disk failed (typically disk full); the caller must fail the
 // save instead of muxing a silently truncated audio track.
@@ -590,6 +606,12 @@ void ReplayBuffer::pushVideo(EncodedPacket packet) {
     if (!settings_.enabled) {
         return;
     }
+    // Storage backstop: upstream durations are wall-clock and a coalesced hold
+    // may arrive oversized; healthy frames are milliseconds, so this only bites
+    // rogue tails.
+    if (packet.duration100ns > kMaxSingleVideoDuration100ns) {
+        packet.duration100ns = kMaxSingleVideoDuration100ns;
+    }
     // Capture the codec parameter sets from the first keyframe that carried
     // them (typically the session-start IDR) so later saves can patch a cut
     // point whose start packet lacks decodable headers.
@@ -632,8 +654,8 @@ bool ReplayBuffer::extendLastVideoDuration(int64_t expectedPts100ns, int64_t dur
         if (diskVideo_.empty() || diskVideo_.back().meta.pts100ns != expectedPts100ns) {
             return false;
         }
-        diskVideo_.back().meta.duration100ns =
-            std::max(diskVideo_.back().meta.duration100ns, duration100ns);
+        diskVideo_.back().meta.duration100ns = clampSingleVideoDuration100ns(
+            (std::max)(diskVideo_.back().meta.duration100ns, duration100ns));
         return true;
     }
     if (video_.empty() || video_.back()->pts100ns != expectedPts100ns) {
@@ -645,7 +667,8 @@ bool ReplayBuffer::extendLastVideoDuration(int64_t expectedPts100ns, int64_t dur
     // trim) goes through mutex_, so copying the whole packet - keyframes are
     // megabytes - per emitted interval bought nothing but allocation spikes.
     EncodedPacket& packet = *video_.back();
-    packet.duration100ns = std::max(packet.duration100ns, duration100ns);
+    packet.duration100ns =
+        clampSingleVideoDuration100ns((std::max)(packet.duration100ns, duration100ns));
     return true;
 }
 
@@ -703,6 +726,8 @@ bool ReplayBuffer::saveTo(
     std::vector<DiskAudioPacket> diskSystemAudio;
     std::vector<DiskAudioPacket> diskMicrophoneAudio;
     int64_t lastSaveEndPts100ns = 0;
+    uint32_t replayWindowSeconds = 0;
+    uint32_t saveGopSeconds = 2;
     std::vector<uint8_t> codecHeaderBytes;
     bool diskMode = false;
     bool diskAudioMode = false;
@@ -745,6 +770,10 @@ bool ReplayBuffer::saveTo(
             diskMicrophoneAudio.assign(diskMicrophoneAudio_.begin(), diskMicrophoneAudio_.end());
         }
         lastSaveEndPts100ns = lastSaveEndPts100ns_;
+        replayWindowSeconds = settings_.seconds;
+        // Cache for videoSpan100ns, which has no VideoSettings of its own.
+        lastGopSeconds_ = (std::max<uint32_t>)(1, videoSettings.gopSeconds);
+        saveGopSeconds = lastGopSeconds_;
         codecHeaderBytes = codecHeaderBytes_;
         // While the pin holds, ring pushes that need space wait instead of
         // trimming: trimming could evict packets this save has not read yet.
@@ -790,7 +819,12 @@ bool ReplayBuffer::saveTo(
         return fail(L"replay video buffer is empty");
     }
 
-    const int64_t newestVideoEndPts =
+    // Storage backstop (see extendLastVideoDuration): a day-long coalesced
+    // tail must not stretch the cut or the muxed sample.
+    video.back().meta.duration100ns =
+        clampSingleVideoDuration100ns(video.back().meta.duration100ns);
+
+    int64_t newestVideoEndPts =
         video.back().meta.pts100ns + std::max<int64_t>(video.back().meta.duration100ns, 0);
     constexpr int64_t kConsecutiveSaveGrace100ns = 3 * kHundredNanosecondsPerSecond;
     const bool saveSinceLastClip =
@@ -831,6 +865,38 @@ bool ReplayBuffer::saveTo(
     }
 
     video.erase(video.begin(), firstKeyFrame);
+    // Window cut, applied after (intersecting) the consecutive-save overlap
+    // cut above: age eviction keys on PTS, which freezes while coalescing, so
+    // a long hold would otherwise publish window + stretched tail. Packets are
+    // dropped by end time, then realigned forward to a keyframe; the cut only
+    // ever narrows.
+    const int64_t oldestAllowedEndPts = newestVideoEndPts - secondsTo100ns(replayWindowSeconds) -
+        gopTolerance100ns(saveGopSeconds);
+    auto windowBegin = video.end();
+    for (auto it = video.begin(); it != video.end(); ++it) {
+        if (it->meta.pts100ns + (std::max<int64_t>)(it->meta.duration100ns, 0) > oldestAllowedEndPts) {
+            windowBegin = it;
+            break;
+        }
+    }
+    if (windowBegin != video.end()) {
+        const auto windowKeyFrame = std::find_if(
+            windowBegin, video.end(), [](const SnapshottedVideo& snapshot) { return snapshot.meta.keyFrame; });
+        if (windowKeyFrame != video.end()) {
+            video.erase(video.begin(), windowKeyFrame);
+        } else {
+            // Tail region holds no keyframe (a stretched P-frame tail): the
+            // buffer already starts at a keyframe, so shrink the tail to fit
+            // the window budget instead of publishing past it.
+            const int64_t tailBudget = secondsTo100ns(replayWindowSeconds) +
+                gopTolerance100ns(saveGopSeconds) -
+                (video.back().meta.pts100ns - video.front().meta.pts100ns);
+            int64_t& tailDuration = video.back().meta.duration100ns;
+            tailDuration = (std::min)(tailDuration, (std::max<int64_t>)(tailBudget, 0));
+        }
+        newestVideoEndPts =
+            video.back().meta.pts100ns + std::max<int64_t>(video.back().meta.duration100ns, 0);
+    }
     const int64_t replayStartPts = video.front().meta.pts100ns;
     const int64_t replayEndPts = newestVideoEndPts;
     if (!outputPath.parent_path().empty()) {
@@ -1189,9 +1255,30 @@ int64_t ReplayBuffer::videoSpan100ns() const {
             return 0;
         }
         const DiskVideoPacket& newest = diskVideo_.back();
-        const int64_t newestVideoEndPts =
-            newest.meta.pts100ns + std::max<int64_t>(newest.meta.duration100ns, 0);
-        return std::max<int64_t>(0, newestVideoEndPts - firstKeyFrame->meta.pts100ns);
+        const int64_t newestVideoEndPts = newest.meta.pts100ns +
+            (std::max<int64_t>)(clampSingleVideoDuration100ns(newest.meta.duration100ns), 0);
+        // Same window cut saveTo applies, so the reported span never exceeds
+        // what a save would publish; keyed on the last GOP saveTo observed.
+        const int64_t oldestAllowedEndPts = newestVideoEndPts - secondsTo100ns(settings_.seconds) -
+            gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_));
+        auto windowBegin = diskVideo_.end();
+        for (auto it = diskVideo_.begin(); it != diskVideo_.end(); ++it) {
+            if (it->meta.pts100ns + (std::max<int64_t>)(it->meta.duration100ns, 0) > oldestAllowedEndPts) {
+                windowBegin = it;
+                break;
+            }
+        }
+        if (windowBegin != diskVideo_.end()) {
+            const auto windowKeyFrame = std::find_if(
+                windowBegin, diskVideo_.end(), [](const DiskVideoPacket& packet) { return packet.meta.keyFrame; });
+            if (windowKeyFrame != diskVideo_.end()) {
+                return (std::max<int64_t>)(0, newestVideoEndPts - windowKeyFrame->meta.pts100ns);
+            }
+        }
+        return (std::min)(
+            (std::max<int64_t>)(0, newestVideoEndPts - firstKeyFrame->meta.pts100ns),
+            secondsTo100ns(settings_.seconds) +
+                gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_)));
     }
 
     if (video_.empty()) {
@@ -1203,9 +1290,30 @@ int64_t ReplayBuffer::videoSpan100ns() const {
     if (firstKeyFrame == video_.end()) {
         return 0;
     }
-    const int64_t newestVideoEndPts =
-        video_.back()->pts100ns + std::max<int64_t>(video_.back()->duration100ns, 0);
-    return std::max<int64_t>(0, newestVideoEndPts - (*firstKeyFrame)->pts100ns);
+    const int64_t newestVideoEndPts = video_.back()->pts100ns +
+        (std::max<int64_t>)(clampSingleVideoDuration100ns(video_.back()->duration100ns), 0);
+    // Same window cut saveTo applies, so the reported span never exceeds what
+    // a save would publish; keyed on the last GOP saveTo observed.
+    const int64_t oldestAllowedEndPts = newestVideoEndPts - secondsTo100ns(settings_.seconds) -
+        gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_));
+    auto windowBegin = video_.end();
+    for (auto it = video_.begin(); it != video_.end(); ++it) {
+        if ((*it)->pts100ns + (std::max<int64_t>)((*it)->duration100ns, 0) > oldestAllowedEndPts) {
+            windowBegin = it;
+            break;
+        }
+    }
+    if (windowBegin != video_.end()) {
+        const auto windowKeyFrame =
+            std::find_if(windowBegin, video_.end(), [](const auto& packet) { return packet->keyFrame; });
+        if (windowKeyFrame != video_.end()) {
+            return (std::max<int64_t>)(0, newestVideoEndPts - (*windowKeyFrame)->pts100ns);
+        }
+    }
+    return (std::min)(
+        (std::max<int64_t>)(0, newestVideoEndPts - (*firstKeyFrame)->pts100ns),
+        secondsTo100ns(settings_.seconds) +
+            gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_)));
 }
 
 int64_t ReplayBuffer::newestVideoPts100ns() const {

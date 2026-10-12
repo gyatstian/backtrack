@@ -168,6 +168,9 @@ ReplaySettings settings(uint32_t seconds) {
     ReplaySettings result;
     result.seconds = seconds;
     result.enabled = true;
+    // Tests pick the backend explicitly, independent of the app default.
+    result.diskBackedVideo = false;
+    result.diskBackedAudio = false;
     return result;
 }
 
@@ -1671,6 +1674,48 @@ void testNewestVideoPtsDiskAndBackendSwitch() {
     std::filesystem::remove_all(storageRoot, error);
 }
 
+// A day-long stall (exclusive-fullscreen hold) must not stretch the replay
+// past its window: extendLastVideoDuration clamps a rogue tail to 60 s and
+// saveTo cuts the tail to the window plus one GOP of keyframe tolerance.
+// Without both, the raw 86400 s duration publishes window + tail.
+void testDayHoldStaysWithinWindow() {
+    constexpr int64_t kDay100ns = 86400 * kSecond100ns;
+    for (const uint32_t windowSeconds : {30u, 120u}) {
+        ReplayBuffer buffer;
+        buffer.configure(settings(windowSeconds));
+        // Window worth of 1 s packets, keyframe every 2 s; the newest packet
+        // is a P-frame so the tail-budget shrink (not keyframe realign) bounds it.
+        for (int64_t pts = 0; pts < static_cast<int64_t>(windowSeconds); ++pts) {
+            buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, (pts % 2) == 0));
+        }
+        const int64_t newestPts = (static_cast<int64_t>(windowSeconds) - 1) * kSecond100ns;
+        // Healthy extends still apply: a 33 ms live-tail increment stretches the span.
+        expect(buffer.extendLastVideoDuration(newestPts, kSecond100ns + 330000),
+            "healthy tail extension was rejected");
+        expect(buffer.videoSpan100ns() == static_cast<int64_t>(windowSeconds) * kSecond100ns + 330000,
+            "healthy tail extension did not extend the video span");
+        // Day-long hold: clamped to 60 s, then cut to window + one GOP (2 s default).
+        expect(buffer.extendLastVideoDuration(newestPts, kDay100ns),
+            "day-long tail extension was rejected");
+        const int64_t bound = static_cast<int64_t>(windowSeconds) * kSecond100ns + 2 * kSecond100ns;
+        expect(buffer.videoSpan100ns() <= bound,
+            "day-long hold stretched the video span past window + GOP");
+        const auto output = testOutputDir() / L"dayhold.mp4";
+        std::error_code error;
+        std::filesystem::create_directories(output.parent_path(), error);
+        expect(buffer.saveTo(output, defaultVideoSettings()), "saveTo failed after a day-long hold");
+        const auto& samples = backtrack::g_lastMuxedInputs.videoSamples;
+        expect(!samples.empty(), "day-long hold saved no video");
+        expect(samples.front().keyFrame, "day-long hold clip does not start at a keyframe");
+        const int64_t savedSpan =
+            samples.back().pts100ns + samples.back().duration100ns - samples.front().pts100ns;
+        expect(savedSpan <= bound,
+            "day-long hold published " + std::to_string(savedSpan) +
+                " 100ns units, past window + GOP (" + std::to_string(bound) + ")");
+        std::filesystem::remove_all(output.parent_path(), error);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -1711,6 +1756,7 @@ int main() {
         testRingReadFailureFailsSaveAndFailsOver();
         testMuxFailurePreservesStreamsAndReportsReason();
         testOrphanedRingFolderIsSwept();
+        testDayHoldStaysWithinWindow();
         std::cout << "ReplayBuffer tests passed\n";
         return 0;
     } catch (const std::exception& error) {

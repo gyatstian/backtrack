@@ -101,6 +101,31 @@ constexpr int kClipGalleryViewButtonId = 409;
 constexpr int kSoundSeparationMuteButtonBaseId = 5000;
 constexpr int kSoundSeparationRemoveButtonBaseId = 6000;
 constexpr int kAutoRecordRemoveButtonBaseId = 7000;
+// Single (non-ranged) owner-drawn button ids. isButtonId() loops this table,
+// so a new button needs its id here plus its WM_COMMAND case - no third list.
+constexpr int kSingleOwnerDrawButtonIds[] = {
+    kStartStopButtonId,
+    kSaveSettingsButtonId,
+    kBrowseClipFolderButtonId,
+    kBrowseRingDirButtonId,
+    kBrowseCustomNotificationSoundButtonId,
+    kResetCustomNotificationSoundButtonId,
+    kSaveReplayButtonId,
+    kRecoverFailedRecordingButtonId,
+    kSoundSeparationRefreshButtonId,
+    kSoundSeparationManualButtonId,
+    kAutoRecordRefreshButtonId,
+    kAutoRecordManualButtonId,
+    kRefreshClipsButtonId,
+    kDeleteClipButtonId,
+    kRenameClipButtonId,
+    kFavoriteClipButtonId,
+    kClipListViewButtonId,
+    kClipGalleryViewButtonId,
+    kOpenLogFolderButtonId,
+    kSaveLogButtonId,
+    kUpdateButtonId,
+};
 constexpr UINT_PTR kDiagnosticsTimerId = 1;
 constexpr UINT_PTR kControllerBusyTimerId = 2;
 constexpr UINT_PTR kAutoRecordTimerId = 3;

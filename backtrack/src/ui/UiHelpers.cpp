@@ -8,6 +8,7 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mmsystem.h>
+#include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
@@ -475,32 +476,19 @@ std::wstring bytesToText(uintmax_t bytes) {
 
 bool isButtonId(WPARAM id) {
     const int controlId = static_cast<int>(id);
-    return (controlId >= kTabButtonBaseId && controlId < kTabButtonBaseId + kTabCount) ||
-           (controlId >= kSettingsCategoryButtonBaseId && controlId < kSettingsCategoryButtonBaseId + kSettingsCategoryCount) ||
-           (controlId >= kSoundSeparationMuteButtonBaseId && controlId < kSoundSeparationMuteButtonBaseId + 512) ||
-           (controlId >= kSoundSeparationRemoveButtonBaseId && controlId < kSoundSeparationRemoveButtonBaseId + 512) ||
-           controlId == kStartStopButtonId ||
-           controlId == kSaveSettingsButtonId ||
-            controlId == kBrowseClipFolderButtonId ||
-            controlId == kBrowseRingDirButtonId ||
-            controlId == kBrowseCustomNotificationSoundButtonId ||
-            controlId == kResetCustomNotificationSoundButtonId ||
-            controlId == kSaveReplayButtonId ||
-           controlId == kRecoverFailedRecordingButtonId ||
-           controlId == kSoundSeparationRefreshButtonId ||
-           controlId == kSoundSeparationManualButtonId ||
-           (controlId >= kAutoRecordRemoveButtonBaseId && controlId < kAutoRecordRemoveButtonBaseId + 512) ||
-           controlId == kAutoRecordRefreshButtonId ||
-           controlId == kAutoRecordManualButtonId ||
-           controlId == kRefreshClipsButtonId ||
-           controlId == kDeleteClipButtonId ||
-           controlId == kRenameClipButtonId ||
-           controlId == kFavoriteClipButtonId ||
-           controlId == kClipListViewButtonId ||
-           controlId == kClipGalleryViewButtonId ||
-           controlId == kOpenLogFolderButtonId ||
-           controlId == kSaveLogButtonId ||
-           controlId == kUpdateButtonId;
+    if ((controlId >= kTabButtonBaseId && controlId < kTabButtonBaseId + kTabCount) ||
+        (controlId >= kSettingsCategoryButtonBaseId && controlId < kSettingsCategoryButtonBaseId + kSettingsCategoryCount) ||
+        (controlId >= kSoundSeparationMuteButtonBaseId && controlId < kSoundSeparationMuteButtonBaseId + 512) ||
+        (controlId >= kSoundSeparationRemoveButtonBaseId && controlId < kSoundSeparationRemoveButtonBaseId + 512) ||
+        (controlId >= kAutoRecordRemoveButtonBaseId && controlId < kAutoRecordRemoveButtonBaseId + 512)) {
+        return true;
+    }
+    for (int single : kSingleOwnerDrawButtonIds) {
+        if (controlId == single) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool isSoundSeparationMuteButtonId(int controlId) {
@@ -984,6 +972,75 @@ std::wstring appNameFromPath(const std::filesystem::path& path) {
     return name.empty() ? path.filename().wstring() : name;
 }
 
+bool pickFileForOpen(
+    HWND owner,
+    const wchar_t* title,
+    const COMDLG_FILTERSPEC* filters,
+    UINT filterCount,
+    const wchar_t* defaultExtension,
+    std::filesystem::path& out) {
+    ComPtr<IFileOpenDialog> dialog;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        Logger::instance().warning(L"ui", std::wstring(L"File picker could not open: ") + hresultToString(hr));
+        return false;
+    }
+    dialog->SetTitle(title);
+    if (filters && filterCount > 0) {
+        dialog->SetFileTypes(filterCount, filters);
+        dialog->SetFileTypeIndex(1);
+    }
+    if (defaultExtension) {
+        dialog->SetDefaultExtension(defaultExtension);
+    }
+    hr = dialog->Show(owner);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        return false;
+    }
+    if (FAILED(hr)) {
+        Logger::instance().warning(L"ui", std::wstring(L"File picker failed: ") + hresultToString(hr));
+        return false;
+    }
+    ComPtr<IShellItem> item;
+    hr = dialog->GetResult(&item);
+    if (FAILED(hr) || !item) {
+        Logger::instance().warning(L"ui", std::wstring(L"File picker returned no item: ") + hresultToString(hr));
+        return false;
+    }
+    PWSTR rawPath = nullptr;
+    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
+    if (FAILED(hr) || !rawPath) {
+        CoTaskMemFree(rawPath);
+        Logger::instance().warning(L"ui", std::wstring(L"File picker path could not be read: ") + hresultToString(hr));
+        return false;
+    }
+    out.assign(rawPath);
+    CoTaskMemFree(rawPath);
+    return true;
+}
+
+bool pickFolder(HWND owner, const wchar_t* title, std::wstring& out) {
+    wchar_t displayName[MAX_PATH]{};
+    BROWSEINFOW browse{};
+    browse.hwndOwner = owner;
+    browse.pszDisplayName = displayName;
+    browse.lpszTitle = title;
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
+    if (!item) {
+        return false;
+    }
+    wchar_t path[MAX_PATH]{};
+    const bool ok = SHGetPathFromIDListW(item, path) != FALSE;
+    CoTaskMemFree(item);
+    if (!ok || path[0] == L'\0') {
+        Logger::instance().warning(L"ui", L"Folder picker path could not be read");
+        return false;
+    }
+    out.assign(path);
+    return true;
+}
+
 HICON loadExecutableIcon(const std::filesystem::path& path) {
     SHFILEINFOW info{};
     if (!path.empty() &&
@@ -1199,10 +1256,11 @@ void drawBitmapFitCached(
 }
 
 int galleryItemHeightForWidth(int listWidth) {
-    constexpr int gap = 10;
     constexpr int verticalPadding = 18;
     constexpr int textHeight = 48;
-    const int tileWidth = std::max(1, (listWidth - gap * (kGalleryClipColumns + 1)) / kGalleryClipColumns);
+    // Same gap the painter (galleryTileRect) and hit test use, so the budgeted
+    // preview height matches the drawn tile instead of drifting a few px.
+    const int tileWidth = std::max(1, (listWidth - kGalleryTileGap * (kGalleryClipColumns + 1)) / kGalleryClipColumns);
     const int previewHeight = std::max(96, tileWidth * 9 / 16);
     return std::max(kGalleryClipMinimumItemHeight, verticalPadding + previewHeight + textHeight);
 }

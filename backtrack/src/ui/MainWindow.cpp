@@ -487,6 +487,11 @@ int MainWindow::runMessageLoop() {
         if (handleShortcut(message)) {
             continue;
         }
+        // Tab/Shift+Tab navigation between controls; nothing here uses
+        // accelerators or a default button that this would disturb.
+        if (window_ && IsDialogMessageW(window_, &message)) {
+            continue;
+        }
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }

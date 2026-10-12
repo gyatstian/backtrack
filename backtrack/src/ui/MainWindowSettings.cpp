@@ -342,15 +342,18 @@ void MainWindow::stashVisibleSettings() {
 }
 
 void MainWindow::applyVisibleSettings() {
-    if (!readVisibleSettingsInto(settings_)) {
-        return;
-    }
-    settings_ = sanitizeSettings(settings_);
+    // Busy check first: everything below persists (file, startup key, hotkeys),
+    // and a save that loses the race would leave disk saved but the recorder
+    // never receiving ApplySettings.
     if (controllerActionPending_.load()) {
         setStatus(L"Recorder is busy; try saving settings again after the current action finishes");
         playActionIndicator(MB_ICONHAND, settings_.notificationSoundVolumePercent);
         return;
     }
+    if (!readVisibleSettingsInto(settings_)) {
+        return;
+    }
+    settings_ = sanitizeSettings(settings_);
     updateStartupRegistration();
     settingsStore_.save(settings_);
     // Settings are now persisted; this becomes the pristine baseline the Save
@@ -682,48 +685,14 @@ void MainWindow::addSelectedSoundSeparationApp() {
 }
 
 void MainWindow::addManualSoundSeparationApp() {
-    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-    if (FAILED(hr) || !dialog) {
-        setStatus(L"Manual app picker could not open");
-        return;
-    }
-
     COMDLG_FILTERSPEC filters[] = {
         {L"Applications", L"*.exe"},
         {L"All files", L"*.*"},
     };
-    dialog->SetTitle(L"Choose app executable");
-    dialog->SetFileTypes(static_cast<UINT>(_countof(filters)), filters);
-    dialog->SetFileTypeIndex(1);
-    dialog->SetDefaultExtension(L"exe");
-
-    hr = dialog->Show(window_);
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+    std::filesystem::path executablePath;
+    if (!pickFileForOpen(window_, L"Choose app executable", filters, static_cast<UINT>(_countof(filters)), L"exe", executablePath)) {
         return;
     }
-    if (FAILED(hr)) {
-        setStatus(L"Manual app picker failed");
-        return;
-    }
-
-    Microsoft::WRL::ComPtr<IShellItem> item;
-    hr = dialog->GetResult(&item);
-    if (FAILED(hr) || !item) {
-        setStatus(L"No executable selected");
-        return;
-    }
-
-    PWSTR rawPath = nullptr;
-    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
-    if (FAILED(hr) || !rawPath) {
-        CoTaskMemFree(rawPath);
-        setStatus(L"Selected app path could not be read");
-        return;
-    }
-
-    std::filesystem::path executablePath(rawPath);
-    CoTaskMemFree(rawPath);
     addSoundSeparationApp(appNameFromPath(executablePath), executablePath);
 }
 
@@ -776,6 +745,7 @@ void MainWindow::rebuildSoundSeparationRows() {
         SoundSeparationRowControls row;
         row.nameLabel = addControl(L"STATIC", L"No apps selected", SS_LEFT, kX, y + 4, 360, 22, -1);
         soundSeparationRows_.push_back(row);
+        parkFocusOnCombo(soundSeparationAppCombo_);
         layoutCurrentPage();
         redrawWindowAndChildren(pageHost_);
         return;
@@ -830,6 +800,9 @@ void MainWindow::rebuildSoundSeparationRows() {
             kMutedWidth,
             22,
             -1);
+        if (app.muted && row.mutedLabel) {
+            mutedLabels_.insert(row.mutedLabel);
+        }
 
         row.removeButton = addControl(
             L"BUTTON",
@@ -846,34 +819,34 @@ void MainWindow::rebuildSoundSeparationRows() {
         y += kRowHeight;
     }
 
+    parkFocusOnCombo(soundSeparationAppCombo_);
     layoutCurrentPage();
     redrawWindowAndChildren(pageHost_);
 }
 
-void MainWindow::destroySoundSeparationRows() {
-    auto removeControl = [&](HWND control) {
-        if (!control) {
-            return;
-        }
-        statusHelpTexts_.erase(control);
-        pageControls_.erase(std::remove(pageControls_.begin(), pageControls_.end(), control), pageControls_.end());
-        layoutItems_.erase(
-            std::remove_if(
-                layoutItems_.begin(),
-                layoutItems_.end(),
-                [control](const LayoutItem& item) {
-                    return item.control == control;
-                }),
-            layoutItems_.end());
-        DestroyWindow(control);
-    };
+void MainWindow::parkFocusOnCombo(HWND combo) {
+    if (!pageHost_ || !combo) {
+        return;
+    }
+    HWND focused = GetFocus();
+    if (!focused || !IsChild(pageHost_, focused)) {
+        SetFocus(combo);
+    }
+}
 
+void MainWindow::destroySoundSeparationRows() {
+    // Reset hover while the old controls are still alive so they repaint
+    // un-hovered; otherwise hoveredHelpControl_/hoveredButton_ dangle and the
+    // status bar can stick tall until the next mousemove.
+    clearButtonHover();
+    hoveredHelpControl_ = nullptr;
+    hoverStickyStatusHeight_ = 0;
     for (auto& row : soundSeparationRows_) {
-        removeControl(row.micButton);
-        removeControl(row.iconControl);
-        removeControl(row.nameLabel);
-        removeControl(row.mutedLabel);
-        removeControl(row.removeButton);
+        detachPageControl(row.micButton);
+        detachPageControl(row.iconControl);
+        detachPageControl(row.nameLabel);
+        detachPageControl(row.mutedLabel);
+        detachPageControl(row.removeButton);
         if (row.icon) {
             DestroyIcon(row.icon);
             row.icon = nullptr;
@@ -929,6 +902,7 @@ void MainWindow::rebuildAutoRecordRows() {
         AppListRowControls row;
         row.nameLabel = addControl(L"STATIC", L"No apps selected", SS_LEFT, kX, y + 4, 360, 22, -1);
         autoRecordRows_.push_back(row);
+        parkFocusOnCombo(autoRecordAppCombo_);
         layoutCurrentPage();
         redrawWindowAndChildren(pageHost_);
         return;
@@ -978,32 +952,21 @@ void MainWindow::rebuildAutoRecordRows() {
         y += kRowHeight;
     }
 
+    parkFocusOnCombo(autoRecordAppCombo_);
     layoutCurrentPage();
     redrawWindowAndChildren(pageHost_);
 }
 
 void MainWindow::destroyAutoRecordRows() {
-    auto removeControl = [&](HWND control) {
-        if (!control) {
-            return;
-        }
-        statusHelpTexts_.erase(control);
-        pageControls_.erase(std::remove(pageControls_.begin(), pageControls_.end(), control), pageControls_.end());
-        layoutItems_.erase(
-            std::remove_if(
-                layoutItems_.begin(),
-                layoutItems_.end(),
-                [control](const LayoutItem& item) {
-                    return item.control == control;
-                }),
-            layoutItems_.end());
-        DestroyWindow(control);
-    };
-
+    // Same hover reset as destroySoundSeparationRows: the clicked Remove
+    // button dies here, so clear hover state before it dangles.
+    clearButtonHover();
+    hoveredHelpControl_ = nullptr;
+    hoverStickyStatusHeight_ = 0;
     for (auto& row : autoRecordRows_) {
-        removeControl(row.iconControl);
-        removeControl(row.nameLabel);
-        removeControl(row.removeButton);
+        detachPageControl(row.iconControl);
+        detachPageControl(row.nameLabel);
+        detachPageControl(row.removeButton);
         if (row.icon) {
             DestroyIcon(row.icon);
             row.icon = nullptr;
@@ -1074,48 +1037,14 @@ void MainWindow::addSelectedAutoRecordApp() {
 }
 
 void MainWindow::addManualAutoRecordApp() {
-    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-    if (FAILED(hr) || !dialog) {
-        setStatus(L"Manual app picker could not open");
-        return;
-    }
-
     COMDLG_FILTERSPEC filters[] = {
         {L"Applications", L"*.exe"},
         {L"All files", L"*.*"},
     };
-    dialog->SetTitle(L"Choose app executable");
-    dialog->SetFileTypes(static_cast<UINT>(_countof(filters)), filters);
-    dialog->SetFileTypeIndex(1);
-    dialog->SetDefaultExtension(L"exe");
-
-    hr = dialog->Show(window_);
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+    std::filesystem::path executablePath;
+    if (!pickFileForOpen(window_, L"Choose app executable", filters, static_cast<UINT>(_countof(filters)), L"exe", executablePath)) {
         return;
     }
-    if (FAILED(hr)) {
-        setStatus(L"Manual app picker failed");
-        return;
-    }
-
-    Microsoft::WRL::ComPtr<IShellItem> item;
-    hr = dialog->GetResult(&item);
-    if (FAILED(hr) || !item) {
-        setStatus(L"No executable selected");
-        return;
-    }
-
-    PWSTR rawPath = nullptr;
-    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
-    if (FAILED(hr) || !rawPath) {
-        CoTaskMemFree(rawPath);
-        setStatus(L"Selected app path could not be read");
-        return;
-    }
-
-    std::filesystem::path executablePath(rawPath);
-    CoTaskMemFree(rawPath);
     addAutoRecordApp(appNameFromPath(executablePath), executablePath);
 }
 
@@ -1145,109 +1074,56 @@ void MainWindow::addAutoRecordApp(std::wstring name, std::filesystem::path execu
 }
 
 bool MainWindow::isSoundSeparationMutedLabel(HWND control) const {
-    if (!control) {
+    return control != nullptr && mutedLabels_.contains(control);
+}
+
+bool MainWindow::isLibraryTitleLabel(HWND control) const {
+    if (!control || page_ != Page::Library) {
         return false;
     }
-    wchar_t text[16]{};
-    if (GetWindowTextW(control, text, static_cast<int>(_countof(text))) <= 0) {
-        return false;
+    for (const auto& item : layoutItems_) {
+        if (item.sectionHeading && item.control == control) {
+            return true;
+        }
     }
-    return lstrcmpW(text, L"MUTED") == 0;
+    return false;
 }
 void MainWindow::updateStartupRegistration() {
     updateWindowsStartupRegistration(settings_.startWithWindowsMinimized);
 }
 
 void MainWindow::browseClipFolder() {
-    wchar_t displayName[MAX_PATH]{};
-    BROWSEINFOW browse{};
-    browse.hwndOwner = window_;
-    browse.pszDisplayName = displayName;
-    browse.lpszTitle = L"Choose where Backtrack saves clips";
-    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-
-    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
-    if (!item) {
+    std::wstring path;
+    if (!pickFolder(window_, L"Choose where Backtrack saves clips", path)) {
         return;
     }
-
-    wchar_t path[MAX_PATH]{};
-    if (SHGetPathFromIDListW(item, path)) {
-        setText(clipFolderEdit_, path);
-        markSettingsDirty();
-    }
-    CoTaskMemFree(item);
+    setText(clipFolderEdit_, path);
+    markSettingsDirty();
 }
 
 void MainWindow::browseRingDirectory() {
     if (!replayRingDirEdit_) {
         return;
     }
-    wchar_t displayName[MAX_PATH]{};
-    BROWSEINFOW browse{};
-    browse.hwndOwner = window_;
-    browse.pszDisplayName = displayName;
-    browse.lpszTitle = L"Choose where the replay ring files are kept";
-    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-
-    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
-    if (!item) {
+    std::wstring path;
+    if (!pickFolder(window_, L"Choose where the replay ring files are kept", path)) {
         return;
     }
-
-    wchar_t path[MAX_PATH]{};
-    if (SHGetPathFromIDListW(item, path)) {
-        setText(replayRingDirEdit_, path);
-        markSettingsDirty();
-    }
-    CoTaskMemFree(item);
+    setText(replayRingDirEdit_, path);
+    markSettingsDirty();
 }
 
 void MainWindow::browseCustomNotificationSound() {
-    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
-    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
-    if (FAILED(hr) || !dialog) {
-        setStatus(L"Sound picker could not open");
-        return;
-    }
-
     COMDLG_FILTERSPEC filters[] = {
         {L"WAV files", L"*.wav"},
         {L"All files", L"*.*"},
     };
-    dialog->SetTitle(L"Choose custom notification sound");
-    dialog->SetFileTypes(static_cast<UINT>(_countof(filters)), filters);
-    dialog->SetFileTypeIndex(1);
-    dialog->SetDefaultExtension(L"wav");
-
-    hr = dialog->Show(window_);
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+    std::filesystem::path path;
+    if (!pickFileForOpen(window_, L"Choose custom notification sound", filters, static_cast<UINT>(_countof(filters)), L"wav", path)) {
         return;
     }
-    if (FAILED(hr)) {
-        setStatus(L"Sound picker failed");
-        return;
-    }
-
-    Microsoft::WRL::ComPtr<IShellItem> item;
-    hr = dialog->GetResult(&item);
-    if (FAILED(hr) || !item) {
-        setStatus(L"No sound file selected");
-        return;
-    }
-
-    PWSTR rawPath = nullptr;
-    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
-    if (FAILED(hr) || !rawPath) {
-        CoTaskMemFree(rawPath);
-        setStatus(L"Selected sound path could not be read");
-        return;
-    }
-
-    const std::wstring path(rawPath);
-    CoTaskMemFree(rawPath);
     if (customNotificationSoundEdit_) {
-        setText(customNotificationSoundEdit_, path);
+        setText(customNotificationSoundEdit_, path.wstring());
         markSettingsDirty();
     }
 }

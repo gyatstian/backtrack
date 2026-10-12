@@ -5,6 +5,8 @@
 
 #include <Windows.h>
 
+#include <shobjidl.h>
+
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -62,6 +64,16 @@ void playActionIndicator(
     const std::filesystem::path& customSuccessSoundPath = {});
 std::wstring thumbnailCacheKey(const std::filesystem::path& path);
 std::wstring appNameFromPath(const std::filesystem::path& path);
+// Shared file/folder pickers so the three manual-app/sound pickers and the two
+// folder browsers share one dialog core instead of copied boilerplate.
+bool pickFileForOpen(
+    HWND owner,
+    const wchar_t* title,
+    const COMDLG_FILTERSPEC* filters,
+    UINT filterCount,
+    const wchar_t* defaultExtension,
+    std::filesystem::path& out);
+bool pickFolder(HWND owner, const wchar_t* title, std::wstring& out);
 HICON loadExecutableIcon(const std::filesystem::path& path);
 HBITMAP loadShellThumbnail(const std::filesystem::path& path, int width, int height);
 void drawBitmapFit(HDC dc, HBITMAP bitmap, const RECT& target);

@@ -22,7 +22,8 @@ icon.
     check
   - `MainWindowMessages.cpp` `windowProc`, subclass procs, custom drawing
   - `MainWindowPages.cpp` page and settings-category construction, page cache
-  - `MainWindowLayout.cpp` layout, scrolling, wheel handling
+  - `MainWindowLayout.cpp` layout, scrolling, wheel handling, single-control
+    teardown (`detachPageControl`)
   - `MainWindowSettings.cpp` read/apply/dirty tracking, status-bar help text
   - `MainWindowLibrary.cpp` clip list, thumbnails, drag and drop
   - `MainWindowDiagnostics.cpp` stats display, log saving
@@ -44,9 +45,11 @@ icon.
 - `UiIds.h` hands out ids in ranges: tabs at `kTabButtonBaseId + index`,
   settings categories at `kSettingsCategoryButtonBaseId + index`, per-row buttons
   at `kSoundSeparationMuteButtonBaseId`, `kSoundSeparationRemoveButtonBaseId`
-  and `kAutoRecordRemoveButtonBaseId` plus the row index. `addControl` forces
-  `BS_OWNERDRAW` on every non-checkbox button, so a new button id also needs an
-  entry in `isButtonId` (`UiHelpers.cpp`) or nothing paints it. `WM_COMMAND`
+  and `kAutoRecordRemoveButtonBaseId` plus the row index. Single buttons are
+  listed in `kSingleOwnerDrawButtonIds`, which `isButtonId` (`UiHelpers.cpp`)
+  loops. `addControl` forces `BS_OWNERDRAW` on every non-checkbox button, so a
+  new button id needs a table entry there plus its `WM_COMMAND` case, or
+  nothing paints it. `WM_COMMAND`
   routes a range button through its `is*ButtonId` helper; `drawButtonItem`
   only special-cases the mute button's owner-drawn icon.
 - `MainWindow::create` registers two window classes: the main window
@@ -91,7 +94,14 @@ icon.
   width with `MulDiv`; heights and fonts are never scaled. `WM_DPICHANGED` only
   adopts the suggested window rect and relayouts.
 - Gallery tile geometry is not duplicated: the painter and the click handler
-  both go through `galleryTileRect` / `galleryTileColumnAt`.
+  both go through `galleryTileRect` / `galleryTileColumnAt`, and both use
+  `kGalleryTileGap` (including `galleryItemHeightForWidth`, so the budgeted
+  row height matches the drawn tile). `clipIndexAtPoint` additionally requires
+  `PtInRect` on the tile, so gap clicks and the empty part of a partial last
+  row resolve to no clip. The tile index (`selectedClipIndex_`) is the only
+  selection source the painter reads; mouse clicks set it in `armClipDrag`,
+  keyboard row changes follow to the row's first tile in
+  `onClipSelectionChanged`.
 - `refreshClips()` is the full folder rescan and runs on the UI thread. A
   single-clip action (favorite, delete, rename) updates that one `clips_` entry
   and repaints instead; only a rescan may reach for `ClipManager::listClips`. A
@@ -102,7 +112,29 @@ icon.
   the entry's sort key moved. `ClipManager::listClips` sorts by modified time
   then filename descending; a rename preserves modified time but changes the
   name, so it re-sorts on that comparator and then re-reads
-  `selectedClipIndex_`.
+  `selectedClipIndex_`. Delete and rename re-queue missing thumbnails through
+  `refreshThumbnailsAfterLibraryEdit`, which reuses the current generation so
+  in-flight decodes survive; only a rescan or view-mode switch may bump the
+  generation through `loadClipThumbnails`.
+- Muted labels are themed by `mutedLabels_` membership, never by reading the
+  label text: `rebuildSoundSeparationRows` registers muted labels there,
+  `detachPageControl` and the page-teardown clears unregister them. The set is
+  not part of `PageCache`: safe only because Settings is never cache-reused
+  (only Diagnostics keeps its controls) - a future change caching Settings
+  must persist it too. The Library
+  title label (`isLibraryTitleLabel`, resolved by its section-heading role)
+  paints transparent text on the page background: the Library has no section
+  cards, so a panel-colored box behind it is a stray rectangle.
+- Mouse selection goes through `armClipDrag`, which sets the listbox cursor
+  with `LB_SETCURSEL` (no notification follows) and then calls
+  `onClipSelectionChanged` directly, so rename text and action-button state
+  stay in sync on clicks, not just on keyboard selection messages.
+- `detachPageControl` (`MainWindowLayout.cpp`) is the only way to destroy a
+  single page control: it removes the HWND from `pageControls_`,
+  `layoutItems_`, `statusHelpTexts_` and `mutedLabels_` before
+  `DestroyWindow`. The file/manual pickers share `pickFileForOpen` /
+  `pickFolder` (`UiHelpers.*`); do not reintroduce per-callsite dialog
+  boilerplate.
 
 ## Work Guidance
 
@@ -119,7 +151,33 @@ icon.
   `MainWindowController.cpp`, which runs before `TranslateMessage` in
   `runMessageLoop`: it captures the hotkey when a hotkey edit has focus, and on
   the Library page handles F2 (rename), Enter inside the rename box, Delete,
-  F5 / Ctrl+R (refresh) and Ctrl+O (open).
+  F5 / Ctrl+R (refresh) and Ctrl+O (open). `runMessageLoop` routes anything
+  `handleShortcut` declines through `IsDialogMessageW`, so Tab/Shift+Tab moves
+  focus app-wide; the hotkey capture lets Tab/Escape through for that reason.
+  In Gallery with the clip list focused, arrows move per tile and Enter opens
+  the clip; F2 with no selection only sets the status hint instead of stealing
+  focus. Library Delete/Favorite/Rename buttons and the rename box enable only
+  while a clip is selected (`updateLibraryActionButtons`).
+- The tray Exit menu prompts to save dirty settings exactly like `WM_CLOSE`;
+  either path may abort the exit.
+- `applyVisibleSettings` checks the controller busy flag before persisting
+  anything, so a save that loses the race cannot leave disk saved without the
+  recorder ever receiving `ApplySettings`.
+- Row rebuilds (`destroySoundSeparationRows`, `destroyAutoRecordRows`) reset
+  button hover and help-hover state before destroying the controls, mirroring
+  `clearPageControls`; `clearPageControls` also clears `sectionPanels_`, and
+  the Gallery layout branch clears them on entry, so a previous page's cards
+  can never paint behind the Library. `rebuildSettingsCategoryBody` restores
+  focus to the rebuilt counterpart of the focused control.
+- `loadClipThumbnails` decodes visible rows first (stable partition on the
+  request queue); completion order and the generation protocol are unchanged.
+  Single-clip edits re-queue through `refreshThumbnailsAfterLibraryEdit`
+  without bumping the generation; picker cancellations stay silent but genuine
+  dialog failures are logged (`pickFileForOpen` / `pickFolder`).
+- Gap clicks in Gallery select nothing: `armClipDrag` records the pre-click
+  listbox cursor and `onClipSelectionChanged` restores it instead of following
+  to the row's first tile. Row-level rebuilds park focus on the owning combo
+  (`parkFocusOnCombo`) when the focused control died with the rows.
 
 ## Verification
 

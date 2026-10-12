@@ -145,7 +145,9 @@ LRESULT CALLBACK MainWindow::pageHostProc(HWND window, UINT message, WPARAM wPar
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
         } else {
-            FillRect(dc, &rect, self->controlBrush_);
+            // No section panels (Library): same dark page background as every
+            // other page so tiles read as cards instead of a flat panel.
+            FillRect(dc, &rect, self->backgroundBrush_);
 
             HGDIOBJ oldPen = SelectObject(dc, self->outlinePen_);
             HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -450,10 +452,11 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
         case kClipListId:
             if (HIWORD(wParam) == LBN_SELCHANGE) {
-                updateGallerySelectionFromCursor();
+                // Clicks already set the exact tile in armClipDrag; deriving
+                // the selection from the cursor here would snap keyboard
+                // navigation back to whatever the mouse hovers.
                 onClipSelectionChanged();
             } else if (HIWORD(wParam) == LBN_DBLCLK) {
-                updateGallerySelectionFromCursor();
                 openSelectedClip();
             }
             return 0;
@@ -599,9 +602,16 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_CTLCOLORSTATIC:
         {
             const HWND ctlColorTarget = reinterpret_cast<HWND>(lParam);
+            if (isLibraryTitleLabel(ctlColorTarget)) {
+                // No panel behind it: transparent text on the page background
+                // instead of a stray panel-colored box.
+                SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
+                SetTextColor(reinterpret_cast<HDC>(wParam), kText);
+                return reinterpret_cast<LRESULT>(backgroundBrush_);
+            }
             COLORREF staticColor = kText;
             if (isSoundSeparationMutedLabel(ctlColorTarget)) {
-                staticColor = RGB(232, 72, 72);
+                staticColor = kMuteIconColor;
             }
             SetTextColor(reinterpret_cast<HDC>(wParam), staticColor);
         }
@@ -711,7 +721,9 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
         SelectObject(item.hDC, oldPen);
 
         if ((item.itemState & ODS_FOCUS) != 0) {
-            DrawFocusRect(item.hDC, &item.rcItem);
+            RECT focus = item.rcItem;
+            InflateRect(&focus, -3, -3);
+            DrawFocusRect(item.hDC, &focus);
         }
         return;
     }
@@ -782,7 +794,9 @@ void MainWindow::drawButtonItem(const DRAWITEMSTRUCT& item) {
     }
 
     if ((item.itemState & ODS_FOCUS) != 0) {
-        DrawFocusRect(item.hDC, &item.rcItem);
+        RECT focus = item.rcItem;
+        InflateRect(&focus, -3, -3);
+        DrawFocusRect(item.hDC, &focus);
     }
 }
 
@@ -815,10 +829,12 @@ void MainWindow::updateButtonHover(HWND control) {
 
     HWND previous = hoveredButton_;
     hoveredButton_ = button;
-    if (previous) {
+    if (previous && IsWindow(previous)) {
         InvalidateRect(previous, nullptr, FALSE);
     }
-    InvalidateRect(hoveredButton_, nullptr, FALSE);
+    if (IsWindow(hoveredButton_)) {
+        InvalidateRect(hoveredButton_, nullptr, FALSE);
+    }
 
     TRACKMOUSEEVENT track{};
     track.cbSize = sizeof(track);
@@ -857,7 +873,10 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
 
             const auto& clip = clips_[clipIndex];
             const RECT tile = galleryTileRect(item.rcItem, column);
-            const bool selected = selectedClipIndex_ == clipIndex || ((item.itemState & ODS_SELECTED) != 0 && selectedClipIndex_ >= clips_.size() && column == 0);
+            // Single source of truth is the tile index: the listbox selects
+            // per row, so ODS_SELECTED would light up column 0 of any selected
+            // row regardless of the picked tile.
+            const bool selected = selectedClipIndex_ == clipIndex;
             const COLORREF text = clip.favorite ? kFavoriteText : kText;
 
             HBRUSH tileBrush = clip.favorite ? favoriteBrush_ : (selected ? selectionBrush_ : controlBrush_);
@@ -874,7 +893,12 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             preview.right -= 8;
             preview.top += 8;
             preview.bottom = preview.top + std::max(64, static_cast<int>((preview.right - preview.left) * 9 / 16));
-            preview.bottom = std::min(preview.bottom, tile.bottom - 46);
+            // Reserve the true text block (name 22 + gaps + meta) so narrow
+            // windows shrink the preview instead of squeezing text to zero.
+            preview.bottom = std::min(preview.bottom, tile.bottom - 56);
+            if (preview.bottom <= preview.top) {
+                preview.bottom = preview.top + 1;
+            }
 
             FillRect(item.hDC, &preview, editBrush_);
             const ClipThumbnail* thumbnail = clipIndex < clipThumbnails_.size() ? &clipThumbnails_[clipIndex] : nullptr;
@@ -928,8 +952,15 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             DrawTextW(item.hDC, meta.c_str(), -1, &metaRect, DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
         }
 
-        if ((item.itemState & ODS_FOCUS) != 0) {
-            DrawFocusRect(item.hDC, &item.rcItem);
+        if ((item.itemState & ODS_FOCUS) != 0 && selectedClipIndex_ < clips_.size()) {
+            // Focus belongs to the selected tile, not the whole 3-tile row.
+            const size_t selectedRow = selectedClipIndex_ / kGalleryClipColumns;
+            if (selectedRow == static_cast<size_t>(item.itemID)) {
+                const int selectedColumn = static_cast<int>(selectedClipIndex_ % kGalleryClipColumns);
+                RECT focus = galleryTileRect(item.rcItem, selectedColumn);
+                InflateRect(&focus, -3, -3);
+                DrawFocusRect(item.hDC, &focus);
+            }
         }
         return;
     }

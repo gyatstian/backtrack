@@ -100,6 +100,7 @@ void MainWindow::rebindPageControlPointers() {
     replaySecondsEdit_ = nullptr;
     replayDiskBackedCheck_ = nullptr;
     replayDiskBackedAudioCheck_ = nullptr;
+    replayRingDirEdit_ = nullptr;
     replayHotkey_ = nullptr;
     leagueKillReminderCheck_ = nullptr;
     discordRichPresenceCombo_ = nullptr;
@@ -504,6 +505,9 @@ void MainWindow::clearPageControls() {
             DestroyWindow(control);
         }
     }
+    // Bulk teardown owns this too: any future invalidate-without-layout would
+    // otherwise leave the previous page's cards painting behind the new one.
+    sectionPanels_.clear();
     releaseSoundSeparationRowIcons();
     soundSeparationRows_.clear();
     releaseAutoRecordRowIcons();
@@ -511,6 +515,7 @@ void MainWindow::clearPageControls() {
     pageControls_.clear();
     layoutItems_.clear();
     statusHelpTexts_.clear();
+    mutedLabels_.clear();
     hoveredHelpControl_ = nullptr;
     hoverStickyStatusHeight_ = 0;
     clearButtonHover();
@@ -640,6 +645,7 @@ void MainWindow::clearSettingsBodyControls() {
     pageControls_ = std::move(keptControls);
     layoutItems_ = std::move(keptLayout);
     statusHelpTexts_ = std::move(keptHelp);
+    mutedLabels_.clear();
     hoveredHelpControl_ = nullptr;
     hoverStickyStatusHeight_ = 0;
     clearButtonHover();
@@ -820,6 +826,9 @@ void MainWindow::rebuildSettingsCategoryBody() {
     }
     SendMessageW(pageHost_, WM_SETREDRAW, FALSE, 0);
     buildingPage_ = true;
+    // The focused control dies with the body; restore focus to its rebuilt
+    // counterpart so keyboard users do not lose their place.
+    const int focusedId = GetDlgCtrlID(GetFocus());
     clearSettingsBodyControls();
     pageScrollY_ = 0;
     pageWheelRemainder_ = 0;
@@ -829,6 +838,11 @@ void MainWindow::rebuildSettingsCategoryBody() {
     updateSaveSettingsButton();
     layoutCurrentPage();
     storeCurrentPageCache();
+    if (focusedId > 0) {
+        if (HWND again = GetDlgItem(pageHost_, focusedId)) {
+            SetFocus(again);
+        }
+    }
     SendMessageW(pageHost_, WM_SETREDRAW, TRUE, 0);
     redrawWindowAndChildren(pageHost_, true);
 }

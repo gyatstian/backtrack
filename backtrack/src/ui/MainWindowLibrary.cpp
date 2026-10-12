@@ -79,12 +79,6 @@ void MainWindow::setLibraryViewMode(LibraryViewMode mode) {
     if (clipList_) {
         setListItemHeightIfChanged(clipList_, clipListItemHeight_, mode == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);
         refreshClips();
-        // Gallery placement moves controls directly without updating
-        // LayoutItem::placed; stale entries would make the next list layout
-        // believe the gallery geometry is already applied and skip the moves.
-        for (auto& item : layoutItems_) {
-            item.placedValid = false;
-        }
         layoutCurrentPage();
         InvalidateRect(clipList_, nullptr, FALSE);
     }
@@ -183,6 +177,77 @@ void MainWindow::loadClipThumbnails() {
         return;
     }
 
+    // Decode what is on screen first: with a large uncached library the
+    // visible tiles would otherwise wait behind every off-screen entry.
+    if (clipList_) {
+        const LRESULT top = SendMessageW(clipList_, LB_GETTOPINDEX, 0, 0);
+        RECT client{};
+        GetClientRect(clipList_, &client);
+        const int itemHeight = std::max(1, clipListItemHeight_ > 0 ? clipListItemHeight_ : kGalleryClipMinimumItemHeight);
+        const int visibleRows = std::max(1, static_cast<int>(client.bottom - client.top) / itemHeight);
+        if (top != LB_ERR && top >= 0) {
+            const size_t firstVisible = static_cast<size_t>(top) * kGalleryClipColumns;
+            const size_t lastVisible = firstVisible + static_cast<size_t>(visibleRows) * kGalleryClipColumns;
+            std::stable_partition(requests.begin(), requests.end(), [&](const ThumbnailRequest& request) {
+                return request.clipIndex >= firstVisible && request.clipIndex < lastVisible;
+            });
+        }
+    }
+
+    startThumbnailWorker();
+    {
+        std::scoped_lock lock(thumbnailQueueMutex_);
+        if (thumbnailWorkerStopping_) {
+            return;
+        }
+        for (auto& request : requests) {
+            thumbnailQueue_.push_back(std::move(request));
+        }
+    }
+    thumbnailQueueCv_.notify_one();
+}
+
+void MainWindow::refreshThumbnailsAfterLibraryEdit() {
+    // Same per-index validation as handleClipThumbnailReady already drops
+    // stale results, so reusing the current generation is safe: duplicates
+    // self-discard instead of starving the worker like a bump would.
+    pruneClipThumbnailCache();
+    if (libraryViewMode_ != LibraryViewMode::Gallery || clips_.empty()) {
+        clipThumbnails_.clear();
+        return;
+    }
+    clipThumbnails_.resize(clips_.size());
+    const uint64_t generation = thumbnailGeneration_.load(std::memory_order_acquire);
+    std::deque<ThumbnailRequest> requests;
+    for (size_t index = 0; index < clips_.size(); ++index) {
+        const auto& clip = clips_[index];
+        const std::wstring key = thumbnailCacheKey(clip.path);
+        const auto cache = thumbnailCache_.find(key);
+        if (cache != thumbnailCache_.end() &&
+            cache->second.bytes == clip.bytes &&
+            cache->second.modifiedTime == clip.modifiedTime) {
+            auto& slot = clipThumbnails_[index];
+            slot.bitmap = cache->second.bitmap;
+            slot.tileBitmap = cache->second.tileBitmap;
+            slot.tileWidth = cache->second.tileWidth;
+            slot.tileHeight = cache->second.tileHeight;
+            slot.loading = false;
+            slot.unavailable = cache->second.unavailable;
+            continue;
+        }
+        clipThumbnails_[index] = ClipThumbnail{};
+        clipThumbnails_[index].loading = true;
+        ThumbnailRequest request;
+        request.generation = generation;
+        request.clipIndex = index;
+        request.path = clip.path;
+        request.modifiedTime = clip.modifiedTime;
+        request.bytes = clip.bytes;
+        requests.push_back(std::move(request));
+    }
+    if (requests.empty()) {
+        return;
+    }
     startThumbnailWorker();
     {
         std::scoped_lock lock(thumbnailQueueMutex_);
@@ -384,41 +449,36 @@ size_t MainWindow::clipIndexAtPoint(POINT point) const {
         GetClientRect(clipList_, &rowRect);
     }
     const int column = galleryTileColumnAt(rowRect, static_cast<int>(point.x));
+    // Gaps belong to no tile: a click between tiles or on the empty part of a
+    // partial last row must not resolve to a neighboring clip.
+    const RECT tile = galleryTileRect(rowRect, column);
+    if (!PtInRect(&tile, point)) {
+        return static_cast<size_t>(-1);
+    }
     const size_t index = static_cast<size_t>(row) * kGalleryClipColumns + static_cast<size_t>(column);
     return index < clips_.size() ? index : static_cast<size_t>(-1);
-}
-
-void MainWindow::updateGallerySelectionFromCursor() {
-    if (!clipList_ || libraryViewMode_ != LibraryViewMode::Gallery || clips_.empty()) {
-        return;
-    }
-
-    POINT point{};
-    if (!GetCursorPos(&point)) {
-        return;
-    }
-    ScreenToClient(clipList_, &point);
-
-    RECT client{};
-    GetClientRect(clipList_, &client);
-    if (point.x < client.left || point.x >= client.right || point.y < client.top || point.y >= client.bottom) {
-        return;
-    }
-
-    const size_t index = clipIndexAtPoint(point);
-    if (index < clips_.size() && selectedClipIndex_ != index) {
-        const size_t previousIndex = selectedClipIndex_;
-        selectedClipIndex_ = index;
-        invalidateClipRow(previousIndex);
-        invalidateClipRow(selectedClipIndex_);
-    }
 }
 
 void MainWindow::armClipDrag(POINT point) {
     clipDragArmed_ = false;
     clipDragPath_.clear();
+    suppressGalleryFollow_ = false;
     const size_t index = clipIndexAtPoint(point);
     if (index >= clips_.size()) {
+        // Gap or empty area in Gallery: the listbox still moves its own row
+        // cursor after this returns, which would make LBN_SELCHANGE follow to
+        // the row's first tile. Record the pre-click cursor so the follow can
+        // restore it instead - but only when the click actually moves the
+        // cursor, or a stale flag would eat the next keyboard selection.
+        if (libraryViewMode_ == LibraryViewMode::Gallery && clipList_) {
+            const DWORD hit = static_cast<DWORD>(SendMessageW(
+                clipList_, LB_ITEMFROMPOINT, 0, MAKELPARAM(point.x, point.y)));
+            const LRESULT current = SendMessageW(clipList_, LB_GETCURSEL, 0, 0);
+            if (HIWORD(hit) == 0 && static_cast<int>(LOWORD(hit)) != static_cast<int>(current)) {
+                gapPrevRow_ = static_cast<int>(current);
+                suppressGalleryFollow_ = true;
+            }
+        }
         return;
     }
 
@@ -430,7 +490,9 @@ void MainWindow::armClipDrag(POINT point) {
     }
     SendMessageW(clipList_, LB_SETCURSEL,
         static_cast<WPARAM>(libraryViewMode_ == LibraryViewMode::Gallery ? index / kGalleryClipColumns : index), 0);
-    setText(renameEdit_, clips_[index].path.stem().wstring());
+    // LB_SETCURSEL sends no notification, so sync dependents here instead of
+    // waiting for a selection message that never comes.
+    onClipSelectionChanged();
     clipDragStartPoint_ = point;
     clipDragPath_ = clips_[index].path;
     clipDragArmed_ = true;
@@ -537,6 +599,7 @@ void MainWindow::populateClipListRows() {
     SendMessageW(clipList_, LB_RESETCONTENT, 0, 0);
     if (clips_.empty()) {
         SendMessageW(clipList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"No clips yet"));
+        updateLibraryActionButtons();
         return;
     }
 
@@ -568,6 +631,21 @@ void MainWindow::populateClipListRows() {
             static_cast<WPARAM>(libraryViewMode_ == LibraryViewMode::Gallery ? selectedClipIndex_ / kGalleryClipColumns : selectedClipIndex_), 0);
     }
     InvalidateRect(clipList_, nullptr, FALSE);
+    updateLibraryActionButtons();
+}
+
+void MainWindow::updateLibraryActionButtons() {
+    // The painter already renders a disabled look; use it instead of leaving
+    // dead-end buttons enabled on an empty or unselected library.
+    const BOOL enabled = (selectedClipIndex_ < clips_.size() && !clips_.empty()) ? TRUE : FALSE;
+    if (pageHost_) {
+        EnableWindow(GetDlgItem(pageHost_, kDeleteClipButtonId), enabled);
+        EnableWindow(GetDlgItem(pageHost_, kFavoriteClipButtonId), enabled);
+        EnableWindow(GetDlgItem(pageHost_, kRenameClipButtonId), enabled);
+    }
+    if (renameEdit_) {
+        EnableWindow(renameEdit_, enabled);
+    }
 }
 
 void MainWindow::onClipSelectionChanged() {
@@ -575,6 +653,37 @@ void MainWindow::onClipSelectionChanged() {
         const auto selected = SendMessageW(clipList_, LB_GETCURSEL, 0, 0);
         if (selected != LB_ERR && selected >= 0) {
             selectedClipIndex_ = clipIndexFromListItem(static_cast<UINT>(selected));
+        }
+    } else if (clipList_ && libraryViewMode_ == LibraryViewMode::Gallery) {
+        if (suppressGalleryFollow_) {
+            // Gap click moved the listbox cursor without touching a tile:
+            // put the cursor back instead of selecting the row's first tile.
+            // LB_SETCURSEL sends no notification, so this cannot recurse.
+            suppressGalleryFollow_ = false;
+            if (gapPrevRow_ != LB_ERR) {
+                SendMessageW(clipList_, LB_SETCURSEL, static_cast<WPARAM>(gapPrevRow_), 0);
+            }
+            return;
+        }
+        // Gallery rows hold 3 clips but the listbox selects per row. Keyboard
+        // navigation changes the row without touching the cursor, so follow it
+        // to the row's first tile; mouse clicks already set the exact tile in
+        // armClipDrag before this runs.
+        const auto selected = SendMessageW(clipList_, LB_GETCURSEL, 0, 0);
+        if (selected != LB_ERR && selected >= 0) {
+            const size_t rowFirst = static_cast<size_t>(selected) * kGalleryClipColumns;
+            const size_t selectedRow = selectedClipIndex_ < clips_.size()
+                ? selectedClipIndex_ / kGalleryClipColumns
+                : static_cast<size_t>(-1);
+            if (rowFirst < clips_.size() && selectedRow != static_cast<size_t>(selected)) {
+                const size_t previousIndex = selectedClipIndex_;
+                selectedClipIndex_ = rowFirst;
+                invalidateClipRow(previousIndex);
+                invalidateClipRow(selectedClipIndex_);
+            } else if (selectedClipIndex_ >= clips_.size() && rowFirst < clips_.size()) {
+                selectedClipIndex_ = rowFirst;
+                invalidateClipRow(selectedClipIndex_);
+            }
         }
     } else if (clipList_ && selectedClipIndex_ >= clips_.size()) {
         const auto selected = SendMessageW(clipList_, LB_GETCURSEL, 0, 0);
@@ -588,6 +697,7 @@ void MainWindow::onClipSelectionChanged() {
     } else {
         setText(renameEdit_, L"");
     }
+    updateLibraryActionButtons();
 }
 
 void MainWindow::openSelectedClip() {
@@ -641,9 +751,9 @@ void MainWindow::deleteSelectedClip() {
             }
         }
         selectedClipIndex_ = static_cast<size_t>(-1);
-        // Releases the deleted clip's cached bitmaps and drops any thumbnail
-        // still in flight for the shifted indices.
-        loadClipThumbnails();
+        // Releases the deleted clip's cached bitmaps without discarding
+        // in-flight decodes for the clips that remain.
+        refreshThumbnailsAfterLibraryEdit();
         populateClipListRows();
         setText(renameEdit_, L"");
         setStatus(L"Clip deleted");
@@ -688,9 +798,9 @@ void MainWindow::renameSelectedClip() {
                 return left.path.filename().wstring() > right.path.filename().wstring();
             });
             selectedClipIndex_ = clipIndexForPath(renamed);
-            // Drops the thumbnail cached under the old path and any request
-            // still in flight for the shifted indices.
-            loadClipThumbnails();
+            // Drops the thumbnail cached under the old path without
+            // discarding in-flight decodes for the clips that remain.
+            refreshThumbnailsAfterLibraryEdit();
             populateClipListRows();
         }
         setStatus(L"Clip renamed");
@@ -718,8 +828,10 @@ void MainWindow::toggleSelectedFavorite() {
         const size_t index = clipIndexForPath(path);
         if (index < clips_.size()) {
             clips_[index].favorite = !currentlyFavorite;
+            // Favorite is paint state, not a sort key: repaint the row instead
+            // of rebuilding the whole list (no flicker, no scroll jump).
+            invalidateClipRow(index);
         }
-        populateClipListRows();
         setStatus(currentlyFavorite ? L"Favorite removed" : L"Clip favorited");
     } else {
         Logger::instance().warning(L"ui", std::wstring(L"Favorite update failed for clip: ") + path.wstring());

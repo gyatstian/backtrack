@@ -33,6 +33,34 @@
 #include <utility>
 
 namespace backtrack {
+void MainWindow::detachPageControl(HWND control) {
+    if (!control) {
+        return;
+    }
+    // Defensive: a future caller that destroys a hovered control without the
+    // row/page pre-clear must not leave hover state dangling on a dead HWND.
+    if (hoveredButton_ == control) {
+        hoveredButton_ = nullptr;
+        buttonHoverTracking_ = false;
+    }
+    if (hoveredHelpControl_ == control) {
+        hoveredHelpControl_ = nullptr;
+        hoverStickyStatusHeight_ = 0;
+    }
+    statusHelpTexts_.erase(control);
+    mutedLabels_.erase(control);
+    pageControls_.erase(std::remove(pageControls_.begin(), pageControls_.end(), control), pageControls_.end());
+    layoutItems_.erase(
+        std::remove_if(
+            layoutItems_.begin(),
+            layoutItems_.end(),
+            [control](const LayoutItem& item) {
+                return item.control == control;
+            }),
+        layoutItems_.end());
+    DestroyWindow(control);
+}
+
 void MainWindow::layoutWindow() {
     if (!window_) {
         return;
@@ -128,8 +156,40 @@ bool MainWindow::layoutCurrentPage() {
 
         bool changed = false;
         bool listChanged = false;
+        if (!sectionPanels_.empty()) {
+            // Section cards belong to the Capture/Settings/Diagnostics
+            // builders. This branch returns before the generic path's clear,
+            // so without this the previous page's cards paint behind the
+            // library.
+            sectionPanels_.clear();
+            changed = true;
+        }
+        auto findLayoutItem = [&](HWND control) -> LayoutItem* {
+            for (auto& item : layoutItems_) {
+                if (item.control == control) {
+                    return &item;
+                }
+            }
+            return nullptr;
+        };
         auto move = [&](HWND control, int x, int y, int width, int height) {
             if (control) {
+                // Join the placed-cache protocol the generic path uses, so a
+                // later generic layout does not mistake gallery geometry for
+                // already-applied state (or vice versa).
+                if (LayoutItem* cached = findLayoutItem(control)) {
+                    const RECT placed{x, y - pageScrollY_, x + width, y - pageScrollY_ + height};
+                    if (cached->placedValid &&
+                        cached->placed.left == placed.left &&
+                        cached->placed.top == placed.top &&
+                        cached->placed.right == placed.right &&
+                        cached->placed.bottom == placed.bottom) {
+                        showWindowIfHidden(control);
+                        return;
+                    }
+                    cached->placed = placed;
+                    cached->placedValid = true;
+                }
                 changed = moveWindowIfChanged(control, x, y - pageScrollY_, width, height) || changed;
                 changed = showWindowIfHidden(control) || changed;
             }
@@ -139,8 +199,20 @@ bool MainWindow::layoutCurrentPage() {
                 move(pageControls_[index], x, y, width, height);
             }
         };
+        // The title is the page's only section heading: resolve it by role,
+        // not by build order, so inserting a control above it cannot move the
+        // wrong HWND into the title slot.
+        auto moveTitle = [&](int x, int y, int width, int height) {
+            for (auto& item : layoutItems_) {
+                if (item.sectionHeading) {
+                    move(item.control, x, y, width, height);
+                    return;
+                }
+            }
+            movePageControl(0, x, y, width, height);
+        };
 
-        movePageControl(0, kLayoutPadding, yTitle, 220, 24);
+        moveTitle(kLayoutPadding, yTitle, 220, 24);
         move(GetDlgItem(pageHost_, kDeleteClipButtonId), actionsLeft, yTitle - 2, actionButtonWidth, controlHeight);
         move(GetDlgItem(pageHost_, kFavoriteClipButtonId), actionsLeft + (actionButtonWidth + actionGap), yTitle - 2, actionButtonWidth, controlHeight);
         move(GetDlgItem(pageHost_, kRefreshClipsButtonId), actionsLeft + (actionButtonWidth + actionGap) * 2, yTitle - 2, actionButtonWidth, controlHeight);

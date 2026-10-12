@@ -203,6 +203,11 @@ bool MainWindow::handleShortcut(MSG& message) {
 
     HWND focused = GetFocus();
     if (focused == recordHotkey_ || focused == replayHotkey_) {
+        // Tab must reach IsDialogMessage so focus can leave the field; Escape
+        // is merely let through so it is not captured as a hotkey value.
+        if (message.wParam == VK_TAB || message.wParam == VK_ESCAPE) {
+            return false;
+        }
         if (isModifierKey(message.wParam)) {
             return true;
         }
@@ -236,9 +241,11 @@ bool MainWindow::handleShortcut(MSG& message) {
 
     if (message.wParam == VK_F2 && renameEdit_) {
         const auto path = selectedClipPath();
-        if (!path.empty()) {
-            setText(renameEdit_, path.stem().wstring());
+        if (path.empty()) {
+            setStatus(L"Select a clip to rename");
+            return true;
         }
+        setText(renameEdit_, path.stem().wstring());
         SetFocus(renameEdit_);
         SendMessageW(renameEdit_, EM_SETSEL, 0, -1);
         return true;
@@ -247,6 +254,45 @@ bool MainWindow::handleShortcut(MSG& message) {
     if (message.wParam == VK_RETURN && renameEdit_ && GetFocus() == renameEdit_) {
         renameSelectedClip();
         return true;
+    }
+
+    if (message.wParam == VK_RETURN && GetFocus() == clipList_) {
+        openSelectedClip();
+        return true;
+    }
+
+    if (libraryViewMode_ == LibraryViewMode::Gallery && GetFocus() == clipList_ && !clips_.empty()) {
+        int step = 0;
+        if (message.wParam == VK_LEFT) {
+            step = -1;
+        } else if (message.wParam == VK_RIGHT) {
+            step = 1;
+        } else if (message.wParam == VK_UP) {
+            step = -kGalleryClipColumns;
+        } else if (message.wParam == VK_DOWN) {
+            step = kGalleryClipColumns;
+        }
+        if (step != 0) {
+            // Per-tile keyboard movement; the listbox only selects per row.
+            suppressGalleryFollow_ = false;
+            size_t target = 0;
+            if (selectedClipIndex_ < clips_.size()) {
+                const auto next = static_cast<int>(selectedClipIndex_) + step;
+                target = static_cast<size_t>(std::clamp(next, 0, static_cast<int>(clips_.size()) - 1));
+            }
+            if (target != selectedClipIndex_) {
+                const size_t previousIndex = selectedClipIndex_;
+                selectedClipIndex_ = target;
+                // LB_SETCURSEL sends no notification, so sync + repaint here;
+                // the row sync in onClipSelectionChanged agrees (same row).
+                SendMessageW(clipList_, LB_SETCURSEL, static_cast<WPARAM>(target / kGalleryClipColumns), 0);
+                setText(renameEdit_, clips_[target].path.stem().wstring());
+                invalidateClipRow(previousIndex);
+                invalidateClipRow(selectedClipIndex_);
+                updateLibraryActionButtons();
+            }
+            return true;
+        }
     }
 
     if (GetFocus() != renameEdit_) {
@@ -325,6 +371,11 @@ void MainWindow::showTrayMenu() {
     if (command == kTrayOpenId) {
         restoreFromTray();
     } else if (command == kTrayExitId) {
+        // Same unsaved-settings prompt as WM_CLOSE; tray exit is the path a
+        // tray-dwelling user takes, so silently discarding edits hurts most.
+        if (settingsDirty_ && !promptSaveSettingsIfDirty(true)) {
+            return;
+        }
         exitFromTray_ = true;
         removeTrayIcon();
         DestroyWindow(window_);

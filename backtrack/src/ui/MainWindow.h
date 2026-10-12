@@ -21,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace backtrack {
@@ -230,6 +231,7 @@ private:
     int statusHeightForWidth(int width) const;
     void layoutWindow();
     bool layoutCurrentPage();
+    void detachPageControl(HWND control);
     void scrollPageTo(int position);
     void scrollPageBy(int delta);
     void scrollPageWheel(WPARAM wParam);
@@ -242,10 +244,14 @@ private:
     void addSoundSeparationApp(std::wstring name, std::filesystem::path executablePath);
     void rebuildSoundSeparationRows();
     void destroySoundSeparationRows();
+    void parkFocusOnCombo(HWND combo);
     void releaseSoundSeparationRowIcons();
     void toggleSoundSeparationApp(size_t index);
     void removeSoundSeparationApp(size_t index);
     bool isSoundSeparationMutedLabel(HWND control) const;
+    // The Library page has no section cards, so its title label paints text
+    // directly on the page background instead of a panel-colored box.
+    bool isLibraryTitleLabel(HWND control) const;
     void refreshAutoRecordApps();
     void addSelectedAutoRecordApp();
     void addManualAutoRecordApp();
@@ -270,6 +276,9 @@ private:
     void releaseClipThumbnailCache();
     void pruneClipThumbnailCache();
     void loadClipThumbnails();
+    // Re-queues missing thumbnails without bumping the generation, so rapid
+    // single-clip edits do not starve the worker by discarding in-flight work.
+    void refreshThumbnailsAfterLibraryEdit();
     void startThumbnailWorker();
     void stopThumbnailWorker();
     void thumbnailWorkerLoop();
@@ -281,7 +290,6 @@ private:
     // these so a click can never land on a different tile than the one drawn.
     static RECT galleryTileRect(const RECT& row, int column);
     static int galleryTileColumnAt(const RECT& row, int x);
-    void updateGallerySelectionFromCursor();
     void armClipDrag(POINT point);
     void beginClipDrag();
     void onClipSelectionChanged();
@@ -317,6 +325,7 @@ private:
     void showTrayMenu();
     void drawButtonItem(const DRAWITEMSTRUCT& item);
     void drawClipItem(const DRAWITEMSTRUCT& item);
+    void updateLibraryActionButtons();
     void applyDarkTheme(HWND control);
     void setStatus(const std::wstring& status);
     std::wstring currentStatusDisplayText() const;
@@ -472,6 +481,11 @@ private:
     bool clipDragArmed_ = false;
     POINT clipDragStartPoint_{};
     std::filesystem::path clipDragPath_;
+    // Gap-click suppression: armClipDrag runs before the listbox moves its own
+    // row cursor, so a gap click records the pre-click cursor and asks
+    // onClipSelectionChanged to restore it instead of following to the row.
+    bool suppressGalleryFollow_ = false;
+    int gapPrevRow_ = 0;
     std::wstring statusText_ = L"Ready";
     std::wstring displayedStatusText_;
     // Status-bar height held onto while a help text is hovered. Moving the
@@ -492,6 +506,9 @@ private:
     std::vector<AudioDeviceInfo> inputDevices_;
     std::vector<AudioSessionAppInfo> soundSeparationAvailableApps_;
     std::vector<SoundSeparationRowControls> soundSeparationRows_;
+    // HWNDs currently showing the muted state. The CTLCOLOR handler themes by
+    // membership here instead of reading the label text back out of the UI.
+    std::unordered_set<HWND> mutedLabels_;
     std::vector<AudioSessionAppInfo> autoRecordAvailableApps_;
     std::vector<AppListRowControls> autoRecordRows_;
     std::vector<ClipThumbnail> clipThumbnails_;

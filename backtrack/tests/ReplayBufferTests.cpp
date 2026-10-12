@@ -95,6 +95,12 @@ struct ReplayBufferTestAccess {
     static void breakAudioRing(ReplayBuffer& buffer) {
         buffer.breakAudioRingForTesting();
     }
+    static uint64_t ramVideoBytes(const ReplayBuffer& buffer) {
+        return buffer.ramVideoBytes_;
+    }
+    static uint64_t ramAudioBytes(const ReplayBuffer& buffer) {
+        return buffer.ramAudioBytes_;
+    }
 };
 
 } // namespace backtrack
@@ -1716,6 +1722,70 @@ void testDayHoldStaysWithinWindow() {
     }
 }
 
+// A long window at a high bitrate must not grow RAM without bound: the passed
+// capacities cap the memory backends too, video realigning to a keyframe and
+// audio evicting oldest-first. The same cap survives a disk-to-RAM failover.
+void testRamModeEnforcesByteCap() {
+    constexpr uint64_t kVideoCap = 16ull * 1024;
+    constexpr uint64_t kAudioCap = 256ull * 1024;
+    constexpr int64_t kPackets = 100;
+
+    ReplayBuffer buffer;
+    buffer.configure(settings(3600), {}, kVideoCap, kAudioCap);
+    for (int64_t pts = 0; pts < kPackets; ++pts) {
+        buffer.pushVideo(makeVideoPayload(
+            pts * kSecond100ns, kSecond100ns, (pts % 5) == 0, static_cast<uint8_t>(0x30 + pts), 1024));
+    }
+    expect(backtrack::ReplayBufferTestAccess::ramVideoBytes(buffer) <= kVideoCap,
+        "RAM video grew past its byte cap");
+    expect(buffer.videoPacketCount() <= kVideoCap / 1024,
+        "RAM video kept more packets than fit the byte cap");
+    expect(buffer.newestVideoPts100ns() == (kPackets - 1) * kSecond100ns,
+        "RAM byte eviction dropped the newest packet");
+    expect(buffer.videoPacketCount() > 0, "RAM byte eviction emptied the buffer");
+
+    for (int64_t pts = 0; pts < 10; ++pts) {
+        buffer.pushAudio(makeAudio(pts * kSecond100ns, 1));
+    }
+    expect(backtrack::ReplayBufferTestAccess::ramAudioBytes(buffer) <= kAudioCap,
+        "RAM audio grew past its byte cap");
+
+    // Failover path: a dead disk ring lands on the same RAM cap, not uncapped.
+    const auto storageRoot = testOutputDir() / L"ram_cap_failover";
+    std::error_code error;
+    std::filesystem::remove_all(storageRoot, error);
+    std::filesystem::create_directories(storageRoot, error);
+    ReplaySettings diskSettings = settings(3600);
+    diskSettings.diskBackedVideo = true;
+    ReplayBuffer disk;
+    constexpr uint64_t kDiskCap = 8ull * 1024 * 1024;
+    disk.configure(diskSettings, storageRoot, kDiskCap);
+    for (int64_t pts = 0; pts < 6; ++pts) {
+        disk.pushVideo(makeVideoPayload(
+            pts * kSecond100ns, kSecond100ns, pts == 0, static_cast<uint8_t>(0x40 + pts), 1024));
+    }
+    backtrack::ReplayBufferTestAccess::breakRing(disk);
+    const auto output = testOutputDir() / L"ram_cap_failover.mp4";
+    std::wstring detail;
+    expect(!disk.saveTo(output, defaultVideoSettings(), &detail),
+        "a save reported success after the ring stopped reading");
+    for (int64_t pts = 6; pts < 106; ++pts) {
+        disk.pushVideo(makeVideoPayload(
+            pts * kSecond100ns, kSecond100ns, (pts % 5) == 0, static_cast<uint8_t>(0x40 + pts), 100 * 1024));
+    }
+    expect(backtrack::ReplayBufferTestAccess::ramVideoBytes(disk) <= kDiskCap,
+        "post-failover RAM video grew past its byte cap");
+    expect(disk.newestVideoPts100ns() == 105 * kSecond100ns,
+        "post-failover eviction dropped the newest packet");
+    expect(disk.saveTo(output, defaultVideoSettings()),
+        "the session could not save again after failover under a byte cap");
+
+    disk.clear();
+    buffer.clear();
+    std::filesystem::remove_all(storageRoot, error);
+    std::filesystem::remove_all(output.parent_path(), error);
+}
+
 } // namespace
 
 int main() {
@@ -1757,6 +1827,7 @@ int main() {
         testMuxFailurePreservesStreamsAndReportsReason();
         testOrphanedRingFolderIsSwept();
         testDayHoldStaysWithinWindow();
+        testRamModeEnforcesByteCap();
         std::cout << "ReplayBuffer tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -9,7 +9,8 @@ process memory when the user opts out per track (`replay_video.bin` and
 
 ## Ownership
 
-- Owns: `ReplayBuffer`, its metadata model, the ring files, and the trimming and
+- Owns: `ReplayBuffer`, `RingFile` (the byte store both ring files share),
+  its metadata model, the ring files, and the trimming and
   save logic. Owns the ring folder's layout, its startup cleanup
   (`removeOrphanedRing`), and the report of a disk-to-RAM degradation
   (`storageFallbackReason`, kept per track). Each ring file is pre-sized to
@@ -28,13 +29,30 @@ process memory when the user opts out per track (`replay_video.bin` and
   capacity is at least `kMinRingCapacityBytes` (8 MiB); the audio capacity
   likewise gates `settings.diskBackedAudio` at `kMinAudioRingCapacityBytes`
   (1 MiB). Anything else is a RAM configuration for that track, so a capacity
-  below the floor is not a capacity change at all. `settings.enabled` off
+  below the floor is not a capacity change at all. Either capacity is still
+  stored as that track's RAM byte cap (zero falls back to the controller's
+  derivation), so a long window can never grow memory without bound and the
+  cap survives a disk-to-RAM failover. `settings.enabled` off
   clears every buffer and closes both rings. Each track switches backends on
   its own: toggling sound to disk drops buffered audio only, never video.
+- RAM trimming evicts to both bounds: the time window and the stored byte cap.
+  Video realigns to the oldest buffered keyframe on either bound (same as
+  `freeRingSpaceLocked`); audio evicts plain oldest-first across both tracks
+  by front PTS (same as `freeAudioRingSpaceLocked`). RAM snapshots hold
+  shared pointers, so byte eviction needs no save-pin wait.
+- The video and audio rings share one byte store (`RingFile`: handle, path,
+  capacity, write cursor, live count, overlapped transfer). Only the eviction
+  policy is per track, passed into `RingFile::ensureSpace`: video realigns to
+  the next keyframe (`freeRingSpaceLocked`), audio evicts plain oldest-first
+  across both tracks by front PTS (`freeAudioRingSpaceLocked`). The save pin,
+  the deferred close, and the failover reasons stay in `ReplayBuffer`, because
+  the pin covers both rings at once.
 - Only a backend or ring-directory switch may drop buffered video. A capacity
   change must not: the recorded extents stay valid at their offsets, and
-  `settings.seconds` already reshapes the window on the next trim, so capacity
-  is only a disk-usage ceiling. Re-laying out a ring that still holds packets
+  `settings.seconds` already reshapes the window on the next trim, so on disk
+  capacity is only a usage ceiling. On RAM the stored cap is a live bound
+  enforced by trim; shrinking it below the buffered bytes evicts on the next
+  push or configure. Re-laying out a ring that still holds packets
   would invalidate every live extent, so a capacity change is deferred while
   the ring holds packets or a save is pinned and takes effect on a later
   settings change once the buffer has drained. The
@@ -123,21 +141,26 @@ process memory when the user opts out per track (`replay_video.bin` and
   `freeRingSpaceLocked`, which does not go through `trimLocked`. The span and
   newest-PTS getters stay locked because only the controller worker calls them.
 - Audio follows the same timeline rules as the recording path
-  (`mux/AGENTS.md`): `writeTimelineAudio` drops a mismatched format, fills a PTS
-  gap with at most 10 s of silence, and resyncs the pacing pointer to the
-  incoming packet past that cap. The cap is load-bearing here, not cosmetic: a
-  replay window runs up to an hour, so one unavailable loopback device would
-  otherwise be written out as tens of minutes of silence, and the mux free-space
-  preflight then demands hundreds of megabytes for a clip whose real audio is a
-  few megabytes.
-- A failed mux keeps its temporary directory only when the recovery manifest was
-  published, and reports it through `RecoveryStore::preservedRecordingDetail`.
-  The reverse case deletes the directory: `saveTo` has already verified every
-  elementary-stream write by that point, so a manifest that will not publish is
-  a real write failure, not a scanner race (`writeManifest` retries those
-  itself). A directory holding streams but no manifest is skipped by
-  `recoverLatestFailedRecording` and swept as garbage later, so keeping it would
-  only promise a recovery that cannot happen.
+  (`mux/AGENTS.md`): `writeTimelineAudio` opens the WAV and drops
+  format-mismatched packets, then paces every packet through the shared
+  `paceAudioPacket` core (`mux/AudioTimeline.h`) with the replay window
+  `[start, end]` as its bound. The 10 s silence cap is load-bearing here, not
+  cosmetic: a replay window runs up to an hour, so one unavailable loopback
+  device would otherwise be written out as tens of minutes of silence, and the
+  mux free-space preflight then demands hundreds of megabytes for a clip whose
+  real audio is a few megabytes.
+- A failed mux goes through the shared `RecoveryStore::publishMuxedInputs`
+  tail (same as the recording finalize): the temp directory is kept only when
+  the recovery manifest was published, and the outcome is reported through
+  `RecoveryStore::preservedRecordingDetail`. The reverse case deletes the
+  directory: `saveTo` has already verified every elementary-stream write by
+  that point, so a manifest that will not publish is a real write failure, not
+  a scanner race (`writeManifest` retries those itself). A directory holding
+  streams but no manifest is skipped by `recoverLatestFailedRecording` and
+  swept as garbage later, so keeping it would only promise a recovery that
+  cannot happen. `saveTo` clears a stale manifest first
+  (`clearStaleManifest`), because it truncates the streams the previous
+  attempt's manifest described.
 - `newestVideoPts100ns` exists because PTS-age trimming cannot detect a stalled
   capture or encode pipeline; heartbeats keep advancing timestamps while the
   pipeline is idle. Callers use it to detect that case.
@@ -168,7 +191,11 @@ process memory when the user opts out per track (`replay_video.bin` and
   mux-failure recovery path, a capacity-only reconfigure (buffer kept, retained
   extents read back byte for byte, deferred resize applied once the buffer
   drains), backend and directory switches, a failed ring open, an oversized
-  packet, an induced ring read failure, and the orphan-folder sweep.
+  packet, an induced ring read failure, a RAM byte cap (large window plus many
+  pushes stays under the passed caps and retains newest, including after a
+  read-failure failover), and the orphan-folder sweep. The ring
+  cases above are also the `RingFile` coverage: it is header-only and reaches
+  the suite through `ReplayBuffer.cpp`, so no `SOURCES` entry was needed.
 - `breakRingForTesting` drops the video ring handle (and `breakAudioRingForTesting`
   the audio one) to induce the read failure, and
   `ReplayBufferTestAccess` in the test source is their only caller. Keep it that

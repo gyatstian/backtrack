@@ -9,7 +9,7 @@ GPU scaler that converts frames to whatever the active encoder wants.
 ## Ownership
 
 - Owns: `ICaptureSource`, `WgcCaptureSource`, `DesktopDuplicationCapture`,
-  `D3DDevice`, `D3D11FrameScaler`.
+  `D3DDevice`, `D3D11FrameScaler`, `GpuTexturePool.h`.
 - Does not own: encoder input format decisions (the encoder declares its
   preference through `IEncoder::preferredInputFormat`) or the frame queue, which
   belongs to `app`.
@@ -46,11 +46,13 @@ GPU scaler that converts frames to whatever the active encoder wants.
   `monitorHasAdvancedColor` is true and the surface is `R10G10B10A2_UNORM` (PQ)
   or `R16G16B16A16_FLOAT` (scRGB). The scaler declares that input color space so
   the video processor tone-maps to the SDR output. Every other frame, including
-  every WGC frame, leaves it false.
+  every WGC frame, leaves it false; WGC assigns `hdr = false` explicitly on
+  both emit paths so a stale DD `true` can never leak across a backend switch.
 - `resolutionChangeCount()` advances when a source handles a change without a
   rebind: the WGC `FramePool.Recreate` path on a display-mode change, and
   `DesktopDuplicationCapture` on an HDR flip (`applyHdrState`) or a pool
-  recreate (size/format switch). The capture loop then requests an encoder
+  recreate (size/format switch). `applyHdrState` returns whether it flipped so
+  the recreate path skips its own bump when both coincide (single IDR). The capture loop then requests an encoder
   keyframe so the jump never lands mid-GOP.
 - Cursor capture is per source, not shared. WGC delegates to the session
   (`IsCursorCaptureEnabled`), and `setCursorCaptureEnabled` re-applies it to the
@@ -71,24 +73,32 @@ GPU scaler that converts frames to whatever the active encoder wants.
   reprograms it only when the configuration actually differs; reissuing the
   `Set*` calls every frame costs driver calls for nothing. Any new processor
   setting must go into `VpState` and `equals`, or the cache silently skips it.
-- The scaler's fallbacks are sticky for the session, not per frame, and only
-  `reset()` clears them: `nv12Unavailable_` drops NV12 output to BGRA after a
-  conversion failure, `hdrInputRejected_` pins a refused HDR input back to the
-  SDR interpretation, and `useCopiedInput_` switches to a pooled input copy when
-  `CreateVideoProcessorInputView` rejects the capture surface. That copy is
-  created with `BindFlags = 0`: a SHADER_RESOURCE flag makes the call fail with
-  `E_INVALIDARG` on strict drivers.
+- The scaler's NV12 fallback is sticky for the session and only `reset()`
+  clears it: `nv12Unavailable_` drops NV12 output to BGRA after a conversion
+  failure. An input-view failure (unknown capture surface) drops the frame
+  without latching BGRA; only genuine init/`VideoProcessorBlt` failures under
+  NV12 latch. `useCopiedInput_` is per processor generation, cleared in
+  `releaseResources()`, so every rebuild retries the direct path before using
+  the pooled input copy when `CreateVideoProcessorInputView` rejects the
+  capture surface. That copy is created with `BindFlags = 0`: a
+  SHADER_RESOURCE flag makes the call fail with `E_INVALIDARG` on strict
+  drivers.
 - The HDR latch is narrow and self-healing. Only `E_INVALIDARG` /
   `DXGI_ERROR_UNSUPPORTED` under an applied HDR input space sets
   `hdrInputRejected_` (`isHdrRejectionHr`); any other failure under that mapping
   is transient and retries tone-mapping on the next HDR frame. A latched frame
   retries in-call under the SDR mapping instead of dropping, keeping NV12
-  instead of degrading to BGRA. `inputFormat_` is tracked in
-  `ensureInitialized` / `ensureCopyPool`, and the copied input texture is
-  rebuilt when the source format changes (PQ<->scRGB reuse the copy path at the
-  same resolution). `hdrInputRejected()` / `hdrMappingActive()` expose the latch
-  and the applied mapping; both are read by `app` only under
-  `pipelineGpuMutex_`, which also guards every mutation.
+  instead of degrading to BGRA. The latch auto-clears on the next HDR frame
+  after 5 s (`kHdrRejectionCooldown`) or when input format/dims change; latch
+  logs one warning, recovery logs info. The legacy path (no `VideoContext1`)
+  programs no HDR input space, so `appliedHdrInputSpace_` stays false and
+  `hdrMappingActive()` is false; HDR input there logs one warning and records
+  without tone-mapping. `inputFormat_` is tracked in `ensureInitialized` /
+  `ensureCopyPool`, and the copied input texture is rebuilt when the source
+  format changes (PQ<->scRGB reuse the copy path at the same resolution).
+  `hdrInputRejected()` / `hdrMappingActive()` expose the latch and the applied
+  mapping; both are read by `app` only under `pipelineGpuMutex_`, which also
+  guards every mutation.
 - Desktop Duplication polls HDR state at most once per second through its cached
   `IDXGIOutput6` (`colorProbe_`, no factory walk; falls back to
   `monitorHasAdvancedColor` when the probe is gone). `hdrActive()` /
@@ -97,13 +107,17 @@ GPU scaler that converts frames to whatever the active encoder wants.
   recreate to get there.
 - The scaler prunes cached input views whose texture is otherwise unreferenced.
   Views pin their texture, so a missed prune holds GPU memory.
-- Textures come from fixed pools: both capture pools are
-  `clamp(settings.gpu.frameQueueLimit + 4, 5, 16)`, headroom over the queue
+- Textures come from fixed `GpuTexturePool` pools sized by
+  `texturePoolSizeForQueueLimit` (`frameQueueLimit + 4`, clamped 5..16; the
+  sanitize 1..8 limit makes the live range 5..12), headroom over the queue
   limit because the capture loop pins one slot as `lastFrame`, and `app` feeds
   the same value to the scaler through `setPoolSize`. Pool exhaustion is a drop,
-  counted as such, never a blocking wait on the capture thread. WGC zero-copy
-  has a second cap, `framePoolSize - 1` in-flight leases; hitting it drops that
-  frame onto the copy path instead of holding the `Direct3D11CaptureFrame`.
+  counted as such, never a blocking wait on the capture thread; every pool logs
+  through `acquireOrLog` (1st + every 300th). WGC zero-copy
+  has a second cap, `wgcMaxZeroCopyLeases` (`framePoolSize - 1`, the frame pool
+  itself is `wgcFramePoolSizeForQueueLimit`: `frameQueueLimit + 2`, 3..8);
+  hitting it drops that frame onto the copy path instead of holding the
+  `Direct3D11CaptureFrame`.
 - Every pool teardown invalidates any GPU registration the consumer still holds
   for those textures, so `releaseResources()` bumps `poolGeneration()` and the
   caller must drop its registrations when that value changes across a call. The

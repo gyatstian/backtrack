@@ -1,13 +1,14 @@
 #pragma once
 
 #include "capture/D3DDevice.h"
+#include "capture/GpuTexturePool.h"
 #include "core/Types.h"
 
 #include <d3d11_1.h>
 
+#include <chrono>
 #include <memory>
 #include <unordered_map>
-#include <vector>
 
 namespace backtrack {
 
@@ -55,7 +56,6 @@ private:
         uint32_t height,
         DXGI_FORMAT format);
     void releaseResources();
-    std::shared_ptr<TextureSlot> acquireSlot();
     ID3D11VideoProcessorInputView* inputViewFor(D3DDevice& device, ID3D11Texture2D* texture);
     ID3D11VideoProcessorInputView* copiedInputViewFor(D3DDevice& device, ID3D11Texture2D* texture);
     // Drops cached input views whose source texture is no longer referenced by
@@ -98,15 +98,22 @@ private:
     ComPtr<ID3D11VideoProcessor> processor_;
     ComPtr<ID3D11Texture2D> copiedInputTexture_;
     ComPtr<ID3D11VideoProcessorInputView> copiedInputView_;
-    std::vector<std::shared_ptr<TextureSlot>> pool_;
+    GpuTexturePool<TextureSlot> pool_;
     std::unordered_map<ID3D11Texture2D*, ComPtr<ID3D11VideoProcessorInputView>> inputViews_;
-    uint64_t poolExhaustionDrops_ = 0;
+    // Cleared in releaseResources so every processor rebuild retries the
+    // direct path; set when CreateVideoProcessorInputView rejects the
+    // capture surface.
     bool useCopiedInput_ = false;
     bool nv12Unavailable_ = false;
-    // Sticky: set when the video processor rejected an HDR (PQ/scRGB) input
-    // color space, so later frames fall back to the plain SDR interpretation
-    // instead of failing every frame.
+    // Sticky with cooldown: set when the video processor rejected an HDR
+    // (PQ/scRGB) input color space, so later frames fall back to the plain
+    // SDR interpretation instead of failing every frame. Auto-clears on the
+    // next HDR frame after the cooldown or when input format/dims change.
     bool hdrInputRejected_ = false;
+    std::chrono::steady_clock::time_point hdrRejectedAt_{};
+    DXGI_FORMAT hdrRejectedFormat_ = DXGI_FORMAT_UNKNOWN;
+    uint32_t hdrRejectedWidth_ = 0;
+    uint32_t hdrRejectedHeight_ = 0;
     uint32_t inputWidth_ = 0;
     uint32_t inputHeight_ = 0;
     DXGI_FORMAT inputFormat_ = DXGI_FORMAT_UNKNOWN;

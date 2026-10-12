@@ -1,8 +1,8 @@
 #include "encoder/NvencEncoder.h"
 
 #include "core/Logger.h"
-#include "encoder/BitstreamUtils.h"
 #include "encoder/DecodeOrderTimestamps.h"
+#include "encoder/EncoderCommon.h"
 
 #include <Windows.h>
 
@@ -130,54 +130,6 @@ NV_ENC_TUNING_INFO tuningInfo(EncoderMode mode) {
         return NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY;
     }
     return NV_ENC_TUNING_INFO_HIGH_QUALITY;
-}
-
-EncoderEffectiveSettings effectiveSettingsFor(const VideoSettings& settings) {
-    EncoderEffectiveSettings effective;
-    effective.profile = settings.encoderProfile;
-
-    switch (settings.encoderProfile) {
-    case EncoderProfile::LowestGpu:
-        effective.preset = EncoderPreset::P1;
-        effective.mode = EncoderMode::UltraLowLatency;
-        effective.zeroReorderDelay = true;
-        effective.referenceFrames = 1;
-        break;
-    case EncoderProfile::Balanced:
-        effective.preset = EncoderPreset::P3;
-        effective.mode = EncoderMode::LowLatency;
-        effective.zeroReorderDelay = true;
-        effective.referenceFrames = 2;
-        break;
-    case EncoderProfile::Custom:
-        effective.preset = settings.encoderPreset;
-        effective.mode = settings.encoderMode;
-        effective.lookahead = settings.encoderLookahead;
-        effective.lookaheadDepth = std::min<uint32_t>(31, settings.encoderLookaheadDepth);
-        effective.spatialAQ = settings.encoderSpatialAQ;
-        effective.aqStrength = std::clamp<uint32_t>(settings.encoderAQStrength, 1, 15);
-        effective.temporalAQ = settings.encoderTemporalAQ;
-        effective.multipass = settings.encoderMultipass;
-        effective.bFrames = settings.encoderBFrames;
-        effective.adaptiveBFrames = settings.encoderAdaptiveBFrames;
-        effective.adaptiveIFrames = settings.encoderAdaptiveIFrames;
-        effective.zeroReorderDelay = settings.encoderZeroReorderDelay;
-        effective.referenceFrames = std::clamp<uint32_t>(settings.encoderReferenceFrames, 1, 4);
-        break;
-    }
-
-    if (!effective.lookahead) {
-        effective.lookaheadDepth = 0;
-        effective.adaptiveBFrames = false;
-        effective.adaptiveIFrames = false;
-    }
-    if (!effective.spatialAQ) {
-        effective.aqStrength = 0;
-    }
-    if (!effective.bFrames) {
-        effective.adaptiveBFrames = false;
-    }
-    return effective;
 }
 
 NV_ENC_MULTI_PASS nvencMultipass(EncoderMultipass multipass) {
@@ -317,7 +269,7 @@ struct NvencEncoder::Impl {
     // conditions hold, escalate to an encoder fault (encoderAvailable=false)
     // so the capture loop recreates the pipeline instead of hanging or
     // recycling a stuck buffer while pipelineGpuMutex_ is held.
-    static constexpr auto kBitstreamLockTimeout = std::chrono::seconds(5);
+    static constexpr auto kBitstreamLockTimeout = kEncoderOutputTimeout;
 
     uint32_t reorderDelayFrames() const {
         return (caps.effective.bFrames ? 2u : 0u) +
@@ -348,7 +300,7 @@ struct NvencEncoder::Impl {
     // reporting healthy and the recording degrades into a freeze-frame. After
     // this many consecutive failures the session is faulted (encoderAvailable
     // = false) so the capture loop's recreateGpuPipeline path rebuilds it.
-    static constexpr uint32_t kMaxConsecutiveEncodeFailures = 30;
+    static constexpr uint32_t kMaxConsecutiveEncodeFailures = kEncoderMaxConsecutiveFailures;
 
     bool loadApi() {
         module = LoadLibraryExW(L"nvEncodeAPI64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -766,22 +718,6 @@ struct NvencEncoder::Impl {
         return true;
     }
 
-    // Prepends cached parameter sets to a keyframe packet that lacks them so
-    // every replay cut point is self-contained (see cachedParameterSets).
-    void ensureKeyFrameCarriesHeaders(EncodedPacket& packet) {
-        if (!packet.keyFrame || bitstreamContainsParameterSets(settings.codec, packet.bytes)) {
-            return;
-        }
-        if (cachedParameterSets.empty()) {
-            return;
-        }
-        std::vector<uint8_t> withHeaders;
-        withHeaders.reserve(cachedParameterSets.size() + packet.bytes.size());
-        withHeaders.insert(withHeaders.end(), cachedParameterSets.begin(), cachedParameterSets.end());
-        withHeaders.insert(withHeaders.end(), packet.bytes.begin(), packet.bytes.end());
-        packet.bytes = std::move(withHeaders);
-    }
-
     bool harvestPendingOutputs(bool waitForCompletion) {
         // Drain mode uses an idle bound refreshed on every successfully locked
         // output instead of one absolute budget: a large queue of completed
@@ -888,59 +824,22 @@ struct NvencEncoder::Impl {
 
             EncodedPacket packet;
             const auto* begin = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
-            packet.bytes.assign(begin, begin + lock.bitstreamSizeInBytes);
-            // Driver-timestamp validity is explicit: outputTimeStamp echoes the
-            // pic.inputTimeStamp we submitted (frame.pts100ns, QPC-derived
-            // steady-clock time since boot), which can never legitimately be
-            // zero by the time frames reach the encoder. Unlike decode
-            // timestamps - which CAN be zero or negative and therefore carry
-            // hasDts (see Types.h) - this sentinel-free comparison is safe.
-            const bool driverPtsValid = lock.outputTimeStamp != 0;
-            packet.pts100ns = driverPtsValid
-                ? static_cast<int64_t>(lock.outputTimeStamp)
-                : pending.fallbackPts100ns;
-            packet.duration100ns = lock.outputDuration != 0
-                ? static_cast<int64_t>(lock.outputDuration)
-                : pending.fallbackDuration100ns;
-            // NVENC emits packets in decode order; map each output back to the
-            // submission slot it decodes at so PTS regressions within a GOP
-            // stay representable (the MP4 mux needs DTS for B-frames).
-            packet.dts100ns = decodeTimestamps.onOutput(packet.pts100ns, pending.fallbackDuration100ns);
-            packet.hasDts = true;
-            // Only real IDR pictures are replay cut points. A plain I picture
-            // (adaptive I-frames) or CRA open-GOP picture leaves decoders
-            // referencing frames from before it, which breaks clips cut there.
+            // Only the picture-type read stays backend-specific; timestamps,
+            // keyframe rule, headers, and stats live in finalizePacket.
             const bool metadataIdr = lock.pictureType == NV_ENC_PIC_TYPE_IDR;
-            packet.keyFrame = metadataIdr ||
-                (bitstreamContainsKeyFrame(settings.codec, packet.bytes) &&
-                 !bitstreamContainsCraFrame(settings.codec, packet.bytes));
-            ensureKeyFrameCarriesHeaders(packet);
-            packet.codec = settings.codec;
+            const bool finalized = finalizePacket(
+                settings.codec, begin, lock.bitstreamSizeInBytes,
+                static_cast<int64_t>(lock.outputTimeStamp),
+                static_cast<int64_t>(lock.outputDuration),
+                pending.fallbackPts100ns, pending.fallbackDuration100ns,
+                metadataIdr, decodeTimestamps, cachedParameterSets,
+                encoderStats, pending.submittedAt, packet);
 
             api.nvEncUnlockBitstream(session, pending.bitstream);
             releaseBitstreamBuffer(pending.bitstream);
 
-            if (packet.bytes.empty()) {
-                ++encoderStats.droppedFrames;
+            if (!finalized) {
                 continue;
-            }
-            if (cachedParameterSets.empty()) {
-                std::vector<uint8_t> parameterSets;
-                if (extractParameterSets(settings.codec, packet.bytes, parameterSets)) {
-                    cachedParameterSets = std::move(parameterSets);
-                }
-            }
-
-            const auto elapsed = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - pending.submittedAt).count();
-            encoderStats.averageEncodeMs =
-                encoderStats.encodedFrames == 0
-                ? elapsed
-                : (encoderStats.averageEncodeMs * 0.95 + elapsed * 0.05);
-            ++encoderStats.encodedFrames;
-            encoderStats.encodedBytes += packet.bytes.size();
-            if (packet.keyFrame) {
-                ++encoderStats.keyFrames;
             }
             readyPackets.push_back(std::move(packet));
         }

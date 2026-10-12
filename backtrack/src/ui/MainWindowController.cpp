@@ -81,14 +81,9 @@ void MainWindow::updateGameIntegrations() {
     } else {
         leagueIntegration_.stop();
     }
-    if (current.gameIntegrations.discordRichPresence !=
-        GameIntegrationSettings::DiscordRichPresenceMode::Off) {
-        discordRichPresence_.start(
-            current.gameIntegrations.discordRichPresence,
-            current.gameIntegrations.discordRichPresenceResetTimerOnSwitch);
-    } else {
-        discordRichPresence_.stop();
-    }
+    discordRichPresence_.start(
+        current.gameIntegrations.discordRichPresence,
+        current.gameIntegrations.discordRichPresenceResetTimerOnSwitch);
     voiceCommandService_.configure(
         window_,
         current.gameIntegrations.voiceCommand,

@@ -1,6 +1,7 @@
 #include "hotkeys/HotkeyService.h"
 
 #include "core/Logger.h"
+#include "settings/SettingsStore.h"
 
 namespace backtrack {
 
@@ -75,7 +76,8 @@ bool isKeyDownNow(int virtualKey) {
 }
 
 uint32_t supportedHookModifiers(uint32_t modifiers) {
-    return modifiers & (MOD_ALT | MOD_CONTROL | MOD_SHIFT);
+    // Single source is sanitizeSettings' mask; a second expression here drifts.
+    return supportedHotkeyModifiers(modifiers);
 }
 
 } // namespace

@@ -59,11 +59,6 @@ SteadyClock::time_point steadyPointFrom100ns(int64_t value100ns) {
             std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>(value100ns)));
 }
 
-uint32_t evenEncodeDimension(uint32_t value) {
-    value = std::max<uint32_t>(16, value);
-    return value % 2 == 0 ? value : value - 1;
-}
-
 uint32_t captureTexturePoolSize(const GpuOptimizationSettings& settings) {
     // +1 for lastFrame pin in captureLoop (keeps one scaler/capture slot in use).
     return std::clamp<uint32_t>(settings.frameQueueLimit + 4, 5, 16);
@@ -150,10 +145,9 @@ CaptureBackend selectedBackendForSettings(const AppSettings& settings) {
 }
 
 VideoSettings activeVideoSettingsFor(const AppSettings& settings) {
-    VideoSettings active = settings.video;
-    active.width = evenEncodeDimension(active.width);
-    active.height = evenEncodeDimension(active.height);
-    return active;
+    // sanitizeSettings already clamps width/height even 16-7680/4320; no second
+    // clamp here so the sanitizer stays the sole authority.
+    return settings.video;
 }
 
 enum class OutputNameReservation {
@@ -218,111 +212,19 @@ bool hasMutedSoundSeparationApps(const AppSettings& settings) {
         });
 }
 
-int32_t readSigned24(const uint8_t* sample) {
-    int32_t value = static_cast<int32_t>(sample[0]) |
-                    (static_cast<int32_t>(sample[1]) << 8) |
-                    (static_cast<int32_t>(sample[2]) << 16);
-    if ((value & 0x00800000) != 0) {
-        value |= static_cast<int32_t>(0xff000000);
-    }
-    return value;
-}
-
-void writeSigned24(uint8_t* sample, int32_t value) {
-    sample[0] = static_cast<uint8_t>(value & 0xff);
-    sample[1] = static_cast<uint8_t>((value >> 8) & 0xff);
-    sample[2] = static_cast<uint8_t>((value >> 16) & 0xff);
-}
-
-template <typename Sample>
-Sample scaledIntegerSample(Sample value, float gain) {
-    const auto scaled = static_cast<long long>(std::llround(static_cast<double>(value) * gain));
-    return static_cast<Sample>(std::clamp<long long>(
-        scaled,
-        static_cast<long long>(std::numeric_limits<Sample>::min()),
-        static_cast<long long>(std::numeric_limits<Sample>::max())));
-}
-
-void applyPcmVolume(AudioPacket& packet, uint16_t bitsPerSample, float gain) {
-    const uint16_t bytesPerSample = bitsPerSample / 8;
-    if (bytesPerSample == 0 || bitsPerSample % 8 != 0) {
-        return;
-    }
-
-    for (size_t offset = 0; offset + bytesPerSample <= packet.bytes.size(); offset += bytesPerSample) {
-        uint8_t* sample = packet.bytes.data() + offset;
-        switch (bitsPerSample) {
-        case 8: {
-            const int value = static_cast<int>(*sample) - 128;
-            const int scaled = std::clamp(static_cast<int>(std::lround(value * gain)), -128, 127);
-            *sample = static_cast<uint8_t>(scaled + 128);
-            break;
-        }
-        case 16: {
-            int16_t value = 0;
-            std::memcpy(&value, sample, sizeof(value));
-            value = scaledIntegerSample(value, gain);
-            std::memcpy(sample, &value, sizeof(value));
-            break;
-        }
-        case 24: {
-            const int32_t value = readSigned24(sample);
-            const int32_t scaled = static_cast<int32_t>(std::clamp<long long>(
-                static_cast<long long>(std::llround(static_cast<double>(value) * gain)),
-                -8388608,
-                8388607));
-            writeSigned24(sample, scaled);
-            break;
-        }
-        case 32: {
-            int32_t value = 0;
-            std::memcpy(&value, sample, sizeof(value));
-            value = scaledIntegerSample(value, gain);
-            std::memcpy(sample, &value, sizeof(value));
-            break;
-        }
-        default:
-            return;
-        }
-    }
-}
-
-void applyFloatVolume(AudioPacket& packet, uint16_t bitsPerSample, float gain) {
-    if (bitsPerSample != 32) {
-        return;
-    }
-
-    for (size_t offset = 0; offset + sizeof(float) <= packet.bytes.size(); offset += sizeof(float)) {
-        float value = 0.0f;
-        std::memcpy(&value, packet.bytes.data() + offset, sizeof(value));
-        value = std::clamp(value * gain, -1.0f, 1.0f);
-        std::memcpy(packet.bytes.data() + offset, &value, sizeof(value));
-    }
-}
-
-void applyAudioVolume(AudioPacket& packet, uint32_t volumePercent) {
-    if (volumePercent == 100 || packet.bytes.empty()) {
-        return;
-    }
-
-    if (!packet.format) {
-        return;
-    }
-    const AudioFormatInfo format = parseAudioFormat(*packet.format);
-    const float gain = static_cast<float>(std::clamp<uint32_t>(volumePercent, 0, 200)) / 100.0f;
-    switch (format.encoding) {
-    case AudioSampleEncoding::Pcm:
-        applyPcmVolume(packet, format.bitsPerSample, gain);
-        break;
-    case AudioSampleEncoding::Float:
-        applyFloatVolume(packet, format.bitsPerSample, gain);
-        break;
-    case AudioSampleEncoding::Unsupported:
-        break;
-    }
-}
-
 } // namespace
+
+// Canonical float gain helper for the mic AGC path: packets are canonical by
+// the time AGC/volume run, so integer PCM scaling is dead. AudioConvert owns
+// the pure mute/gain primitive; this thin wrapper reuses it.
+void applyCanonicalGain(AudioPacket& packet, float gain) {
+    if (gain == 1.0f || packet.bytes.empty()) {
+        return;
+    }
+    auto* floats = reinterpret_cast<float*>(packet.bytes.data());
+    applyMuteGain(
+        std::span<float>(floats, packet.bytes.size() / sizeof(float)), gain, false);
+}
 
 // Voice-oriented automatic gain control. Keeps a slow level envelope and drives
 // a smoothed gain so average speech lands near a target RMS, mirroring the AGC
@@ -389,40 +291,17 @@ BlockLevels measureBlockLevels(const AudioPacket& packet, const AudioFormatInfo&
         return levels;
     }
 
+    // Intentional RMS pool in double: float accumulation loses quiet-mic
+    // resolution over long blocks; the sum itself never allocates.
     uint64_t sampleCount = 0;
     double sumOfSquares = 0.0;
     float peak = 0.0f;
     const uint8_t* data = packet.bytes.data();
     const size_t byteCount = packet.bytes.size();
     for (size_t offset = 0; offset + bytesPerSample <= byteCount; offset += bytesPerSample) {
-        float value = 0.0f;
-        if (format.encoding == AudioSampleEncoding::Float && format.bitsPerSample == 32) {
-            std::memcpy(&value, data + offset, sizeof(value));
-            value = std::clamp(value, -1.0f, 1.0f);
-        } else {
-            switch (format.bitsPerSample) {
-            case 8:
-                value = (static_cast<int>(data[offset]) - 128) / 128.0f;
-                break;
-            case 16: {
-                int16_t sample = 0;
-                std::memcpy(&sample, data + offset, sizeof(sample));
-                value = sample / 32768.0f;
-                break;
-            }
-            case 24:
-                value = readSigned24(data + offset) / 8388608.0f;
-                break;
-            case 32: {
-                int32_t sample = 0;
-                std::memcpy(&sample, data + offset, sizeof(sample));
-                value = sample / 2147483648.0f;
-                break;
-            }
-            default:
-                return levels;
-            }
-        }
+        // Single decode path (8/16/24/32 + float32) owned by AudioConvert;
+        // no hand-rolled integer magic here.
+        const float value = decodeInterleavedSample(data + offset, format);
         const float magnitude = std::fabs(value);
         peak = std::max(peak, magnitude);
         sumOfSquares += static_cast<double>(value) * value;
@@ -447,16 +326,9 @@ void applyMicrophoneAgc(AudioPacket& packet, const AudioFormatInfo& format, Micr
             : 0.010f;
     const BlockLevels levels = measureBlockLevels(packet, format);
     const float gain = agc.gainFor(levels.rmsDb, blockSeconds);
-    switch (format.encoding) {
-    case AudioSampleEncoding::Pcm:
-        applyPcmVolume(packet, format.bitsPerSample, gain);
-        break;
-    case AudioSampleEncoding::Float:
-        applyFloatVolume(packet, format.bitsPerSample, gain);
-        break;
-    case AudioSampleEncoding::Unsupported:
-        break;
-    }
+    // Packets are canonical float32 by the time AGC runs, so the old integer
+    // PCM scaling is dead; AudioConvert owns the single gain primitive.
+    applyCanonicalGain(packet, gain);
 }
 
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
@@ -544,18 +416,36 @@ RecorderController::~RecorderController() {
     }
 }
 
+void RecorderController::publishLiveMirrors(const AppSettings& settings) {
+    // Called wherever settings_ is assigned so the lock-free readers
+    // (stats(), the stall watchdog, the capture-loop cursor poll, the audio
+    // writer volumes) never drift from the sanitized source of truth.
+    replayEnabledMirror_.store(settings.replay.enabled, std::memory_order_relaxed);
+    videoGopSecondsMirror_.store(settings.video.gopSeconds, std::memory_order_relaxed);
+    captureCursorMirror_.store(settings.captureCursor, std::memory_order_relaxed);
+    audioOutputVolumePercent_.store(settings.audioOutputVolumePercent, std::memory_order_relaxed);
+    audioInputVolumePercent_.store(settings.audioInputVolumePercent, std::memory_order_relaxed);
+    audioInputAutoGain_.store(settings.audioInputAutoGainEnabled, std::memory_order_relaxed);
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    audioInputNoiseSuppression_.store(settings.audioInputNoiseSuppressionEnabled, std::memory_order_relaxed);
+#endif
+}
+
 void RecorderController::beginStartupSweep() {
     std::scoped_lock lock(startupSweepMutex_);
     if (startupSweepThread_.joinable()) {
         return; // A sweep is already in flight.
     }
+    // Single snapshot: the path and the ring gate must come from one settings
+    // read, not three separately allocated copies.
+    const AppSettings snapshot = settings();
     // Capture the path: a settings change must not redirect the running sweep.
-    const std::filesystem::path clipDirectory = settings().clipDirectory;
+    const std::filesystem::path clipDirectory = snapshot.clipDirectory;
     // Also captured for the same reason. Only swept when disk backing is off:
     // an enabled ring is truncated and reused by openRingLocked on the next
     // configure, so there is nothing to reclaim and nothing is open to race.
-    const std::filesystem::path ringDirectory = replayRingDirectoryFor(settings());
-    const bool sweepOrphanedRing = !settings().replay.diskBackedVideo && !settings().replay.diskBackedAudio;
+    const std::filesystem::path ringDirectory = replayRingDirectoryFor(snapshot);
+    const bool sweepOrphanedRing = !snapshot.replay.diskBackedVideo && !snapshot.replay.diskBackedAudio;
     Logger::instance().info(L"app", L"Startup recovery sweep started in background");
     startupSweepThread_ = std::thread([clipDirectory, ringDirectory, sweepOrphanedRing]() {
         try {
@@ -592,12 +482,9 @@ bool RecorderController::initialize(AppSettings settings) {
         applied = settings_;
         activeVideoSettings_ = settings_.video;
         activeGpuSettings_ = settings_.gpu;
-        audioOutputVolumePercent_.store(settings_.audioOutputVolumePercent, std::memory_order_relaxed);
-        audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
-        audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
+        publishLiveMirrors(settings_);
         microphoneAgcResetPending_ = true;
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-        audioInputNoiseSuppression_.store(settings_.audioInputNoiseSuppressionEnabled, std::memory_order_relaxed);
         microphoneDenoiserResetPending_ = true;
 #endif
         replay_.clear();
@@ -660,6 +547,59 @@ bool RecorderController::updateSettings(AppSettings settings) {
                 L"Replay buffer settings changed; reconfigured the buffer in place without restarting capture pipeline");
             return true;
         }
+        // Volume, AGC-enable, denoiser-enable, and cursor changes apply live:
+        // the audio writer reads those mirrors per packet and the capture loop
+        // polls the cursor mirror every second. Restarting the pipeline here
+        // would split the replay timeline (and the active recording) on every
+        // volume-drag tick, so store and publish instead of bouncing.
+        AppSettings currentBase = currentWithoutVoice;
+        currentBase.audioOutputVolumePercent = 0;
+        currentBase.audioInputVolumePercent = 0;
+        currentBase.audioInputAutoGainEnabled = false;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+        currentBase.audioInputNoiseSuppressionEnabled = false;
+#endif
+        currentBase.captureCursor = false;
+        AppSettings incomingBase = settings;
+        incomingBase.audioOutputVolumePercent = 0;
+        incomingBase.audioInputVolumePercent = 0;
+        incomingBase.audioInputAutoGainEnabled = false;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+        incomingBase.audioInputNoiseSuppressionEnabled = false;
+#endif
+        incomingBase.captureCursor = false;
+        // startReplayPipeline means nothing actually changed (voice branch fell
+        // through): let it reach ensurePipeline below instead of returning here.
+        if (!startReplayPipeline && currentBase == incomingBase) {
+            const bool agcChanged =
+                settings_.audioInputAutoGainEnabled != settings.audioInputAutoGainEnabled;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+            const bool denoiserChanged =
+                settings_.audioInputNoiseSuppressionEnabled != settings.audioInputNoiseSuppressionEnabled;
+#endif
+            settings_.gameIntegrations.voiceCommand = settings.gameIntegrations.voiceCommand;
+            settings_.audioOutputVolumePercent = settings.audioOutputVolumePercent;
+            settings_.audioInputVolumePercent = settings.audioInputVolumePercent;
+            settings_.audioInputAutoGainEnabled = settings.audioInputAutoGainEnabled;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+            settings_.audioInputNoiseSuppressionEnabled = settings.audioInputNoiseSuppressionEnabled;
+#endif
+            settings_.captureCursor = settings.captureCursor;
+            publishLiveMirrors(settings_);
+            // Reset envelopes only when their enable actually flipped; a
+            // volume-drag tick must not restart AGC adaptation audibly.
+            if (agcChanged) {
+                microphoneAgcResetPending_ = true;
+            }
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+            if (denoiserChanged) {
+                microphoneDenoiserResetPending_ = true;
+            }
+#endif
+            Logger::instance().info(L"recorder",
+                L"Audio volume/cursor settings changed; applied live without restarting capture pipeline");
+            return true;
+        }
     }
     if (startReplayPipeline) {
         Logger::instance().info(L"recorder",
@@ -687,12 +627,9 @@ bool RecorderController::updateSettings(AppSettings settings) {
         settings_ = std::move(settings);
         activeVideoSettings_ = settings_.video;
         activeGpuSettings_ = settings_.gpu;
-        audioOutputVolumePercent_.store(settings_.audioOutputVolumePercent, std::memory_order_relaxed);
-        audioInputVolumePercent_.store(settings_.audioInputVolumePercent, std::memory_order_relaxed);
-        audioInputAutoGain_.store(settings_.audioInputAutoGainEnabled, std::memory_order_relaxed);
+        publishLiveMirrors(settings_);
         microphoneAgcResetPending_ = true;
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-        audioInputNoiseSuppression_.store(settings_.audioInputNoiseSuppressionEnabled, std::memory_order_relaxed);
         microphoneDenoiserResetPending_ = true;
 #endif
         replayEnabledAfterApply = settings_.replay.enabled;
@@ -750,7 +687,7 @@ bool RecorderController::startRecording() {
         // Release the clip name reserved by nextClipPath; nothing was written.
         removeEmptyOutputReservation(output);
         setLastRecordingError(detail);
-        if (!settings().replay.enabled) {
+        if (!replayEnabledMirror_.load(std::memory_order_relaxed)) {
             stopPipeline();
         }
         return false;
@@ -788,8 +725,9 @@ std::filesystem::path RecorderController::stopRecording() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    AppSettings snapshot = settings();
-    if (!snapshot.replay.enabled) {
+    // Mirror, not settings(): this path needs one bool, not a whole struct
+    // copy with paths and vectors.
+    if (!replayEnabledMirror_.load(std::memory_order_relaxed)) {
         stopPipeline();
     }
 
@@ -800,10 +738,6 @@ std::filesystem::path RecorderController::stopRecording() {
     Logger::instance().info(L"recorder", output.empty()
                                 ? std::wstring(L"Recording stopped without a finalized clip")
                                 : std::wstring(L"Recording stopped and saved: ") + output.wstring());
-
-    if (!snapshot.replay.enabled && pipelineRunning_) {
-        stopPipeline();
-    }
     return output;
 }
 
@@ -836,7 +770,10 @@ std::filesystem::path RecorderController::saveReplay() {
     // Cleared up front so the UI never surfaces a stale reason from an
     // earlier action; every failure path below stores a specific cause.
     setLastRecordingError({});
-    if (!settings().replay.enabled) {
+    // Single snapshot for the whole save: the enable gate, the window math,
+    // and the output folder must agree with each other.
+    const AppSettings snapshot = settings();
+    if (!snapshot.replay.enabled) {
         const std::wstring detail = L"instant replay is disabled in settings";
         Logger::instance().warning(L"recorder", L"Replay save ignored: " + detail);
         setLastRecordingError(detail);
@@ -848,7 +785,7 @@ std::filesystem::path RecorderController::saveReplay() {
     // fraction (the first keyframe can sit inside the window, so a full window
     // may be unreachable); for long windows keep the 2-second minimum.
     const int64_t playbackWindow100ns = secondsTo100ns(
-        std::max<uint32_t>(1, settings().replay.seconds));
+        std::max<uint32_t>(1, snapshot.replay.seconds));
     const int64_t minReplayVideo100ns = std::min<int64_t>(
         2 * kHundredNanosecondsPerSecond,
         std::max<int64_t>(kHundredNanosecondsPerSecond / 2, (playbackWindow100ns * 2) / 3));
@@ -858,7 +795,7 @@ std::filesystem::path RecorderController::saveReplay() {
     // would mux the last real frame from before the stall. Treat a buffer
     // older than the window plus a few GOPs as needing a fresh keyframe.
     const int64_t freshnessSlack100ns = 3 * secondsTo100ns(
-        std::max<uint32_t>(1, settings().video.gopSeconds));
+        std::max<uint32_t>(1, snapshot.video.gopSeconds));
     const int64_t staleWindow100ns = playbackWindow100ns + freshnessSlack100ns;
     auto bufferedVideoStale = [&]() {
         const int64_t newestPts = replay_.newestVideoPts100ns();
@@ -933,7 +870,7 @@ std::filesystem::path RecorderController::saveReplay() {
     const std::wstring gameName = foregroundApplicationName();
     const auto output = nextClipPath(
         gameName.empty() ? L"replay" : gameName.c_str(),
-        settings().organizeClipsByGame && !gameName.empty());
+        snapshot.organizeClipsByGame && !gameName.empty());
     VideoSettings videoSettings;
     {
         std::scoped_lock lock(stateMutex_);
@@ -965,7 +902,9 @@ void RecorderController::shutdown() {
 RecordingStats RecorderController::stats() const {
     RecordingStats stats;
     stats.recording = recording_.load();
-    stats.replayEnabled = settings().replay.enabled;
+    // Mirror, not settings(): the diagnostics timer calls here ~1/s and a
+    // settings() copy allocates (paths, vectors) on every call.
+    stats.replayEnabled = replayEnabledMirror_.load(std::memory_order_relaxed);
     {
         std::scoped_lock lock(captureStatusMutex_);
         stats.selectedCaptureBackend = selectedCaptureBackend_;
@@ -1039,7 +978,7 @@ RecordingStats RecorderController::stats() const {
 }
 
 void RecorderController::detectVideoPipelineStall() const {
-    if (!pipelineRunning_.load() || stopRequested_.load() || !settings().replay.enabled) {
+    if (!pipelineRunning_.load() || stopRequested_.load() || !replayEnabledMirror_.load(std::memory_order_relaxed)) {
         videoStallWarningActive_.store(false, std::memory_order_relaxed);
         videoStallSeenPts100ns_.store(0, std::memory_order_relaxed);
         return;
@@ -1066,7 +1005,7 @@ void RecorderController::detectVideoPipelineStall() const {
     // heartbeat interval while still catching a wedged capture/encoder.
     const int64_t stallThreshold100ns = std::max<int64_t>(
         10 * kHundredNanosecondsPerSecond,
-        3 * secondsTo100ns(std::max<uint32_t>(1, settings().video.gopSeconds)));
+        3 * secondsTo100ns(std::max<uint32_t>(1, videoGopSecondsMirror_.load(std::memory_order_relaxed))));
     if (idleAge100ns < stallThreshold100ns) {
         return;
     }
@@ -1485,7 +1424,9 @@ bool RecorderController::createCaptureSource(
         location.adapterIndex == d3d_.adapterIndex();
     bool dxgiSkippedForTarget = false;
     // Cache the advanced-color probe: stats() derives hdrRejected from it
-    // without re-walking DXGI on the diagnostics path.
+    // without re-walking DXGI on the diagnostics path. An OS HDR toggle
+    // mid-session on WGC stays invisible until the next rebind (WGC frames
+    // carry no hdr flag); DD toggles still surface via the per-frame flag.
     const bool monitorHdr = monitor && monitorHasAdvancedColor(monitor);
     hdrMonitorActive_.store(monitorHdr, std::memory_order_relaxed);
 
@@ -1695,32 +1636,17 @@ void RecorderController::captureLoopImpl() {
     auto statsSampleAt = std::chrono::steady_clock::now();
     uint64_t sourceFramesAtLastSample = 0;
     uint64_t timelineIntervalsAtLastSample = 0;
-    auto lastCaptureRebindAt = SteadyClock::time_point::min();
-    auto accessLostAt = SteadyClock::time_point::min();
     HMONITOR pendingMonitor = nullptr;
     bool emitClockStarted = false;
     auto lastEmitTime = SteadyClock::time_point::min();
     bool requestKeyFrameAfterAcceptedFrame = false;
-    // Known source switches may accept the first fresh source frame. The longer
-    // sustained-frame gate remains for ambiguous capture-loss recovery.
-    bool acceptFirstLiveFrameAfterTransition = false;
-    bool immediateRebindPending = false;
+    // Recovery state lives in the header-only CaptureSession supervisor; frame
+    // data and clocks stay here.
     // Capture session under exclusive fullscreen:
     // Capturing → AccessLost → WaitStable → Rebind (DXGI only) → Capturing | Holding.
     // Never thrash WGC CreateForWindow for exclusive cover (zero frames).
-    enum class CaptureSessionState {
-        Capturing,
-        AccessLost,
-        WaitStable,
-        Rebind,
-        Holding,
-    };
-    CaptureSessionState captureSession = CaptureSessionState::Capturing;
-    auto liveFramesSince = SteadyClock::time_point::min();
-    int rebindAttempts = 0;
-    int exclusiveDxgiAttempts = 0;
-    int sustainedLiveFrameCount = 0;
-    auto nextTargetLostCheckAt = SteadyClock::time_point::min();
+    // Transitions are session.toX(); partial resets write session fields directly.
+    CaptureSession session;
     // Tracks capture_->cursorOnlyFrames() from the last delivered frame. A DXGI
     // frame whose counter did not advance carries a real desktop present (proof of
     // composited/capturable content); a cursor-only stale frame advances it.
@@ -1736,28 +1662,17 @@ void RecorderController::captureLoopImpl() {
     bool prevHdr = false;
     DXGI_FORMAT prevHdrFormat = DXGI_FORMAT_UNKNOWN;
     bool exclusiveCoverActive = false;
-    HWND exclusiveTargetWindow = nullptr;
-    bool loggedExclusiveHold = false;
-    bool exclusiveBlind = false;
-    // A monitor-sized borderless game remains an exclusive-cover candidate.
-    // Periodically probe desktop capture while holding so composition resume
-    // is detected without waiting for the cover geometry to change.
-    bool desktopRecoveryProbe = false;
-    auto rebindSourceBornAt = SteadyClock::time_point::min();
+    // A monitor-sized borderless game remains an exclusive-cover candidate:
+    // session.recoveryProbe periodically retries desktop capture while holding
+    // so composition resume is detected without waiting for cover geometry.
     // Non-exclusive soft-stall episode tracking (see kSoftStallRecreateAfterMs).
     // min() begin time means no stall is in progress; a delivered frame or any
     // recovery transition ends the episode and re-arms the escalation budget.
-    auto softStallBeganAt = SteadyClock::time_point::min();
-    int softStallRecreates = 0;
-    auto lastSoftStallRecreateAt = SteadyClock::time_point::min();
     // Capture-target-loss escalation (finding 18): an unplugged or dead target
     // monitor would otherwise be retried forever while the recording holds one
     // frozen frame. After enough failed desktop rebinds, either retarget once
     // to another live display (when one exists) or latch a hard error that
     // surfaces in diagnostics instead of silently freezing.
-    int deadTargetRebindFailures = 0;
-    bool captureTargetLostLatched = false;
-    bool retargetedToAlternateMonitor = false;
     // Cursor-capture preference currently applied to the live source; polled
     // once per stats interval so a settings toggle applies without a rebind.
     bool appliedCursorPreference = captureSettings.captureCursor;
@@ -1778,38 +1693,22 @@ void RecorderController::captureLoopImpl() {
         static_cast<int64_t>(keyFrameHeartbeatInterval.count()) * kHundredNanosecondsPerSecond;
     // Exclusive-blind: coalesce only (no periodic GOP Submit of frozen texture).
     // One IDR on enter hold + on first real live frames after recover.
-    bool captureStallHold = false;
     auto enterAccessLost = [&](const wchar_t* reason) {
-        if (captureSession == CaptureSessionState::AccessLost ||
-            captureSession == CaptureSessionState::WaitStable ||
-            captureSession == CaptureSessionState::Rebind ||
-            captureSession == CaptureSessionState::Holding) {
-            captureStallHold = true;
-            return;
+        // toAccessLost is a no-op past Capturing; log only the fresh transition.
+        const bool fresh = session.state == CaptureSessionState::Capturing;
+        session.toAccessLost(
+            std::chrono::steady_clock::now(),
+            exclusiveCoverActive ? GetForegroundWindow() : nullptr);
+        if (fresh) {
+            Logger::instance().warning(L"recorder",
+                std::wstring(L"Capture session AccessLost: ") + (reason ? reason : L"unspecified"));
         }
-        accessLostAt = std::chrono::steady_clock::now();
-        exclusiveTargetWindow = exclusiveCoverActive ? GetForegroundWindow() : nullptr;
-        captureSession = CaptureSessionState::AccessLost;
-        captureStallHold = true;
-        liveFramesSince = SteadyClock::time_point::min();
-        sustainedLiveFrameCount = 0;
-        softStallBeganAt = SteadyClock::time_point::min();
-        softStallRecreates = 0;
-        Logger::instance().warning(L"recorder",
-            std::wstring(L"Capture session AccessLost: ") + (reason ? reason : L"unspecified"));
     };
     auto enterExclusiveHold = [&](const wchar_t* reason) {
-        const bool firstHold = !loggedExclusiveHold;
-        captureSession = CaptureSessionState::Holding;
-        captureStallHold = true;
-        exclusiveBlind = true;
-        sustainedLiveFrameCount = 0;
-        liveFramesSince = SteadyClock::time_point::min();
-        softStallBeganAt = SteadyClock::time_point::min();
-        softStallRecreates = 0;
-        if (firstHold) {
+        // toHolding reports the first hold of this cover episode; only then
+        // emit the one IDR + log + status line.
+        if (session.toHolding()) {
             forceVideoHeartbeat_ = true; // one IDR of freeze; no periodic slideshow
-            loggedExclusiveHold = true;
             Logger::instance().warning(L"recorder",
                 std::wstring(L"Exclusive fullscreen hold: ") +
                     (reason ? reason : L"desktop APIs blind") +
@@ -1824,7 +1723,7 @@ void RecorderController::captureLoopImpl() {
     auto idleCoalescingAllowed = [&]() {
         // Stall/hold: always coalesce duplicates (stop slideshow). Do not gate on
         // zeroReorderDelay — that was re-encoding frozen texture every cadence tick.
-        if (captureStallHold || captureSession != CaptureSessionState::Capturing) {
+        if (session.stalled()) {
             return true;
         }
         // Cached mirror of "encoder_ && capabilities().effective.zeroReorderDelay",
@@ -1850,8 +1749,8 @@ void RecorderController::captureLoopImpl() {
         // Stall/hold: suppress periodic GOP Submit of same texture (slideshow).
         // Forced heartbeat (enter hold / recover) still allowed for seekability.
         const bool periodicHeartbeat =
-            !captureStallHold &&
-            captureSession == CaptureSessionState::Capturing &&
+            !session.stallHold &&
+            session.state == CaptureSessionState::Capturing &&
             lastVideoSubmission != SteadyClock::time_point::min() &&
             emitTime - lastVideoSubmission >= keyFrameHeartbeatInterval;
         const VideoTimelineEmission emission = timelineScheduler.plan(
@@ -2056,6 +1955,9 @@ void RecorderController::captureLoopImpl() {
         lastVideoSubmission = SteadyClock::time_point::min();
         requestKeyFrameAfterAcceptedFrame = true;
         prevHdrSeen = false;
+        // A DD(hdr=true) mirror must not survive the handoff gap: no HDR frame
+        // flows again until the new source delivers one.
+        hdrActive_.store(false, std::memory_order_relaxed);
     };
 
     auto switchCaptureTarget = [&](const CaptureTarget& target,
@@ -2092,6 +1994,13 @@ void RecorderController::captureLoopImpl() {
             }
             prevResolutionChanges = capture_->resolutionChangeCount();
             prevHdrSeen = false;
+            // Stale DD(hdr=true) must not survive the gap: the privatized freeze
+            // frame is already SDR after its scaler copy, and WGC emits SDR
+            // only, so re-flagging it HDR would tone-map twice.
+            if (capture_->backend() == CaptureBackend::WindowsGraphicsCapture) {
+                lastFrame.hdr = false;
+            }
+            hdrActive_.store(false, std::memory_order_relaxed);
             if (encoder_) {
                 encoder_->resetInputResources();
             }
@@ -2152,16 +2061,16 @@ void RecorderController::captureLoopImpl() {
                 if (switchCaptureTarget(focusedTarget, reason)) {
                     lastMonitorSwitch = loopNow;
                     pendingMonitor = nullptr;
-                    captureSession = CaptureSessionState::Capturing;
-                    rebindAttempts = 0;
-                    loggedExclusiveHold = false;
-                    lastCaptureRebindAt = loopNow;
+                    session.state = CaptureSessionState::Capturing;
+                    session.rebindAttempts = 0;
+                    session.loggedHold = false;
+                    session.lastRebindAt = loopNow;
                     lastSourceFrameAt = loopNow;
-                    captureStallHold = true;
-                    liveFramesSince = SteadyClock::time_point::min();
+                    session.stallHold = true;
+                    session.liveSince = SteadyClock::time_point::min();
                     // Target selection was already debounced. Do not hold a valid
                     // first frame behind the recovery gate intended for lost capture.
-                    acceptFirstLiveFrameAfterTransition = true;
+                    session.acceptFirstLive = true;
                 }
             }
         }
@@ -2189,8 +2098,8 @@ void RecorderController::captureLoopImpl() {
         // so cover detection alone cannot tell that exclusive mode has ended.
         // Sustained desktop frames below are the proof that composition resumed.
         const bool skipAcquire =
-            (captureSession != CaptureSessionState::Capturing &&
-             captureSession != CaptureSessionState::Holding) ||
+            (session.state != CaptureSessionState::Capturing &&
+             session.state != CaptureSessionState::Holding) ||
             (capture_ && capture_->isDeviceLost()) ||
             !capture_;
         const bool acquired =
@@ -2235,9 +2144,9 @@ void RecorderController::captureLoopImpl() {
             lastSourceFrameAt = std::chrono::steady_clock::now();
             // Frames are flowing again: any soft-stall episode is over and the
             // escalation budget re-arms.
-            softStallBeganAt = SteadyClock::time_point::min();
-            softStallRecreates = 0;
-            deadTargetRebindFailures = 0;
+            session.softStallBeganAt = SteadyClock::time_point::min();
+            session.softStallRecreates = 0;
+            session.deadTargetFailures = 0;
             // Mid-session HDR toggle flips the duplication surface in place
             // (no rebind, no isDeviceLost). A silent flip would stretch
             // whitened frames into the running GOP, so open a new one.
@@ -2281,8 +2190,8 @@ void RecorderController::captureLoopImpl() {
             const bool dxgiPresentProof =
                 dxgiBackend && curCursorOnlyFrames == prevCursorOnlyFrames;
             prevCursorOnlyFrames = curCursorOnlyFrames;
-            const bool desktopRecoveryProbeActive =
-                desktopRecoveryProbe &&
+            const bool recoveryProbeActive =
+                session.recoveryProbe &&
                 exclusiveCoverActive &&
                 desktopBackend;
             const bool freezeDesktopFrame =
@@ -2290,18 +2199,18 @@ void RecorderController::captureLoopImpl() {
                 desktopBackend &&
                 !wgcBackend &&
                 !dxgiPresentProof &&
-                !desktopRecoveryProbeActive &&
-                (captureStallHold ||
-                 exclusiveBlind ||
-                 exclusiveDxgiAttempts >= 1 ||
-                 captureSession != CaptureSessionState::Capturing);
+                !recoveryProbeActive &&
+                (session.stallHold ||
+                 session.exclusiveBlind ||
+                 session.exclusiveDxgiAttempts >= 1 ||
+                 session.state != CaptureSessionState::Capturing);
             if (freezeDesktopFrame) {
                 // Drain acquire only; keep frozen lastFrame + coalesce.
             } else {
-                if (liveFramesSince == SteadyClock::time_point::min()) {
-                    liveFramesSince = lastSourceFrameAt;
+                if (session.liveSince == SteadyClock::time_point::min()) {
+                    session.liveSince = lastSourceFrameAt;
                 }
-                ++sustainedLiveFrameCount;
+                ++session.sustainedLive;
                 // Healthy only after sustained live frames (not one transient DXGI blip).
                 // During a hold, sustained desktop frames prove a monitor-sized
                 // borderless window has left exclusive mode.
@@ -2311,12 +2220,12 @@ void RecorderController::captureLoopImpl() {
                     !exclusiveCoverActive ||
                     wgcBackend ||
                     dxgiPresentProof ||
-                    desktopRecoveryProbeActive ||
-                    desktopRecoveryProbe;
+                    recoveryProbeActive ||
+                    session.recoveryProbe;
                 const bool sustained =
                     backendOkForExclusive &&
-                    sustainedLiveFrameCount >= kSustainedLiveFrames &&
-                    lastSourceFrameAt - liveFramesSince >= kSustainedLiveMs &&
+                    session.sustainedLive >= kSustainedLiveFrames &&
+                    lastSourceFrameAt - session.liveSince >= kSustainedLiveMs &&
                     !(capture_ && capture_->isDeviceLost());
                 ++sourceFrames_;
                 cursorOnlyFrames_.store(capture_->cursorOnlyFrames(), std::memory_order_relaxed);
@@ -2332,18 +2241,9 @@ void RecorderController::captureLoopImpl() {
                     continue;
                 }
 
-                if ((captureStallHold || captureSession != CaptureSessionState::Capturing) &&
-                    (acceptFirstLiveFrameAfterTransition || sustained)) {
-                    captureStallHold = false;
-                    exclusiveBlind = false;
-                    captureSession = CaptureSessionState::Capturing;
-                    rebindAttempts = 0;
-                    exclusiveDxgiAttempts = 0;
-                    desktopRecoveryProbe = false;
-                    loggedExclusiveHold = false;
-                    acceptFirstLiveFrameAfterTransition = false;
-                    softStallBeganAt = SteadyClock::time_point::min();
-                    softStallRecreates = 0;
+                if (session.stalled() &&
+                    (session.acceptFirstLive || sustained)) {
+                    session.toCapturing();
                     forceVideoHeartbeat_ = true;
                     Logger::instance().info(L"recorder", L"Capture session Capturing (live frames resumed)");
                 }
@@ -2389,7 +2289,7 @@ void RecorderController::captureLoopImpl() {
                     const bool relockPhase =
                         desktopBackend &&
                         !exclusiveCoverActive &&
-                        captureSession == CaptureSessionState::Capturing;
+                        session.state == CaptureSessionState::Capturing;
                     // Only snap forward and only past the last emitted instant, so the
                     // emit timeline stays strictly monotonic (advanceVideoCadence emits
                     // at emitTime == nextEmit; a backward snap would double-emit).
@@ -2447,21 +2347,21 @@ void RecorderController::captureLoopImpl() {
                         encoder_->requestKeyFrame();
                     }
                 }
-                captureSession = CaptureSessionState::Capturing;
-                rebindAttempts = 0;
-                captureStallHold = true;
+                session.state = CaptureSessionState::Capturing;
+                session.rebindAttempts = 0;
+                session.stallHold = true;
                 lastSourceFrameAt = std::chrono::steady_clock::now();
             }
-        } else if (captureTargetLostLatched) {
+        } else if (session.targetLostLatched) {
             // Hard-error hold (finding 18): the capture target is gone and
             // could not be recovered or replaced. Stop rebind churn (which
             // would otherwise retry a dead monitor forever) and hold the last
             // frame while the cadence keeps the timeline continuous. Poll the
             // configured target once per second so replugging recovers.
-            captureStallHold = true;
-            if (nextTargetLostCheckAt == SteadyClock::time_point::min() ||
-                nowLoop >= nextTargetLostCheckAt) {
-                nextTargetLostCheckAt = nowLoop + std::chrono::seconds(1);
+            session.stallHold = true;
+            if (session.nextTargetCheckAt == SteadyClock::time_point::min() ||
+                nowLoop >= session.nextTargetCheckAt) {
+                session.nextTargetCheckAt = nowLoop + std::chrono::seconds(1);
                 const CaptureTarget desired = captureTargetForSettings(captureSettings);
                 const bool targetBackOnline =
                     (desired.monitor && monitorAlive(desired.monitor)) ||
@@ -2469,13 +2369,13 @@ void RecorderController::captureLoopImpl() {
                 if (targetBackOnline) {
                     Logger::instance().info(L"recorder",
                         L"Capture display is back online; recovering capture source");
-                    captureTargetLostLatched = false;
-                    retargetedToAlternateMonitor = false;
-                    deadTargetRebindFailures = 0;
-                    rebindAttempts = 0;
-                    lastCaptureRebindAt = SteadyClock::time_point::min();
-                    captureSession = CaptureSessionState::WaitStable;
-                    accessLostAt = nowLoop;
+                    session.targetLostLatched = false;
+                    session.retargetedAlternate = false;
+                    session.deadTargetFailures = 0;
+                    session.rebindAttempts = 0;
+                    session.lastRebindAt = SteadyClock::time_point::min();
+                    session.state = CaptureSessionState::WaitStable;
+                    session.accessLostAt = nowLoop;
                     setLastRecordingError({});
                     std::scoped_lock lock(captureStatusMutex_);
                     captureBackendActive_ = false;
@@ -2506,22 +2406,22 @@ void RecorderController::captureLoopImpl() {
 
             // Instant DXGI death after exclusive rebind → hard hold (no loop).
             if (exclusiveCoverActive &&
-                captureSession == CaptureSessionState::Capturing &&
+                session.state == CaptureSessionState::Capturing &&
                 captureLost &&
-                rebindSourceBornAt != SteadyClock::time_point::min() &&
-                nowLoop - rebindSourceBornAt < kDxgiInstantDeathMs) {
+                session.rebindBornAt != SteadyClock::time_point::min() &&
+                nowLoop - session.rebindBornAt < kDxgiInstantDeathMs) {
                 enterExclusiveHold(L"DXGI died immediately under exclusive");
-            } else if (captureLost && captureSession == CaptureSessionState::Capturing) {
+            } else if (captureLost && session.state == CaptureSessionState::Capturing) {
                 // Desktop Duplication reports ACCESS_LOST as exclusive mode takes
                 // ownership. Rebind straight to the Present hook; one bad first
                 // frame is preferable to freezing the replay for seconds.
-                immediateRebindPending = exclusiveCoverActive && capture_ &&
+                session.immediateRebind = exclusiveCoverActive && capture_ &&
                     capture_->backend() == CaptureBackend::DesktopDuplication;
                 enterAccessLost(L"ACCESS_LOST / invalid duplication");
             }
 
             // WGC under exclusive: one recovery path (no CreateForWindow thrash).
-            if (captureSession == CaptureSessionState::Capturing &&
+            if (session.state == CaptureSessionState::Capturing &&
                 capture_ &&
                 capture_->backend() == CaptureBackend::WindowsGraphicsCapture &&
                 exclusiveCoverActive &&
@@ -2530,46 +2430,46 @@ void RecorderController::captureLoopImpl() {
                 enterAccessLost(L"WGC stall under exclusive cover");
             }
 
-            if (captureSession == CaptureSessionState::AccessLost) {
+            if (session.state == CaptureSessionState::AccessLost) {
                 // Already proven blind this cover session → skip rebind thrash.
-                if (exclusiveCoverActive && exclusiveBlind) {
+                if (exclusiveCoverActive && session.exclusiveBlind) {
                     enterExclusiveHold(L"still exclusive-blind");
                 } else {
-                    captureSession = CaptureSessionState::WaitStable;
-                    accessLostAt = nowLoop;
+                    session.state = CaptureSessionState::WaitStable;
+                    session.accessLostAt = nowLoop;
                 }
             }
 
-            if (captureSession == CaptureSessionState::WaitStable) {
-                captureStallHold = true;
-                if (immediateRebindPending || nowLoop - accessLostAt >= kWaitStableMs) {
-                    captureSession = CaptureSessionState::Rebind;
+            if (session.state == CaptureSessionState::WaitStable) {
+                session.stallHold = true;
+                if (session.immediateRebind || nowLoop - session.accessLostAt >= kWaitStableMs) {
+                    session.state = CaptureSessionState::Rebind;
                 }
             }
 
-            if (captureSession == CaptureSessionState::Rebind) {
-                captureStallHold = true;
-                if (lastCaptureRebindAt != SteadyClock::time_point::min() &&
-                    nowLoop - lastCaptureRebindAt < kRebindCooldownMs &&
-                    !immediateRebindPending) {
+            if (session.state == CaptureSessionState::Rebind) {
+                session.stallHold = true;
+                if (session.lastRebindAt != SteadyClock::time_point::min() &&
+                    nowLoop - session.lastRebindAt < kRebindCooldownMs &&
+                    !session.immediateRebind) {
                     // Holding lastFrame between rebinds.
                 } else {
                     const bool validatedExclusiveTarget =
                         exclusiveCoverActive &&
-                        exclusiveTargetWindow &&
-                        GetForegroundWindow() == exclusiveTargetWindow;
+                        session.exclusiveWindow &&
+                        GetForegroundWindow() == session.exclusiveWindow;
                     CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
                         ? captureTargetForSettings(captureSettings)
                         : activeCaptureTarget_;
-                    target.window = validatedExclusiveTarget ? exclusiveTargetWindow : nullptr;
-                    ++rebindAttempts;
-                    lastCaptureRebindAt = nowLoop;
+                    target.window = validatedExclusiveTarget ? session.exclusiveWindow : nullptr;
+                    ++session.rebindAttempts;
+                    session.lastRebindAt = nowLoop;
                     // Exclusive + one DXGI death already observed: never thrash DXGI.
                     const bool skipDxgi =
-                        validatedExclusiveTarget && exclusiveDxgiAttempts >= 1;
+                        validatedExclusiveTarget && session.exclusiveDxgiAttempts >= 1;
                     Logger::instance().warning(L"recorder",
                         L"Capture session Rebind (DXGI) attempt=" +
-                        std::to_wstring(rebindAttempts) +
+                        std::to_wstring(session.rebindAttempts) +
                         L", exclusiveCover=" + (exclusiveCoverActive ? L"yes" : L"no") +
                         L", skipDxgi=" + (skipDxgi ? L"yes" : L"no"));
 
@@ -2583,32 +2483,32 @@ void RecorderController::captureLoopImpl() {
                             validatedExclusiveTarget);
                     if (validatedExclusiveTarget && switched && capture_ &&
                         capture_->backend() == CaptureBackend::DesktopDuplication) {
-                        ++exclusiveDxgiAttempts;
+                        ++session.exclusiveDxgiAttempts;
                     }
                     if (switched) {
-                        rebindSourceBornAt = nowLoop;
+                        session.rebindBornAt = nowLoop;
                     }
 
-                    captureStallHold = true;
-                    liveFramesSince = SteadyClock::time_point::min();
-                    sustainedLiveFrameCount = 0;
+                    session.stallHold = true;
+                    session.liveSince = SteadyClock::time_point::min();
+                    session.sustainedLive = 0;
                     lastSourceFrameAt = nowLoop;
-                    const bool fastRebind = immediateRebindPending;
-                    immediateRebindPending = false;
+                    const bool fastRebind = session.immediateRebind;
+                    session.immediateRebind = false;
                     if (switched) {
                         if (fastRebind) {
-                            acceptFirstLiveFrameAfterTransition = true;
+                            session.acceptFirstLive = true;
                             Logger::instance().info(L"recorder",
                                 L"Fast fullscreen transition: immediate Desktop Duplication rebind");
                         }
                         // Desktop mode and provisional DXGI recovery both need
                         // sustained live frames before removing stall hold.
-                        captureSession = CaptureSessionState::Capturing;
+                        session.state = CaptureSessionState::Capturing;
                     } else if (!validatedExclusiveTarget) {
                         // F11 or focus changed during recovery. A stale
                         // exclusive incident must not force a hold.
-                        captureSession = CaptureSessionState::WaitStable;
-                        accessLostAt = nowLoop;
+                        session.state = CaptureSessionState::WaitStable;
+                        session.accessLostAt = nowLoop;
                     } else {
                         enterExclusiveHold(L"desktop APIs blind under exclusive");
                     }
@@ -2620,18 +2520,18 @@ void RecorderController::captureLoopImpl() {
                     // enough failures either switch once to another live
                     // display or latch a hard error that diagnostics surface.
                     if (!switched && !validatedExclusiveTarget) {
-                        ++deadTargetRebindFailures;
+                        ++session.deadTargetFailures;
                         constexpr int kMaxDeadTargetRebinds = 4;
-                        if (deadTargetRebindFailures >= kMaxDeadTargetRebinds &&
-                            !captureTargetLostLatched) {
-                            deadTargetRebindFailures = 0;
+                        if (session.deadTargetFailures >= kMaxDeadTargetRebinds &&
+                            !session.targetLostLatched) {
+                            session.deadTargetFailures = 0;
                             const HMONITOR targetMonitor =
                                 activeCaptureTarget_.monitor
                                     ? activeCaptureTarget_.monitor
                                     : monitorFromIndex(activeCaptureTarget_.monitorIndex);
                             bool recovered = false;
                             if (targetMonitor && !monitorAlive(targetMonitor) &&
-                                !retargetedToAlternateMonitor) {
+                                !session.retargetedAlternate) {
                                 for (const auto& entry : enumerateMonitors()) {
                                     CaptureTarget alternate;
                                     alternate.monitorIndex = entry.index;
@@ -2645,10 +2545,10 @@ void RecorderController::captureLoopImpl() {
                                     if (switchCaptureTarget(
                                             alternate,
                                             L"capture display lost; switched to a live display")) {
-                                        retargetedToAlternateMonitor = true;
-                                        captureSession = CaptureSessionState::Capturing;
-                                        captureStallHold = true;
-                                        acceptFirstLiveFrameAfterTransition = true;
+                                        session.retargetedAlternate = true;
+                                        session.state = CaptureSessionState::Capturing;
+                                        session.stallHold = true;
+                                        session.acceptFirstLive = true;
                                         lastSourceFrameAt = nowLoop;
                                         forceVideoHeartbeat_ = true;
                                         {
@@ -2665,8 +2565,8 @@ void RecorderController::captureLoopImpl() {
                                 // No alternate display (or every candidate
                                 // failed). Latch a hard error instead of
                                 // retrying the dead target indefinitely.
-                                captureTargetLostLatched = true;
-                                nextTargetLostCheckAt = SteadyClock::time_point::min();
+                                session.targetLostLatched = true;
+                                session.nextTargetCheckAt = SteadyClock::time_point::min();
                                 const std::wstring detail =
                                     L"Capture display is unavailable; recording holds its "
                                     L"last frame. Reconnect the display or change the "
@@ -2680,81 +2580,81 @@ void RecorderController::captureLoopImpl() {
                             }
                         }
                     } else if (switched) {
-                        deadTargetRebindFailures = 0;
+                        session.deadTargetFailures = 0;
                     }
                 }
             }
 
-            if (captureSession == CaptureSessionState::Holding) {
-                captureStallHold = true;
+            if (session.state == CaptureSessionState::Holding) {
+                session.stallHold = true;
                 if (!exclusiveCoverActive) {
                     Logger::instance().info(L"recorder",
                         L"Exclusive cover ended; rebinding desktop capture");
-                    rebindAttempts = 0;
-                    exclusiveDxgiAttempts = 0;
-                    exclusiveBlind = false;
-                    exclusiveTargetWindow = nullptr;
-                    loggedExclusiveHold = false;
-                    lastCaptureRebindAt = SteadyClock::time_point::min();
-                    rebindSourceBornAt = SteadyClock::time_point::min();
-                    sustainedLiveFrameCount = 0;
+                    session.rebindAttempts = 0;
+                    session.exclusiveDxgiAttempts = 0;
+                    session.exclusiveBlind = false;
+                    session.exclusiveWindow = nullptr;
+                    session.loggedHold = false;
+                    session.lastRebindAt = SteadyClock::time_point::min();
+                    session.rebindBornAt = SteadyClock::time_point::min();
+                    session.sustainedLive = 0;
                     CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
                         ? captureTargetForSettings(captureSettings)
                         : activeCaptureTarget_;
                     target.window = nullptr;
                     if (switchCaptureTarget(target, L"exclusive cover ended")) {
-                        captureSession = CaptureSessionState::Capturing;
-                        captureStallHold = true;
-                        liveFramesSince = SteadyClock::time_point::min();
+                        session.state = CaptureSessionState::Capturing;
+                        session.stallHold = true;
+                        session.liveSince = SteadyClock::time_point::min();
                         lastSourceFrameAt = nowLoop;
                         forceVideoHeartbeat_ = true;
                     } else {
-                        captureSession = CaptureSessionState::Rebind;
+                        session.state = CaptureSessionState::Rebind;
                     }
-                } else if (nowLoop - lastCaptureRebindAt >= kHoldDesktopProbeMs) {
+                } else if (nowLoop - session.lastRebindAt >= kHoldDesktopProbeMs) {
                     // Full-monitor borderless still satisfies exclusive-cover geometry.
                     // Probe Desktop Duplication once more; repeated identical
                     // attempts would not make desktop capture recover.
-                    exclusiveBlind = false;
-                    exclusiveDxgiAttempts = 0;
-                    rebindAttempts = 0;
-                    desktopRecoveryProbe = true;
-                    captureSession = CaptureSessionState::Rebind;
+                    session.exclusiveBlind = false;
+                    session.exclusiveDxgiAttempts = 0;
+                    session.rebindAttempts = 0;
+                    session.recoveryProbe = true;
+                    session.state = CaptureSessionState::Rebind;
                 }
             }
 
             // Soft stall: coalesce only. Do not thrash from Holding.
-            if (captureSession == CaptureSessionState::Capturing &&
+            if (session.state == CaptureSessionState::Capturing &&
                 !acquired && !captureLost) {
                 const auto noFrameFor = nowLoop - lastSourceFrameAt;
                 if (exclusiveCoverActive && noFrameFor >= kExclusiveNoFrameMs) {
-                    if (exclusiveBlind || exclusiveDxgiAttempts >= 1) {
+                    if (session.exclusiveBlind || session.exclusiveDxgiAttempts >= 1) {
                         enterExclusiveHold(L"no live frames under exclusive cover");
                     } else {
                         enterAccessLost(L"no live frames under exclusive cover");
                     }
                 } else if (!exclusiveCoverActive && noFrameFor >= kSoftStallMs) {
-                    captureStallHold = true;
-                    sustainedLiveFrameCount = 0;
+                    session.stallHold = true;
+                    session.sustainedLive = 0;
                     // Escalate a sustained non-exclusive stall: coalescing
                     // alone keeps encoding a freeze-frame forever when the
                     // source wedges without reporting device loss. Recreate
                     // the desktop capture source after the stall persists,
                     // bounded per episode and cooldown-limited.
                     const bool desktopSourceRecoverable = capture_ != nullptr;
-                    if (softStallBeganAt == SteadyClock::time_point::min()) {
-                        softStallBeganAt = nowLoop - noFrameFor;
+                    if (session.softStallBeganAt == SteadyClock::time_point::min()) {
+                        session.softStallBeganAt = nowLoop - noFrameFor;
                     }
                     const bool recreateCooldownElapsed =
-                        lastSoftStallRecreateAt == SteadyClock::time_point::min() ||
-                        nowLoop - lastSoftStallRecreateAt >= kSoftStallRecreateCooldownMs;
+                        session.lastSoftStallAt == SteadyClock::time_point::min() ||
+                        nowLoop - session.lastSoftStallAt >= kSoftStallRecreateCooldownMs;
                     if (desktopSourceRecoverable &&
-                        softStallRecreates < kMaxSoftStallRecreates &&
+                        session.softStallRecreates < kMaxSoftStallRecreates &&
                         recreateCooldownElapsed &&
-                        nowLoop - softStallBeganAt >= kSoftStallRecreateAfterMs) {
-                        ++softStallRecreates;
-                        lastSoftStallRecreateAt = nowLoop;
-                        softStallBeganAt = nowLoop;
+                        nowLoop - session.softStallBeganAt >= kSoftStallRecreateAfterMs) {
+                        ++session.softStallRecreates;
+                        session.lastSoftStallAt = nowLoop;
+                        session.softStallBeganAt = nowLoop;
                         CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
                             ? captureTargetForSettings(captureSettings)
                             : activeCaptureTarget_;
@@ -2764,7 +2664,7 @@ void RecorderController::captureLoopImpl() {
                             std::to_wstring(
                                 std::chrono::duration_cast<std::chrono::milliseconds>(nowLoop - lastSourceFrameAt).count()) +
                             L"ms without device loss; recreating capture source (attempt " +
-                            std::to_wstring(softStallRecreates) + L"/" +
+                            std::to_wstring(session.softStallRecreates) + L"/" +
                             std::to_wstring(kMaxSoftStallRecreates) + L")");
                         // switchCaptureTarget discards queued frames and arms
                         // a keyframe on the next live frame.
@@ -2815,7 +2715,7 @@ void RecorderController::captureLoopImpl() {
             // pipeline restart; apply them to the live source as well so the
             // setting takes effect immediately even when a rebind is not
             // possible (finding 19).
-            const bool cursorPreference = settings().captureCursor;
+            const bool cursorPreference = captureCursorMirror_.load(std::memory_order_relaxed);
             if (cursorPreference != appliedCursorPreference && capture_) {
                 std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
                 if (gpuLock.owns_lock()) {
@@ -3111,7 +3011,9 @@ void RecorderController::writeAudioPacket(AudioPacket&& packet) {
     const uint32_t volumePercent = packet.track == AudioTrack::System
         ? audioOutputVolumePercent_.load(std::memory_order_relaxed)
         : audioInputVolumePercent_.load(std::memory_order_relaxed);
-    applyAudioVolume(packet, volumePercent);
+    // Packet is canonical float32 here; sanitizeSettings owns the 0-200 range
+    // so the gain is percent/100 exactly with no second clamp.
+    applyCanonicalGain(packet, static_cast<float>(volumePercent) / 100.0f);
 
     if (recording_ && muxer_.active()) {
         muxer_.writeAudioPacket(packet);

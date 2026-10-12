@@ -9,7 +9,7 @@ microphone denoiser.
 
 ## Ownership
 
-- Owns: `WasapiCapture`, `AudioConvert`, `AudioMix`, `WavReader`,
+- Owns: `WasapiCapture`, `SessionMuteStore`, `AudioConvert`, `AudioMix`, `WavReader`,
   `RnnoiseDenoiser`.
 - Does not own: WAV or MP4 writing (`mux/WavWriter.h`, `mux/Mp4Muxer.h`), or
   the microphone AGC, which is implemented inside `app/RecorderController.cpp`.
@@ -52,18 +52,22 @@ microphone denoiser.
   `running_` and retry with 250 ms exponential backoff capped at 2 s until
   `stop()`. `start()` reports only the first attempt, so a start that returns
   false can still be followed by a successful reconnect.
-- Session mutes are global system state. `WasapiCapture` mirrors them into
+- Session mutes are global system state. `SessionMuteStore` mirrors them into
   `audio-session-mutes.txt` under `%LOCALAPPDATA%\Backtrack`, sweeps orphaned
-  mutes at startup, and exposes `emergencyRestoreSessionMutes()` for the fatal
-  handlers in `main.cpp`. Sound separation is mute-based, so getting this wrong
+  mutes at startup, and exposes `emergencyRestore()` for the fatal handlers in
+  `main.cpp` (via `WasapiCapture::emergencyRestoreSessionMutes()`). Sound separation is mute-based, so getting this wrong
   leaves other applications silent until the next clean run. The sweep restores
   only sessions still muted, so a user who unmuted one by hand keeps that, and
   it deletes the journal only after a sweep that actually ran, rewriting the
   entries it could not reach so a failed enumeration leaves them for the next
   launch. The journal is written after every applied mute rather than once per
-  sweep: `g_sessionMuteMutex` is held across the whole enumeration and the crash
+  sweep: the store lock is held across the whole enumeration and the crash
   path only try_locks it, so a kill inside that walk has no second chance to be
-  recorded. Any thread that calls into a session volume needs its own COM
+  recorded. `WasapiCapture` keeps only the static mute API and the WASAPI
+  session enumeration that feeds the store (`SessionMuteCandidate` lists); all
+  journal, prune, sweep, and crash-restore logic lives in the store, which
+  takes its journal path and injectable enumeration callbacks so it is testable
+  without WASAPI. Any thread that calls into a session volume needs its own COM
   apartment, including the fatal handlers in `main.cpp` (OS-created or faulting
   threads); `emergencyRestoreSessionMutes` therefore initializes one and ignores
   a changed-apartment result, because such a thread is initialized all the same.
@@ -74,6 +78,9 @@ microphone denoiser.
 - Microphone processing order on the audio writer thread: canonicalization,
   denoise (if enabled), AGC, then volume. The denoiser is microphone-only and
   requires the canonical format; system audio is never processed.
+- Gain after canonicalization is `applyMuteGain` over the float span alone
+  (muted zeroes, unity is a no-op, otherwise scale and clamp). The percent
+  range belongs to `sanitizeSettings`; the call site never re-clamps.
 - `RnnoiseDenoiser` is opt-in, not thread-safe, and works in whole 480-sample
   frames. `process` may emit one buffered frame more than it consumed, so the
   output buffer needs `count + 480` headroom or the backlog grows without bound.
@@ -110,6 +117,11 @@ microphone denoiser.
 - `AudioConvertTests` (CTest) covers format parsing, canonicalization, resampling
   with mono duplication, a mid-stream format change, an unsupported format being
   dropped, and the 5.1 fold-down.
+- `SessionMuteStoreTests` (CTest) covers the journal codec round trip and
+  malformed-line skipping, write-after-every-mute with atomic publish and no
+  temp leftover, stale pruning, the orphan sweep (still-muted check, rewrite of
+  unreached entries, no-journal and failed-enumeration no-ops that preserve the
+  journal), and the try_lock-only crash path skipping a held lock.
 - `ReplayBufferTests` (CTest) links `WavReader.cpp` and covers a well-formed WAV
   and one whose RIFF and data sizes were never patched.
 - `AudioDenoiseTests` (CTest, only with `BACKTRACK_NOISE_SUPPRESSION=ON`) covers

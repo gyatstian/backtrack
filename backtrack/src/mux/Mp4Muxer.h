@@ -37,6 +37,20 @@ struct MuxedInputs {
     ResolutionMode resolutionMode = ResolutionMode::P1080;
 };
 
+// Effective decode timestamp for one sample: valid only when explicitly
+// flagged and not past the presentation time (the encoders never produce a
+// DTS past PTS); otherwise the presentation time stands in. Zero and negative
+// timestamps are legal values, so validity comes from the flag alone. Shared
+// by the recording path and ReplayBuffer::saveTo, which must agree exactly,
+// or the same packet muxes with different timing depending on the path.
+inline int64_t effectiveDts(int64_t pts100ns, int64_t dts100ns, bool hasDts) {
+    return (hasDts && dts100ns <= pts100ns) ? dts100ns : pts100ns;
+}
+
+inline bool hasEffectiveDts(int64_t pts100ns, int64_t dts100ns, bool hasDts) {
+    return hasDts && dts100ns <= pts100ns;
+}
+
 class Mp4Muxer {
 public:
     bool startRecording(const std::filesystem::path& outputPath, const VideoSettings& settings);

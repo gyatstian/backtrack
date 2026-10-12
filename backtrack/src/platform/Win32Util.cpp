@@ -144,6 +144,21 @@ bool isBacktrackMicrophoneConsentKey(const std::wstring& keyName) {
     return CompareStringOrdinal(executableName, -1, kBacktrackExecutableName, -1, TRUE) == CSTR_EQUAL;
 }
 
+// Shared validity gate for both foreground queries: a window that is gone,
+// hidden, minimized, or ours is neither a game to name nor a surface to test.
+HWND validForegroundWindow() {
+    const HWND foreground = GetForegroundWindow();
+    if (!foreground || !IsWindow(foreground) || !IsWindowVisible(foreground) || IsIconic(foreground)) {
+        return nullptr;
+    }
+    DWORD processId = 0;
+    GetWindowThreadProcessId(foreground, &processId);
+    if (processId == 0 || processId == GetCurrentProcessId()) {
+        return nullptr;
+    }
+    return foreground;
+}
+
 std::wstring processImagePath(DWORD processId) {
     if (processId == 0 || processId == GetCurrentProcessId()) {
         return {};
@@ -303,21 +318,18 @@ std::wstring makeTimestampedFileName(const wchar_t* prefix, const wchar_t* exten
     localtime_s(&localTime, &time);
 
     std::wstringstream stream;
-    stream << prefix << L"_" << std::put_time(&localTime, L"%ml%dl%Y_%Hl%M") << extension;
+    stream << prefix << L"_" << std::put_time(&localTime, L"%m%d%Y_%H%M") << extension;
     return stream.str();
 }
 
 std::wstring foregroundApplicationName() {
-    HWND foreground = GetForegroundWindow();
-    if (!foreground || !IsWindow(foreground)) {
+    const HWND foreground = validForegroundWindow();
+    if (!foreground) {
         return {};
     }
 
     DWORD processId = 0;
     GetWindowThreadProcessId(foreground, &processId);
-    if (processId == 0 || processId == GetCurrentProcessId()) {
-        return {};
-    }
 
     const std::wstring imagePath = processImagePath(processId);
     std::wstring name = friendlyNameForImagePath(imagePath);
@@ -371,8 +383,8 @@ BOOL CALLBACK fullscreenMonitorEnumProc(HMONITOR monitor, HDC, LPRECT, LPARAM lP
 } // namespace
 
 bool foregroundWindowIsFullscreen() {
-    const HWND foreground = GetForegroundWindow();
-    if (!foreground || !IsWindow(foreground) || !IsWindowVisible(foreground) || IsIconic(foreground)) {
+    const HWND foreground = validForegroundWindow();
+    if (!foreground) {
         return false;
     }
     // Skip child/owned windows; they are never the fullscreen application surface.

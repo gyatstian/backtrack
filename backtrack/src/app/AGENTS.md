@@ -77,6 +77,21 @@ frame-cadence logic.
   drains, and only a later successful capture could release it, so holding it
   across the swap stalls the capture thread. Losing one freeze frame beats a
   stalled rebind.
+- `updateSettings` restarts the pipeline only when it must. Voice-command,
+  replay-buffer, and live audio/cursor changes (volumes, AGC enable, denoiser
+  enable, cursor capture) apply in place through the lock-free mirrors; a
+  volume drag must never split the replay timeline or the active recording.
+  Anything else takes the full stop/start path.
+- Per-second reads never copy `AppSettings` (paths and vectors allocate).
+  `stats()`, the stall watchdog, the capture-loop cursor poll, and the audio
+  volumes read the mirrors published by `publishLiveMirrors`, which runs
+  wherever `settings_` is assigned. Keep new hot reads off `settings()`.
+- Exclusive-fullscreen recovery state lives in the `CaptureSession`
+  supervisor in `RecorderController.h` (explicit `toX()` transitions); the
+  loop keeps frame data and clocks only. Partial resets write `session`
+  fields directly. Microphone gain runs on canonical floats through
+  `audio/applyMuteGain`; `sanitizeSettings` owns the 0-200 % range, so the
+  call site never re-clamps.
 - HDR capture is automatic, never a setting. `createCaptureSource` prefers
   Desktop Duplication on an advanced-color monitor (WGC stays fixed-BGRA and
   leans on DWM pre-tonemap, which washes out); WGC remains the fallback when DD
@@ -93,7 +108,17 @@ frame-cadence logic.
   the existing `try_to_lock` won-lock scope, race-free because the scaler is
   only touched under `pipelineGpuMutex_` - gated on live HDR input so a stale
   latch cannot paint SDR content as rejected, with the monitor-probe-no-frame
-  case covering WGC/SDR interpretation.
+  case covering WGC/SDR interpretation. Both mirrors reset on every video
+  handoff (`resetVideoHandoff`, `switchCaptureTarget`) so a DD(hdr=true)
+  freeze frame never poisons a WGC session: the privatized copy is already
+  SDR, and its `hdr` flag is cleared when the new source is WGC so
+  `emitFrame` does not tone-map twice. The monitor probe is creation-time
+  only; an OS HDR toggle mid-session on WGC stays invisible until the next
+  rebind (diagnostics-only known limit), while DD toggles still arrive via the
+  per-frame flag. The Diagnostics page splits `hdrRejected` for display -
+  scaler refusal on live HDR input reads as rejected, monitor-probe-no-frame
+  reads as SDR-on-HDR-monitor (WGC/DWM) - so the washout witness never looks
+  like a driver refusal and `stats()` fields stay stable.
 - `stats()` and `encoderCapabilities()` run on two threads at once - the UI
   thread (diagnostics timer, page refresh) and the controller worker thread
   `MainWindow` uses for blocking actions - and must never block on

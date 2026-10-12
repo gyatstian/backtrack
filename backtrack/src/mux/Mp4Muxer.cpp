@@ -4,6 +4,7 @@
 #include "audio/AudioMix.h"
 #include "audio/WavReader.h"
 #include "core/Logger.h"
+#include "mux/AudioTimeline.h"
 #include "mux/RecoveryStore.h"
 
 #include <mfapi.h>
@@ -267,7 +268,7 @@ int64_t videoCompositionDelay100ns(const MuxedInputs& inputs) {
         return 0;
     }
     const MuxedInputs::VideoSample& first = inputs.videoSamples.front();
-    if (!first.hasDts || first.dts100ns >= first.pts100ns) {
+    if (!hasEffectiveDts(first.pts100ns, first.dts100ns, first.hasDts)) {
         return 0;
     }
     constexpr int64_t kMaxPlausibleDelay = 2 * kHundredNanosecondsPerSecond;
@@ -339,7 +340,7 @@ bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInpu
         sample->AddBuffer(buffer.Get());
         sample->SetSampleTime(videoSample.pts100ns - timeBase);
         if (hasDecodeTimestamps) {
-            const int64_t dts = videoSample.hasDts ? videoSample.dts100ns : videoSample.pts100ns;
+            const int64_t dts = effectiveDts(videoSample.pts100ns, videoSample.dts100ns, videoSample.hasDts);
             const int64_t dtsOffset = dts - timeBase;
             // Decode order keeps every offset non-negative, so this is a no-op on
             // valid input; it only stops a corrupt DTS wrapping to a huge delta.
@@ -529,8 +530,8 @@ void Mp4Muxer::writeVideoPacket(const EncodedPacket& packet) {
     // Packets arrive in decode order. A decode timestamp below the PTS marks
     // a reordered (B-frame) stream; without one, regressing PTS cannot be
     // represented in MP4 and would corrupt the stts timeline.
-    const bool hasDts = packet.hasDts && packet.dts100ns <= packet.pts100ns;
-    const int64_t dts100ns = hasDts ? packet.dts100ns : packet.pts100ns;
+    const bool hasDts = hasEffectiveDts(packet.pts100ns, packet.dts100ns, packet.hasDts);
+    const int64_t dts100ns = effectiveDts(packet.pts100ns, packet.dts100ns, packet.hasDts);
     if (!warnedRegressingPts_ &&
         firstVideoPts100ns_ &&
         packet.pts100ns < lastWrittenVideoPts100ns_ &&
@@ -675,33 +676,32 @@ std::filesystem::path Mp4Muxer::finalize() {
         return {};
     }
 
-    RecoveryStore::writeManifest(inputs, tempDirectory);
-    RecoveryStore::writeReadme(inputs, tempDirectory);
-
+    // Shared publish tail with the replay save path: manifest+readme first,
+    // then mux with retry. The temp directory is kept only when the manifest
+    // describes the streams on disk (recoverable); a manifest that will not
+    // publish means a real write failure, so the directory is dropped rather
+    // than promise a recovery that cannot happen.
     std::wstring muxErrorDetail;
-    if (!RecoveryStore::muxToMp4WithRetry(inputs, outputPath, &muxErrorDetail)) {
-        // The muxer never writes to outputPath directly (staged publish), so
-        // anything there can only be our own empty name reservation; a foreign
-        // file must survive a failed save untouched.
-        removeEmptyOutputReservation(outputPath);
-        const std::wstring detail =
-            RecoveryStore::preservedRecordingDetail(outputPath, tempDirectory, inputs, muxErrorDetail);
-        {
-            std::scoped_lock lock(mutex_);
-            lastError_ = detail;
+    const auto publishResult =
+        RecoveryStore::publishMuxedInputs(inputs, outputPath, tempDirectory, &muxErrorDetail);
+    if (publishResult == RecoveryStore::MuxPublishResult::kPublished) {
+        std::error_code cleanupError;
+        std::filesystem::remove_all(tempDirectory, cleanupError);
+        if (cleanupError) {
+            Logger::instance().warning(L"mux", L"Could not remove recording temporary directory: " + tempDirectory.wstring());
         }
-        Logger::instance().warning(L"mux", detail);
-        return {};
+        Logger::instance().info(L"mux", L"MP4 finalized: " + outputPath.wstring());
+        return outputPath;
     }
-
-    std::error_code cleanupError;
-    std::filesystem::remove_all(tempDirectory, cleanupError);
-    if (cleanupError) {
-        Logger::instance().warning(L"mux", L"Could not remove recording temporary directory: " + tempDirectory.wstring());
+    if (publishResult == RecoveryStore::MuxPublishResult::kFailed) {
+        std::error_code cleanupError;
+        std::filesystem::remove_all(tempDirectory, cleanupError);
     }
-
-    Logger::instance().info(L"mux", L"MP4 finalized: " + outputPath.wstring());
-    return outputPath;
+    {
+        std::scoped_lock lock(mutex_);
+        lastError_ = muxErrorDetail;
+    }
+    return {};
 }
 
 void Mp4Muxer::abort() {
@@ -787,13 +787,6 @@ void Mp4Muxer::closeManifestStreamLocked() {
 }
 
 void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPacket& packet, const wchar_t* fileName) {
-    // Hard limit on PTS gap-fill: a long capture outage (device failure, sleep,
-    // clock jump) otherwise becomes hours of written silence, ballooning the
-    // temporary WAV and stalling the save. Gaps beyond this are bridged with
-    // the capped fill and the audio timeline then resumes immediately; audio
-    // after a longer outage plays that much earlier relative to video instead
-    // of the recording growing unbounded.
-    constexpr int64_t kMaxSilenceGapFill100ns = 10 * kHundredNanosecondsPerSecond;
     if (!firstVideoPts100ns_ || packet.frameCount == 0 || writeFailed_) {
         return;
     }
@@ -834,62 +827,19 @@ void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPa
         return;
     }
 
-    const int64_t packetDuration100ns =
-        static_cast<int64_t>((static_cast<int64_t>(packet.frameCount) * kHundredNanosecondsPerSecond) / samplesPerSec);
-    const int64_t packetEnd100ns = packet.pts100ns + packetDuration100ns;
-    if (packetEnd100ns <= state.nextPts100ns) {
-        return;
-    }
-
-    if (packet.pts100ns > state.nextPts100ns) {
-        const int64_t gap100ns = packet.pts100ns - state.nextPts100ns;
-        const int64_t fill100ns = std::min<int64_t>(gap100ns, kMaxSilenceGapFill100ns);
-        const auto gapFrames = static_cast<uint64_t>(
-            (fill100ns * static_cast<int64_t>(samplesPerSec)) / kHundredNanosecondsPerSecond);
-        const bool silenceWritten = state.writer.writeSilenceFrames(gapFrames);
-        state.nextPts100ns += static_cast<int64_t>((gapFrames * kHundredNanosecondsPerSecond) / samplesPerSec);
-        if (!silenceWritten) {
-            noteAudioWriteFailedLocked(fileName);
-            return;
-        }
-        if (fill100ns < gap100ns) {
-            // Cap hit: bridge with the capped silence, then resynchronize the
-            // pacing pointer to the incoming packet. Without the resync every
-            // later packet would still lag the residual gap and trigger
-            // another capped fill, re-inflating the stream. Post-outage audio
-            // then plays (gap - limit) earlier against video than captured,
-            // which beats an unbounded silent WAV.
-            state.nextPts100ns = packet.pts100ns;
-            Logger::instance().warning(L"mux",
-                std::wstring(L"Audio gap of ") + std::to_wstring((gap100ns + kHundredNanosecondsPerSecond - 1) / kHundredNanosecondsPerSecond) +
-                L"s exceeded the silence-fill limit; audio timeline compressed after " + fileName);
-        }
-    }
-
-    uint32_t startFrame = 0;
-    if (packet.pts100ns < state.nextPts100ns) {
-        startFrame = static_cast<uint32_t>(std::min<uint64_t>(
-            packet.frameCount,
-            (((state.nextPts100ns - packet.pts100ns) * static_cast<int64_t>(samplesPerSec)) + kHundredNanosecondsPerSecond - 1) /
-                kHundredNanosecondsPerSecond));
-    }
-    if (startFrame >= packet.frameCount) {
-        return;
-    }
-
-    const size_t byteOffset = static_cast<size_t>(startFrame) * blockAlign;
-    if (byteOffset >= packet.bytes.size()) {
-        return;
-    }
-    const size_t bytesToWrite = std::min(
-        packet.bytes.size() - byteOffset,
-        static_cast<size_t>(packet.frameCount - startFrame) * blockAlign);
-    if (!state.writer.write(packet.bytes.data() + byteOffset, bytesToWrite)) {
+    // Shared pacing core with the replay path (mux/AudioTimeline.h): gap fill
+    // capped at 10 s with resync past the cap, overlap trim, unbounded above
+    // (the recording has no video end yet). A write failure flags the
+    // recording so finalize() reports it instead of publishing truncated audio.
+    if (!paceAudioPacket(
+            state.writer,
+            state.nextPts100ns,
+            packet,
+            kNoAudioWindowEnd,
+            L"mux",
+            fileName)) {
         noteAudioWriteFailedLocked(fileName);
-        return;
     }
-    const uint64_t framesWritten = bytesToWrite / blockAlign;
-    state.nextPts100ns += static_cast<int64_t>((framesWritten * kHundredNanosecondsPerSecond) / samplesPerSec);
 }
 
 // A failed temporary-WAV write (typically a full disk) must fail the save

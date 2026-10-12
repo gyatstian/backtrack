@@ -143,6 +143,11 @@ icon.
   it never marks the page dirty, an `addControl` call that records its design
   rect, a read in `readVisibleSettingsInto`, and a reset plus rebind in
   `rebindPageControlPointers` if it gets a member pointer.
+- `readVisibleSettingsInto` reads controls raw and never clamps:
+  `sanitizeSettings` is the sole clamp (stash, save, and dirty all run through
+  it). The follow-mouse read applies the full
+  `multiMonitorSupport && followFocusedMonitor` gate so a checked box is exactly
+  what sanitize keeps.
 - Preferences and behavior the user expects to persist go into `AppSettings`,
   not into a local variable in a page builder.
 - Copy in this folder is user-facing English in a deliberately plain voice.

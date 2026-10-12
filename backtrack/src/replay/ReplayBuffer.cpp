@@ -3,6 +3,7 @@
 #include "audio/AudioConvert.h"
 #include "core/Logger.h"
 #include "encoder/BitstreamUtils.h"
+#include "mux/AudioTimeline.h"
 #include "mux/Mp4Muxer.h"
 #include "mux/RecoveryStore.h"
 #include "mux/WavWriter.h"
@@ -57,15 +58,6 @@ public:
 private:
     std::filesystem::path path_;
 };
-
-// Hard limit on PTS gap-fill, the same rule the recording path applies in
-// Mp4Muxer::writeTimelineAudioPacket. A replay window is up to an hour, so a
-// loopback device that drops out early would otherwise be written out as tens
-// of minutes of silence, and the mux preflight then demands hundreds of
-// megabytes of free disk for a clip whose real audio is a few. Past the cap the
-// pacing pointer resyncs to the incoming packet, compressing the audio
-// timeline instead of inflating the temporary WAV.
-constexpr int64_t kMaxSilenceGapFill100ns = 10 * kHundredNanosecondsPerSecond;
 
 // Single-sample duration ceiling: storage-level backstop for wall-clock
 // durations from coalesced hold intervals. Covers the largest healthy
@@ -138,6 +130,10 @@ bool writeTimelineAudio(
         return false;
     }
 
+    // Shared pacing core with the recording path (mux/AudioTimeline.h): gap
+    // fill capped at 10 s with resync past the cap, overlap trim, and the
+    // replay window end as the write bound.
+    const std::wstring fileName = path.filename().wstring();
     int64_t nextPts100ns = startPts100ns;
     for (const auto& packet : audio) {
         if (packet->frameCount == 0 || packet->bytes.empty()) {
@@ -146,83 +142,9 @@ bool writeTimelineAudio(
         if (!packetFormatMatches(*packet)) {
             continue;
         }
-
-        const int64_t packetDuration100ns =
-            static_cast<int64_t>((static_cast<int64_t>(packet->frameCount) * kHundredNanosecondsPerSecond) / samplesPerSec);
-        const int64_t packetEnd100ns = packet->pts100ns + packetDuration100ns;
-        if (packetEnd100ns <= nextPts100ns) {
-            continue;
-        }
-        if (packet->pts100ns >= endPts100ns) {
-            continue;
-        }
-
-        if (packet->pts100ns > nextPts100ns) {
-            const int64_t gap100ns = std::min(packet->pts100ns, endPts100ns) - nextPts100ns;
-            const int64_t fill100ns = std::min<int64_t>(gap100ns, kMaxSilenceGapFill100ns);
-            const auto gapFrames = static_cast<uint64_t>(
-                (fill100ns * static_cast<int64_t>(samplesPerSec)) / kHundredNanosecondsPerSecond);
-            const bool silenceWritten = writer.writeSilenceFrames(gapFrames);
-            nextPts100ns += static_cast<int64_t>((gapFrames * kHundredNanosecondsPerSecond) / samplesPerSec);
-            if (!silenceWritten) {
-                return false;
-            }
-            if (fill100ns < gap100ns) {
-                // Cap hit: bridge with the capped silence, then resynchronize the
-                // pacing pointer to the incoming packet. Without the resync every
-                // later packet would still lag the residual gap and trigger
-                // another capped fill, re-inflating the stream. Post-outage audio
-                // then plays (gap - limit) earlier against video than captured,
-                // which beats an unbounded silent WAV.
-                nextPts100ns = std::min(packet->pts100ns, endPts100ns);
-                Logger::instance().warning(L"replay",
-                    L"Replay audio gap exceeded the silence-fill limit; audio timeline compressed: " +
-                    path.filename().wstring());
-            }
-            if (nextPts100ns >= endPts100ns) {
-                break;
-            }
-        }
-
-        uint32_t startFrame = 0;
-        if (packet->pts100ns < nextPts100ns) {
-            startFrame = static_cast<uint32_t>(std::min<uint64_t>(
-                packet->frameCount,
-                (((nextPts100ns - packet->pts100ns) * static_cast<int64_t>(samplesPerSec)) + kHundredNanosecondsPerSecond - 1) /
-                    kHundredNanosecondsPerSecond));
-        }
-        if (startFrame >= packet->frameCount) {
-            continue;
-        }
-
-        const size_t byteOffset = static_cast<size_t>(startFrame) * blockAlign;
-        if (byteOffset >= packet->bytes.size()) {
-            continue;
-        }
-        const int64_t writeStartPts100ns =
-            packet->pts100ns +
-            static_cast<int64_t>((static_cast<int64_t>(startFrame) * kHundredNanosecondsPerSecond) / samplesPerSec);
-        if (writeStartPts100ns >= endPts100ns) {
-            continue;
-        }
-        const uint64_t framesToReplayEnd = static_cast<uint64_t>(
-            ((endPts100ns - writeStartPts100ns) * static_cast<int64_t>(samplesPerSec)) /
-            kHundredNanosecondsPerSecond);
-        if (framesToReplayEnd == 0) {
-            continue;
-        }
-        const uint64_t frameLimit = std::min<uint64_t>(
-            framesToReplayEnd,
-            static_cast<uint64_t>((std::numeric_limits<size_t>::max)() / blockAlign));
-        const size_t bytesToWrite = std::min(
-            {packet->bytes.size() - byteOffset,
-             static_cast<size_t>(packet->frameCount - startFrame) * blockAlign,
-             static_cast<size_t>(frameLimit) * blockAlign});
-        if (!writer.write(packet->bytes.data() + byteOffset, bytesToWrite)) {
+        if (!paceAudioPacket(writer, nextPts100ns, *packet, endPts100ns, L"replay", fileName.c_str())) {
             return false;
         }
-        const uint64_t framesWritten = bytesToWrite / blockAlign;
-        nextPts100ns += static_cast<int64_t>((framesWritten * kHundredNanosecondsPerSecond) / samplesPerSec);
         if (nextPts100ns >= endPts100ns) {
             break;
         }
@@ -257,59 +179,30 @@ constexpr uint64_t kMinRingCapacityBytes = 8ull * 1024 * 1024;
 // change at all - it turns audio disk backing off, like the video floor.
 constexpr uint64_t kMinAudioRingCapacityBytes = 1024ull * 1024;
 
-// Bound on a single ring IRP. The ring folder is user-chosen, so a USB stick,
-// a network drive or a sleeping disk can leave a request pending forever, and
-// both callers hold mutex_ while this runs: an unbounded wait would wedge the
-// encode loop, the UI, and stopPipeline's thread joins, with no way to close the
-// app. Generous enough that a merely slow removable drive is not mistaken for a
-// stall, short enough that a wedged one degrades to memory rather than hanging.
-constexpr DWORD kRingIoTimeoutMs = 8000;
+// RAM fallback caps when configure arrives with a zero capacity: the same
+// derivation RecorderController applies (one window at the default bitrate
+// plus ~33% VBR headroom for video, one window of two PCM tracks doubled for
+// audio). configure always passes real caps from the controller, so this only
+// bites callers that pass none (tests).
+uint64_t defaultRamVideoCapBytes(uint32_t seconds) {
+    constexpr uint64_t kMinCapacityBytes = 64ull * 1024 * 1024;
+    constexpr uint64_t kMaxCapacityBytes = 16ull * 1024 * 1024 * 1024;
+    const uint64_t windowSeconds = (std::max<uint32_t>)(1, seconds);
+    const uint64_t bytesPerWindow =
+        (static_cast<uint64_t>(VideoSettings{}.bitrateKbps) * 1000ull / 8ull) * windowSeconds;
+    return (std::min<uint64_t>)(
+        (std::max<uint64_t>)(bytesPerWindow + bytesPerWindow / 3, kMinCapacityBytes),
+        kMaxCapacityBytes);
+}
 
-// Explicit-offset synchronous-completion transfer on an overlapped ring
-// handle. The ring file carries no per-handle file position, so a save thread
-// reading while the encoder thread writes cannot tear seek/read or
-// seek/write pairs - every operation names its own offset. Returns false with
-// GetLastError() set on failure.
-bool transferRing(HANDLE file, bool write, uint64_t offset, uint8_t* data, uint32_t size) {
-    uint32_t done = 0;
-    while (done < size) {
-        OVERLAPPED overlapped{};
-        const uint64_t absolute = offset + done;
-        overlapped.Offset = static_cast<DWORD>(absolute & 0xFFFFFFFFu);
-        overlapped.OffsetHigh = static_cast<DWORD>(absolute >> 32);
-        const DWORD chunkBytes = static_cast<DWORD>(std::min<uint64_t>(size - done, 16ull * 1024 * 1024));
-        DWORD moved = 0;
-        const BOOL ok = write
-            ? WriteFile(file, data + done, chunkBytes, &moved, &overlapped)
-            : ReadFile(file, data + done, chunkBytes, &moved, &overlapped);
-        if (!ok) {
-            const DWORD error = GetLastError();
-            if (error != ERROR_IO_PENDING) {
-                return false;
-            }
-            if (GetOverlappedResult(file, &overlapped, &moved, kRingIoTimeoutMs)) {
-                // completed within the budget
-            } else {
-                // Returning here would leave the IRP writing into this frame's
-                // OVERLAPPED and into the caller's buffer after both go away, so
-                // cancel and then drain instead: CancelIoEx guarantees the
-                // request completes, which makes this second INFINITE wait
-                // return promptly with ERROR_OPERATION_ABORTED rather than
-                // block. Report the transfer as failed either way, so the
-                // caller falls back to memory instead of using partial bytes.
-                CancelIoEx(file, &overlapped);
-                GetOverlappedResult(file, &overlapped, &moved, TRUE);
-                SetLastError(write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT);
-                return false;
-            }
-        }
-        if (moved == 0) {
-            SetLastError(write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT);
-            return false;
-        }
-        done += moved;
-    }
-    return true;
+uint64_t defaultRamAudioCapBytes(uint32_t seconds) {
+    constexpr uint64_t kMinAudioCapacityBytes = 1024ull * 1024;
+    constexpr uint64_t kMaxAudioCapacityBytes = 4ull * 1024 * 1024 * 1024;
+    constexpr uint64_t kBytesPerSecond = 768000;
+    const uint64_t windowSeconds = (std::max<uint32_t>)(1, seconds);
+    return (std::min<uint64_t>)(
+        (std::max<uint64_t>)(windowSeconds * kBytesPerSecond, kMinAudioCapacityBytes),
+        kMaxAudioCapacityBytes);
 }
 
 } // namespace
@@ -376,11 +269,19 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
     const std::filesystem::path previousDirectory = ringDirectory_;
     settings_ = settings;
     ringDirectory_ = storageDirectory;
+    // Bound RAM too: a long window at a high bitrate would otherwise grow the
+    // process without limit. Failover keeps these, so the cap survives to RAM.
+    ramVideoCapacityBytes_ =
+        capacityBytes != 0 ? capacityBytes : defaultRamVideoCapBytes(settings.seconds);
+    ramAudioCapacityBytes_ =
+        audioCapacityBytes != 0 ? audioCapacityBytes : defaultRamAudioCapBytes(settings.seconds);
 
     if (!settings_.enabled) {
         video_.clear();
         systemAudio_.clear();
         microphoneAudio_.clear();
+        ramVideoBytes_ = 0;
+        ramAudioBytes_ = 0;
         clearBufferedVideoLocked();
         clearBufferedAudioLocked();
         lastSaveEndPts100ns_ = 0;
@@ -417,8 +318,8 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
     } else if (!usingDisk || directoryChanged) {
         // A backend or location switch makes buffered video unreadable in the
         // new configuration; drop it exactly like a codec change does.
-        openRingLocked(capacityBytes);
-    } else if (capacityBytes != ringCapacityBytes_) {
+        openRingWithFallbackLocked(capacityBytes);
+    } else if (capacityBytes != videoRing_.capacity()) {
         // A capacity change alone must not drop buffered video: the recorded
         // extents stay valid at their offsets, and settings_.seconds (already
         // applied above) reshapes the window on the next trim. Re-laying out a
@@ -426,10 +327,10 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
         // the resize waits until there is nothing left to invalidate - which is
         // what makes editing the replay window length non-destructive.
         if (diskVideo_.empty() && !savePinsRefs_) {
-            openRingLocked(capacityBytes);
+            openRingWithFallbackLocked(capacityBytes);
         } else {
             Logger::instance().info(L"replay",
-                L"Replay ring stays at " + std::to_wstring(ringCapacityBytes_ / (1024ull * 1024ull)) +
+                L"Replay ring stays at " + std::to_wstring(videoRing_.capacity() / (1024ull * 1024ull)) +
                 L" MiB while buffered video remains; the new capacity takes effect on a later settings change once the buffer has drained");
         }
     }
@@ -447,14 +348,14 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
         // audio, which is unreadable in the new configuration. Only the audio
         // window is dropped; video buffering is untouched.
         openAudioRingWithFallbackLocked(audioCapacityBytes);
-    } else if (audioCapacityBytes != audioRingCapacityBytes_) {
+    } else if (audioCapacityBytes != audioRing_.capacity()) {
         // Same non-destructive rule as the video ring: re-laying out a ring
         // that still holds packets would invalidate every live extent.
         if (diskSystemAudio_.empty() && diskMicrophoneAudio_.empty() && !savePinsRefs_) {
             openAudioRingWithFallbackLocked(audioCapacityBytes);
         } else {
             Logger::instance().info(L"replay",
-                L"Replay audio ring stays at " + std::to_wstring(audioRingCapacityBytes_ / (1024ull * 1024ull)) +
+                L"Replay audio ring stays at " + std::to_wstring(audioRing_.capacity() / (1024ull * 1024ull)) +
                 L" MiB while buffered audio remains; the new capacity takes effect on a later settings change once the buffer has drained");
         }
     }
@@ -462,12 +363,11 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
     trimLocked();
 }
 
-void ReplayBuffer::openRingLocked(uint64_t capacityBytes) {
+void ReplayBuffer::openRingWithFallbackLocked(uint64_t capacityBytes) {
     // Caller holds mutex_ and has already decided the buffer may be dropped.
     clearBufferedVideoLocked();
     closeRingLocked();
-    ringCapacityBytes_ = capacityBytes;
-    if (!openRingLocked()) {
+    if (!openRingLocked(capacityBytes)) {
         videoBackend_ = VideoBackend::Ram;
         // Surfaced on the Diagnostics page and next to the settings checkbox:
         // the user asked for a disk ring and is silently getting RAM, which
@@ -482,15 +382,43 @@ void ReplayBuffer::openRingLocked(uint64_t capacityBytes) {
     videoBackend_ = VideoBackend::Disk;
     setVideoFallbackReasonLocked({});
     Logger::instance().info(L"replay",
-        L"Replay video buffering moved to disk ring " + ringPath_.wstring() +
+        L"Replay video buffering moved to disk ring " + videoRing_.path().wstring() +
         L" (" + std::to_wstring(capacityBytes / (1024ull * 1024ull)) + L" MiB)");
+}
+
+bool ReplayBuffer::openRingLocked(uint64_t capacityBytes) {
+    if (ringPendingClose_) {
+        // A previous ring awaits its close. If a save is still reading it,
+        // reopening now is impossible without leaking the old handle.
+        if (savePinsRefs_) {
+            Logger::instance().warning(L"replay",
+                L"Cannot reopen the replay ring while a save is still reading the old one");
+            return false;
+        }
+        closeRingNowLocked();
+    }
+    return videoRing_.open(ringDirectory_ / kRingFolderName, kRingFileName, capacityBytes);
+}
+
+void ReplayBuffer::closeRingLocked() noexcept {
+    if (savePinsRefs_) {
+        // A save may still be reading through the handle; defer the physical
+        // close to pin release.
+        ringPendingClose_ = true;
+        return;
+    }
+    closeRingNowLocked();
+}
+
+void ReplayBuffer::closeRingNowLocked() noexcept {
+    videoRing_.closeNow();
+    ringPendingClose_ = false;
 }
 
 void ReplayBuffer::openAudioRingWithFallbackLocked(uint64_t capacityBytes) {
     // Caller holds mutex_ and has already decided the audio buffer may be dropped.
     clearBufferedAudioLocked();
     closeAudioRingLocked();
-    audioRingCapacityBytes_ = capacityBytes;
     if (!openAudioRingLocked(capacityBytes)) {
         audioBackend_ = AudioBackend::Ram;
         setAudioFallbackReasonLocked(
@@ -503,7 +431,7 @@ void ReplayBuffer::openAudioRingWithFallbackLocked(uint64_t capacityBytes) {
     audioBackend_ = AudioBackend::Disk;
     setAudioFallbackReasonLocked({});
     Logger::instance().info(L"replay",
-        L"Replay audio buffering moved to disk ring " + audioRingPath_.wstring() +
+        L"Replay audio buffering moved to disk ring " + audioRing_.path().wstring() +
         L" (" + std::to_wstring(capacityBytes / (1024ull * 1024ull)) + L" MiB)");
 }
 
@@ -516,41 +444,7 @@ bool ReplayBuffer::openAudioRingLocked(uint64_t capacityBytes) {
         }
         closeAudioRingNowLocked();
     }
-    std::error_code error;
-    const auto directory = ringDirectory_ / kRingFolderName;
-    std::filesystem::create_directories(directory, error);
-    if (error) {
-        Logger::instance().warning(L"replay",
-            L"Could not create replay ring folder " + directory.wstring() +
-            L" (" + utf8ToWide(error.message()) + L")");
-        return false;
-    }
-    audioRingPath_ = directory / kAudioRingFileName;
-    audioRingFile_ = CreateFileW(
-        audioRingPath_.c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-        nullptr);
-    if (audioRingFile_ == INVALID_HANDLE_VALUE) {
-        audioRingFile_ = nullptr;
-        Logger::instance().warning(L"replay",
-            L"Could not create replay audio ring file " + audioRingPath_.wstring() +
-            L" (Win32 error " + std::to_wstring(GetLastError()) + L")");
-        return false;
-    }
-    LARGE_INTEGER end{};
-    end.QuadPart = static_cast<LONGLONG>(capacityBytes);
-    if ((!SetFilePointerEx(audioRingFile_, end, nullptr, FILE_BEGIN) || !SetEndOfFile(audioRingFile_))) {
-        Logger::instance().warning(L"replay",
-            L"Could not pre-size replay audio ring file " + audioRingPath_.wstring() +
-            L" (Win32 error " + std::to_wstring(GetLastError()) + L"); it will grow as packets arrive");
-    }
-    audioRingWriteOffset_ = 0;
-    audioRingLiveBytes_ = 0;
-    return true;
+    return audioRing_.open(ringDirectory_ / kRingFolderName, kAudioRingFileName, capacityBytes);
 }
 
 void ReplayBuffer::closeAudioRingLocked() noexcept {
@@ -562,40 +456,18 @@ void ReplayBuffer::closeAudioRingLocked() noexcept {
 }
 
 void ReplayBuffer::closeAudioRingNowLocked() noexcept {
-    if (audioRingFile_) {
-        CloseHandle(audioRingFile_);
-        audioRingFile_ = nullptr;
-    }
-    if (!audioRingPath_.empty()) {
-        std::error_code error;
-        std::filesystem::remove(audioRingPath_, error);
-        // The folder is shared with the video ring, so only take it when it is
-        // actually empty; otherwise the video backend's file keeps it alive.
-        if (!error) {
-            std::error_code directoryError;
-            std::filesystem::remove(audioRingPath_.parent_path(), directoryError);
-        }
-        audioRingPath_.clear();
-    }
-    audioRingWriteOffset_ = 0;
-    audioRingLiveBytes_ = 0;
+    audioRing_.closeNow();
     audioRingPendingClose_ = false;
 }
 
 void ReplayBuffer::breakRingForTesting() noexcept {
     std::scoped_lock lock(mutex_);
-    if (ringFile_) {
-        CloseHandle(ringFile_);
-        ringFile_ = nullptr;
-    }
+    videoRing_.breakForTesting();
 }
 
 void ReplayBuffer::breakAudioRingForTesting() noexcept {
     std::scoped_lock lock(mutex_);
-    if (audioRingFile_) {
-        CloseHandle(audioRingFile_);
-        audioRingFile_ = nullptr;
-    }
+    audioRing_.breakForTesting();
 }
 
 void ReplayBuffer::pushVideo(EncodedPacket packet) {
@@ -641,6 +513,14 @@ void ReplayBuffer::pushVideo(EncodedPacket packet) {
     if (packet.keyFrame) {
         ++videoKeyFrames_;
     }
+    // A packet larger than the whole RAM cap can never fit, same as the ring.
+    if (ramVideoCapacityBytes_ > 0 && packet.bytes.size() > ramVideoCapacityBytes_) {
+        if (packet.keyFrame && videoKeyFrames_ > 0) {
+            --videoKeyFrames_;
+        }
+        return;
+    }
+    ramVideoBytes_ += packet.bytes.size();
     video_.push_back(std::make_shared<EncodedPacket>(std::move(packet)));
     trimLocked();
 }
@@ -693,6 +573,10 @@ void ReplayBuffer::pushAudio(AudioPacket packet) {
             L"being buffered in memory for the rest of this session. See the log for details.");
     }
     auto& queue = packet.track == AudioTrack::System ? systemAudio_ : microphoneAudio_;
+    if (ramAudioCapacityBytes_ > 0 && packet.bytes.size() > ramAudioCapacityBytes_) {
+        return;
+    }
+    ramAudioBytes_ += packet.bytes.size();
     queue.push_back(std::make_shared<AudioPacket>(std::move(packet)));
     trimLocked();
 }
@@ -732,15 +616,15 @@ bool ReplayBuffer::saveTo(
     bool diskMode = false;
     bool diskAudioMode = false;
     // Read under the same lock as the packet snapshot: a concurrent configure
-    // can move or clear ringPath_, and the pin release below may clear it too.
+    // can replace the ring files, and the pin release below may close them too.
     std::filesystem::path ringPath;
     std::filesystem::path audioRingPath;
     {
         std::scoped_lock lock(mutex_);
         diskMode = videoBackend_ == VideoBackend::Disk;
         diskAudioMode = audioBackend_ == AudioBackend::Disk;
-        ringPath = ringPath_;
-        audioRingPath = audioRingPath_;
+        ringPath = videoRing_.path();
+        audioRingPath = audioRing_.path();
         if (diskMode) {
             video.reserve(diskVideo_.size());
             for (const auto& entry : diskVideo_) {
@@ -917,18 +801,11 @@ bool ReplayBuffer::saveTo(
     }
     ScopedDirectoryCleanup cleanup(tempDirectory);
 
-    // A recovery manifest left here belongs to a previous failed save whose
-    // elementary streams this attempt is about to truncate. Remove it before
-    // opening the streams so a crash mid-attempt can never leave a manifest
-    // describing bytes the streams no longer contain; this attempt publishes
-    // a fresh manifest (matching the new streams) right before muxing.
-    const std::wstring staleManifestNames[] = {
-        std::wstring(RecoveryStore::kRecoveryManifestName),
-        std::wstring(RecoveryStore::kRecoveryManifestName) + L".tmp"};
-    for (const auto& staleName : staleManifestNames) {
-        std::error_code removeError;
-        std::filesystem::remove(tempDirectory / staleName, removeError);
-    }
+    // A stale manifest belongs to a previous failed save whose elementary
+    // streams this attempt is about to truncate; drop it before opening the
+    // streams so a crash mid-attempt can never describe bytes that no longer
+    // exist. This attempt publishes a fresh manifest before muxing.
+    RecoveryStore::clearStaleManifest(tempDirectory);
 
     const auto videoPath = tempDirectory / (videoSettings.codec == VideoCodec::H264 ? L"replay.h264" : L"replay.hevc");
 
@@ -960,12 +837,12 @@ bool ReplayBuffer::saveTo(
         const uint32_t totalBytes = snapshot.first.byteCount + snapshot.second.byteCount;
         ringScratch.resize(totalBytes);
         if (snapshot.first.byteCount != 0 &&
-            !readRingLocked(snapshot.first.offset, ringScratch.data(), snapshot.first.byteCount)) {
+            !videoRing_.read(snapshot.first.offset, ringScratch.data(), snapshot.first.byteCount)) {
             ringReadFailed = true;
             return false;
         }
         if (snapshot.second.byteCount != 0 &&
-            !readRingLocked(
+            !videoRing_.read(
                 snapshot.second.offset,
                 ringScratch.data() + snapshot.first.byteCount,
                 snapshot.second.byteCount)) {
@@ -989,9 +866,9 @@ bool ReplayBuffer::saveTo(
         const uint32_t totalBytes = first.first.byteCount + first.second.byteCount;
         ringScratch.resize(totalBytes);
         const bool probeRead =
-            readRingLocked(first.first.offset, ringScratch.data(), first.first.byteCount) &&
+            videoRing_.read(first.first.offset, ringScratch.data(), first.first.byteCount) &&
             (first.second.byteCount == 0 ||
-             readRingLocked(
+             videoRing_.read(
                  first.second.offset,
                  ringScratch.data() + first.first.byteCount,
                  first.second.byteCount));
@@ -1018,11 +895,10 @@ bool ReplayBuffer::saveTo(
     uint64_t videoOffset = 0;
     for (size_t index = 0; index < video.size(); ++index) {
         const SnapshottedVideo& snapshot = video[index];
-        // A decode timestamp is used only when explicitly flagged valid:
-        // values can legitimately be zero or negative, so no numeric sentinel
-        // works. When the flag is missing (or the DTS regressed past the PTS,
-        // which the encoders never produce), presentation time stands in.
-        const bool hasDts = snapshot.meta.hasDts && snapshot.meta.dts100ns <= snapshot.meta.pts100ns;
+        // Shared validity rule with the recording path (mux/Mp4Muxer.h): a
+        // decode timestamp counts only when explicitly flagged, and values
+        // can legitimately be zero or negative, so no numeric sentinel works.
+        const bool hasDts = hasEffectiveDts(snapshot.meta.pts100ns, snapshot.meta.dts100ns, snapshot.meta.hasDts);
         const uint32_t payloadBytes = snapshot.ram
             ? static_cast<uint32_t>(snapshot.ram->bytes.size())
             : snapshot.first.byteCount + snapshot.second.byteCount;
@@ -1035,7 +911,7 @@ bool ReplayBuffer::saveTo(
             videoOffset,
             sampleBytes,
             snapshot.meta.pts100ns,
-            hasDts ? snapshot.meta.dts100ns : snapshot.meta.pts100ns,
+            effectiveDts(snapshot.meta.pts100ns, snapshot.meta.dts100ns, snapshot.meta.hasDts),
             hasDts,
             snapshot.meta.duration100ns,
             snapshot.meta.keyFrame});
@@ -1052,12 +928,12 @@ bool ReplayBuffer::saveTo(
                 const uint32_t totalBytes = entry.first.byteCount + entry.second.byteCount;
                 ringScratch.resize(totalBytes);
                 if (entry.first.byteCount != 0 &&
-                    !readAudioRingLocked(entry.first.offset, ringScratch.data(), entry.first.byteCount)) {
+                    !audioRing_.read(entry.first.offset, ringScratch.data(), entry.first.byteCount)) {
                     audioRingReadFailed = true;
                     return;
                 }
                 if (entry.second.byteCount != 0 &&
-                    !readAudioRingLocked(
+                    !audioRing_.read(
                         entry.second.offset,
                         ringScratch.data() + entry.first.byteCount,
                         entry.second.byteCount)) {
@@ -1164,59 +1040,31 @@ bool ReplayBuffer::saveTo(
     inputs.bitrateKbps = videoSettings.bitrateKbps;
     inputs.resolutionMode = videoSettings.resolutionMode;
 
-    // Mirror the recording finalize path: persist the recovery manifest (and
-    // readme) before muxing, so a failed save keeps the elementary streams
-    // recoverable via "Recover Failed" or the startup sweep instead of
-    // destroying them. The replay temp layout matches what
+    // Shared publish tail with the recording finalize path: manifest+readme
+    // first, then mux with retry. The temp layout matches what
     // recoverLatestFailedRecording scans, so recovery needs no special case.
-    const bool manifestWritten = RecoveryStore::writeManifest(inputs, tempDirectory);
-    RecoveryStore::writeReadme(inputs, tempDirectory);
-
-    std::wstring muxErrorDetail;
-    // Same retry wrapper the recording finalize uses: a transient Media
-    // Foundation init/finalize failure should not fail a save that one retry
-    // would pass.
-    const bool ok = RecoveryStore::muxToMp4WithRetry(inputs, outputPath, &muxErrorDetail);
-    if (ok) {
-        cleanup.cleanup();
-        std::scoped_lock lock(mutex_);
-        lastSaveEndPts100ns_ = newestVideoEndPts;
-        Logger::instance().info(L"replay", L"Replay saved: " + outputPath.wstring());
-    } else {
-        // Only an empty output-name reservation may be removed; a real file
-        // that appeared at the target in the meantime must survive.
-        removeEmptyOutputReservation(outputPath);
-        if (manifestWritten) {
-            // The manifest exactly describes the streams on disk: keep the
-            // directory so the clip stays recoverable.
-            cleanup.release();
-            if (errorDetail) {
-                *errorDetail = RecoveryStore::preservedRecordingDetail(
-                    outputPath,
-                    tempDirectory,
-                    inputs,
-                    muxErrorDetail.empty() ? L"MP4 muxing failed; see log for details" : muxErrorDetail);
-            }
-            Logger::instance().warning(L"replay",
-                L"Replay mux failed; preserved elementary streams for recovery in " + tempDirectory.wstring());
-        } else {
-            // Every elementary-stream write above was verified before this
-            // point, so a manifest that will not publish means the disk or the
-            // folder failed, not that a scanner briefly held recovery.tsv (that
-            // race is retried inside writeManifest). A directory with streams
-            // but no manifest is skipped by recoverLatestFailedRecording and
-            // swept as garbage later, so keeping it would only promise the user
-            // a recovery that cannot happen. Remove it.
+    switch (RecoveryStore::publishMuxedInputs(inputs, outputPath, tempDirectory, errorDetail)) {
+        case RecoveryStore::MuxPublishResult::kPublished:
             cleanup.cleanup();
-            if (errorDetail) {
-                *errorDetail = muxErrorDetail.empty() ? L"MP4 muxing failed; see log for details" : muxErrorDetail;
+            {
+                std::scoped_lock lock(mutex_);
+                lastSaveEndPts100ns_ = newestVideoEndPts;
+                Logger::instance().info(L"replay", L"Replay saved: " + outputPath.wstring());
             }
-            Logger::instance().warning(L"replay",
-                L"Replay mux failed and no recovery manifest could be written; removed temporary replay files for " +
-                outputPath.wstring());
-        }
+            return true;
+        case RecoveryStore::MuxPublishResult::kPreservedForRecovery:
+            // The manifest describes the streams on disk: keep the directory
+            // so the clip stays recoverable. errorDetail already carries the
+            // preserved-recording reason.
+            cleanup.release();
+            return false;
+        case RecoveryStore::MuxPublishResult::kFailed:
+            // No manifest, so nothing is recoverable; drop the directory
+            // rather than promise a recovery that cannot happen.
+            cleanup.cleanup();
+            return false;
     }
-    return ok;
+    return false;
 }
 
 void ReplayBuffer::clear() {
@@ -1224,6 +1072,8 @@ void ReplayBuffer::clear() {
     video_.clear();
     systemAudio_.clear();
     microphoneAudio_.clear();
+    ramVideoBytes_ = 0;
+    ramAudioBytes_ = 0;
     clearBufferedVideoLocked();
     clearBufferedAudioLocked();
     lastSaveEndPts100ns_ = 0;
@@ -1348,7 +1198,7 @@ void ReplayBuffer::trimLocked() {
 
             auto popDiskFront = [&]() {
                 const DiskVideoPacket& front = diskVideo_.front();
-                ringLiveBytes_ -= front.first.byteCount + front.second.byteCount;
+                videoRing_.releaseBytes(front.first.byteCount + front.second.byteCount);
                 if (front.meta.keyFrame && diskVideoKeyFrames_ > 0) {
                     --diskVideoKeyFrames_;
                 }
@@ -1376,6 +1226,8 @@ void ReplayBuffer::trimLocked() {
             systemAudio_.clear();
             microphoneAudio_.clear();
             videoKeyFrames_ = 0;
+            ramVideoBytes_ = 0;
+            ramAudioBytes_ = 0;
             lastSaveEndPts100ns_ = 0;
             publishCountersLocked();
             return;
@@ -1385,10 +1237,13 @@ void ReplayBuffer::trimLocked() {
         const int64_t oldestAllowed = newestPts - secondsTo100ns(settings_.seconds);
 
         auto popVideoFront = [&]() {
-            if (!video_.empty() && video_.front()->keyFrame && videoKeyFrames_ > 0) {
-                --videoKeyFrames_;
+            if (!video_.empty()) {
+                ramVideoBytes_ -= video_.front()->bytes.size();
+                if (video_.front()->keyFrame && videoKeyFrames_ > 0) {
+                    --videoKeyFrames_;
+                }
+                video_.pop_front();
             }
-            video_.pop_front();
         };
 
         while (!video_.empty() && video_.front()->pts100ns < oldestAllowed) {
@@ -1403,33 +1258,60 @@ void ReplayBuffer::trimLocked() {
                 popVideoFront();
             }
         }
+        // RAM byte cap, same realign as the disk ring: evict oldest until
+        // under the cap, dropping the stranded P-frames before each keyframe
+        // so the buffer stays decodable. Safe mid-save: RAM snapshots hold
+        // shared_ptrs, so no pin wait is needed.
+        while (ramVideoCapacityBytes_ > 0 && ramVideoBytes_ > ramVideoCapacityBytes_ && !video_.empty()) {
+            popVideoFront();
+            const auto nextKeyFrame = std::find_if(
+                video_.begin(), video_.end(), [](const auto& packet) { return packet->keyFrame; });
+            if (nextKeyFrame == video_.end()) {
+                continue;
+            }
+            const auto stranded =
+                static_cast<size_t>(std::distance(video_.begin(), nextKeyFrame));
+            for (size_t index = 0; index < stranded; ++index) {
+                popVideoFront();
+            }
+        }
     }
 
-    auto trimPacketQueue = [&](auto& queue) {
-        const int64_t referencePts = videoBackend_ == VideoBackend::Disk
-            ? (diskVideo_.empty() ? 0 : diskVideo_.back().meta.pts100ns)
-            : (video_.empty() ? 0 : video_.back()->pts100ns);
-        const int64_t oldestAllowed = referencePts - secondsTo100ns(settings_.seconds);
-        while (!queue.empty() && audioPacketEndPts100ns(*queue.front()) <= oldestAllowed) {
+    // One audio trim for both backends and both bounds below: RAM packets
+    // subtract their RAM bytes, disk packets release their ring bytes. The
+    // end-time function differs because the disk metadata is not an
+    // AudioPacket.
+    const int64_t newestAudioReferencePts = videoBackend_ == VideoBackend::Disk
+        ? (diskVideo_.empty() ? 0 : diskVideo_.back().meta.pts100ns)
+        : (video_.empty() ? 0 : video_.back()->pts100ns);
+    const int64_t oldestAudioAllowed = newestAudioReferencePts - secondsTo100ns(settings_.seconds);
+    auto trimAudioQueue = [](auto& queue, int64_t bound, auto endPts, auto evicted) {
+        while (!queue.empty() && endPts(queue.front()) <= bound) {
+            evicted(queue.front());
             queue.pop_front();
         }
     };
-
-    auto trimDiskAudioQueue = [&](auto& queue) {
-        const int64_t referencePts = videoBackend_ == VideoBackend::Disk
-            ? (diskVideo_.empty() ? 0 : diskVideo_.back().meta.pts100ns)
-            : (video_.empty() ? 0 : video_.back()->pts100ns);
-        const int64_t oldestAllowed = referencePts - secondsTo100ns(settings_.seconds);
-        while (!queue.empty() && diskAudioPacketEndPts100ns(queue.front()) <= oldestAllowed) {
-            audioRingLiveBytes_ -= queue.front().first.byteCount + queue.front().second.byteCount;
-            queue.pop_front();
-        }
+    auto ramAudioEndPts = [](const std::shared_ptr<const AudioPacket>& packet) {
+        return audioPacketEndPts100ns(*packet);
+    };
+    auto dropRamAudio = [this](const std::shared_ptr<const AudioPacket>& packet) {
+        ramAudioBytes_ -= packet->bytes.size();
+    };
+    auto diskAudioEndPts = [](const DiskAudioPacket& packet) {
+        return diskAudioPacketEndPts100ns(packet);
+    };
+    auto releaseDiskAudio = [this](const DiskAudioPacket& packet) {
+        audioRing_.releaseBytes(packet.first.byteCount + packet.second.byteCount);
     };
 
     const bool videoEmpty = videoBackend_ == VideoBackend::Disk ? diskVideo_.empty() : video_.empty();
     if (videoEmpty) {
         systemAudio_.clear();
         microphoneAudio_.clear();
+        ramAudioBytes_ = 0;
+        if (video_.empty()) {
+            ramVideoBytes_ = 0;
+        }
         // Pinned extents keep their bytes until the deferred close, so a
         // mid-save clear must not make the ring look free (see
         // clearBufferedVideoLocked). The pin release path trims again.
@@ -1443,32 +1325,35 @@ void ReplayBuffer::trimLocked() {
         return;
     }
 
-    trimPacketQueue(systemAudio_);
-    trimPacketQueue(microphoneAudio_);
+    trimAudioQueue(systemAudio_, oldestAudioAllowed, ramAudioEndPts, dropRamAudio);
+    trimAudioQueue(microphoneAudio_, oldestAudioAllowed, ramAudioEndPts, dropRamAudio);
     if (!savePinsRefs_) {
-        trimDiskAudioQueue(diskSystemAudio_);
-        trimDiskAudioQueue(diskMicrophoneAudio_);
+        trimAudioQueue(diskSystemAudio_, oldestAudioAllowed, diskAudioEndPts, releaseDiskAudio);
+        trimAudioQueue(diskMicrophoneAudio_, oldestAudioAllowed, diskAudioEndPts, releaseDiskAudio);
     }
 
     const int64_t videoStartPts = videoBackend_ == VideoBackend::Disk
         ? diskVideo_.front().meta.pts100ns
         : video_.front()->pts100ns;
-    auto trimAudioPacketQueueBeforeVideo = [videoStartPts](auto& queue) {
-        while (!queue.empty() && audioPacketEndPts100ns(*queue.front()) <= videoStartPts) {
-            queue.pop_front();
-        }
-    };
-    trimAudioPacketQueueBeforeVideo(systemAudio_);
-    trimAudioPacketQueueBeforeVideo(microphoneAudio_);
+    trimAudioQueue(systemAudio_, videoStartPts, ramAudioEndPts, dropRamAudio);
+    trimAudioQueue(microphoneAudio_, videoStartPts, ramAudioEndPts, dropRamAudio);
     if (!savePinsRefs_) {
-        auto trimDiskAudioQueueBeforeVideo = [this, videoStartPts](auto& queue) {
-            while (!queue.empty() && diskAudioPacketEndPts100ns(queue.front()) <= videoStartPts) {
-                audioRingLiveBytes_ -= queue.front().first.byteCount + queue.front().second.byteCount;
-                queue.pop_front();
-            }
-        };
-        trimDiskAudioQueueBeforeVideo(diskSystemAudio_);
-        trimDiskAudioQueueBeforeVideo(diskMicrophoneAudio_);
+        trimAudioQueue(diskSystemAudio_, videoStartPts, diskAudioEndPts, releaseDiskAudio);
+        trimAudioQueue(diskMicrophoneAudio_, videoStartPts, diskAudioEndPts, releaseDiskAudio);
+    }
+    // RAM audio byte cap: plain oldest-first across both tracks by front PTS,
+    // same policy as the audio ring. Safe mid-save for the same shared_ptr
+    // reason as RAM video.
+    while (ramAudioCapacityBytes_ > 0 && ramAudioBytes_ > ramAudioCapacityBytes_ &&
+           (!systemAudio_.empty() || !microphoneAudio_.empty())) {
+        const int64_t systemPts =
+            systemAudio_.empty() ? (std::numeric_limits<int64_t>::max)() : systemAudio_.front()->pts100ns;
+        const int64_t microphonePts = microphoneAudio_.empty()
+            ? (std::numeric_limits<int64_t>::max)()
+            : microphoneAudio_.front()->pts100ns;
+        auto& oldest = systemPts <= microphonePts ? systemAudio_ : microphoneAudio_;
+        ramAudioBytes_ -= oldest.front()->bytes.size();
+        oldest.pop_front();
     }
     publishCountersLocked();
 }
@@ -1478,171 +1363,42 @@ void ReplayBuffer::clearBufferedVideoLocked() {
     diskVideo_.clear();
     videoKeyFrames_ = 0;
     diskVideoKeyFrames_ = 0;
-    ringLiveBytes_ = 0;
+    ramVideoBytes_ = 0;
+    videoRing_.clearLive();
     publishCountersLocked();
-    // ringWriteOffset_ deliberately survives: re-zeroing it would point the
+    // The write cursor deliberately survives: re-zeroing it would point the
     // next push at offset 0, the most likely place for a still-pinned save to
     // have unread bytes. Resuming from the current cursor keeps the write head
     // at least a full buffer ahead of that. It does NOT make clear() safe
-    // during a pin - zeroing ringLiveBytes_ makes the whole ring look free, so
+    // during a pin - zeroing the live count makes the whole ring look free, so
     // a push could wrap onto pinned bytes. That is why every caller other than
     // failOverToRamLocked runs on the controller worker, serialized against
     // saveReplay. failOverToRamLocked is the one caller that can clear from the
     // encode thread mid-pin, and it is safe only because it immediately flips
     // the backend to RAM, so no push writes the ring again and the pinned
     // extents keep their bytes until the deferred close. Any new caller must
-    // preserve one of those two properties. Only openRingLocked and
-    // closeRingNowLocked reset the cursor.
-}
-
-bool ReplayBuffer::openRingLocked() {
-    if (ringPendingClose_) {
-        // A previous ring awaits its close. If a save is still reading it,
-        // reopening now is impossible without leaking the old handle.
-        if (savePinsRefs_) {
-            Logger::instance().warning(L"replay",
-                L"Cannot reopen the replay ring while a save is still reading the old one");
-            return false;
-        }
-        closeRingNowLocked();
-    }
-    std::error_code error;
-    const auto directory = ringDirectory_ / kRingFolderName;
-    std::filesystem::create_directories(directory, error);
-    if (error) {
-        Logger::instance().warning(L"replay",
-            L"Could not create replay ring folder " + directory.wstring() +
-            L" (" + utf8ToWide(error.message()) + L")");
-        return false;
-    }
-    ringPath_ = directory / kRingFileName;
-    ringFile_ = CreateFileW(
-        ringPath_.c_str(),
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ,
-        nullptr,
-        CREATE_ALWAYS,
-        // Overlapped: every transfer names its own offset, so save reads and
-        // push writes never share a file position.
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
-        nullptr);
-    if (ringFile_ == INVALID_HANDLE_VALUE) {
-        ringFile_ = nullptr;
-        Logger::instance().warning(L"replay",
-            L"Could not create replay ring file " + ringPath_.wstring() +
-            L" (Win32 error " + std::to_wstring(GetLastError()) + L")");
-        return false;
-    }
-    // Pre-size the file so the steady-state footprint is fixed from the
-    // start. NTFS assigns real clusters lazily, so this costs no I/O beyond
-    // metadata until packets actually occupy the ranges.
-    LARGE_INTEGER end{};
-    end.QuadPart = static_cast<LONGLONG>(ringCapacityBytes_);
-    if ((!SetFilePointerEx(ringFile_, end, nullptr, FILE_BEGIN) || !SetEndOfFile(ringFile_))) {
-        Logger::instance().warning(L"replay",
-            L"Could not pre-size replay ring file " + ringPath_.wstring() +
-            L" (Win32 error " + std::to_wstring(GetLastError()) + L"); it will grow as packets arrive");
-    }
-    ringWriteOffset_ = 0;
-    ringLiveBytes_ = 0;
-    return true;
-}
-
-void ReplayBuffer::closeRingLocked() noexcept {
-    if (savePinsRefs_) {
-        // A save may still be reading through the handle; defer the physical
-        // close to pin release.
-        ringPendingClose_ = true;
-        return;
-    }
-    closeRingNowLocked();
-}
-
-void ReplayBuffer::closeRingNowLocked() noexcept {
-    if (ringFile_) {
-        CloseHandle(ringFile_);
-        ringFile_ = nullptr;
-    }
-    if (!ringPath_.empty()) {
-        std::error_code error;
-        std::filesystem::remove(ringPath_, error);
-        // The folder is shared with the audio ring, so only take it when it
-        // is actually empty; otherwise the audio backend's file keeps it
-        // alive. Only attempted when the ring file itself is gone.
-        const auto directory = ringPath_.parent_path();
-        if (!error) {
-            std::error_code directoryError;
-            std::filesystem::remove(directory, directoryError);
-        }
-        ringPath_.clear();
-    }
-    ringWriteOffset_ = 0;
-    ringLiveBytes_ = 0;
-    ringPendingClose_ = false;
+    // preserve one of those two properties. Only RingFile::open and closeNow
+    // reset the cursor.
 }
 
 bool ReplayBuffer::ensureRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size) {
-    const uint64_t capacity = ringCapacityBytes_;
-    if (size > capacity) {
-        Logger::instance().warning(L"replay",
-            L"Replay ring packet of " + std::to_wstring(size) +
-            L" bytes exceeds the entire ring capacity; dropping it");
-        return false;
-    }
-    // Saturating free-space: a VBR overshoot can push ringLiveBytes_ past the
-    // capacity; without the clamp the unsigned difference would wrap to ~2^64
-    // and defeat every eviction/wait decision below.
-    const uint64_t freeBytes = ringLiveBytes_ >= capacity ? 0 : capacity - ringLiveBytes_;
-    if (freeBytes >= size) {
-        return true;
-    }
-    while (true) {
-        if (savePinsRefs_) {
-            // A save is still consuming pinned refs; wait for it to finish
-            // rather than evicting packets it may not have read yet.
-            ringSpace_.wait(lock);
-        } else {
-            freeRingSpaceLocked(size);
-        }
-        const uint64_t availableNow =
-            ringLiveBytes_ >= capacity ? 0 : capacity - ringLiveBytes_;
-        if (availableNow >= size) {
-            return true;
-        }
-        if (!savePinsRefs_ && diskVideo_.empty()) {
-            // Everything evicted and still not enough cannot happen
-            // (size <= capacity), but bail out defensively instead of spinning.
-            Logger::instance().warning(L"replay", L"Replay ring could not free enough space; dropping a packet");
-            return false;
-        }
-    }
+    // Video eviction policy: freeRingSpaceLocked realigns to the next
+    // keyframe so the buffer stays independently decodable.
+    return videoRing_.ensureSpace(
+        lock,
+        size,
+        savePinsRefs_,
+        ringSpace_,
+        [this](uint64_t bytesNeeded) { freeRingSpaceLocked(bytesNeeded); },
+        [this] { return diskVideo_.empty(); },
+        L"ring");
 }
 
 bool ReplayBuffer::appendRingLocked(const EncodedPacket& packet) {
-    if (!ringFile_ && !openRingLocked()) {
+    if (!videoRing_.isOpen() && !openRingLocked(videoRing_.capacity())) {
         return false;
     }
-    const uint64_t capacity = ringCapacityBytes_;
     const uint32_t size = static_cast<uint32_t>(packet.bytes.size());
-
-    // Explicit-offset overlapped writes: the handle carries no file position,
-    // so a save reading concurrently can never observe a torn seek/write pair.
-    auto writeAt = [this](uint64_t offset, const uint8_t* data, DWORD byteCount) -> bool {
-        return transferRing(ringFile_, true, offset, const_cast<uint8_t*>(data), byteCount);
-    };
-
-    const uint64_t firstSize = std::min<uint64_t>(size, capacity - ringWriteOffset_);
-    const uint64_t secondSize = size - firstSize;
-    if (firstSize > 0 && !writeAt(ringWriteOffset_, packet.bytes.data(), static_cast<DWORD>(firstSize))) {
-        Logger::instance().warning(L"replay",
-            L"Replay ring write failed (Win32 error " + std::to_wstring(GetLastError()) + L")");
-        return false;
-    }
-    if (secondSize > 0 && !writeAt(0, packet.bytes.data() + firstSize, static_cast<DWORD>(secondSize))) {
-        Logger::instance().warning(L"replay",
-            L"Replay ring wrap write failed (Win32 error " + std::to_wstring(GetLastError()) + L")");
-        return false;
-    }
 
     DiskVideoPacket entry;
     entry.meta.pts100ns = packet.pts100ns;
@@ -1650,11 +1406,9 @@ bool ReplayBuffer::appendRingLocked(const EncodedPacket& packet) {
     entry.meta.duration100ns = packet.duration100ns;
     entry.meta.hasDts = packet.hasDts;
     entry.meta.keyFrame = packet.keyFrame;
-    entry.first = RingExtent{ringWriteOffset_, static_cast<uint32_t>(firstSize)};
-    // secondSize == 0 marks a non-wrapping packet; its offset is unused.
-    entry.second = RingExtent{0, static_cast<uint32_t>(secondSize)};
-    ringWriteOffset_ = (ringWriteOffset_ + size) % capacity;
-    ringLiveBytes_ += size;
+    if (!videoRing_.writeWrapped(packet.bytes.data(), size, entry.first, entry.second, L"ring")) {
+        return false;
+    }
     if (entry.meta.keyFrame) {
         ++diskVideoKeyFrames_;
     }
@@ -1663,21 +1417,10 @@ bool ReplayBuffer::appendRingLocked(const EncodedPacket& packet) {
     return true;
 }
 
-bool ReplayBuffer::readRingLocked(uint64_t offset, uint8_t* destination, uint32_t size) const {
-    if (!ringFile_ || size == 0) {
-        return size == 0;
-    }
-    return transferRing(ringFile_, false, offset, destination, size);
-}
-
 void ReplayBuffer::freeRingSpaceLocked(uint64_t bytesNeeded) {
-    // Saturating subtraction: see ensureRingSpaceLocked.
-    const auto freeBytes = [this]() {
-        return ringLiveBytes_ >= ringCapacityBytes_ ? 0 : ringCapacityBytes_ - ringLiveBytes_;
-    };
-    while (!diskVideo_.empty() && freeBytes() < bytesNeeded) {
+    while (!diskVideo_.empty() && videoRing_.freeBytes() < bytesNeeded) {
         const DiskVideoPacket& front = diskVideo_.front();
-        ringLiveBytes_ -= front.first.byteCount + front.second.byteCount;
+        videoRing_.releaseBytes(front.first.byteCount + front.second.byteCount);
         if (front.meta.keyFrame && diskVideoKeyFrames_ > 0) {
             --diskVideoKeyFrames_;
         }
@@ -1693,7 +1436,7 @@ void ReplayBuffer::freeRingSpaceLocked(uint64_t bytesNeeded) {
                 static_cast<size_t>(std::distance(diskVideo_.begin(), firstBufferedKeyFrame));
             for (size_t index = 0; index < packetsBeforeKeyFrame; ++index) {
                 const DiskVideoPacket& stale = diskVideo_.front();
-                ringLiveBytes_ -= stale.first.byteCount + stale.second.byteCount;
+                videoRing_.releaseBytes(stale.first.byteCount + stale.second.byteCount);
                 if (stale.meta.keyFrame && diskVideoKeyFrames_ > 0) {
                     --diskVideoKeyFrames_;
                 }
@@ -1720,9 +1463,9 @@ void ReplayBuffer::failOverToRamLocked(std::wstring reason) {
 void ReplayBuffer::clearBufferedAudioLocked() {
     diskSystemAudio_.clear();
     diskMicrophoneAudio_.clear();
-    audioRingLiveBytes_ = 0;
-    // audioRingWriteOffset_ deliberately survives, for the same reason the
-    // video cursor does in clearBufferedVideoLocked.
+    audioRing_.clearLive();
+    // The write cursor deliberately survives, for the same reason the video
+    // cursor does in clearBufferedVideoLocked.
 }
 
 void ReplayBuffer::failOverAudioToRamLocked(std::wstring reason) {
@@ -1736,58 +1479,23 @@ void ReplayBuffer::failOverAudioToRamLocked(std::wstring reason) {
 }
 
 bool ReplayBuffer::ensureAudioRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size) {
-    const uint64_t capacity = audioRingCapacityBytes_;
-    if (size > capacity) {
-        Logger::instance().warning(L"replay",
-            L"Replay audio ring packet of " + std::to_wstring(size) +
-            L" bytes exceeds the entire audio ring capacity; dropping it");
-        return false;
-    }
-    const uint64_t freeBytes = audioRingLiveBytes_ >= capacity ? 0 : capacity - audioRingLiveBytes_;
-    if (freeBytes >= size) {
-        return true;
-    }
-    while (true) {
-        if (savePinsRefs_) {
-            ringSpace_.wait(lock);
-        } else {
-            freeAudioRingSpaceLocked(size);
-        }
-        const uint64_t availableNow =
-            audioRingLiveBytes_ >= capacity ? 0 : capacity - audioRingLiveBytes_;
-        if (availableNow >= size) {
-            return true;
-        }
-        if (!savePinsRefs_ && diskSystemAudio_.empty() && diskMicrophoneAudio_.empty()) {
-            Logger::instance().warning(L"replay", L"Replay audio ring could not free enough space; dropping a packet");
-            return false;
-        }
-    }
+    // Audio eviction policy: plain oldest-first across both tracks, since
+    // audio packets stand alone with no keyframe realignment.
+    return audioRing_.ensureSpace(
+        lock,
+        size,
+        savePinsRefs_,
+        ringSpace_,
+        [this](uint64_t bytesNeeded) { freeAudioRingSpaceLocked(bytesNeeded); },
+        [this] { return diskSystemAudio_.empty() && diskMicrophoneAudio_.empty(); },
+        L"audio ring");
 }
 
 bool ReplayBuffer::appendAudioRingLocked(const AudioPacket& packet) {
-    if (!audioRingFile_ && !openAudioRingLocked(audioRingCapacityBytes_)) {
+    if (!audioRing_.isOpen() && !openAudioRingLocked(audioRing_.capacity())) {
         return false;
     }
-    const uint64_t capacity = audioRingCapacityBytes_;
     const uint32_t size = static_cast<uint32_t>(packet.bytes.size());
-
-    auto writeAt = [this](uint64_t offset, const uint8_t* data, DWORD byteCount) -> bool {
-        return transferRing(audioRingFile_, true, offset, const_cast<uint8_t*>(data), byteCount);
-    };
-
-    const uint64_t firstSize = std::min<uint64_t>(size, capacity - audioRingWriteOffset_);
-    const uint64_t secondSize = size - firstSize;
-    if (firstSize > 0 && !writeAt(audioRingWriteOffset_, packet.bytes.data(), static_cast<DWORD>(firstSize))) {
-        Logger::instance().warning(L"replay",
-            L"Replay audio ring write failed (Win32 error " + std::to_wstring(GetLastError()) + L")");
-        return false;
-    }
-    if (secondSize > 0 && !writeAt(0, packet.bytes.data() + firstSize, static_cast<DWORD>(secondSize))) {
-        Logger::instance().warning(L"replay",
-            L"Replay audio ring wrap write failed (Win32 error " + std::to_wstring(GetLastError()) + L")");
-        return false;
-    }
 
     DiskAudioPacket entry;
     entry.track = packet.track;
@@ -1795,39 +1503,28 @@ bool ReplayBuffer::appendAudioRingLocked(const AudioPacket& packet) {
     entry.pts100ns = packet.pts100ns;
     entry.frameCount = packet.frameCount;
     entry.format = packet.format;
-    entry.first = RingExtent{audioRingWriteOffset_, static_cast<uint32_t>(firstSize)};
-    entry.second = RingExtent{0, static_cast<uint32_t>(secondSize)};
-    audioRingWriteOffset_ = (audioRingWriteOffset_ + size) % capacity;
-    audioRingLiveBytes_ += size;
+    if (!audioRing_.writeWrapped(packet.bytes.data(), size, entry.first, entry.second, L"audio ring")) {
+        return false;
+    }
     auto& queue = packet.track == AudioTrack::System ? diskSystemAudio_ : diskMicrophoneAudio_;
     queue.push_back(std::move(entry));
     trimLocked();
     return true;
 }
 
-bool ReplayBuffer::readAudioRingLocked(uint64_t offset, uint8_t* destination, uint32_t size) const {
-    if (!audioRingFile_ || size == 0) {
-        return size == 0;
-    }
-    return transferRing(audioRingFile_, false, offset, destination, size);
-}
-
 void ReplayBuffer::freeAudioRingSpaceLocked(uint64_t bytesNeeded) {
     // Audio has no keyframe realignment: every packet stands alone, so plain
     // oldest-first eviction across both tracks (by front PTS) keeps the window
     // coherent without stranding anything.
-    const auto freeBytes = [this]() {
-        return audioRingLiveBytes_ >= audioRingCapacityBytes_ ? 0 : audioRingCapacityBytes_ - audioRingLiveBytes_;
-    };
     auto frontPts = [](const std::deque<DiskAudioPacket>& queue) {
         return queue.empty() ? (std::numeric_limits<int64_t>::max)() : queue.front().pts100ns;
     };
-    while ((!diskSystemAudio_.empty() || !diskMicrophoneAudio_.empty()) && freeBytes() < bytesNeeded) {
+    while ((!diskSystemAudio_.empty() || !diskMicrophoneAudio_.empty()) && audioRing_.freeBytes() < bytesNeeded) {
         auto& queue = frontPts(diskSystemAudio_) <= frontPts(diskMicrophoneAudio_)
             ? diskSystemAudio_
             : diskMicrophoneAudio_;
         const DiskAudioPacket& front = queue.front();
-        audioRingLiveBytes_ -= front.first.byteCount + front.second.byteCount;
+        audioRing_.releaseBytes(front.first.byteCount + front.second.byteCount);
         queue.pop_front();
     }
 }

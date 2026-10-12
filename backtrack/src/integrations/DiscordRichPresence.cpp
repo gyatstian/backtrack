@@ -111,6 +111,12 @@ DiscordRichPresence::~DiscordRichPresence() {
 }
 
 void DiscordRichPresence::start(GameIntegrationSettings::DiscordRichPresenceMode mode, bool resetTimerOnSwitch) {
+    if (mode == GameIntegrationSettings::DiscordRichPresenceMode::Off) {
+        // Same gate as VoiceCommandService::configure: never run a worker for
+        // Off, and stop one that a settings change left behind.
+        stop();
+        return;
+    }
     std::scoped_lock lock(mutex_);
     mode_.store(mode, std::memory_order_release);
     resetTimerOnSwitch_.store(resetTimerOnSwitch, std::memory_order_release);

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -247,6 +248,22 @@ void testSurroundDownmixKeepsCenterAndDropsLfe() {
         "test lost sensitivity to a dropped center channel");
 }
 
+void testMuteGainPrimitive() {
+    // applyMuteGain is the sole gain stage for canonical float samples: muted
+    // zeroes, unity is a no-op, otherwise scale and clamp, never allocating.
+    std::vector<float> samples = {0.5f, -0.25f, 0.9f, -1.0f};
+    backtrack::applyMuteGain(std::span<float>(samples), 1.0f, false);
+    expect(samples[0] == 0.5f && samples[3] == -1.0f, "unity gain must leave samples untouched");
+    backtrack::applyMuteGain(std::span<float>(samples), 0.5f, false);
+    expect(std::fabs(samples[0] - 0.25f) < 1e-6f, "half gain did not scale");
+    backtrack::applyMuteGain(std::span<float>(samples), 4.0f, false);
+    expect(samples[2] == 1.0f && samples[3] == -1.0f, "gain must clamp to [-1, 1]");
+    backtrack::applyMuteGain(std::span<float>(samples), 1.0f, true);
+    expect(samples[0] == 0.0f && samples[2] == 0.0f, "muted must zero the span");
+    std::vector<float> empty;
+    backtrack::applyMuteGain(std::span<float>(empty), 2.0f, false); // must not crash
+}
+
 } // namespace
 
 int main() {
@@ -257,6 +274,7 @@ int main() {
         testUnsupportedFormatDropped();
         testSilenceStaysSilent();
         testSurroundDownmixKeepsCenterAndDropsLfe();
+        testMuteGainPrimitive();
         std::cout << "AudioConvert tests passed\n";
         return 0;
     } catch (const std::exception& error) {

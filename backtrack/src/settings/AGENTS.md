@@ -7,7 +7,8 @@ untrusted values, and the enum name mappings that cross the file boundary.
 
 ## Ownership
 
-- Owns: `SettingsStore`, `sanitizeSettings`, the hotkey-safety rule
+- Owns: `SettingsStore`, `sanitizeSettings`, the pure `validateEncoderConfig`
+  for the `VideoSettings` ranges, the hotkey-safety rule
   (`supportedHotkeyModifiers`, `isSafeBareHotkey`, `isSafeGlobalHotkey`), and
   the `xxxName` / `xxxFromName` pair for every settings enum except `LogLevel`.
 - Does not own: the field definitions or their defaults (`core/Types.h`), the
@@ -31,7 +32,10 @@ untrusted values, and the enum name mappings that cross the file boundary.
   map an unrecognized name to a known value instead of failing the load.
 - `sanitizeSettings` is the trust boundary. It runs on every load **and** on
   every save, so a hand-edited file is normalized on the next start and an
-  out-of-range value can never reach disk. It clamps:
+  out-of-range value can never reach disk. The `VideoSettings` ranges and the
+  adaptive B/I-frame gates live in the pure `validateEncoderConfig`, which
+  `sanitizeSettings` calls, so the load/save path and live encoder use share
+  one expression per range. It clamps:
   - width to 16-7680 and height to 16-4320, both forced to an even value
   - fps 1-240, bitrate 1000-200000 kbps, GOP 1-30 s, AQ strength 1-15,
     reference frames 1-4, replay seconds 1-3600, frame queue limit 1-8
@@ -104,7 +108,8 @@ untrusted values, and the enum name mappings that cross the file boundary.
 - Defaults exist exactly once, in the `core/Types.h` struct definitions. Do not
   repeat them in the parse path.
 - Keep `sanitizeSettings` exhaustive rather than defensive per call site; a
-  second validation layer in the UI will drift from this one.
+  second validation layer in the UI will drift from this one. The UI reads
+  controls raw and lets `sanitizeSettings` clamp on stash, save, and dirty.
 - Related: `core/AGENTS.md` records the five places a new setting must be added.
 
 ## Verification

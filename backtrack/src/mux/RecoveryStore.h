@@ -28,6 +28,30 @@ void writeManifestHeader(std::ostream& stream, const MuxedInputs& partialInputs)
 // Single tab-separated "sample" line shared by full and incremental manifests.
 std::string manifestSampleLine(const MuxedInputs::VideoSample& sample);
 void writeReadme(const MuxedInputs& inputs, const std::filesystem::path& tempDirectory);
+// Removes a recovery manifest left by a previous failed save before its
+// elementary streams are truncated: a crash mid-attempt must never leave a
+// manifest describing bytes the streams no longer contain. Only paths that
+// truncate streams (the replay save) call this; the recording path only grows
+// its streams and rewrites the manifest atomically, so deleting first would
+// trade a complete incremental manifest for a crash window with none.
+void clearStaleManifest(const std::filesystem::path& tempDirectory);
+// Shared mux-publish tail for Mp4Muxer::finalize and ReplayBuffer::saveTo:
+// writes manifest+readme, muxes with retry, then reports how the temp
+// directory was left. Returns kPublished (caller deletes the temp directory),
+// kPreservedForRecovery (manifest describes the streams on disk; caller keeps
+// the directory), or kFailed (no manifest, so nothing is recoverable; caller
+// deletes the directory). errorDetail carries the user-presentable reason on
+// either failure.
+enum class MuxPublishResult {
+    kPublished,
+    kPreservedForRecovery,
+    kFailed,
+};
+MuxPublishResult publishMuxedInputs(
+    const MuxedInputs& inputs,
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& tempDirectory,
+    std::wstring* errorDetail = nullptr);
 bool muxToMp4WithRetry(
     const MuxedInputs& inputs,
     const std::filesystem::path& outputPath,

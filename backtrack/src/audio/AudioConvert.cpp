@@ -153,6 +153,23 @@ bool isCanonicalAudioFormat(const AudioFormatInfo& info) {
            info.samplesPerSec == kCanonicalAudioSampleRate;
 }
 
+void applyMuteGain(std::span<float> samples, float gain, bool muted) {
+    if (samples.empty()) {
+        return;
+    }
+    if (muted) {
+        // Zero stays zero; no gain math needed.
+        std::fill(samples.begin(), samples.end(), 0.0f);
+        return;
+    }
+    if (gain == 1.0f) {
+        return;
+    }
+    for (float& sample : samples) {
+        sample = std::clamp(sample * gain, -1.0f, 1.0f);
+    }
+}
+
 namespace {
 
 // Speaker position bits (dwChannelMask values from ksmedia.h, restated locally

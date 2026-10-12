@@ -11,10 +11,11 @@ namespace {
 
 constexpr size_t kMaxInputViewCacheEntries = 64;
 
-bool shouldLogRepeatedDrop(uint64_t& count) {
-    ++count;
-    return count == 1 || (count % 300) == 0;
-}
+// Transient mode-switch/virtual-adapter blips must not pin SDR forever:
+// the HDR latch auto-clears after this cooldown (or on input format/dims
+// change) so tone-mapping is retried. Stays latched inside the window to
+// avoid per-frame log spam.
+constexpr auto kHdrRejectionCooldown = std::chrono::seconds(5);
 
 // Only a refusal of the HDR color space latches the sticky SDR fallback.
 // Anything else under an HDR mapping (device loss, timeout, ...) is
@@ -46,6 +47,16 @@ bool D3D11FrameScaler::scale(
             : preferredOutputFormat;
 
     // Budget: initial attempt + NV12->BGRA fallback + HDR-rejection retry.
+    bool hdrRetryAfterCooldown = false;
+    if (hdrInputRejected_ && input.hdr) {
+        const bool formatChanged = input.format != hdrRejectedFormat_ ||
+            input.width != hdrRejectedWidth_ || input.height != hdrRejectedHeight_;
+        if (formatChanged ||
+            std::chrono::steady_clock::now() - hdrRejectedAt_ >= kHdrRejectionCooldown) {
+            hdrInputRejected_ = false;
+            hdrRetryAfterCooldown = true;
+        }
+    }
     for (uint32_t attempt = 0; attempt < 3; ++attempt) {
         if (sizeMatches && input.format == outputFormat) {
             if (!forceOutputTexture) {
@@ -60,16 +71,10 @@ bool D3D11FrameScaler::scale(
             if (!ensureCopyPool(device, outputWidth, outputHeight, outputFormat)) {
                 return false;
             }
-            auto slot = acquireSlot();
+            auto slot = pool_.acquireOrLog(L"D3D11 scaler texture pool exhausted");
             if (!slot) {
-                if (shouldLogRepeatedDrop(poolExhaustionDrops_)) {
-                    Logger::instance().warning(L"capture",
-                        L"D3D11 scaler texture pool exhausted; dropping frame count=" +
-                        std::to_wstring(poolExhaustionDrops_));
-                }
                 return false;
             }
-            poolExhaustionDrops_ = 0;
             {
                 std::scoped_lock lock(device.immediateContextMutex());
                 device.context()->CopyResource(slot->texture.Get(), input.texture.Get());
@@ -83,6 +88,7 @@ bool D3D11FrameScaler::scale(
 
         bool conversionFailed = false;
         bool hdrRejectedThisAttempt = false;
+        bool inputViewFailed = false;
         if (!ensureInitialized(
                 device,
                 input.width,
@@ -93,22 +99,19 @@ bool D3D11FrameScaler::scale(
                 outputFormat)) {
             conversionFailed = true;
         } else {
-            auto slot = acquireSlot();
+            auto slot = pool_.acquireOrLog(L"D3D11 scaler texture pool exhausted");
             if (!slot) {
-                if (shouldLogRepeatedDrop(poolExhaustionDrops_)) {
-                    Logger::instance().warning(L"capture",
-                        L"D3D11 scaler texture pool exhausted; dropping frame count=" +
-                        std::to_wstring(poolExhaustionDrops_));
-                }
                 return false;
             }
-            poolExhaustionDrops_ = 0;
 
             std::scoped_lock lock(device.immediateContextMutex());
             ID3D11VideoProcessorInputView* inputView =
                 inputViewFor(device, input.texture.Get());
             if (!inputView) {
                 conversionFailed = true;
+                // Input-side failure (unknown capture surface), not an NV12
+                // output failure: drop the frame without latching BGRA.
+                inputViewFailed = true;
             } else {
                 RECT sourceRect{
                     0,
@@ -189,6 +192,10 @@ bool D3D11FrameScaler::scale(
                     if (appliedHdrInputSpace_ && !hdrInputRejected_ && isHdrRejectionHr(hr)) {
                         hdrInputRejected_ = true;
                         hdrRejectedThisAttempt = true;
+                        hdrRejectedAt_ = std::chrono::steady_clock::now();
+                        hdrRejectedFormat_ = input.format;
+                        hdrRejectedWidth_ = input.width;
+                        hdrRejectedHeight_ = input.height;
                         releaseResources();
                         Logger::instance().warning(L"capture",
                             L"D3D11 video processor rejected HDR input conversion (" +
@@ -199,6 +206,11 @@ bool D3D11FrameScaler::scale(
                     }
                     conversionFailed = true;
                 } else {
+                    if (hdrRetryAfterCooldown && appliedHdrInputSpace_) {
+                        hdrRetryAfterCooldown = false;
+                        Logger::instance().info(L"capture",
+                            L"D3D11 video processor HDR tone-mapping recovered after transient rejection");
+                    }
                     output = input;
                     output.texture = slot->texture;
                     output.lease = slot;
@@ -216,6 +228,10 @@ bool D3D11FrameScaler::scale(
         // and keep NV12 instead of permanently degrading to BGRA.
         if (hdrRejectedThisAttempt) {
             continue;
+        }
+
+        if (inputViewFailed) {
+            return false;
         }
 
         if (!conversionFailed || outputFormat != DXGI_FORMAT_NV12) {
@@ -269,7 +285,7 @@ void D3D11FrameScaler::applyVideoProcessorState(const VpState& state) {
     // Interpreting them as gamma-22 SDR washes out color and clips
     // highlights; declaring the real input color space makes the
     // video processor tone-map down to the SDR output. A rejected
-    // conversion falls back permanently to the legacy mapping so a
+    // conversion falls back to the SDR mapping for a cooldown so a
     // limited processor degrades to old behavior, never to frame
     // drops (finding 16).
     DXGI_COLOR_SPACE_TYPE inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -280,8 +296,16 @@ void D3D11FrameScaler::applyVideoProcessorState(const VpState& state) {
             inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
         }
     }
+    // Legacy path programs no input color space, so nothing tone-maps there:
+    // report no HDR mapping so hdrMappingActive() stays truthful.
     appliedHdrInputSpace_ =
+        state.colorSpace1Path &&
         inputColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    if (!state.colorSpace1Path &&
+        inputColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+        Logger::instance().warning(L"capture",
+            L"D3D11 video processor lacks VideoContext1; HDR input will record without tone-mapping");
+    }
 
     if (state.colorSpace1Path) {
         videoContext1_->VideoProcessorSetStreamColorSpace1(
@@ -327,7 +351,6 @@ void D3D11FrameScaler::releaseResources() {
     inputViews_.clear();
     copiedInputView_.Reset();
     copiedInputTexture_.Reset();
-    poolExhaustionDrops_ = 0;
     pool_.clear();
     processor_.Reset();
     enumerator_.Reset();
@@ -335,6 +358,10 @@ void D3D11FrameScaler::releaseResources() {
     videoContext_.Reset();
     videoDevice_.Reset();
     // The sticky state died with the processor; the next blit reprograms it.
+    // useCopiedInput_ is per-generation, not per-session: every rebuild
+    // retries the direct path first (one extra failed VP call is cheap
+    // against enumerator recreation), so DD<->WGC switches don't pin the copy.
+    useCopiedInput_ = false;
     vpState_ = {};
     appliedHdrInputSpace_ = false;
     inputWidth_ = 0;
@@ -350,6 +377,10 @@ void D3D11FrameScaler::reset() {
     useCopiedInput_ = false;
     nv12Unavailable_ = false;
     hdrInputRejected_ = false;
+    hdrRejectedAt_ = {};
+    hdrRejectedFormat_ = DXGI_FORMAT_UNKNOWN;
+    hdrRejectedWidth_ = 0;
+    hdrRejectedHeight_ = 0;
 }
 
 bool D3D11FrameScaler::hdrInputRejected() const {
@@ -366,7 +397,7 @@ uint64_t D3D11FrameScaler::poolGeneration() const {
 
 void D3D11FrameScaler::setPoolSize(uint32_t poolSize) {
     // Min 5: captureLoop keeps one slot pinned via lastFrame (effective free = size−1).
-    const uint32_t normalized = std::clamp<uint32_t>(poolSize, 5, 16);
+    const uint32_t normalized = std::clamp<uint32_t>(poolSize, kMinTexturePoolSize, kMaxTexturePoolSize);
     if (poolSize_ == normalized) {
         return;
     }
@@ -486,14 +517,16 @@ bool D3D11FrameScaler::ensureInitialized(
     outputWidth_ = outputWidth;
     outputHeight_ = outputHeight;
     outputFormat_ = outputFormat;
+    pool_.setFootprintBytes(dxgiTextureBytes(outputWidth, outputHeight, outputFormat) * pool_.size());
     Logger::instance().debug(L"capture",
         L"D3D11 scaler initialized " +
         std::to_wstring(inputWidth) + L"x" + std::to_wstring(inputHeight) +
         L" -> " + std::to_wstring(outputWidth) + L"x" + std::to_wstring(outputHeight) +
-        (outputFormat == DXGI_FORMAT_NV12 ? L" NV12" : L" BGRA"));
+        (outputFormat == DXGI_FORMAT_NV12 ? L" NV12" : L" BGRA") +
+        L" pool=" + std::to_wstring(pool_.size()) +
+        L" (" + std::to_wstring(pool_.footprintBytes() / 1024) + L" KiB)");
     return true;
 }
-
 bool D3D11FrameScaler::ensureCopyPool(
     D3DDevice& device,
     uint32_t width,
@@ -543,20 +576,14 @@ bool D3D11FrameScaler::ensureCopyPool(
     outputWidth_ = width;
     outputHeight_ = height;
     outputFormat_ = format;
+    pool_.setFootprintBytes(dxgiTextureBytes(width, height, format) * pool_.size());
     Logger::instance().debug(L"capture",
         L"D3D11 scaler copy pool initialized " +
         std::to_wstring(width) + L"x" + std::to_wstring(height) +
-        (format == DXGI_FORMAT_NV12 ? L" NV12" : L" BGRA"));
+        (format == DXGI_FORMAT_NV12 ? L" NV12" : L" BGRA") +
+        L" pool=" + std::to_wstring(pool_.size()) +
+        L" (" + std::to_wstring(pool_.footprintBytes() / 1024) + L" KiB)");
     return true;
-}
-
-std::shared_ptr<D3D11FrameScaler::TextureSlot> D3D11FrameScaler::acquireSlot() {
-    for (auto& slot : pool_) {
-        if (slot.use_count() == 1) {
-            return slot;
-        }
-    }
-    return {};
 }
 
 ID3D11VideoProcessorInputView* D3D11FrameScaler::inputViewFor(

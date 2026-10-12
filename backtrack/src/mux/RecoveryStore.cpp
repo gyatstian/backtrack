@@ -469,6 +469,67 @@ void writeReadme(const MuxedInputs& inputs, const std::filesystem::path& tempDir
     stream << "\nThe recovery.tsv file contains packet timing used by Backtrack's native muxer.\n";
 }
 
+void clearStaleManifest(const std::filesystem::path& tempDirectory) {
+    const std::wstring staleManifestNames[] = {
+        std::wstring(kRecoveryManifestName),
+        std::wstring(kRecoveryManifestName) + L".tmp"};
+    for (const auto& staleName : staleManifestNames) {
+        std::error_code removeError;
+        std::filesystem::remove(tempDirectory / staleName, removeError);
+    }
+}
+
+MuxPublishResult publishMuxedInputs(
+    const MuxedInputs& inputs,
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& tempDirectory,
+    std::wstring* errorDetail) {
+    // Mirror of the recording finalize path, shared with the replay save: the
+    // manifest (and readme) is persisted before muxing, so a failed save keeps
+    // the elementary streams recoverable via "Recover Failed" or the startup
+    // sweep instead of destroying them.
+    const bool manifestWritten = writeManifest(inputs, tempDirectory);
+    writeReadme(inputs, tempDirectory);
+
+    std::wstring muxErrorDetail;
+    // Same retry wrapper for both paths: a transient Media Foundation
+    // init/finalize failure should not fail a save that one retry would pass.
+    if (muxToMp4WithRetry(inputs, outputPath, &muxErrorDetail)) {
+        return MuxPublishResult::kPublished;
+    }
+
+    // Only an empty output-name reservation may be removed; a real file that
+    // appeared at the target in the meantime must survive.
+    removeEmptyOutputReservation(outputPath);
+    if (manifestWritten) {
+        // The manifest exactly describes the streams on disk: keep the
+        // directory so the clip stays recoverable.
+        if (errorDetail) {
+            *errorDetail = preservedRecordingDetail(
+                outputPath,
+                tempDirectory,
+                inputs,
+                muxErrorDetail.empty() ? L"MP4 muxing failed; see log for details" : muxErrorDetail);
+        }
+        Logger::instance().warning(L"mux",
+            L"MP4 mux failed; preserved elementary streams for recovery in " + tempDirectory.wstring());
+        return MuxPublishResult::kPreservedForRecovery;
+    }
+    // Every elementary-stream write above was verified before this point, so a
+    // manifest that will not publish means the disk or the folder failed, not
+    // that a scanner briefly held recovery.tsv (that race is retried inside
+    // writeManifest). A directory with streams but no manifest is skipped by
+    // recoverLatestFailedRecording and swept as garbage later, so keeping it
+    // would only promise a recovery that cannot happen.
+    if (errorDetail) {
+        *errorDetail = muxErrorDetail.empty() ? L"MP4 muxing failed; see log for details" : muxErrorDetail;
+    }
+    Logger::instance().warning(L"mux",
+        L"MP4 mux failed and no recovery manifest could be written; removing temporary files for " +
+        outputPath.wstring());
+    return MuxPublishResult::kFailed;
+}
+
 std::wstring preservedRecordingDetail(
     const std::filesystem::path& outputPath,
     const std::filesystem::path& tempDirectory,

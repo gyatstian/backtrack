@@ -174,6 +174,16 @@ add_backtrack_test(AudioConvertTests
         backtrack/src/audio/AudioConvert.cpp
         backtrack/src/core/Logger.cpp)
 
+# SessionMuteStoreTests exercises audio/SessionMuteStore.cpp without WASAPI:
+# the journal codec, write-after-every-mute, stale pruning, the orphan sweep
+# (including the still-muted check and the rewrite of unreached entries), and
+# the try_lock-only crash path. Logger.cpp provides the UTF-8 codec.
+add_backtrack_test(SessionMuteStoreTests
+    SOURCES
+        backtrack/tests/SessionMuteStoreTests.cpp
+        backtrack/src/audio/SessionMuteStore.cpp
+        backtrack/src/core/Logger.cpp)
+
 # ReplayBufferTests stubs Mp4Muxer::muxToMp4 and removeEmptyOutputReservation
 # at link time (defined inside the test source) and links everything around
 # them: the real replay buffer, WAV reader/writer, recovery store, converter,

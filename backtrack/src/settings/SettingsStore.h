@@ -21,8 +21,16 @@ private:
 
 AppSettings sanitizeSettings(AppSettings settings);
 
+// Pure VideoSettings validation: every numeric range and the adaptive B/I-frame
+// gates live here and nowhere else, so a range change is one edit in one
+// expression. sanitizeSettings calls it on the load/save path; live encoder use
+// shares it rather than repeating the ranges.
+VideoSettings validateEncoderConfig(VideoSettings video);
+
 // Hotkey safety is defined here, not in the UI, because sanitizeSettings is the
 // authority: the UI must reject exactly the hotkeys a load would reset.
+// supportedHotkeyModifiers is the single source for the mask; the HotkeyService
+// hook matcher must call it instead of repeating the expression.
 uint32_t supportedHotkeyModifiers(uint32_t modifiers);
 bool isSafeBareHotkey(uint32_t virtualKey);
 bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey);

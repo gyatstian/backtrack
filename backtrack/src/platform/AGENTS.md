@@ -54,7 +54,9 @@ Windows startup registration, microphone privacy cleanup, and the constants
   Chromium forks often keep the upstream exe name while branding the version
   resource, so the stem alone misnames them. It feeds replay clip names (and,
   when per-game folders are on, their parent folder) and Discord Rich Presence;
-  all change together.
+  all change together. Both foreground queries share one validity gate (gone,
+  hidden, minimized, or ours is neither a game to name nor a surface to test),
+  so the naming and the fullscreen test can never disagree on what is foreground.
 - `updateWindowsStartupRegistration` and `pruneStaleMicrophoneConsentEntries`
   both write to HKCU and nowhere else: the `Run` and `StartupApproved\Run` keys,
   and the microphone `CapabilityAccessManager\ConsentStore`. `Application::run`

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Types.h"
+#include "replay/RingFile.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -21,11 +22,14 @@ public:
     ReplayBuffer(const ReplayBuffer&) = delete;
     ReplayBuffer& operator=(const ReplayBuffer&) = delete;
 
-    // storageDirectory/capacityBytes only apply when settings.diskBackedVideo
-    // is set: they select where the video ring file lives and how large it may
-    // grow. audioCapacityBytes likewise gates settings.diskBackedAudio. With
-    // the flags off the corresponding argument is ignored and buffering for
-    // that track stays fully in RAM.
+    // storageDirectory/capacityBytes only select the video ring file location
+    // and size when settings.diskBackedVideo is set: the directory must be
+    // non-empty and the capacity at least kMinRingCapacityBytes (8 MiB).
+    // audioCapacityBytes likewise gates settings.diskBackedAudio at
+    // kMinAudioRingCapacityBytes (1 MiB). Either capacity is still stored as
+    // the RAM byte cap for that track when its backend is memory, so a long
+    // time window can never grow RAM without bound. With the flags off
+    // buffering for that track stays fully in RAM, bounded by the stored cap.
     void configure(const ReplaySettings& settings,
                    const std::filesystem::path& storageDirectory = {},
                    uint64_t capacityBytes = 0,
@@ -75,12 +79,8 @@ private:
         bool keyFrame = false;
     };
 
-    // One contiguous or wrap-split extent of a packet's bytes inside the ring
-    // file. secondByteCount == 0 means the payload did not wrap.
-    struct RingExtent {
-        uint64_t offset = 0;
-        uint32_t byteCount = 0;
-    };
+    // One buffered video packet's bytes inside the video ring; the payload
+    // wraps at most once, so two extents always suffice.
     struct DiskVideoPacket {
         VideoPacketMeta meta;
         RingExtent first;
@@ -117,12 +117,11 @@ private:
     // Caller holds mutex_. Lock order is always mutex_ then storageFallbackMutex_.
     void setVideoFallbackReasonLocked(std::wstring reason);
     void setAudioFallbackReasonLocked(std::wstring reason);
-    bool openRingLocked();
+    bool openRingLocked(uint64_t capacityBytes);
     // Caller holds mutex_ and has decided the buffered video may be dropped.
     // Opens a ring of the given capacity and, on failure, degrades to RAM with
-    // a user-visible reason. Distinct from the bool overload above, which only
-    // opens and reports success.
-    void openRingLocked(uint64_t capacityBytes);
+    // a user-visible reason.
+    void openRingWithFallbackLocked(uint64_t capacityBytes);
     bool openAudioRingLocked(uint64_t capacityBytes);
     // Caller holds mutex_ and has decided the buffered audio may be dropped.
     // Opens an audio ring of the given capacity and, on failure, degrades to
@@ -134,26 +133,22 @@ private:
     void closeRingNowLocked() noexcept;
     void closeAudioRingLocked() noexcept;
     void closeAudioRingNowLocked() noexcept;
-    // Caller must have secured space via ensureRingSpaceLocked; appends the
-    // packet payload to the ring (wrap split handled here) and records its
-    // extents. False on any write failure - the caller must then stop
-    // trusting the ring contents.
+    // Caller must have secured space via the ring's ensureSpace; appends the
+    // packet payload to the ring and records its extents. False on any write
+    // failure - the caller must then stop trusting the ring contents.
     bool appendRingLocked(const EncodedPacket& packet);
-    // Waits (while a save pins refs) or evicts oldest packets until size
-    // bytes of ring space are free. False when the request can never fit.
+    // Per-track space policy for the video ring: waits on the save pin or
+    // evicts via freeRingSpaceLocked (keyframe realignment).
     bool ensureRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size);
-    // Explicit-offset overlapped read; safe to call with or without mutex_
-    // held because no per-handle file position exists.
-    bool readRingLocked(uint64_t offset, uint8_t* destination, uint32_t size) const;
-    bool readAudioRingLocked(uint64_t offset, uint8_t* destination, uint32_t size) const;
     void freeRingSpaceLocked(uint64_t bytesNeeded);
     void freeAudioRingSpaceLocked(uint64_t bytesNeeded);
+    // Per-track space policy for the audio ring: waits on the save pin or
+    // evicts via freeAudioRingSpaceLocked (oldest-first).
     bool ensureAudioRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size);
     static int64_t diskAudioPacketEndPts100ns(const DiskAudioPacket& packet);
-    // Caller must have secured space via ensureAudioRingSpaceLocked; appends
-    // the packet payload to the audio ring (wrap split handled here) and
-    // records its extents. False on any write failure - the caller must then
-    // stop trusting the ring contents.
+    // Caller must have secured space via the audio ring's ensureSpace; appends
+    // the packet payload to the audio ring and records its extents. False on
+    // any write failure - the caller must then stop trusting the ring contents.
     bool appendAudioRingLocked(const AudioPacket& packet);
     void clearBufferedAudioLocked();
     // Audio ring storage failed: discard the buffered audio window and fall
@@ -193,6 +188,13 @@ private:
     std::deque<std::shared_ptr<EncodedPacket>> video_;
     std::deque<std::shared_ptr<const AudioPacket>> systemAudio_;
     std::deque<std::shared_ptr<const AudioPacket>> microphoneAudio_;
+    // RAM byte caps, stored from configure's capacity arguments even when the
+    // backend is memory (0 falls back to the controller's derivation). Live
+    // byte totals for the RAM queues; disk backends account in RingFile.
+    uint64_t ramVideoCapacityBytes_ = 0;
+    uint64_t ramAudioCapacityBytes_ = 0;
+    uint64_t ramVideoBytes_ = 0;
+    uint64_t ramAudioBytes_ = 0;
     size_t videoKeyFrames_ = 0;
     int64_t lastSaveEndPts100ns_ = 0;
     // GOP most recently seen by saveTo (VideoSettings is save-scoped), so
@@ -207,15 +209,9 @@ private:
     // --- disk-backed video backend ---
     VideoBackend videoBackend_ = VideoBackend::Ram;
     std::filesystem::path ringDirectory_;
-    std::filesystem::path ringPath_;
-    HANDLE ringFile_ = nullptr;
-    uint64_t ringCapacityBytes_ = 0;
-    // Next write position inside [0, capacity). Payloads crossing the end of
-    // the file wrap around to offset 0 and produce a two-extent packet.
-    uint64_t ringWriteOffset_ = 0;
-    // Total bytes of all live refs; capacity minus this is the free gap the
-    // write cursor may consume before it would collide with the oldest ref.
-    uint64_t ringLiveBytes_ = 0;
+    // Byte store for the video ring; eviction policy is freeRingSpaceLocked
+    // (realigns to the next keyframe so the buffer stays decodable).
+    RingFile videoRing_;
     std::deque<DiskVideoPacket> diskVideo_;
     size_t diskVideoKeyFrames_ = 0;
     // Lock-free mirrors of the two counts RecorderController::stats reads.
@@ -239,11 +235,9 @@ private:
 
     // --- disk-backed audio backend (independent of the video backend) ---
     AudioBackend audioBackend_ = AudioBackend::Ram;
-    std::filesystem::path audioRingPath_;
-    HANDLE audioRingFile_ = nullptr;
-    uint64_t audioRingCapacityBytes_ = 0;
-    uint64_t audioRingWriteOffset_ = 0;
-    uint64_t audioRingLiveBytes_ = 0;
+    // Byte store for the audio ring; eviction is plain oldest-first across
+    // both tracks (freeAudioRingSpaceLocked), since audio has no keyframes.
+    RingFile audioRing_;
     std::deque<DiskAudioPacket> diskSystemAudio_;
     std::deque<DiskAudioPacket> diskMicrophoneAudio_;
     bool audioRingPendingClose_ = false;

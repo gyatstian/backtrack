@@ -20,9 +20,11 @@ and the crash recovery store that keeps a killed recording recoverable.
   and starts the incremental recovery manifest; each track's WAV opens lazily on
   its first audio packet, because the writer's format comes from that packet.
   `finalize` muxes into the MP4 and returns the published path, or `{}` with
-  `lastError()` set. `abort` gives up without publishing. A mux failure keeps
-  the temp directory and its manifest for recovery; a write failure or a
-  recording with no video deletes it.
+  `lastError()` set. `abort` gives up without publishing. `finalize` and
+  `ReplayBuffer::saveTo` share the `RecoveryStore::publishMuxedInputs` tail:
+  a mux failure keeps the temp directory only when the manifest was published;
+  a write failure, a recording with no video, or a mux failure with no
+  publishable manifest deletes it.
 - Audio that arrives before the first video packet is held in `pendingAudio_`
   (at most 512 packets) and flushed when that packet anchors the timeline, so
   short recordings and pre-keyframe audio are not dropped.
@@ -59,7 +61,8 @@ and the crash recovery store that keeps a killed recording recoverable.
   relative to its own directory, so every stream must stay beside
   `recovery.tsv` in the same `.backtrack_tmp/<stem>/` folder. `writeManifest`
   publishes atomically through `recovery.tsv.tmp`; anything that truncates those
-  streams underneath it (the replay save path does) must delete both files
+  streams underneath it (the replay save path does, via
+  `RecoveryStore::clearStaleManifest`) must delete both files
   first and republish a fresh manifest before muxing, or a stale table would
   describe bytes that no longer exist. The publish retries a sharing or lock
   violation on the same bounded budget as the staged MP4 (`publishWithRetry`),
@@ -93,8 +96,10 @@ and the crash recovery store that keeps a killed recording recoverable.
   honest record. A DTS that lands before `timeBase` is warned about and clamped
   to the base instead of wrapping into `UINT64`; decode order makes that
   unreachable for real input, so the clamp never changes a valid file.
-- Audio timeline rules, applied by `Mp4Muxer::writeTimelineAudioPacket` and
-  again by `ReplayBuffer`'s `writeTimelineAudio`:
+- Audio timeline rules, applied once in `paceAudioPacket`
+  (`mux/AudioTimeline.h`) and called from both `Mp4Muxer::writeTimelineAudioPacket`
+  (open-ended: `kNoAudioWindowEnd`) and `ReplayBuffer`'s `writeTimelineAudio`
+  (window-bounded by the replay `[start, end]`):
   - A packet whose format differs from the WAV the writer opened is dropped, not
     appended. Appending wrong-rate bytes corrupts the timeline silently.
   - A PTS gap is filled with silence, capped at 10 s per gap; past the cap the
@@ -116,6 +121,11 @@ and the crash recovery store that keeps a killed recording recoverable.
   data.
 - `MuxedInputs` is the shared hand-off shape between the muxer, the recovery
   store, and `audio/AudioMix.h`. Extending it means updating all three.
+  `effectiveDts` / `hasEffectiveDts` (`mux/Mp4Muxer.h`) is the one DTS-validity
+  rule both the recording path and `ReplayBuffer::saveTo` use
+  (`hasDts && dts <= pts`, else PTS). The `dts != pts` test stays where
+  detection, not validity, is meant: the sink's `hasDecodeTimestamps` flag and
+  the legacy-manifest `hasDts` inference in `RecoveryStore`.
 - `RecoveryStore::flushFileToDisk` is the one disk-flush helper, declared in
   `RecoveryStore.h` and used by both publishes (the staged MP4 and the manifest).
   It takes a `DWORD&` out-param so a sharing violation stays distinguishable from

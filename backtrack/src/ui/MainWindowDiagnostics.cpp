@@ -26,6 +26,7 @@
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -35,6 +36,22 @@
 #include <utility>
 
 namespace backtrack {
+
+// hdrRejected covers two cases; split them here so a WGC washout never reads
+// as a driver refusal. stats() fields stay as-is.
+static std::wstring hdrStatusLine(const RecordingStats& stats) {
+    if (stats.hdrActive && stats.hdrRejected) {
+        return L"HDR: rejected (tone-mapping refused)";
+    }
+    if (stats.hdrActive) {
+        return L"HDR: active (tone-mapping)";
+    }
+    if (stats.hdrRejected) {
+        return L"HDR: SDR on HDR monitor (WGC/DWM)";
+    }
+    return L"HDR: SDR";
+}
+
 void MainWindow::saveLog() {
     const auto source = Logger::instance().currentPath();
     if (source.empty()) {
@@ -90,6 +107,21 @@ void MainWindow::saveLog() {
         setStatus(L"Could not save log: " + utf8ToWide(copyError.message()));
         return;
     }
+    // Bug-report attachment: carry the HDR witness with the log (same line
+    // updateStats renders). Append-only, so a failure here keeps the copy.
+    const RecordingStats tailStats = controller_.stats();
+    std::wstringstream tail;
+    tail << L"\nActive backend: ";
+    if (tailStats.captureBackendActive) {
+        tail << captureBackendDisplayName(tailStats.activeCaptureBackend);
+    } else {
+        tail << L"inactive";
+    }
+    tail << L"\n" << hdrStatusLine(tailStats) << L"\n";
+    std::ofstream out(destination, std::ios::binary | std::ios::app);
+    if (out) {
+        out << wideToUtf8(tail.str());
+    }
     setStatus(std::wstring(L"Log saved to ") + fileName);
 }
 
@@ -118,6 +150,7 @@ void MainWindow::updateStats() {
         }
         stream << L"Capture size: " << stats.captureWidth << L"x" << stats.captureHeight << L"\r\n";
         stream << L"Encode size: " << stats.encodeWidth << L"x" << stats.encodeHeight << L"\r\n";
+        stream << hdrStatusLine(stats) << L"\r\n";
         stream << L"Timeline intervals: " << stats.capturedFrames << L"\r\n";
         stream << L"New source frames: " << stats.sourceFrames << L"\r\n";
         stream << L"Source frames/sec: " << stats.sourceFramesPerSecond << L"\r\n";
@@ -154,6 +187,11 @@ void MainWindow::updateStats() {
         const auto voiceStats = voiceCommandService_.stats();
         stream << L"Voice command: " << voiceStats.status << L"\r\n";
         stream << L"Voice accepted/rejected: " << voiceStats.accepted << L"/" << voiceStats.rejected << L"\r\n";
+        const auto leagueStats = leagueIntegration_.stats();
+        stream << L"League live client: " << (leagueStats.gameAvailable ? L"available" : L"not detected") << L"\r\n";
+        if (!leagueStats.lastError.empty()) {
+            stream << L"League last error: " << leagueStats.lastError << L"\r\n";
+        }
         if (const std::wstring saveFailure = trimText(controller_.lastRecordingError()); !saveFailure.empty()) {
             stream << L"Last save failure: " << saveFailure << L"\r\n";
         }

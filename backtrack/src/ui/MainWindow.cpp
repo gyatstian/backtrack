@@ -5,6 +5,7 @@
 #include "audio/WasapiCapture.h"
 #include "core/AppVersion.h"
 #include "core/Logger.h"
+#include "integrations/WinHttpJson.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
 #include "settings/SettingsStore.h"
@@ -42,78 +43,6 @@ namespace {
 constexpr wchar_t kGithubHost[] = L"api.github.com";
 constexpr wchar_t kLatestReleasePath[] = L"/repos/gyatstian/backtrack/releases/latest";
 
-struct InternetHandle {
-    HINTERNET value = nullptr;
-
-    InternetHandle() = default;
-    explicit InternetHandle(HINTERNET handle)
-        : value(handle) {
-    }
-    ~InternetHandle() {
-        if (value) {
-            WinHttpCloseHandle(value);
-        }
-    }
-
-    InternetHandle(const InternetHandle&) = delete;
-    InternetHandle& operator=(const InternetHandle&) = delete;
-
-    explicit operator bool() const {
-        return value != nullptr;
-    }
-};
-
-size_t skipJsonWhitespace(std::string_view json, size_t pos) {
-    while (pos < json.size()) {
-        const char ch = json[pos];
-        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
-            break;
-        }
-        ++pos;
-    }
-    return pos;
-}
-
-std::optional<std::wstring> parseJsonStringAt(std::string_view json, size_t quotePos) {
-    if (quotePos >= json.size() || json[quotePos] != '"') {
-        return std::nullopt;
-    }
-
-    std::string value;
-    bool escaped = false;
-    for (size_t index = quotePos + 1; index < json.size(); ++index) {
-        const char ch = json[index];
-        if (escaped) {
-            value.push_back(ch);
-            escaped = false;
-            continue;
-        }
-        if (ch == '\\') {
-            escaped = true;
-            continue;
-        }
-        if (ch == '"') {
-            return utf8ToWide(value);
-        }
-        value.push_back(ch);
-    }
-    return std::nullopt;
-}
-
-std::optional<std::wstring> latestReleaseVersionFromJson(std::string_view json) {
-    constexpr std::string_view kTagField = "\"tag_name\"";
-    const size_t field = json.find(kTagField);
-    if (field == std::string_view::npos) {
-        return std::nullopt;
-    }
-    size_t pos = json.find(':', field + kTagField.size());
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-    pos = skipJsonWhitespace(json, pos + 1);
-    return parseJsonStringAt(json, pos);
-}
-
 std::optional<std::wstring> fetchLatestReleaseVersion() {
     // Carries the real build so a triage log identifies the version that made
     // the request; a literal here drifts from kCurrentAppVersion on release.
@@ -135,59 +64,16 @@ std::optional<std::wstring> fetchLatestReleaseVersion() {
         return std::nullopt;
     }
 
-    InternetHandle request(WinHttpOpenRequest(
-        connection.value,
-        L"GET",
-        kLatestReleasePath,
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE));
-    if (!request) {
-        return std::nullopt;
-    }
-
     const std::wstring headers =
         L"User-Agent: " + userAgent + L"\r\n"
         L"Accept: application/vnd.github+json\r\n"
         L"X-GitHub-Api-Version: 2022-11-28\r\n";
-    if (!WinHttpSendRequest(request.value, headers.c_str(), static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(request.value, nullptr)) {
+    // Internet host: default proxy and real cert validation (no cert ignore).
+    const auto body = httpGetBody(session.value, connection.value, kLatestReleasePath, headers.c_str(), false, L"ui");
+    if (!body) {
         return std::nullopt;
     }
-
-    DWORD statusCode = 0;
-    DWORD statusCodeSize = sizeof(statusCode);
-    if (!WinHttpQueryHeaders(
-            request.value,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &statusCode,
-            &statusCodeSize,
-            WINHTTP_NO_HEADER_INDEX) ||
-        statusCode != 200) {
-        return std::nullopt;
-    }
-
-    std::string body;
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request.value, &available)) {
-            return std::nullopt;
-        }
-        if (available == 0) {
-            break;
-        }
-        const size_t offset = body.size();
-        body.resize(offset + available);
-        DWORD read = 0;
-        if (!WinHttpReadData(request.value, body.data() + offset, available, &read)) {
-            return std::nullopt;
-        }
-        body.resize(offset + read);
-    }
-
-    return latestReleaseVersionFromJson(body);
+    return jsonStringField(*body, "tag_name");
 }
 
 } // namespace

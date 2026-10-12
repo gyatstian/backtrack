@@ -357,9 +357,11 @@ struct RecordingStats {
     bool captureBackendFallbackUsed = false;
     std::wstring captureBackendStatus;
     // HDR telemetry (diagnostics only, lock-free mirrors). hdrActive follows
-    // the last acquired frame's GpuFrame::hdr flag (tone-map path live);
-    // hdrRejected means the monitor reports advanced color but no HDR frame
-    // was observed (WGC/SDR interpretation of an HDR desktop).
+    // the last acquired frame's GpuFrame::hdr flag (tone-map path live),
+    // cleared on every video handoff so a stale DD flag never leaks into WGC;
+    // hdrRejected means the scaler refused tone-mapping on live HDR input or
+    // the monitor reports advanced color but no HDR frame was observed
+    // (WGC/SDR interpretation of an HDR desktop). Output stays SDR either way.
     bool hdrActive = false;
     bool hdrRejected = false;
     uint64_t capturedFrames = 0;

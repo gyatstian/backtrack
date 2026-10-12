@@ -38,7 +38,7 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.video.bitrateKbps = readUIntControl(bitrateEdit_, target.video.bitrateKbps);
     }
     if (fpsEdit_) {
-        target.video.fps = std::max<uint32_t>(1, readUIntControl(fpsEdit_, target.video.fps));
+        target.video.fps = readUIntControl(fpsEdit_, target.video.fps);
     }
     bool monitorEntrySelected = false;
     if (resolutionModeCombo_) {
@@ -62,10 +62,10 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     // width/height edits (which still hold the previous mode's values until the
     // category body is rebuilt).
     if (widthEdit_ && !monitorEntrySelected) {
-        target.video.width = std::max<uint32_t>(16, readUIntControl(widthEdit_, target.video.width));
+        target.video.width = readUIntControl(widthEdit_, target.video.width);
     }
     if (heightEdit_ && !monitorEntrySelected) {
-        target.video.height = std::max<uint32_t>(16, readUIntControl(heightEdit_, target.video.height));
+        target.video.height = readUIntControl(heightEdit_, target.video.height);
     }
     if (multiMonitorSupportCheck_) {
         target.multiMonitorSupport = SendMessageW(multiMonitorSupportCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -74,7 +74,7 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.followFocusedMonitor = SendMessageW(followFocusedMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (followMouseMonitorCheck_) {
-        target.followMouseMonitor = target.followFocusedMonitor &&
+        target.followMouseMonitor = target.multiMonitorSupport && target.followFocusedMonitor &&
             SendMessageW(followMouseMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (captureCursorCheck_) {
@@ -152,13 +152,13 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.video.encoderLookahead = SendMessageW(encoderLookaheadCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderLookaheadDepthEdit_) {
-        target.video.encoderLookaheadDepth = std::min<uint32_t>(31, readUIntControl(encoderLookaheadDepthEdit_, target.video.encoderLookaheadDepth));
+        target.video.encoderLookaheadDepth = readUIntControl(encoderLookaheadDepthEdit_, target.video.encoderLookaheadDepth);
     }
     if (encoderSpatialAQCheck_) {
         target.video.encoderSpatialAQ = SendMessageW(encoderSpatialAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderAQStrengthEdit_) {
-        target.video.encoderAQStrength = std::clamp<uint32_t>(readUIntControl(encoderAQStrengthEdit_, target.video.encoderAQStrength), 1, 15);
+        target.video.encoderAQStrength = readUIntControl(encoderAQStrengthEdit_, target.video.encoderAQStrength);
     }
     if (encoderTemporalAQCheck_) {
         target.video.encoderTemporalAQ = SendMessageW(encoderTemporalAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;

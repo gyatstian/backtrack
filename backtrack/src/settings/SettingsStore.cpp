@@ -472,6 +472,25 @@ void SettingsStore::save(const AppSettings& settings) const {
     }
 }
 
+VideoSettings validateEncoderConfig(VideoSettings video) {
+    video.width = clampEven(video.width, 16, 7680);
+    video.height = clampEven(video.height, 16, 4320);
+    video.fps = std::clamp<uint32_t>(video.fps, 1, 240);
+    video.bitrateKbps = std::clamp<uint32_t>(video.bitrateKbps, 1000, 200000);
+    video.gopSeconds = std::clamp<uint32_t>(video.gopSeconds, 1, 30);
+    video.encoderLookaheadDepth = std::min<uint32_t>(video.encoderLookaheadDepth, 31);
+    video.encoderAQStrength = std::clamp<uint32_t>(video.encoderAQStrength, 1, 15);
+    video.encoderReferenceFrames = std::clamp<uint32_t>(video.encoderReferenceFrames, 1, 4);
+    if (!video.encoderLookahead) {
+        video.encoderAdaptiveBFrames = false;
+        video.encoderAdaptiveIFrames = false;
+    }
+    if (!video.encoderBFrames) {
+        video.encoderAdaptiveBFrames = false;
+    }
+    return video;
+}
+
 AppSettings sanitizeSettings(AppSettings settings) {
     uint32_t presetWidth = 0;
     uint32_t presetHeight = 0;
@@ -479,14 +498,7 @@ AppSettings sanitizeSettings(AppSettings settings) {
         settings.video.width = presetWidth;
         settings.video.height = presetHeight;
     }
-    settings.video.width = clampEven(settings.video.width, 16, 7680);
-    settings.video.height = clampEven(settings.video.height, 16, 4320);
-    settings.video.fps = std::clamp<uint32_t>(settings.video.fps, 1, 240);
-    settings.video.bitrateKbps = std::clamp<uint32_t>(settings.video.bitrateKbps, 1000, 200000);
-    settings.video.gopSeconds = std::clamp<uint32_t>(settings.video.gopSeconds, 1, 30);
-    settings.video.encoderLookaheadDepth = std::min<uint32_t>(settings.video.encoderLookaheadDepth, 31);
-    settings.video.encoderAQStrength = std::clamp<uint32_t>(settings.video.encoderAQStrength, 1, 15);
-    settings.video.encoderReferenceFrames = std::clamp<uint32_t>(settings.video.encoderReferenceFrames, 1, 4);
+    settings.video = validateEncoderConfig(settings.video);
     settings.replay.seconds = std::clamp<uint32_t>(settings.replay.seconds, 1, 3600);
     settings.gpu.frameQueueLimit = std::clamp<uint32_t>(settings.gpu.frameQueueLimit, 1, 8);
     settings.audioInputVolumePercent = std::clamp<uint32_t>(settings.audioInputVolumePercent, 0, 200);
@@ -507,13 +519,6 @@ AppSettings sanitizeSettings(AppSettings settings) {
          settings.hotkeys.saveReplayVirtualKey == settings.hotkeys.startStopVirtualKey)) {
         settings.hotkeys.saveReplayModifiers = defaultHotkeys.saveReplayModifiers;
         settings.hotkeys.saveReplayVirtualKey = defaultHotkeys.saveReplayVirtualKey;
-    }
-    if (!settings.video.encoderLookahead) {
-        settings.video.encoderAdaptiveBFrames = false;
-        settings.video.encoderAdaptiveIFrames = false;
-    }
-    if (!settings.video.encoderBFrames) {
-        settings.video.encoderAdaptiveBFrames = false;
     }
     if (!settings.multiMonitorSupport || !settings.followFocusedMonitor) {
         settings.followMouseMonitor = false;

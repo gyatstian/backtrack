@@ -8,7 +8,8 @@ League of Legends kill reminder.
 ## Ownership
 
 - Owns: `DiscordRichPresence`, `LeagueOfLegendsIntegration`, their worker
-  threads, and the protocol details of talking to those applications.
+  threads, the shared `WinHttpJson.h` GET + JSON helpers, and the protocol
+  details of talking to those applications.
 - Does not own: the actions they trigger. Both report through a callback or a
   posted message; `MainWindowController.cpp` reacts.
 
@@ -23,12 +24,20 @@ League of Legends kill reminder.
   `ChampionKill` names the active player (`riotId`, `summonerName`, or
   `riotIdGameName`, compared tag-insensitively). The window turns that into
   `kLeagueKillDetectedMessage`. Kill reminder only: it never triggers a save.
-- Live Client Data responses are size-capped (`kMaxResponseBytes`, 4 MiB). Port
+- Live Client Data responses are size-capped (`kMaxHttpResponseBytes`, 4 MiB,
+  in `WinHttpJson.h`). Port
   2999 is loopback but not ours, so an oversized body is refused, never
   buffered, and the session is opened `WINHTTP_ACCESS_TYPE_NO_PROXY` so a system
   proxy cannot redirect the poll off the machine. That cap is on the raw
   `std::string` body; `trimText` only ever sees the extracted player names
   inside it, so its erase-from-front cost is bounded by a name, not by the body.
+- `WinHttpJson.h` is the one WinHTTP GET (`httpGetBody`: status-checked,
+  capped, per-stage logging) and the one `\u`-safe JSON string reader for both
+  the League poll and the update check in `ui`. `ignoreCert` exists for the
+  self-signed local game endpoint only, never for internet hosts.
+- Liveness and failures are published through `stats()` (`gameAvailable`,
+  `lastError`) for the Diagnostics page; the worker sets them on
+  detect/loss/fault transitions, not per poll.
 - `DiscordRichPresence` speaks the local Discord IPC named-pipe protocol: open
   `\\?\pipe\discord-ipc-0` through `-9`, handshake (opcode 0), send framed
   commands (opcode 1), drain the inbox, and treat opcode 2 as a close. It is a
@@ -37,7 +46,10 @@ League of Legends kill reminder.
   `kMaxInboundFrameBytes`; an oversized length drops the connection instead of
   sizing an allocation. `kDiscordApplicationId` must be a real Discord
   application id or Discord silently ignores every frame.
-- Presence modes are `Always`, `FullscreenOnly`, and `Off`. `FullscreenOnly`
+- Presence modes are `Always`, `FullscreenOnly`, and `Off`. `start()` with
+  `Off` stops the worker and returns, mirroring
+  `VoiceCommandService::configure`, so the caller passes the mode through
+  unconditionally. `FullscreenOnly`
   relies on `platform/Win32Util.h:foregroundWindowIsFullscreen`; leaving
   fullscreen sends a null-activity frame, so the presence disappears rather than
   freezing on the last game. The elapsed-timer policy (`resetTimerOnSwitch_`,

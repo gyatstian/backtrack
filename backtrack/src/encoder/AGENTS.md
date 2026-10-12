@@ -9,7 +9,7 @@ share.
 ## Ownership
 
 - Owns: `IEncoder`, `NvencEncoder`, `AmfEncoder`, `EncoderFactory`,
-  `BitstreamUtils`, `DecodeOrderTimestamps.h`.
+  `EncoderCommon`, `BitstreamUtils`, `DecodeOrderTimestamps.h`.
 - Does not own: frame timing (that is `app/VideoTimelineScheduler.h`) or muxing
   (`mux`).
 
@@ -101,6 +101,17 @@ share.
   and shutting the encoder down. That is the only signal
   `RecorderController`'s pipeline-recreate path uses, so never leave a broken
   session reporting healthy.
+- `EncoderCommon` is the single source for what both backends do
+  identically: `effectiveSettingsFor` (profile mapping plus the dependent
+  lookahead/AQ/B-frame resets; capability gating stays per-backend),
+  `finalizePacket` (driver-timestamp fallback, decode-order DTS, the
+  IDR-or-bitstream keyframe rule, header patching, parameter-set caching, EMA
+  stats), `ensureKeyFrameCarriesHeaders`, `effectiveDts` for consumers, and
+  the shared escalation budgets (`kEncoderMaxConsecutiveFailures`,
+  `kEncoderOutputTimeout`, `kEncoderInFlightMaxAge`). Only the keyframe
+  picture-type read stays per-backend (NVENC `pictureType`, AMF
+  `OUTPUT_DATA_TYPE`), passed in as `metadataIdr`; so do the drain
+  mechanisms (NVENC EOS poll, AMF helper-thread `Drain()`).
 - `BitstreamUtils` decides replay cut safety, so it is shared and strict:
   `bitstreamContainsKeyFrame` matches IDR (or HEVC BLA/IDR) only. A plain I
   frame, or an open-GOP CRA frame that a driver reports as an I frame, must not

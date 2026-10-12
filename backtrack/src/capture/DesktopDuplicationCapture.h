@@ -1,6 +1,7 @@
 #pragma once
 
 #include "capture/D3DDevice.h"
+#include "capture/GpuTexturePool.h"
 #include "capture/ICaptureSource.h"
 
 #include <dxgi1_6.h>
@@ -32,10 +33,9 @@ private:
         ComPtr<ID3D11RenderTargetView> renderTargetView;
     };
 
-    std::shared_ptr<TextureSlot> acquireSlot();
     bool createTexturePool(uint32_t width, uint32_t height, DXGI_FORMAT format, uint32_t poolSize);
     bool queryAdvancedColor();
-    void applyHdrState(bool advanced);
+    bool applyHdrState(bool advanced);
     void markLost(const wchar_t* reason, HRESULT hr);
     void releaseHeldFrame();
     void logAcquireFailureOnce(const wchar_t* reason, HRESULT hr);
@@ -50,8 +50,7 @@ private:
     HMONITOR monitor_ = nullptr;
     ComPtr<IDXGIOutputDuplication> duplication_;
     ComPtr<IDXGIOutput6> colorProbe_; // cached HDR state source; GetDesc1 is cheap, no factory walk
-    std::vector<std::shared_ptr<TextureSlot>> pool_;
-    uint64_t poolExhaustionDrops_ = 0;
+    GpuTexturePool<TextureSlot> pool_;
     uint64_t frameIndex_ = 0;
     uint64_t cursorOnlyFrames_ = 0;
     std::chrono::steady_clock::time_point nextCursorOnlyFrameAt_{};

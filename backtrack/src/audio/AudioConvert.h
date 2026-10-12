@@ -3,6 +3,7 @@
 #include "core/Types.h"
 
 #include <cstdint>
+#include <span>
 
 namespace backtrack {
 
@@ -54,5 +55,11 @@ bool isCanonicalAudioFormat(const AudioFormatInfo& info);
 // packet's format cannot be interpreted; callers must then drop the packet
 // instead of writing its bytes into a differently formatted stream.
 bool convertAudioPacketToCanonical(AudioPacket& packet);
+
+// Pure gain/mute for canonical float samples (post-canonicalization only).
+// No format lookup, no clamp of the gain itself: sanitizeSettings owns the
+// 0-200% range, so gain is percent/100 exactly. Muted zeroes, gain==1 is a
+// no-op, otherwise multiply and clamp to [-1, 1]. No allocation.
+void applyMuteGain(std::span<float> samples, float gain, bool muted);
 
 } // namespace backtrack

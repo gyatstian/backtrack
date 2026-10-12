@@ -46,7 +46,8 @@ capture device, or a window.
     the zero-request clamp to 1.
   - `AudioConvertTests` - `audio/AudioConvert.cpp`, `core/Logger.cpp`:
     canonical conversion (passthrough, resample, mono duplication, 5.1
-    downmix, rejection of an unsupported format) and that a mid-stream format
+    downmix, rejection of an unsupported format), the `applyMuteGain`
+    primitive (mute, unity no-op, scale, clamp), and that a mid-stream format
     change still leaves every packet on one uniform format.
   - `ReplayBufferTests` - `replay/ReplayBuffer.cpp`, `mux/RecoveryStore.cpp`,
     `audio/AudioConvert.cpp`, `audio/WavReader.cpp`, `mux/WavWriter.cpp`,
@@ -78,6 +79,14 @@ capture device, or a window.
   - `AudioDenoiseTests` - `audio/RnnoiseDenoiser.cpp`, `LIBS rnnoise`. Built
     only when `BACKTRACK_NOISE_SUPPRESSION=ON`; the suite itself has no
     `#ifdef`, the CMake `if` around `add_backtrack_test` is the whole gate.
+  - `SessionMuteStoreTests` - `audio/SessionMuteStore.cpp`,
+    `core/Logger.cpp` (the journal's UTF-8 codec). Covers the journal codec
+    round trip and malformed-line skipping, write-after-every-mute with atomic
+    publish, stale pruning, the orphan sweep (still-muted check, rewrite of
+    unreached entries, no-journal and failed-enumeration no-ops that preserve
+    the journal), and the try_lock-only crash path proven against a lock held
+    on another thread. Needs no COM or WASAPI: sessions enter as
+    `SessionMuteCandidate` values with recording lambdas.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` defines
   `Mp4Muxer::muxToMp4` and `removeEmptyOutputReservation` itself so

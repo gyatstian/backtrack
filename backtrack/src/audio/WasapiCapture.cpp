@@ -1,4 +1,5 @@
 #include "audio/WasapiCapture.h"
+#include "audio/SessionMuteStore.h"
 
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
@@ -14,16 +15,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <cwctype>
 #include <cwchar>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <system_error>
-#include <unordered_set>
 #include <vector>
 
 namespace backtrack {
@@ -463,181 +460,41 @@ std::vector<AudioSessionAppInfo> WasapiCapture::enumerateAudioSessionApps() {
 
 namespace {
 
-struct SessionMuteEntry {
-    DWORD processId = 0;
-    std::wstring pathKey;
-    bool previousMute = false;
-    Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
-};
-
-std::mutex g_sessionMuteMutex;
-std::vector<SessionMuteEntry> g_sessionMutes;
-
-// Applied mutes are global system state: they outlive this process if it
-// crashes between muting a foreign session and restoring it. The journal
-// below mirrors g_sessionMutes on disk so a later start can undo what a dead
-// session left muted. Format per line: "<pid>\t<previousMute 0|1>\t<pathKey>".
-std::filesystem::path sessionMuteJournalPath() {
-    return localAppDataPath() / L"audio-session-mutes.txt";
+SessionMuteStore& sessionMuteStore() {
+    // Process-global like the mutes it mirrors: applied mutes are global
+    // system state, not per-stream state.
+    static SessionMuteStore store(localAppDataPath() / L"audio-session-mutes.txt");
+    return store;
 }
 
-std::string serializeSessionMutesLocked() {
-    std::string content;
-    for (const auto& entry : g_sessionMutes) {
-        content += std::to_string(entry.processId);
-        content += '\t';
-        content += entry.previousMute ? '1' : '0';
-        content += '\t';
-        content += wideToUtf8(entry.pathKey);
-        content += '\n';
-    }
-    return content;
-}
-
-void writeSessionMuteJournalLocked(const std::string& content) {
-    static std::string lastWritten;
-    if (content == lastWritten) {
-        return;
-    }
-
-    const std::filesystem::path journalPath = sessionMuteJournalPath();
-    std::error_code error;
-    if (content.empty()) {
-        std::filesystem::remove(journalPath, error);
-        lastWritten = content;
-        return;
-    }
-
-    std::filesystem::create_directories(journalPath.parent_path(), error);
-    error = {};
-    const std::filesystem::path tempPath = journalPath.wstring() + L".tmp";
-    {
-        std::ofstream stream(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!stream.is_open()) {
-            return;
-        }
-        stream.write(content.data(), static_cast<std::streamsize>(content.size()));
-        stream.flush();
-        if (!stream) {
-            return;
-        }
-    }
-    // Atomic replace so a crash mid-write never leaves a torn journal behind.
-    std::filesystem::rename(tempPath, journalPath, error);
-    if (!error) {
-        lastWritten = content;
-    }
-}
-
-void persistSessionMutesLocked() {
-    writeSessionMuteJournalLocked(serializeSessionMutesLocked());
-}
-
-void restoreSessionMutesLocked() {
-    for (auto& entry : g_sessionMutes) {
-        if (entry.volume) {
-            entry.volume->SetMute(entry.previousMute ? TRUE : FALSE, nullptr);
-        }
-    }
-    const bool hadEntries = !g_sessionMutes.empty();
-    g_sessionMutes.clear();
-    if (hadEntries) {
-        // Journal removal is part of the clean-restore path; an empty journal
-        // tells the startup sweep there is nothing orphaned to undo.
-        writeSessionMuteJournalLocked({});
-    }
-}
-
-} // namespace
-
-void WasapiCapture::emergencyRestoreSessionMutes() noexcept {
-    // Crash-path restore (unhandled exception / terminate / console ctrl).
-    // Best effort by design: skip if another thread holds the registry lock,
-    // and never let a failure escape into a crashing process.
-    std::unique_lock<std::mutex> lock(g_sessionMuteMutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        return;
-    }
-    // COM is per-thread and none of the threads that reach here have it: the
-    // console control handler runs on an OS-created thread, the SEH filter and
-    // the terminate handler on whatever faulted. Un-initialized, the SetMute
-    // below fails with CO_E_NOTINITIALIZED and the discarded HRESULT hides it,
-    // leaving the application muted with only the next launch's sweep to undo
-    // it. A mismatched apartment (RPC_E_CHANGED_MODE) is still a usable COM
-    // thread, so the result is deliberately not checked. The destructor only
-    // balances this call, which makes it safe on the crash path.
-    ScopedComInitialization com(COINIT_MULTITHREADED);
-    for (auto& entry : g_sessionMutes) {
-        if (entry.volume) {
-            try {
-                entry.volume->SetMute(entry.previousMute ? TRUE : FALSE, nullptr);
-            } catch (...) {
-            }
-        }
-    }
-    g_sessionMutes.clear();
-}
-
-void WasapiCapture::restoreOrphanedSessionMutes() {
-    // Startup sweep for mutes applied by a previous crashed session. Runs
-    // under the single-instance mutex, so no concurrent session can apply
-    // fresh mutes while sweeping.
-    const std::filesystem::path journalPath = sessionMuteJournalPath();
-    std::error_code error;
-    if (!std::filesystem::exists(journalPath, error) || error) {
-        return;
-    }
-
-    struct OrphanedMute {
-        DWORD processId = 0;
-        bool previousMute = false;
-        std::wstring pathKey;
-    };
-    std::vector<OrphanedMute> orphans;
-    {
-        std::ifstream stream(journalPath, std::ios::in | std::ios::binary);
-        if (!stream.is_open()) {
-            return;
-        }
-        std::string line;
-        while (std::getline(stream, line)) {
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            const auto firstTab = line.find('\t');
-            const auto secondTab = firstTab == std::string::npos ? std::string::npos : line.find('\t', firstTab + 1);
-            if (firstTab == std::string::npos || secondTab == std::string::npos) {
-                continue;
-            }
-            OrphanedMute orphan;
-            orphan.processId = static_cast<DWORD>(_strtoui64(line.c_str(), nullptr, 10));
-            orphan.previousMute = line[firstTab + 1] == '1';
-            orphan.pathKey = utf8ToWide(line.substr(secondTab + 1));
-            if (orphan.processId != 0 && !orphan.pathKey.empty()) {
-                orphans.push_back(std::move(orphan));
-            }
-        }
-    }
+// Collects every live foreign render session. False when the endpoint
+// enumeration itself failed, in which case the caller leaves everything
+// untouched. Only the sweep logs that failure; the mute path stays silent.
+bool enumerateForeignRenderSessions(
+    DWORD currentProcessId, std::vector<SessionMuteCandidate>& out, bool logFailures) {
     ScopedComInitialization com(COINIT_MULTITHREADED);
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
-    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))) || !enumerator) {
-        Logger::instance().warning(L"audio",
-            L"Could not sweep orphaned session mutes: MMDeviceEnumerator unavailable");
-        return;
+    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+    if (FAILED(hr) || !enumerator) {
+        if (logFailures) {
+            Logger::instance().warning(L"audio",
+                L"Could not sweep orphaned session mutes: MMDeviceEnumerator unavailable");
+        }
+        return false;
     }
 
     Microsoft::WRL::ComPtr<IMMDeviceCollection> endpoints;
-    HRESULT hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &endpoints);
+    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &endpoints);
     if (FAILED(hr) || !endpoints) {
-        Logger::instance().warning(L"audio",
-            L"Could not sweep orphaned session mutes: endpoint enumeration failed (" + hresultToString(hr) + L")");
-        return;
+        if (logFailures) {
+            Logger::instance().warning(L"audio",
+                L"Could not sweep orphaned session mutes: endpoint enumeration failed (" + hresultToString(hr) + L")");
+        }
+        return false;
     }
 
-    const DWORD currentProcessId = GetCurrentProcessId();
     UINT endpointCount = 0;
     endpoints->GetCount(&endpointCount);
-    uint32_t restored = 0;
     for (UINT endpointIndex = 0; endpointIndex < endpointCount; ++endpointIndex) {
         Microsoft::WRL::ComPtr<IMMDevice> endpoint;
         if (FAILED(endpoints->Item(endpointIndex, &endpoint)) || !endpoint) {
@@ -645,7 +502,8 @@ void WasapiCapture::restoreOrphanedSessionMutes() {
         }
 
         Microsoft::WRL::ComPtr<IAudioSessionManager2> sessionManager;
-        if (FAILED(endpoint->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &sessionManager)) || !sessionManager) {
+        if (FAILED(endpoint->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &sessionManager)) ||
+            !sessionManager) {
             continue;
         }
 
@@ -682,189 +540,74 @@ void WasapiCapture::restoreOrphanedSessionMutes() {
                 continue;
             }
 
-            const auto orphan = std::find_if(
-                orphans.begin(),
-                orphans.end(),
-                [&](const OrphanedMute& candidate) {
-                    return candidate.processId == processId && candidate.pathKey == key;
-                });
-            if (orphan == orphans.end()) {
-                continue;
-            }
-
             Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
             if (FAILED(session.As(&volume)) || !volume) {
                 continue;
             }
 
-            // Only touch sessions still muted: if the user already unmuted
-            // the app after the crash, respect that instead of re-applying
-            // the journaled state blindly.
-            BOOL currentMute = FALSE;
-            volume->GetMute(&currentMute);
-            if (currentMute == TRUE &&
-                SUCCEEDED(volume->SetMute(orphan->previousMute ? TRUE : FALSE, nullptr))) {
-                ++restored;
-                orphans.erase(orphan);
-            }
+            BOOL muted = FALSE;
+            volume->GetMute(&muted);
+            // The lambda holds the volume alive, so the session cannot die
+            // between enumeration and restore.
+            out.push_back(SessionMuteCandidate{
+                static_cast<uint32_t>(processId),
+                key,
+                muted == TRUE,
+                [volume](bool mute) {
+                    return SUCCEEDED(volume->SetMute(mute ? TRUE : FALSE, nullptr));
+                },
+            });
         }
     }
+    return true;
+}
 
-    // Consumed only after a sweep actually ran: the enumeration failures above
-    // return early, and entries the loop could not reach are rewritten, not dropped.
-    if (orphans.empty()) {
-        std::filesystem::remove(journalPath, error);
-    } else {
-        std::string unresolved;
-        for (const OrphanedMute& orphan : orphans) {
-            unresolved += std::to_string(orphan.processId) + '\t' + (orphan.previousMute ? '1' : '0') + '\t' +
-                          wideToUtf8(orphan.pathKey) + '\n';
-        }
-        std::scoped_lock lock(g_sessionMuteMutex);
-        writeSessionMuteJournalLocked(unresolved);
+bool isProcessAlive(DWORD processId) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process) {
+        CloseHandle(process);
+    }
+    return process != nullptr;
+}
+
+} // namespace
+
+void WasapiCapture::emergencyRestoreSessionMutes() noexcept {
+    sessionMuteStore().emergencyRestore();
+}
+
+void WasapiCapture::restoreOrphanedSessionMutes() {
+    // Startup sweep for mutes applied by a previous crashed session. Runs
+    // under the single-instance mutex, so no concurrent session can apply
+    // fresh mutes while sweeping.
+    const DWORD currentProcessId = GetCurrentProcessId();
+    const auto result = sessionMuteStore().sweepOrphans(
+        [&](std::vector<SessionMuteCandidate>& sessions) {
+            return enumerateForeignRenderSessions(currentProcessId, sessions, true);
+        });
+    if (!result) {
+        return;
     }
 
     Logger::instance().info(L"audio",
-        L"Orphaned session-mute sweep restored " + std::to_wstring(restored) +
-        L" audio session(s); " + std::to_wstring(orphans.size()) +
+        L"Orphaned session-mute sweep restored " + std::to_wstring(result->restored) +
+        L" audio session(s); " + std::to_wstring(result->unmatched) +
         L" journaled entr(y/ies) no longer matched");
 }
 
 
 uint32_t WasapiCapture::applySessionMutesForExecutables(const std::vector<std::wstring>& mutedExecutableKeys) {
-    std::scoped_lock lock(g_sessionMuteMutex);
-    if (mutedExecutableKeys.empty()) {
-        restoreSessionMutesLocked();
-        return 0;
-    }
-
-    std::unordered_set<std::wstring> mutedKeys(
-        mutedExecutableKeys.begin(), mutedExecutableKeys.end());
-
-    ScopedComInitialization com(COINIT_MULTITHREADED);
-    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
-    if (FAILED(hr) || !enumerator) {
-        return 0;
-    }
-
-    Microsoft::WRL::ComPtr<IMMDeviceCollection> endpoints;
-    hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &endpoints);
-    if (FAILED(hr) || !endpoints) {
-        return 0;
-    }
-
-    // Drop stale mute entries for processes that exited or are no longer requested.
-    for (auto it = g_sessionMutes.begin(); it != g_sessionMutes.end();) {
-        const bool stillWanted = mutedKeys.contains(it->pathKey);
-        HANDLE process = stillWanted ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, it->processId) : nullptr;
-        const bool alive = process != nullptr;
-        if (process) {
-            CloseHandle(process);
-        }
-        if (!stillWanted || !alive || !it->volume) {
-            if (it->volume) {
-                it->volume->SetMute(it->previousMute ? TRUE : FALSE, nullptr);
-            }
-            it = g_sessionMutes.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    std::unordered_set<DWORD> alreadyMuted;
-    for (const auto& entry : g_sessionMutes) {
-        alreadyMuted.insert(entry.processId);
-    }
-
     const DWORD currentProcessId = GetCurrentProcessId();
-    UINT endpointCount = 0;
-    endpoints->GetCount(&endpointCount);
-    for (UINT endpointIndex = 0; endpointIndex < endpointCount; ++endpointIndex) {
-        Microsoft::WRL::ComPtr<IMMDevice> endpoint;
-        if (FAILED(endpoints->Item(endpointIndex, &endpoint)) || !endpoint) {
-            continue;
-        }
-
-        Microsoft::WRL::ComPtr<IAudioSessionManager2> sessionManager;
-        hr = endpoint->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &sessionManager);
-        if (FAILED(hr) || !sessionManager) {
-            continue;
-        }
-
-        Microsoft::WRL::ComPtr<IAudioSessionEnumerator> sessions;
-        hr = sessionManager->GetSessionEnumerator(&sessions);
-        if (FAILED(hr) || !sessions) {
-            continue;
-        }
-
-        int sessionCount = 0;
-        sessions->GetCount(&sessionCount);
-        for (int sessionIndex = 0; sessionIndex < sessionCount; ++sessionIndex) {
-            Microsoft::WRL::ComPtr<IAudioSessionControl> session;
-            if (FAILED(sessions->GetSession(sessionIndex, &session)) || !session) {
-                continue;
-            }
-
-            Microsoft::WRL::ComPtr<IAudioSessionControl2> session2;
-            if (FAILED(session.As(&session2)) || !session2) {
-                continue;
-            }
-            if (session2->IsSystemSoundsSession() == S_OK) {
-                continue;
-            }
-
-            DWORD processId = 0;
-            if (FAILED(session2->GetProcessId(&processId)) ||
-                processId == 0 ||
-                processId == currentProcessId ||
-                alreadyMuted.contains(processId)) {
-                continue;
-            }
-
-            const std::filesystem::path imagePath = processImagePath(processId);
-            const std::wstring key = normalizedPathKey(imagePath);
-            if (key.empty() || !mutedKeys.contains(key)) {
-                continue;
-            }
-
-            Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
-            if (FAILED(session.As(&volume)) || !volume) {
-                continue;
-            }
-
-            BOOL previousMute = FALSE;
-            volume->GetMute(&previousMute);
-            if (FAILED(volume->SetMute(TRUE, nullptr))) {
-                continue;
-            }
-
-            SessionMuteEntry entry;
-            entry.processId = processId;
-            entry.pathKey = key;
-            entry.previousMute = previousMute == TRUE;
-            entry.volume = std::move(volume);
-            g_sessionMutes.push_back(std::move(entry));
-            alreadyMuted.insert(processId);
-            // Journal this mute before walking the next session: a kill inside
-            // the walk is precisely what the journal exists for, and the lock
-            // the crash path try_locks is held across the whole enumeration, so
-            // there is no second chance to record it. Unchanged content
-            // short-circuits the write, so this costs one small file per newly
-            // muted session and nothing on the no-op sweeps after it.
-            persistSessionMutesLocked();
-        }
-    }
-
-    // Covers the stale-entry removals above, which unmute sessions too. No-op
-    // when the loop already persisted this exact content.
-    persistSessionMutesLocked();
-    return static_cast<uint32_t>(g_sessionMutes.size());
+    return sessionMuteStore().apply(
+        mutedExecutableKeys,
+        [&](std::vector<SessionMuteCandidate>& sessions) {
+            return enumerateForeignRenderSessions(currentProcessId, sessions, false);
+        },
+        isProcessAlive);
 }
 
 void WasapiCapture::clearSessionMutes() {
-    std::scoped_lock lock(g_sessionMuteMutex);
-    restoreSessionMutesLocked();
+    sessionMuteStore().clear();
 }
 
 std::vector<AudioSessionAppInfo> WasapiCapture::enumerateOpenApps() {

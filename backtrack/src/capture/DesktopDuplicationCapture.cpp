@@ -13,13 +13,6 @@ namespace backtrack {
 
 namespace {
 
-constexpr uint32_t kMinPoolSize = 5;
-constexpr uint32_t kMaxPoolSize = 16;
-
-uint32_t captureTexturePoolSize(const AppSettings& settings) {
-    // +1 for lastFrame pin in captureLoop (keeps one pool slot in use).
-    return std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 4, kMinPoolSize, kMaxPoolSize);
-}
 
 // Minimal quad pipeline. The vertex shader synthesises a triangle strip from
 // SV_VertexID (no vertex/index buffers) and positions it using a clip-space
@@ -126,9 +119,9 @@ bool DesktopDuplicationCapture::queryAdvancedColor() {
     return monitorHasAdvancedColor(monitor_);
 }
 
-void DesktopDuplicationCapture::applyHdrState(bool advanced) {
+bool DesktopDuplicationCapture::applyHdrState(bool advanced) {
     if (advanced == hdrActive_) {
-        return;
+        return false;
     }
     hdrActive_ = advanced;
     ++hdrChangeCount_;
@@ -138,6 +131,7 @@ void DesktopDuplicationCapture::applyHdrState(bool advanced) {
     Logger::instance().warning(L"capture",
         advanced ? L"Desktop Duplication HDR turned on; flagging HDR frames"
                  : L"Desktop Duplication HDR turned off; flagging SDR frames");
+    return true;
 }
 
 bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings& settings, const CaptureTarget& target) {
@@ -155,7 +149,6 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     cursorOnlyFrameInterval_ = std::chrono::nanoseconds(
         1'000'000'000 / std::max<uint32_t>(1, settings.video.fps));
     nextCursorOnlyFrameAt_ = {};
-    poolExhaustionDrops_ = 0;
     haveContent_ = false;
     frameHeld_ = false;
     lastLoggedAcquireHr_ = S_OK;
@@ -251,7 +244,7 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     }
     frameHeld_ = false;
 
-    poolSize_ = captureTexturePoolSize(settings);
+    poolSize_ = texturePoolSizeForQueueLimit(settings.gpu.frameQueueLimit);
     // The pool stays empty until the first acquired surface reveals its real
     // format; eagerly creating BGRA here forces a recreate on every HDR start.
     lastHdrPollAt_ = std::chrono::steady_clock::now();
@@ -334,15 +327,18 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         height_ = acquiredDesc.Height;
         format_ = acquiredDesc.Format;
         // A display-mode switch is also when HDR can toggle; refresh the flag
-        // so frames carry the correct color-space hint.
-        applyHdrState(queryAdvancedColor());
+        // so frames carry the correct color-space hint. applyHdrState already
+        // bumped resolutionChanges_ on a real flip, so skip the second bump.
+        const bool hdrFlipped = applyHdrState(queryAdvancedColor());
         if (!createTexturePool(width_, height_, format_, poolSize_)) {
             markLost(L"Texture pool recreate failed", E_FAIL);
             return false;
         }
         // In-place resize/format switch opens a new GOP via the app's
         // existing resolutionChangeCount hook.
-        ++resolutionChanges_;
+        if (!hdrFlipped) {
+            ++resolutionChanges_;
+        }
     }
 
     const bool cursorUpdated = captureCursor_ && frameInfo.LastMouseUpdateTime.QuadPart != 0;
@@ -384,17 +380,10 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         return false;
     }
 
-    auto slot = acquireSlot();
+    auto slot = pool_.acquireOrLog(L"Capture texture pool exhausted");
     if (!slot) {
-        ++poolExhaustionDrops_;
-        if (poolExhaustionDrops_ == 1 || (poolExhaustionDrops_ % 300) == 0) {
-            Logger::instance().warning(L"capture",
-                L"Capture texture pool exhausted; dropping frame count=" +
-                std::to_wstring(poolExhaustionDrops_));
-        }
         return false;
     }
-    poolExhaustionDrops_ = 0;
 
     const bool drawCursor = captureCursor_ && cursorVisible_ && cursorShapeValid_ && ensureCompositor();
     {
@@ -463,22 +452,12 @@ void DesktopDuplicationCapture::shutdown() {
     device_ = nullptr;
 }
 
-std::shared_ptr<DesktopDuplicationCapture::TextureSlot> DesktopDuplicationCapture::acquireSlot() {
-    for (auto& slot : pool_) {
-        if (slot.use_count() == 1) {
-            return slot;
-        }
-    }
-    return {};
-}
-
 bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t height, DXGI_FORMAT format, uint32_t poolSize) {
     pool_.clear();
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
     haveContent_ = false;
-    poolExhaustionDrops_ = 0;
-    poolSize = std::clamp<uint32_t>(poolSize, kMinPoolSize, kMaxPoolSize);
+    poolSize = std::clamp<uint32_t>(poolSize, kMinTexturePoolSize, kMaxTexturePoolSize);
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = width;
@@ -531,6 +510,13 @@ bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t heigh
         desktopCopySrv_.Reset();
         return false;
     }
+
+    pool_.setFootprintBytes(dxgiTextureBytes(width, height, format) * pool_.size());
+    Logger::instance().debug(L"capture",
+        L"Desktop Duplication texture pool initialized " +
+        std::to_wstring(width) + L"x" + std::to_wstring(height) +
+        L" pool=" + std::to_wstring(pool_.size()) +
+        L" (" + std::to_wstring(pool_.footprintBytes() / 1024) + L" KiB)");
 
     return true;
 }

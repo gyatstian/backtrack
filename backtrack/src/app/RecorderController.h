@@ -27,6 +27,97 @@ class MicrophoneAgc;
 class RnnoiseDenoiser;
 #endif
 
+// Capture-session supervisor: the 5-state exclusive-fullscreen recovery
+// machine plus the flags that used to live as ~30 captureLoopImpl locals.
+// All recovery state lives here; frame data and clocks stay in the loop.
+// Transitions are explicit methods so call sites read as state changes, not
+// flag soup. Dropped twins (not stored): the derived
+// desktopRecoveryProbeActive predicate (computed from recoveryProbe +
+// cover), and the ad-hoc `stallHold || state != Capturing` checks, which are
+// now stalled(). exclusiveBlind vs loggedHold both stay: blindness is
+// recovery input, loggedHold is first-hold output (IDR + log once).
+enum class CaptureSessionState {
+    Capturing,
+    AccessLost,
+    WaitStable,
+    Rebind,
+    Holding,
+};
+
+struct CaptureSession {
+    CaptureSessionState state = CaptureSessionState::Capturing;
+    bool stallHold = false;
+    bool exclusiveBlind = false;
+    bool recoveryProbe = false;
+    bool targetLostLatched = false;
+    bool retargetedAlternate = false;
+    bool immediateRebind = false;
+    // Known source switches may accept the first fresh source frame; the longer
+    // sustained-frame gate remains for ambiguous capture-loss recovery.
+    bool acceptFirstLive = false;
+    bool loggedHold = false;
+    int rebindAttempts = 0;
+    int exclusiveDxgiAttempts = 0;
+    int sustainedLive = 0;
+    int softStallRecreates = 0;
+    int deadTargetFailures = 0;
+    SteadyClock::time_point accessLostAt = SteadyClock::time_point::min();
+    SteadyClock::time_point liveSince = SteadyClock::time_point::min();
+    SteadyClock::time_point rebindBornAt = SteadyClock::time_point::min();
+    SteadyClock::time_point lastRebindAt = SteadyClock::time_point::min();
+    SteadyClock::time_point softStallBeganAt = SteadyClock::time_point::min();
+    SteadyClock::time_point lastSoftStallAt = SteadyClock::time_point::min();
+    SteadyClock::time_point nextTargetCheckAt = SteadyClock::time_point::min();
+    HWND exclusiveWindow = nullptr;
+
+    bool stalled() const { return stallHold || state != CaptureSessionState::Capturing; }
+
+    void toAccessLost(SteadyClock::time_point now, HWND coverWindow) {
+        if (state != CaptureSessionState::Capturing) {
+            stallHold = true;
+            return;
+        }
+        accessLostAt = now;
+        exclusiveWindow = coverWindow;
+        state = CaptureSessionState::AccessLost;
+        stallHold = true;
+        liveSince = SteadyClock::time_point::min();
+        sustainedLive = 0;
+        softStallBeganAt = SteadyClock::time_point::min();
+        softStallRecreates = 0;
+    }
+
+    // Returns true on the first hold of this cover episode (caller emits the
+    // one IDR + log + status line).
+    bool toHolding() {
+        const bool firstHold = !loggedHold;
+        state = CaptureSessionState::Holding;
+        stallHold = true;
+        exclusiveBlind = true;
+        sustainedLive = 0;
+        liveSince = SteadyClock::time_point::min();
+        softStallBeganAt = SteadyClock::time_point::min();
+        softStallRecreates = 0;
+        if (firstHold) {
+            loggedHold = true;
+        }
+        return firstHold;
+    }
+
+    void toCapturing() {
+        state = CaptureSessionState::Capturing;
+        stallHold = false;
+        exclusiveBlind = false;
+        recoveryProbe = false;
+        loggedHold = false;
+        acceptFirstLive = false;
+        rebindAttempts = 0;
+        exclusiveDxgiAttempts = 0;
+        softStallBeganAt = SteadyClock::time_point::min();
+        softStallRecreates = 0;
+    }
+};
+
 class RecorderController {
 public:
     RecorderController();
@@ -84,6 +175,10 @@ private:
     void handleAudioPacket(AudioPacket&& packet);
     void writeAudioPacket(AudioPacket&& packet);
     void refreshSystemAudioCapture(const AppSettings& settings);
+    // Publishes the lock-free mirrors for hot UI-timer reads (replay enable,
+    // GOP seconds, cursor preference). Called wherever settings_ is assigned
+    // so the mirrors never drift from the sanitized source of truth.
+    void publishLiveMirrors(const AppSettings& settings);
     // Diagnostics-only watchdog: warns (once per stall episode) when the
     // capture/encode pipeline stops producing encoded video while it should be
     // running and replay is enabled. Reads lastEncodedVideoPts100ns_ against
@@ -167,6 +262,13 @@ private:
     std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<uint32_t> audioInputVolumePercent_{100};
     std::atomic<bool> audioInputAutoGain_{false};
+    // Lock-free mirrors for hot UI-timer/diagnostics reads. settings() copies
+    // the whole struct (paths, vectors) per call; these load without a lock
+    // or allocation. Written only where settings_ is assigned, always from
+    // the sanitized value.
+    std::atomic<bool> replayEnabledMirror_{true};
+    std::atomic<uint32_t> videoGopSecondsMirror_{2};
+    std::atomic<bool> captureCursorMirror_{true};
     // Set when the microphone stream restarts or AGC is toggled; the audio
     // writer resets the AGC envelope on its own thread before the next packet.
     std::atomic<bool> microphoneAgcResetPending_{true};

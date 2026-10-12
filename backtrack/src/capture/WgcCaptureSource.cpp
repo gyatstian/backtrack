@@ -1,6 +1,7 @@
 #include "capture/WgcCaptureSource.h"
 
 #include "capture/D3DDevice.h"
+#include "capture/GpuTexturePool.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -48,8 +49,7 @@ struct WgcCaptureSource::Impl {
     // if the global timer period was not raised (timeBeginPeriod denied). nullptr
     // falls back to the coarse WaitForSingleObject path.
     HANDLE cadenceTimer = nullptr;
-    std::vector<std::shared_ptr<TextureSlot>> pool;
-    uint64_t poolExhaustionDrops = 0;
+    GpuTexturePool<TextureSlot> pool;
     uint64_t zeroCopyLeaseDrops = 0;
     uint64_t frameIndex = 0;
     uint32_t width = 0;
@@ -84,10 +84,10 @@ struct WgcCaptureSource::Impl {
         zeroCopy = settings.gpu.wgcZeroCopy;
         captureCursor = settings.captureCursor;
         // +1 for lastFrame pin in captureLoop (keeps one copy-path pool slot in use).
-        texturePoolSize = std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 4, 5, 16);
+        texturePoolSize = texturePoolSizeForQueueLimit(settings.gpu.frameQueueLimit);
         // Bound WGC pool so in-flight zero-copy leases cannot exhaust it.
         // Keep at least one free slot for the next FrameArrived.
-        framePoolSize = std::clamp<uint32_t>(settings.gpu.frameQueueLimit + 2, 3, 8);
+        framePoolSize = wgcFramePoolSizeForQueueLimit(settings.gpu.frameQueueLimit);
         // FrameArrived can fire while capture work is running. Keep notification
         // asserted until the consumer has drained the frame pool.
         frameEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -313,15 +313,14 @@ struct WgcCaptureSource::Impl {
             }
 
             if (zeroCopy) {
-                // Keep at least one WGC pool slot free so TryGetNextFrame keeps working.
-                // Each zero-copy lease holds a Direct3D11CaptureFrame until encode finishes.
+                // Each zero-copy lease holds a Direct3D11CaptureFrame until encode
+                // finishes; keep one WGC pool slot free so FrameArrived /
+                // TryGetNextFrame keep working.
                 const uint32_t outstanding =
                     outstandingZeroCopyLeases->load(std::memory_order_acquire);
-                // Keep ≥1 WGC pool slot free so FrameArrived / TryGetNextFrame keep working.
-                const uint32_t maxLeases = framePoolSize > 1 ? framePoolSize - 1 : 1;
+                const uint32_t maxLeases = wgcMaxZeroCopyLeases(framePoolSize);
                 if (outstanding >= maxLeases) {
-                    ++zeroCopyLeaseDrops;
-                    if (zeroCopyLeaseDrops == 1 || (zeroCopyLeaseDrops % 300) == 0) {
+                    if (gpuDropShouldLog(zeroCopyLeaseDrops)) {
                         Logger::instance().warning(L"capture",
                             L"WGC zero-copy lease limit reached; falling back to copy path count=" +
                             std::to_wstring(zeroCopyLeaseDrops) +
@@ -329,33 +328,8 @@ struct WgcCaptureSource::Impl {
                             L" pool=" + std::to_wstring(framePoolSize));
                     }
                     // Force a copy so the Direct3D11CaptureFrame is released immediately.
-                    if (pool.empty() && !createTexturePool(width, height)) {
-                        return false;
-                    }
-                    auto slot = acquireSlot();
-                    if (!slot) {
-                        ++poolExhaustionDrops;
-                        if (poolExhaustionDrops == 1 || (poolExhaustionDrops % 300) == 0) {
-                            Logger::instance().warning(L"capture",
-                                L"WGC capture texture pool exhausted; dropping frame count=" +
-                                std::to_wstring(poolExhaustionDrops));
-                        }
-                        return false;
-                    }
-                    poolExhaustionDrops = 0;
-                    {
-                        std::scoped_lock lock(device->immediateContextMutex());
-                        device->context()->CopyResource(slot->texture.Get(), capturedTexture.Get());
-                    }
                     // frame goes out of scope after this block → WGC pool slot freed.
-                    output.texture = slot->texture;
-                    output.lease = slot;
-                    output.frameIndex = frameIndex++;
-                    output.pts100ns = presentTime100ns;
-                    output.width = width;
-                    output.height = height;
-                    output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                    return true;
+                    return emitCopyFrame(output, capturedTexture.Get(), presentTime100ns);
                 }
 
                 auto counter = outstandingZeroCopyLeases;
@@ -375,34 +349,12 @@ struct WgcCaptureSource::Impl {
                 output.width = width;
                 output.height = height;
                 output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                // DWM pre-tonemaps WGC to SDR; scaler must not tone-map again.
+                output.hdr = false;
                 return true;
             }
 
-            auto slot = acquireSlot();
-            if (!slot) {
-                ++poolExhaustionDrops;
-                if (poolExhaustionDrops == 1 || (poolExhaustionDrops % 300) == 0) {
-                    Logger::instance().warning(L"capture",
-                        L"WGC capture texture pool exhausted; dropping frame count=" +
-                        std::to_wstring(poolExhaustionDrops));
-                }
-                return false;
-            }
-            poolExhaustionDrops = 0;
-
-            {
-                std::scoped_lock lock(device->immediateContextMutex());
-                device->context()->CopyResource(slot->texture.Get(), capturedTexture.Get());
-            }
-
-            output.texture = slot->texture;
-            output.lease = slot;
-            output.frameIndex = frameIndex++;
-            output.pts100ns = presentTime100ns;
-            output.width = width;
-            output.height = height;
-            output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            return true;
+            return emitCopyFrame(output, capturedTexture.Get(), presentTime100ns);
         } catch (const winrt::hresult_error& error) {
             Logger::instance().warning(L"capture", L"Windows Graphics Capture frame acquisition failed: " + std::wstring(error.message().c_str()));
             deviceLost.store(true);
@@ -553,18 +505,36 @@ struct WgcCaptureSource::Impl {
         }
     }
 
-    std::shared_ptr<TextureSlot> acquireSlot() {
-        for (auto& slot : pool) {
-            if (slot.use_count() == 1) {
-                return slot;
-            }
+    // Shared copy path for the no-zero-copy mode and the zero-copy lease-cap
+    // fallback: copies the captured surface into a pooled texture so the
+    // Direct3D11CaptureFrame is released on return.
+    bool emitCopyFrame(GpuFrame& output, ID3D11Texture2D* captured, int64_t presentTime100ns) {
+        // Lazy for the lease-cap fallback, which never built the pool at init.
+        if (pool.empty() && !createTexturePool(width, height)) {
+            return false;
         }
-        return {};
+        auto slot = pool.acquireOrLog(L"WGC capture texture pool exhausted");
+        if (!slot) {
+            return false;
+        }
+        {
+            std::scoped_lock lock(device->immediateContextMutex());
+            device->context()->CopyResource(slot->texture.Get(), captured);
+        }
+        output.texture = slot->texture;
+        output.lease = slot;
+        output.frameIndex = frameIndex++;
+        output.pts100ns = presentTime100ns;
+        output.width = width;
+        output.height = height;
+        output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        // DWM pre-tonemaps WGC to SDR; scaler must not tone-map again.
+        output.hdr = false;
+        return true;
     }
 
     bool createTexturePool(uint32_t newWidth, uint32_t newHeight) {
         pool.clear();
-        poolExhaustionDrops = 0;
 
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = newWidth;
@@ -590,6 +560,13 @@ struct WgcCaptureSource::Impl {
             }
             pool.push_back(std::move(slot));
         }
+        pool.setFootprintBytes(
+            dxgiTextureBytes(newWidth, newHeight, DXGI_FORMAT_B8G8R8A8_UNORM) * pool.size());
+        Logger::instance().debug(L"capture",
+            L"WGC texture pool initialized " +
+            std::to_wstring(newWidth) + L"x" + std::to_wstring(newHeight) +
+            L" pool=" + std::to_wstring(pool.size()) +
+            L" (" + std::to_wstring(pool.footprintBytes() / 1024) + L" KiB)");
         return true;
     }
 };

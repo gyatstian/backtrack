@@ -1,6 +1,7 @@
 #include "integrations/LeagueOfLegendsIntegration.h"
 
 #include "core/Logger.h"
+#include "integrations/WinHttpJson.h"
 #include "platform/Win32Util.h"
 
 #include <winhttp.h>
@@ -26,37 +27,6 @@ constexpr wchar_t kHost[] = L"127.0.0.1";
 constexpr INTERNET_PORT kPort = 2999;
 constexpr auto kPollInterval = std::chrono::milliseconds(1000);
 constexpr auto kUnavailablePollInterval = std::chrono::milliseconds(2500);
-// 4 MiB dwarfs any real Live Client Data payload, so reaching the cap means
-// something other than the game client owns port 2999.
-constexpr size_t kMaxResponseBytes = 4 * 1024 * 1024;
-
-struct InternetHandle {
-    HINTERNET value = nullptr;
-
-    InternetHandle() = default;
-    explicit InternetHandle(HINTERNET handle)
-        : value(handle) {
-    }
-    ~InternetHandle() {
-        if (value) {
-            WinHttpCloseHandle(value);
-        }
-    }
-
-    InternetHandle(const InternetHandle&) = delete;
-    InternetHandle& operator=(const InternetHandle&) = delete;
-
-    void reset(HINTERNET handle = nullptr) {
-        if (value) {
-            WinHttpCloseHandle(value);
-        }
-        value = handle;
-    }
-
-    explicit operator bool() const {
-        return value != nullptr;
-    }
-};
 
 struct LiveEvent {
     int64_t eventId = -1;
@@ -64,127 +34,6 @@ struct LiveEvent {
     std::wstring eventName;
     std::wstring killerName;
 };
-
-int hexValue(char ch) {
-    if (ch >= '0' && ch <= '9') {
-        return ch - '0';
-    }
-    if (ch >= 'a' && ch <= 'f') {
-        return ch - 'a' + 10;
-    }
-    if (ch >= 'A' && ch <= 'F') {
-        return ch - 'A' + 10;
-    }
-    return -1;
-}
-
-std::optional<std::wstring> parseJsonStringAt(std::string_view json, size_t quotePos, size_t* endPos = nullptr) {
-    if (quotePos >= json.size() || json[quotePos] != '"') {
-        return std::nullopt;
-    }
-
-    std::wstring result;
-    std::string utf8Chunk;
-    auto flushUtf8 = [&] {
-        if (!utf8Chunk.empty()) {
-            result += utf8ToWide(utf8Chunk);
-            utf8Chunk.clear();
-        }
-    };
-
-    for (size_t index = quotePos + 1; index < json.size(); ++index) {
-        const char ch = json[index];
-        if (ch == '"') {
-            flushUtf8();
-            if (endPos) {
-                *endPos = index + 1;
-            }
-            return result;
-        }
-        if (ch != '\\') {
-            utf8Chunk.push_back(ch);
-            continue;
-        }
-        if (index + 1 >= json.size()) {
-            return std::nullopt;
-        }
-
-        flushUtf8();
-        const char escaped = json[++index];
-        switch (escaped) {
-        case '"':
-            result.push_back(L'"');
-            break;
-        case '\\':
-            result.push_back(L'\\');
-            break;
-        case '/':
-            result.push_back(L'/');
-            break;
-        case 'b':
-            result.push_back(L'\b');
-            break;
-        case 'f':
-            result.push_back(L'\f');
-            break;
-        case 'n':
-            result.push_back(L'\n');
-            break;
-        case 'r':
-            result.push_back(L'\r');
-            break;
-        case 't':
-            result.push_back(L'\t');
-            break;
-        case 'u': {
-            if (index + 4 >= json.size()) {
-                return std::nullopt;
-            }
-            uint32_t code = 0;
-            for (int digit = 0; digit < 4; ++digit) {
-                const int value = hexValue(json[index + 1 + digit]);
-                if (value < 0) {
-                    return std::nullopt;
-                }
-                code = (code << 4) | static_cast<uint32_t>(value);
-            }
-            index += 4;
-            result.push_back(static_cast<wchar_t>(code));
-            break;
-        }
-        default:
-            result.push_back(static_cast<wchar_t>(escaped));
-            break;
-        }
-    }
-
-    return std::nullopt;
-}
-
-size_t skipJsonWhitespace(std::string_view json, size_t pos) {
-    while (pos < json.size()) {
-        const char ch = json[pos];
-        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
-            break;
-        }
-        ++pos;
-    }
-    return pos;
-}
-
-std::optional<std::wstring> jsonStringField(std::string_view object, std::string_view field) {
-    const std::string pattern = "\"" + std::string(field) + "\"";
-    size_t pos = object.find(pattern);
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-    pos = object.find(':', pos + pattern.size());
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-    pos = skipJsonWhitespace(object, pos + 1);
-    return parseJsonStringAt(object, pos);
-}
 
 std::optional<int64_t> jsonIntField(std::string_view object, std::string_view field) {
     const std::string pattern = "\"" + std::string(field) + "\"";
@@ -249,76 +98,6 @@ std::optional<double> jsonDoubleField(std::string_view object, std::string_view 
         return std::nullopt;
     }
     return value;
-}
-
-// Polling hits the live client API twice per second; the session and
-// connection are pooled by the caller (workerLoop) so TCP/TLS setup is paid
-// once instead of on every request. The caller drops the pooled connection
-// after any failed request, so a restarted game client still gets fresh
-// transport state on the next poll.
-std::optional<std::string> httpGet(HINTERNET session, HINTERNET connection, const wchar_t* path) {
-    if (!session || !connection) {
-        return std::nullopt;
-    }
-
-    InternetHandle request(WinHttpOpenRequest(
-        connection,
-        L"GET",
-        path,
-        nullptr,
-        WINHTTP_NO_REFERER,
-        WINHTTP_DEFAULT_ACCEPT_TYPES,
-        WINHTTP_FLAG_SECURE));
-    if (!request) {
-        return std::nullopt;
-    }
-
-    DWORD securityFlags =
-        SECURITY_FLAG_IGNORE_UNKNOWN_CA |
-        SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-        SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-    WinHttpSetOption(request.value, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
-
-    if (!WinHttpSendRequest(request.value, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(request.value, nullptr)) {
-        return std::nullopt;
-    }
-
-    DWORD statusCode = 0;
-    DWORD statusCodeSize = sizeof(statusCode);
-    if (!WinHttpQueryHeaders(
-            request.value,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &statusCode,
-            &statusCodeSize,
-            WINHTTP_NO_HEADER_INDEX) ||
-        statusCode != 200) {
-        return std::nullopt;
-    }
-
-    std::string body;
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request.value, &available)) {
-            return std::nullopt;
-        }
-        if (available == 0) {
-            break;
-        }
-        if (body.size() + available > kMaxResponseBytes) {
-            return std::nullopt;
-        }
-        const size_t offset = body.size();
-        body.resize(offset + available);
-        DWORD read = 0;
-        if (!WinHttpReadData(request.value, body.data() + offset, available, &read)) {
-            return std::nullopt;
-        }
-        body.resize(offset + read);
-    }
-    return body;
 }
 
 std::vector<LiveEvent> parseEvents(std::string_view json) {
@@ -481,6 +260,20 @@ void LeagueOfLegendsIntegration::stop() {
     }
 }
 
+LeagueIntegrationStats LeagueOfLegendsIntegration::stats() const {
+    LeagueIntegrationStats result;
+    std::scoped_lock lock(statsMutex_);
+    result.gameAvailable = gameAvailable_;
+    result.lastError = lastError_;
+    return result;
+}
+
+void LeagueOfLegendsIntegration::setStats(bool gameAvailable, std::wstring lastError) {
+    std::scoped_lock lock(statsMutex_);
+    gameAvailable_ = gameAvailable;
+    lastError_ = std::move(lastError);
+}
+
 void LeagueOfLegendsIntegration::workerLoop() {
     setThreadDescriptionSafe(L"Backtrack League integration");
     Logger::instance().info(L"league", L"League of Legends integration started");
@@ -516,11 +309,14 @@ void LeagueOfLegendsIntegration::workerLoop() {
             if (session && !connection) {
                 connection.reset(WinHttpConnect(session.value, kHost, kPort, 0));
             }
-            auto activePlayer = httpGet(session.value, connection.value, L"/liveclientdata/activeplayer");
+            // Local endpoint with a self-signed cert; polled twice per second, so
+            // the session and connection stay pooled and only the connection is
+            // dropped after a failure, giving a restarted client fresh state.
+            auto activePlayer = httpGetBody(session.value, connection.value, L"/liveclientdata/activeplayer", nullptr, true, L"league");
             // activeplayer is the liveness probe, so when it fails the client is
             // gone: skip the request that would be a guaranteed connection failure.
             auto eventData = activePlayer
-                ? httpGet(session.value, connection.value, L"/liveclientdata/eventdata")
+                ? httpGetBody(session.value, connection.value, L"/liveclientdata/eventdata", nullptr, true, L"league")
                 : std::nullopt;
             if (!activePlayer || !eventData) {
                 connection.reset();
@@ -528,6 +324,7 @@ void LeagueOfLegendsIntegration::workerLoop() {
                     Logger::instance().info(L"league", L"League of Legends live client data is no longer available");
                 }
                 gameAvailable = false;
+                setStats(false, {});
                 baselineReady = false;
                 lastEventId = -1;
                 lastEventTime = 0.0;
@@ -548,6 +345,7 @@ void LeagueOfLegendsIntegration::workerLoop() {
                 Logger::instance().info(L"league", L"League of Legends live client data detected");
             }
             gameAvailable = true;
+            setStats(true, {});
 
             if (!baselineReady || maxEventId < lastEventId || maxEventTime + 0.001 < lastEventTime) {
                 lastEventId = maxEventId;
@@ -574,9 +372,11 @@ void LeagueOfLegendsIntegration::workerLoop() {
             sleepUntilNextPoll(stopRequested_, kPollInterval);
         }
     } catch (const std::exception& error) {
+        setStats(false, utf8ToWide(error.what()));
         Logger::instance().warning(L"league",
             std::wstring(L"League of Legends kill reminder disabled by an unexpected error: ") + utf8ToWide(error.what()));
     } catch (...) {
+        setStats(false, L"unknown error");
         Logger::instance().warning(L"league", L"League of Legends kill reminder disabled by an unknown error");
     }
 

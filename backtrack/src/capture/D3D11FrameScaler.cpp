@@ -1,9 +1,11 @@
 #include "capture/D3D11FrameScaler.h"
 
+#include "capture/GpuPoolBuilder.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
 #include <algorithm>
+#include <vector>
 
 namespace backtrack {
 
@@ -40,7 +42,6 @@ bool D3D11FrameScaler::scale(
         return false;
     }
 
-    const bool sizeMatches = input.width == outputWidth && input.height == outputHeight;
     DXGI_FORMAT outputFormat =
         preferredOutputFormat == DXGI_FORMAT_NV12 && nv12Unavailable_
             ? DXGI_FORMAT_B8G8R8A8_UNORM
@@ -57,195 +58,240 @@ bool D3D11FrameScaler::scale(
             hdrRetryAfterCooldown = true;
         }
     }
-    for (uint32_t attempt = 0; attempt < 3; ++attempt) {
-        if (sizeMatches && input.format == outputFormat) {
-            if (!forceOutputTexture) {
-                output = input;
-                return true;
-            }
 
-            // Sources such as Desktop Duplication must outlive their acquire call,
-            // but a same-format, same-size frame does not need VideoProcessorBlt.
-            // The copy path still needs pooled output textures; build them here
-            // since ensureInitialized (and its pool allocation) is skipped.
-            if (!ensureCopyPool(device, outputWidth, outputHeight, outputFormat)) {
-                return false;
-            }
-            auto slot = pool_.acquireOrLog(L"D3D11 scaler texture pool exhausted");
-            if (!slot) {
-                return false;
-            }
-            {
-                std::scoped_lock lock(device.immediateContextMutex());
-                device.context()->CopyResource(slot->texture.Get(), input.texture.Get());
-            }
+    // Same-size, same-format frames skip the video processor entirely. This
+    // fast path never consumed the retry budget, so it runs before the slow
+    // path instead of inside its loop.
+    if (input.width == outputWidth && input.height == outputHeight &&
+        input.format == outputFormat) {
+        if (!forceOutputTexture) {
             output = input;
-            output.texture = slot->texture;
-            output.lease = slot;
-            output.format = outputFormat;
             return true;
         }
+        return tryFastCopy(device, input, outputWidth, outputHeight, outputFormat, output);
+    }
 
-        bool conversionFailed = false;
-        bool hdrRejectedThisAttempt = false;
-        bool inputViewFailed = false;
-        if (!ensureInitialized(
-                device,
-                input.width,
-                input.height,
-                input.format,
-                outputWidth,
-                outputHeight,
-                outputFormat)) {
-            conversionFailed = true;
-        } else {
-            auto slot = pool_.acquireOrLog(L"D3D11 scaler texture pool exhausted");
-            if (!slot) {
-                return false;
-            }
-
-            std::scoped_lock lock(device.immediateContextMutex());
-            ID3D11VideoProcessorInputView* inputView =
-                inputViewFor(device, input.texture.Get());
-            if (!inputView) {
-                conversionFailed = true;
-                // Input-side failure (unknown capture surface), not an NV12
-                // output failure: drop the frame without latching BGRA.
-                inputViewFailed = true;
-            } else {
-                RECT sourceRect{
-                    0,
-                    0,
-                    static_cast<LONG>(input.width),
-                    static_cast<LONG>(input.height),
-                };
-                RECT targetRect{
-                    0,
-                    0,
-                    static_cast<LONG>(outputWidth),
-                    static_cast<LONG>(outputHeight),
-                };
-                if (fitWithBars) {
-                    const bool sourceWider =
-                        static_cast<uint64_t>(input.width) * static_cast<uint64_t>(outputHeight) >
-                        static_cast<uint64_t>(outputWidth) * static_cast<uint64_t>(input.height);
-                    uint32_t targetWidth = outputWidth;
-                    uint32_t targetHeight = outputHeight;
-                    if (sourceWider) {
-                        targetHeight = std::max<uint32_t>(
-                            1,
-                            static_cast<uint32_t>(
-                                (static_cast<uint64_t>(outputWidth) * static_cast<uint64_t>(input.height)) /
-                                static_cast<uint64_t>(input.width)));
-                    } else {
-                        targetWidth = std::max<uint32_t>(
-                            1,
-                            static_cast<uint32_t>(
-                                (static_cast<uint64_t>(outputHeight) * static_cast<uint64_t>(input.width)) /
-                                static_cast<uint64_t>(input.height)));
-                    }
-                    targetRect.left = static_cast<LONG>((outputWidth - targetWidth) / 2);
-                    targetRect.top = static_cast<LONG>((outputHeight - targetHeight) / 2);
-                    targetRect.right = targetRect.left + static_cast<LONG>(targetWidth);
-                    targetRect.bottom = targetRect.top + static_cast<LONG>(targetHeight);
-                    if (slot->renderTargetView) {
-                        constexpr FLOAT black[] = {0.0f, 0.0f, 0.0f, 1.0f};
-                        device.context()->ClearRenderTargetView(
-                            slot->renderTargetView.Get(), black);
-                    }
-                }
-                RECT outputRect{
-                    0,
-                    0,
-                    static_cast<LONG>(outputWidth),
-                    static_cast<LONG>(outputHeight),
-                };
-
-                // Program the processor only when the desired state differs
-                // from what is already applied: steady-state blits skip all
-                // eight driver calls (see VpState).
-                VpState desired;
-                desired.colorSpace1Path = videoContext1_ != nullptr;
-                desired.inputWidth = input.width;
-                desired.inputHeight = input.height;
-                desired.outputWidth = outputWidth;
-                desired.outputHeight = outputHeight;
-                desired.inputFormat = input.format;
-                desired.outputFormat = outputFormat;
-                desired.hdr = input.hdr;
-                desired.hdrRejected = hdrInputRejected_;
-                desired.fitWithBars = fitWithBars;
-                desired.sourceRect = sourceRect;
-                desired.targetRect = targetRect;
-                desired.outputRect = outputRect;
-                if (!vpState_.valid || !vpState_.equals(desired)) {
-                    applyVideoProcessorState(desired);
-                }
-
-                D3D11_VIDEO_PROCESSOR_STREAM stream{};
-                stream.Enable = TRUE;
-                stream.pInputSurface = inputView;
-
-                const HRESULT hr = videoContext_->VideoProcessorBlt(
-                    processor_.Get(), slot->outputView.Get(), 0, 1, &stream);
-                if (FAILED(hr)) {
-                    if (appliedHdrInputSpace_ && !hdrInputRejected_ && isHdrRejectionHr(hr)) {
-                        hdrInputRejected_ = true;
-                        hdrRejectedThisAttempt = true;
-                        hdrRejectedAt_ = std::chrono::steady_clock::now();
-                        hdrRejectedFormat_ = input.format;
-                        hdrRejectedWidth_ = input.width;
-                        hdrRejectedHeight_ = input.height;
-                        releaseResources();
-                        Logger::instance().warning(L"capture",
-                            L"D3D11 video processor rejected HDR input conversion (" +
-                            hresultToString(hr) + L"); falling back to SDR interpretation");
-                    } else {
-                        Logger::instance().warning(L"capture",
-                            L"D3D11 VideoProcessorBlt failed: " + hresultToString(hr));
-                    }
-                    conversionFailed = true;
-                } else {
-                    if (hdrRetryAfterCooldown && appliedHdrInputSpace_) {
-                        hdrRetryAfterCooldown = false;
-                        Logger::instance().info(L"capture",
-                            L"D3D11 video processor HDR tone-mapping recovered after transient rejection");
-                    }
-                    output = input;
-                    output.texture = slot->texture;
-                    output.lease = slot;
-                    output.width = outputWidth;
-                    output.height = outputHeight;
-                    output.format = outputFormat;
-                    return true;
-                }
-            }
-        }
-
-        // An HDR color-space rejection is not an NV12-path failure: the
-        // processor accepted RGB→NV12 and only refused tone-mapping. Retry
-        // this frame under the sticky SDR mapping instead of dropping it,
-        // and keep NV12 instead of permanently degrading to BGRA.
-        if (hdrRejectedThisAttempt) {
-            continue;
-        }
-
-        if (inputViewFailed) {
-            return false;
-        }
-
-        if (!conversionFailed || outputFormat != DXGI_FORMAT_NV12) {
-            return false;
-        }
-
+    // Slow path: one VP attempt, then at most one SDR retry (HDR rejection)
+    // and one BGRA downgrade (NV12 failure) as plain sequential calls.
+    VpBltOutcome outcome = tryVpBlt(
+        device, input, outputWidth, outputHeight, outputFormat, output,
+        fitWithBars, hdrRetryAfterCooldown);
+    if (outcome == VpBltOutcome::RetrySdr) {
+        outcome = tryVpBlt(
+            device, input, outputWidth, outputHeight, outputFormat, output,
+            fitWithBars, hdrRetryAfterCooldown);
+    }
+    if (outcome == VpBltOutcome::DowngradeBgra && outputFormat == DXGI_FORMAT_NV12) {
         nv12Unavailable_ = true;
         Logger::instance().warning(L"capture",
             L"Preferred NV12 encoder input failed at runtime; falling back to BGRA for this capture session");
         releaseResources();
         outputFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
+        // The downgrade can make a same-size BGRA frame copyable directly.
+        if (input.width == outputWidth && input.height == outputHeight &&
+            input.format == outputFormat) {
+            if (!forceOutputTexture) {
+                output = input;
+                return true;
+            }
+            return tryFastCopy(device, input, outputWidth, outputHeight, outputFormat, output);
+        }
+        outcome = tryVpBlt(
+            device, input, outputWidth, outputHeight, outputFormat, output,
+            fitWithBars, hdrRetryAfterCooldown);
+        if (outcome == VpBltOutcome::RetrySdr) {
+            outcome = tryVpBlt(
+                device, input, outputWidth, outputHeight, outputFormat, output,
+                fitWithBars, hdrRetryAfterCooldown);
+        }
     }
 
-    return false;
+    return outcome == VpBltOutcome::Ok;
+}
+
+bool D3D11FrameScaler::tryFastCopy(
+    D3DDevice& device,
+    const GpuFrame& input,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
+    DXGI_FORMAT outputFormat,
+    GpuFrame& output) {
+    // Sources such as Desktop Duplication must outlive their acquire call,
+    // but a same-format, same-size frame does not need VideoProcessorBlt.
+    // The copy path still needs pooled output textures; build them here
+    // since ensureInitialized (and its pool allocation) is skipped.
+    if (!ensureCopyPool(device, outputWidth, outputHeight, outputFormat)) {
+        return false;
+    }
+    auto slot = pool_.acquireOrLog(L"D3D11 scaler texture pool exhausted");
+    if (!slot) {
+        return false;
+    }
+    {
+        std::scoped_lock lock(device.immediateContextMutex());
+        device.context()->CopyResource(slot->texture.Get(), input.texture.Get());
+    }
+    output = input;
+    output.texture = slot->texture;
+    output.lease = slot;
+    output.format = outputFormat;
+    return true;
+}
+
+D3D11FrameScaler::VpBltOutcome D3D11FrameScaler::tryVpBlt(
+    D3DDevice& device,
+    const GpuFrame& input,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
+    DXGI_FORMAT outputFormat,
+    GpuFrame& output,
+    bool fitWithBars,
+    bool& hdrRetryAfterCooldown) {
+    if (!ensureInitialized(
+            device,
+            input.width,
+            input.height,
+            input.format,
+            outputWidth,
+            outputHeight,
+            outputFormat)) {
+        // Init failure under NV12 is an output-path failure, not an HDR one.
+        return outputFormat == DXGI_FORMAT_NV12 ? VpBltOutcome::DowngradeBgra : VpBltOutcome::Drop;
+    }
+
+    auto slot = pool_.acquireOrLog(L"D3D11 scaler texture pool exhausted");
+    if (!slot) {
+        return VpBltOutcome::Drop;
+    }
+
+    RECT sourceRect{
+        0,
+        0,
+        static_cast<LONG>(input.width),
+        static_cast<LONG>(input.height),
+    };
+    RECT targetRect{
+        0,
+        0,
+        static_cast<LONG>(outputWidth),
+        static_cast<LONG>(outputHeight),
+    };
+    if (fitWithBars) {
+        const bool sourceWider =
+            static_cast<uint64_t>(input.width) * static_cast<uint64_t>(outputHeight) >
+            static_cast<uint64_t>(outputWidth) * static_cast<uint64_t>(input.height);
+        uint32_t targetWidth = outputWidth;
+        uint32_t targetHeight = outputHeight;
+        if (sourceWider) {
+            targetHeight = std::max<uint32_t>(
+                1,
+                static_cast<uint32_t>(
+                    (static_cast<uint64_t>(outputWidth) * static_cast<uint64_t>(input.height)) /
+                    static_cast<uint64_t>(input.width)));
+        } else {
+            targetWidth = std::max<uint32_t>(
+                1,
+                static_cast<uint32_t>(
+                    (static_cast<uint64_t>(outputHeight) * static_cast<uint64_t>(input.width)) /
+                    static_cast<uint64_t>(input.height)));
+        }
+        targetRect.left = static_cast<LONG>((outputWidth - targetWidth) / 2);
+        targetRect.top = static_cast<LONG>((outputHeight - targetHeight) / 2);
+        targetRect.right = targetRect.left + static_cast<LONG>(targetWidth);
+        targetRect.bottom = targetRect.top + static_cast<LONG>(targetHeight);
+    }
+    RECT outputRect{
+        0,
+        0,
+        static_cast<LONG>(outputWidth),
+        static_cast<LONG>(outputHeight),
+    };
+
+    // Program the processor only when the desired state differs
+    // from what is already applied: steady-state blits skip all
+    // eight driver calls (see VpState).
+    VpState desired;
+    desired.colorSpace1Path = videoContext1_ != nullptr;
+    desired.inputWidth = input.width;
+    desired.inputHeight = input.height;
+    desired.outputWidth = outputWidth;
+    desired.outputHeight = outputHeight;
+    desired.inputFormat = input.format;
+    desired.outputFormat = outputFormat;
+    desired.hdr = input.hdr;
+    desired.hdrRejected = hdrInputRejected_;
+    desired.fitWithBars = fitWithBars;
+    desired.sourceRect = sourceRect;
+    desired.targetRect = targetRect;
+    desired.outputRect = outputRect;
+
+    ID3D11VideoProcessorInputView* inputView = nullptr;
+    bool inputViewFailed = false;
+    HRESULT bltHr = S_OK;
+    {
+        std::scoped_lock lock(device.immediateContextMutex());
+        inputView = inputViewFor(device, input.texture.Get());
+        if (!inputView) {
+            // Input-side failure (unknown capture surface), not an NV12
+            // output failure: drop the frame without latching BGRA.
+            inputViewFailed = true;
+        } else {
+            if (fitWithBars && slot->renderTargetView) {
+                constexpr FLOAT black[] = {0.0f, 0.0f, 0.0f, 1.0f};
+                device.context()->ClearRenderTargetView(
+                    slot->renderTargetView.Get(), black);
+            }
+            if (!vpState_.valid || !vpState_.equals(desired)) {
+                applyVideoProcessorState(desired);
+            }
+
+            D3D11_VIDEO_PROCESSOR_STREAM stream{};
+            stream.Enable = TRUE;
+            stream.pInputSurface = inputView;
+
+            bltHr = videoContext_->VideoProcessorBlt(
+                processor_.Get(), slot->outputView.Get(), 0, 1, &stream);
+        }
+    } // Lock released before any teardown below: destroying the enumerator
+      // under the context mutex serialized teardown behind in-flight blits.
+
+    if (inputViewFailed) {
+        return VpBltOutcome::Drop;
+    }
+    if (FAILED(bltHr)) {
+        // An HDR color-space rejection is not an NV12-path failure: the
+        // processor accepted RGB→NV12 and only refused tone-mapping. Latch
+        // the sticky SDR mapping and retry in-call, keeping NV12 instead of
+        // degrading to BGRA. The retry reprograms state (hdrRejected flips
+        // the cached VpState) with no pool rebuild.
+        if (appliedHdrInputSpace_ && !hdrInputRejected_ && isHdrRejectionHr(bltHr)) {
+            hdrInputRejected_ = true;
+            hdrRejectedAt_ = std::chrono::steady_clock::now();
+            hdrRejectedFormat_ = input.format;
+            hdrRejectedWidth_ = input.width;
+            hdrRejectedHeight_ = input.height;
+            Logger::instance().warning(L"capture",
+                L"D3D11 video processor rejected HDR input conversion (" +
+                hresultToString(bltHr) + L"); falling back to SDR interpretation");
+            return VpBltOutcome::RetrySdr;
+        }
+        Logger::instance().warning(L"capture",
+            L"D3D11 VideoProcessorBlt failed: " + hresultToString(bltHr));
+        return outputFormat == DXGI_FORMAT_NV12 ? VpBltOutcome::DowngradeBgra : VpBltOutcome::Drop;
+    }
+
+    if (hdrRetryAfterCooldown && appliedHdrInputSpace_) {
+        hdrRetryAfterCooldown = false;
+        Logger::instance().info(L"capture",
+            L"D3D11 video processor HDR tone-mapping recovered after transient rejection");
+    }
+    output = input;
+    output.texture = slot->texture;
+    output.lease = slot;
+    output.width = outputWidth;
+    output.height = outputHeight;
+    output.format = outputFormat;
+    return VpBltOutcome::Ok;
 }
 
 bool D3D11FrameScaler::VpState::equals(const VpState& other) const {
@@ -397,7 +443,7 @@ uint64_t D3D11FrameScaler::poolGeneration() const {
 
 void D3D11FrameScaler::setPoolSize(uint32_t poolSize) {
     // Min 5: captureLoop keeps one slot pinned via lastFrame (effective free = size−1).
-    const uint32_t normalized = std::clamp<uint32_t>(poolSize, kMinTexturePoolSize, kMaxTexturePoolSize);
+    const uint32_t normalized = GpuPoolBuilder::normalizePoolSize(poolSize);
     if (poolSize_ == normalized) {
         return;
     }
@@ -469,31 +515,24 @@ bool D3D11FrameScaler::ensureInitialized(
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = outputWidth;
-    desc.Height = outputHeight;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = outputFormat;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-    if (outputFormat == DXGI_FORMAT_B8G8R8A8_UNORM) {
-        desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    GpuPoolBuildOptions poolOptions;
+    poolOptions.wantSrv = (outputFormat == DXGI_FORMAT_B8G8R8A8_UNORM);
+    poolOptions.wantOutputView = true;
+    std::vector<ComPtr<ID3D11Texture2D>> textures;
+    if (!GpuPoolBuilder::build(
+            device.device(), outputWidth, outputHeight, outputFormat,
+            poolOptions, poolSize_, textures, L"D3D11 scaler")) {
+        releaseResources();
+        return false;
     }
 
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc{};
     outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
     outputViewDesc.Texture2D.MipSlice = 0;
 
-    for (uint32_t index = 0; index < poolSize_; ++index) {
+    for (auto& texture : textures) {
         auto slot = std::make_shared<TextureSlot>();
-        hr = device.device()->CreateTexture2D(&desc, nullptr, &slot->texture);
-        if (FAILED(hr)) {
-            Logger::instance().warning(L"capture", L"CreateTexture2D for D3D11 scaler failed: " + hresultToString(hr));
-            releaseResources();
-            return false;
-        }
+        slot->texture = std::move(texture);
         if (outputFormat == DXGI_FORMAT_B8G8R8A8_UNORM) {
             hr = device.device()->CreateRenderTargetView(slot->texture.Get(), nullptr, &slot->renderTargetView);
             if (FAILED(hr)) {
@@ -544,29 +583,20 @@ bool D3D11FrameScaler::ensureCopyPool(
 
     releaseResources();
 
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = format;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
     // Mirror the slow-path bind flags so NVENC accepts these textures as input.
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-    if (format == DXGI_FORMAT_B8G8R8A8_UNORM) {
-        desc.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    GpuPoolBuildOptions copyOptions;
+    copyOptions.wantSrv = (format == DXGI_FORMAT_B8G8R8A8_UNORM);
+    copyOptions.wantOutputView = true;
+    std::vector<ComPtr<ID3D11Texture2D>> textures;
+    if (!GpuPoolBuilder::build(
+            device.device(), width, height, format,
+            copyOptions, poolSize_, textures, L"D3D11 scaler copy pool")) {
+        releaseResources();
+        return false;
     }
-
-    for (uint32_t index = 0; index < poolSize_; ++index) {
+    for (auto& texture : textures) {
         auto slot = std::make_shared<TextureSlot>();
-        const HRESULT hr = device.device()->CreateTexture2D(&desc, nullptr, &slot->texture);
-        if (FAILED(hr)) {
-            Logger::instance().warning(L"capture",
-                L"CreateTexture2D for D3D11 scaler copy pool failed: " + hresultToString(hr));
-            releaseResources();
-            return false;
-        }
+        slot->texture = std::move(texture);
         pool_.push_back(std::move(slot));
     }
 
@@ -681,7 +711,7 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::copiedInputViewFor(
         // Video-processor input textures must have no bind flags on strict
         // drivers (AMD). SHADER_RESOURCE here causes CreateVideoProcessorInputView
         // to fail with E_INVALIDARG. This texture is only used as VP blt input.
-        copyDesc.BindFlags = 0;
+        copyDesc.BindFlags = GpuPoolBuilder::bindFlagsFor({});
 
         HRESULT hr = device.device()->CreateTexture2D(
             &copyDesc, nullptr, &copiedInputTexture_);

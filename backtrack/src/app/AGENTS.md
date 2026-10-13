@@ -174,13 +174,15 @@ frame-cadence logic.
 - When adding a pipeline stage, define where it sits in the queue chain and
   which thread owns it before writing the code; the SPSC queues assume exactly
   one producer and one consumer each.
-- `MicrophoneAgc` is declared in `RecorderController.h` but implemented in
-  `RecorderController.cpp`; the denoiser follows the same pattern behind
-  `BACKTRACK_HAS_NOISE_SUPPRESSION`. Keep both on the audio writer thread.
-- `RecorderController.cpp` includes `ui/UiHelpers.h` for
-  `captureBackendDisplayName` alone. That is the one place `app` reaches into
-  `ui`; a second one means the boundary has moved and belongs in this file's
-  ownership notes rather than staying accidental.
+- `MicrophoneAgc` and the audio-writer packet helpers (canonical gain, block
+  levels, noise suppression) live in `app/AudioWriter.h/.cpp`; the denoiser
+  follows the same pattern behind `BACKTRACK_HAS_NOISE_SUPPRESSION`. Keep both
+  on the audio writer thread: only `RecorderController::writeAudioPacket` calls
+  them. Member state (mirrors, scratch buffers) stays in `RecorderController`.
+- `captureBackendDisplayName` lives in `platform/Win32Util.h`, shared by `app`
+  status lines and the UI so both name a backend identically.
+  `RecorderController.cpp` must not reach into `ui`; a second cross-boundary
+  need belongs here as an ownership note rather than staying accidental.
 
 ## Verification
 

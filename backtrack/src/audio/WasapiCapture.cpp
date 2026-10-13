@@ -1,6 +1,7 @@
 #include "audio/WasapiCapture.h"
 #include "audio/SessionMuteStore.h"
 
+#include "core/Clock.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -53,25 +54,6 @@ const wchar_t* trackName(AudioTrack track) {
         return L"sound separation";
     }
     return L"audio";
-}
-
-int64_t steadyNow100ns() {
-    return std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-int64_t qpcNow100ns() {
-    LARGE_INTEGER frequency{};
-    LARGE_INTEGER counter{};
-    if (!QueryPerformanceFrequency(&frequency) ||
-        !QueryPerformanceCounter(&counter) ||
-        frequency.QuadPart <= 0) {
-        return 0;
-    }
-    return static_cast<int64_t>(
-        (static_cast<long double>(counter.QuadPart) * kHundredNanosecondsPerSecond) /
-        static_cast<long double>(frequency.QuadPart));
 }
 
 EDataFlow dataFlowFor(AudioTrack track) {

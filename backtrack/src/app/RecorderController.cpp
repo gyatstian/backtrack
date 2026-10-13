@@ -1,3 +1,4 @@
+#include "app/AudioWriter.h"
 #include "app/RecorderController.h"
 #include "app/VideoTimelineScheduler.h"
 
@@ -6,12 +7,14 @@
 #include "audio/RnnoiseDenoiser.h"
 #endif
 #include "capture/DesktopDuplicationCapture.h"
+#include "capture/GpuPoolBuilder.h"
 #include "capture/WgcCaptureSource.h"
+#include "core/Clock.h"
 #include "core/Logger.h"
+#include "mux/MuxedInputs.h"
 #include "mux/RecoveryStore.h"
 #include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
-#include "ui/UiHelpers.h"
 
 #include <mmreg.h>
 
@@ -38,30 +41,10 @@ namespace {
 // abandoning a wedged vendor call would destroy the user's clip.
 constexpr auto kGpuPipelineStopTimeout = std::chrono::seconds(30);
 
-int64_t steadyNow100ns() {
-    return std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-int64_t steadyTimePoint100ns(SteadyClock::time_point time) {
-    return std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>>(
-               time.time_since_epoch())
-        .count();
-}
-
-// Inverse of steadyTimePoint100ns. WGC SystemRelativeTime and MSVC steady_clock
-// are both QPC-derived (same epoch), so a source present time in 100ns units maps
-// back to a steady_clock instant for emit-grid phase locking.
-SteadyClock::time_point steadyPointFrom100ns(int64_t value100ns) {
-    return SteadyClock::time_point(
-        std::chrono::duration_cast<SteadyClock::duration>(
-            std::chrono::duration<int64_t, std::ratio<1, 10'000'000>>(value100ns)));
-}
-
 uint32_t captureTexturePoolSize(const GpuOptimizationSettings& settings) {
-    // +1 for lastFrame pin in captureLoop (keeps one scaler/capture slot in use).
-    return std::clamp<uint32_t>(settings.frameQueueLimit + 4, 5, 16);
+    // Single clamp owned by GpuPoolBuilder; +4 covers the capture loop's
+    // lastFrame pin (keeps one scaler/capture slot in use).
+    return GpuPoolBuilder::normalizePoolSize(settings.frameQueueLimit + 4);
 }
 
 CaptureTarget captureTargetForSettings(const AppSettings& settings) {
@@ -213,173 +196,6 @@ bool hasMutedSoundSeparationApps(const AppSettings& settings) {
 }
 
 } // namespace
-
-// Canonical float gain helper for the mic AGC path: packets are canonical by
-// the time AGC/volume run, so integer PCM scaling is dead. AudioConvert owns
-// the pure mute/gain primitive; this thin wrapper reuses it.
-void applyCanonicalGain(AudioPacket& packet, float gain) {
-    if (gain == 1.0f || packet.bytes.empty()) {
-        return;
-    }
-    auto* floats = reinterpret_cast<float*>(packet.bytes.data());
-    applyMuteGain(
-        std::span<float>(floats, packet.bytes.size() / sizeof(float)), gain, false);
-}
-
-// Voice-oriented automatic gain control. Keeps a slow level envelope and drives
-// a smoothed gain so average speech lands near a target RMS, mirroring the AGC
-// Discord applies to quiet microphone streams. Slow attack/release prevents
-// pumping on individual words; the gain itself is time-smoothed as well.
-// Forward-declared in RecorderController.h; defined here at backtrack scope so
-// the class is visible where the unique_ptr member is constructed/destroyed.
-constexpr float kAgcFloorDb = -90.0f;
-
-class MicrophoneAgc {
-public:
-    void reset() {
-        envelopeDb_ = -90.0f;
-        gainDb_ = 0.0f;
-    }
-
-    // Advances the envelopes with this block's RMS (dBFS) and duration and
-    // returns the current smoothed linear gain to apply to the block.
-    float gainFor(float rmsDb, float blockSeconds) {
-        const float levelDb = std::max(rmsDb, -90.0f);
-        if (blockSeconds <= 0.0f) {
-            return linearGain();
-        }
-
-        // Fast attack on loud content, slow release when the mic goes quiet.
-        constexpr float kAttackTauSeconds = 0.03f;
-        constexpr float kReleaseTauSeconds = 0.40f;
-        const float envelopeTau = levelDb > envelopeDb_ ? kAttackTauSeconds : kReleaseTauSeconds;
-        const float envelopeCoeff = 1.0f - std::exp(-blockSeconds / envelopeTau);
-        envelopeDb_ += (levelDb - envelopeDb_) * envelopeCoeff;
-
-        // Bring the envelope to the target speech RMS. Boost up to +30 dB (the
-        // same range as a hardware "Microphone Boost"); only cut very loud mics.
-        constexpr float kTargetRmsDb = -22.0f;
-        constexpr float kMaxBoostDb = 30.0f;
-        constexpr float kMaxCutDb = 6.0f;
-        const float desiredGainDb = std::clamp(kTargetRmsDb - envelopeDb_, -kMaxCutDb, kMaxBoostDb);
-
-        // Smooth the gain itself so level changes do not pump on single words.
-        constexpr float kGainTauSeconds = 0.15f;
-        const float gainCoeff = 1.0f - std::exp(-blockSeconds / kGainTauSeconds);
-        gainDb_ += (desiredGainDb - gainDb_) * gainCoeff;
-        return linearGain();
-    }
-
-private:
-    float linearGain() const {
-        return std::pow(10.0f, gainDb_ / 20.0f);
-    }
-
-    float envelopeDb_ = -90.0f;
-    float gainDb_ = 0.0f;
-};
-
-struct BlockLevels {
-    float rmsDb = -90.0f;
-    float peakDb = -90.0f;
-};
-
-BlockLevels measureBlockLevels(const AudioPacket& packet, const AudioFormatInfo& format) {
-    BlockLevels levels;
-    const uint16_t bytesPerSample = format.bitsPerSample / 8;
-    if (bytesPerSample == 0 || packet.bytes.empty()) {
-        return levels;
-    }
-
-    // Intentional RMS pool in double: float accumulation loses quiet-mic
-    // resolution over long blocks; the sum itself never allocates.
-    uint64_t sampleCount = 0;
-    double sumOfSquares = 0.0;
-    float peak = 0.0f;
-    const uint8_t* data = packet.bytes.data();
-    const size_t byteCount = packet.bytes.size();
-    for (size_t offset = 0; offset + bytesPerSample <= byteCount; offset += bytesPerSample) {
-        // Single decode path (8/16/24/32 + float32) owned by AudioConvert;
-        // no hand-rolled integer magic here.
-        const float value = decodeInterleavedSample(data + offset, format);
-        const float magnitude = std::fabs(value);
-        peak = std::max(peak, magnitude);
-        sumOfSquares += static_cast<double>(value) * value;
-        ++sampleCount;
-    }
-    if (sampleCount == 0) {
-        return levels;
-    }
-    const double rms = std::sqrt(sumOfSquares / static_cast<double>(sampleCount));
-    levels.rmsDb = rms > 0.0 ? static_cast<float>(20.0 * std::log10(rms)) : kAgcFloorDb;
-    levels.peakDb = peak > 0.0f ? 20.0f * std::log10(peak) : kAgcFloorDb;
-    return levels;
-}
-
-void applyMicrophoneAgc(AudioPacket& packet, const AudioFormatInfo& format, MicrophoneAgc& agc) {
-    const uint16_t bytesPerSample = format.bitsPerSample / 8;
-    const float blockSeconds =
-        bytesPerSample > 0 && format.channels > 0 && format.samplesPerSec > 0
-            ? static_cast<float>(packet.bytes.size()) /
-                  (static_cast<float>(bytesPerSample) * static_cast<float>(format.channels) *
-                   static_cast<float>(format.samplesPerSec))
-            : 0.010f;
-    const BlockLevels levels = measureBlockLevels(packet, format);
-    const float gain = agc.gainFor(levels.rmsDb, blockSeconds);
-    // Packets are canonical float32 by the time AGC runs, so the old integer
-    // PCM scaling is dead; AudioConvert owns the single gain primitive.
-    applyCanonicalGain(packet, gain);
-}
-
-#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-// Noise suppression runs after canonicalization, so the packet is guaranteed
-// stereo float32 at 48 kHz; the guard keeps an unexpected format from being
-// misinterpreted. The stereo mic signal is folded to mono (channels are
-// near-identical for voice capture), denoised, and written back to both
-// channels. RNNoise consumes 480-sample frames, so a call may emit up to one
-// buffered frame more or fewer samples than it consumed: the helper resizes
-// the packet payload to match what was actually produced, and held-back
-// samples arrive in a later packet, keeping cumulative stream length exact.
-// Returns the produced mono-sample count.
-size_t applyMicrophoneNoiseSuppression(
-    AudioPacket& packet,
-    const AudioFormatInfo& format,
-    RnnoiseDenoiser& denoiser,
-    std::vector<float>& scratchMonoIn,
-    std::vector<float>& scratchMonoOut) {
-    const size_t frameCount = packet.bytes.size() / (2 * sizeof(float));
-    if (!isCanonicalAudioFormat(format) || !denoiser.valid() || frameCount == 0) {
-        static bool loggedUnsupportedOnce = false;
-        if (!loggedUnsupportedOnce && !isCanonicalAudioFormat(format)) {
-            loggedUnsupportedOnce = true;
-            Logger::instance().warning(L"recorder", L"Microphone noise suppression skipped non-canonical audio packet");
-        }
-        return frameCount; // Bypass: everything "produced" unprocessed.
-    }
-
-    scratchMonoIn.resize(frameCount);
-    const float* interleaved = reinterpret_cast<const float*>(packet.bytes.data());
-    for (size_t frame = 0; frame < frameCount; ++frame) {
-        // Average the channels: mono sources duplicate to L/R in canonical
-        // conversion, so averaging avoids a spurious +6 dB level shift.
-        scratchMonoIn[frame] = 0.5f * (interleaved[2 * frame] + interleaved[2 * frame + 1]);
-    }
-
-    // +480 lets the denoiser flush any frame buffered by an earlier odd-sized
-    // packet instead of accumulating backlog.
-    scratchMonoOut.resize(frameCount + 480);
-    const size_t produced =
-        denoiser.process(scratchMonoIn.data(), frameCount, scratchMonoOut.data(), scratchMonoOut.size());
-
-    packet.bytes.resize(produced * 2 * sizeof(float));
-    float* out = reinterpret_cast<float*>(packet.bytes.data());
-    for (size_t frame = 0; frame < produced; ++frame) {
-        out[2 * frame] = scratchMonoOut[frame];
-        out[2 * frame + 1] = scratchMonoOut[frame];
-    }
-    return produced;
-}
-#endif // BACKTRACK_HAS_NOISE_SUPPRESSION
 
 RecorderController::RecorderController()
     : frameQueue_(8),
@@ -1312,6 +1128,33 @@ bool RecorderController::recreateGpuPipeline(
     std::scoped_lock gpuLock(pipelineGpuMutex_);
 
     if (encoder_) {
+        // Drain the reorder tail before teardown: a B-frame/lookahead session
+        // holds submitted frames past the last encodeFrame output, and a bare
+        // shutdown strands them (replay gap plus a PTS jump under the fresh
+        // keyframe below). Same muxer keyframe gate as the encode-loop drain;
+        // both sinks serialize internally, so this is safe off the encode thread.
+        std::vector<EncodedPacket> tail;
+        encoder_->drain(tail);
+        for (auto& packet : tail) {
+            if (packet.bytes.empty()) {
+                continue;
+            }
+            lastEncodedVideoPts100ns_.store(packet.pts100ns, std::memory_order_release);
+            videoTimelineEndPts100ns_.store(
+                packet.pts100ns + std::max<int64_t>(packet.duration100ns, 0),
+                std::memory_order_release);
+            if (recording_ && muxer_.active()) {
+                if (waitingForRecordingKeyFrame_) {
+                    if (packet.keyFrame) {
+                        waitingForRecordingKeyFrame_ = false;
+                        muxer_.writeVideoPacket(packet);
+                    }
+                } else {
+                    muxer_.writeVideoPacket(packet);
+                }
+            }
+            replay_.pushVideo(std::move(packet));
+        }
         encoder_->shutdown();
         encoder_.reset();
     }
@@ -1422,7 +1265,6 @@ bool RecorderController::createCaptureSource(
         dxgiAdapterSupportsHardwareEncode(location.adapterIndex);
     const bool dxgiTargetOnActiveAdapter = dxgiTargetEncodable &&
         location.adapterIndex == d3d_.adapterIndex();
-    bool dxgiSkippedForTarget = false;
     // Cache the advanced-color probe: stats() derives hdrRejected from it
     // without re-walking DXGI on the diagnostics path. An OS HDR toggle
     // mid-session on WGC stays invisible until the next rebind (WGC frames
@@ -1438,81 +1280,78 @@ bool RecorderController::createCaptureSource(
         windowTarget.window = nullptr;
     }
 
+    const CaptureCandidateState candidateState{
+        selectedBackend, exclusiveRecovery, hasWindowTarget, monitorHdr, dxgiTargetOnActiveAdapter};
+    // DXGI skipped for target on every path that needs it: derived once from
+    // the same adapter test the DD guards use, instead of only inside the
+    // DesktopDuplication-selected fallback branch.
+    bool dxgiSkippedForTarget = selectedBackend == CaptureBackend::DesktopDuplication &&
+        !dxgiTargetOnActiveAdapter;
+    if (dxgiSkippedForTarget) {
+        const wchar_t* detail = !location.valid()
+            ? L"monitor has no DXGI output"
+            : !dxgiTargetEncodable
+                ? L"monitor adapter has no supported hardware encoder"
+                : L"target adapter differs from active D3D adapter";
+        Logger::instance().warning(L"recorder",
+            std::wstring(L"Desktop Duplication unavailable for target; using WGC: ") + detail);
+    }
+
+    // Ordered backend candidates: vector order is the selection priority, so a
+    // wrong-monitor DXGI bind is impossible by construction (every DD entry
+    // carries monitorTarget and runs only when the target output is on the
+    // active D3D adapter). Window targeting never overrides an explicit DD
+    // choice, exclusive recovery stays monitor-only DD, and the HDR-preferred
+    // DD attempt is its own entry rather than nested in the WGC path.
+    struct CaptureCandidate {
+        const wchar_t* name;
+        CaptureTarget target;
+        bool (*eligible)(const CaptureCandidateState&);
+        std::unique_ptr<ICaptureSource> (*create)();
+        const wchar_t* attemptNote = nullptr;
+    };
+    std::unique_ptr<ICaptureSource> (*makeDd)() = []() -> std::unique_ptr<ICaptureSource> {
+        return std::make_unique<DesktopDuplicationCapture>();
+    };
+    std::unique_ptr<ICaptureSource> (*makeWgc)() = []() -> std::unique_ptr<ICaptureSource> {
+        return std::make_unique<WgcCaptureSource>();
+    };
+    // WGC fallbacks stay off the exclusive path: CreateForWindow against an
+    // exclusive-fullscreen surface yields zero frames.
+    bool (*wgcWindowFallbackEligible)(const CaptureCandidateState&) =
+        [](const CaptureCandidateState& s) -> bool {
+        return !s.exclusiveRecovery && captureWgcWindowFallbackEligible(s);
+    };
+    bool (*wgcMonitorFallbackEligible)(const CaptureCandidateState&) =
+        [](const CaptureCandidateState& s) -> bool {
+        return !s.exclusiveRecovery && captureWgcMonitorFallbackEligible(s);
+    };
+    const CaptureCandidate candidates[] = {
+        {L"Desktop Duplication", monitorTarget, captureDdExplicitEligible, makeDd},
+        {L"Windows Graphics Capture (window)", windowTarget, captureWgcWindowEligible, makeWgc},
+        {L"Desktop Duplication", monitorTarget, captureDdRecoveryEligible, makeDd,
+            L"Attempting Desktop Duplication recovery"},
+        {L"Desktop Duplication", monitorTarget, captureDdHdrPreferredEligible, makeDd,
+            L"HDR monitor detected; preferring Desktop Duplication for tone-mapping (WGC fallback if it fails)"},
+        {L"Windows Graphics Capture", monitorTarget, captureWgcMonitorEligible, makeWgc},
+        {L"Windows Graphics Capture (window)", windowTarget, wgcWindowFallbackEligible, makeWgc},
+        {L"Windows Graphics Capture", monitorTarget, wgcMonitorFallbackEligible, makeWgc},
+        {L"Desktop Duplication", monitorTarget, captureDdFallbackEligible, makeDd,
+            L"WGC failed; attempting Desktop Duplication fallback"},
+    };
+
     std::unique_ptr<ICaptureSource> initialized;
-
-    // Respect an explicit DXGI choice before considering WGC window capture.
-    // Window targeting is an optimization, not permission to override capture
-    // method selected by user.
-    if (!initialized && selectedBackend == CaptureBackend::DesktopDuplication &&
-        !exclusiveRecovery && dxgiTargetOnActiveAdapter) {
-        initialized = tryInitialize(
-            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
-    }
-
-    // Normal WGC path can target a window. Exclusive recovery stays on the
-    // monitor: CreateForWindow against an exclusive-fullscreen surface yields
-    // zero frames.
-    if (!initialized && hasWindowTarget && !exclusiveRecovery &&
-        selectedBackend != CaptureBackend::DesktopDuplication) {
-        initialized = tryInitialize(
-            std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture (window)", windowTarget);
-    }
-
-    if (!initialized && exclusiveRecovery &&
-        dxgiTargetOnActiveAdapter) {
-        Logger::instance().info(L"recorder", L"Attempting Desktop Duplication recovery");
-        initialized = tryInitialize(
-            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
-    }
-
-    if (!initialized && selectedBackend == CaptureBackend::WindowsGraphicsCapture &&
-        !exclusiveRecovery) {
-        // HDR monitor on a WGC default stays on a fixed B8G8R8A8 pool and
-        // leans on DWM pre-tonemap, which washes out. Prefer Desktop
-        // Duplication so the scaler tone-maps; WGC below remains the fallback.
-        if (monitorHdr && dxgiTargetOnActiveAdapter) {
-            Logger::instance().info(L"app",
-                L"HDR monitor detected; preferring Desktop Duplication for tone-mapping (WGC fallback if it fails)");
-            initialized = tryInitialize(
-                std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
+    for (const auto& candidate : candidates) {
+        if (!candidate.eligible(candidateState)) {
+            continue;
         }
-        if (!initialized) {
-            initialized = tryInitialize(
-                std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture", monitorTarget);
+        if (candidate.attemptNote) {
+            Logger::instance().info(L"recorder", candidate.attemptNote);
         }
-    }
-
-    if (!initialized && selectedBackend == CaptureBackend::DesktopDuplication) {
-        if (!dxgiTargetOnActiveAdapter) {
-            const wchar_t* detail = !location.valid()
-                ? L"monitor has no DXGI output"
-                : !dxgiTargetEncodable
-                    ? L"monitor adapter has no supported hardware encoder"
-                    : L"target adapter differs from active D3D adapter";
-            Logger::instance().warning(L"recorder",
-                std::wstring(L"Desktop Duplication unavailable for target; using WGC: ") + detail);
-            dxgiSkippedForTarget = true;
-        } else {
-            Logger::instance().warning(L"recorder",
-                L"Desktop Duplication failed; attempting Windows Graphics Capture fallback");
+        initialized = tryInitialize(candidate.create(), candidate.name, candidate.target);
+        if (initialized) {
+            break;
         }
-        if (hasWindowTarget) {
-            initialized = tryInitialize(
-                std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture (window)", windowTarget);
-        }
-        if (!initialized) {
-            initialized = tryInitialize(
-                std::make_unique<WgcCaptureSource>(), L"Windows Graphics Capture", monitorTarget);
-        }
-    }
-
-    // WGC fallback may use Desktop Duplication only when output and active D3D
-    // device share an encoder-capable adapter.
-    if (!initialized && selectedBackend == CaptureBackend::WindowsGraphicsCapture &&
-        !exclusiveRecovery && dxgiTargetOnActiveAdapter) {
-        Logger::instance().info(L"recorder", L"WGC failed; attempting Desktop Duplication fallback");
-        initialized = tryInitialize(
-            std::make_unique<DesktopDuplicationCapture>(), L"Desktop Duplication", monitorTarget);
     }
 
     // Exclusive recovery: if DXGI failed, leave capture null so the loop
@@ -2828,7 +2667,7 @@ void RecorderController::encodeLoopImpl() {
                 }
             }
         } else {
-            it->second = std::max(it->second, duration100ns);
+            it->second = coalesceVideoDuration100ns(it->second, duration100ns);
         }
         const bool recordingExtended =
             recording_ && muxer_.active() &&
@@ -2863,7 +2702,7 @@ void RecorderController::encodeLoopImpl() {
             return;
         }
         if (auto it = pendingDurations.find(packet.pts100ns); it != pendingDurations.end()) {
-            packet.duration100ns = std::max(packet.duration100ns, it->second);
+            packet.duration100ns = coalesceVideoDuration100ns(packet.duration100ns, it->second);
             pendingDurations.erase(it);
         }
         lastEncodedVideoPts100ns_.store(packet.pts100ns, std::memory_order_release);
@@ -2909,15 +2748,17 @@ void RecorderController::encodeLoopImpl() {
 
         extendVideoDuration(frame.previousFramePts100ns, frame.previousFrameDuration100ns);
 
-        EncodedPacket packet;
-        bool encoded = false;
+        // Vector form: one submit can complete several outputs while
+        // reordering/lookahead drains, and the single-packet form strands the
+        // tail. publishPacket skips empties, same as the old encoded gate.
+        std::vector<EncodedPacket> ready;
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
-            if (encoder_ && encoder_->encodeFrame(frame, packet) && !packet.bytes.empty()) {
-                encoded = true;
+            if (encoder_) {
+                encoder_->encodeFrame(frame, ready);
             }
         }
-        if (encoded) {
+        for (auto& packet : ready) {
             publishPacket(std::move(packet));
         }
     }

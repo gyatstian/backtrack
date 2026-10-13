@@ -1,5 +1,6 @@
 #include "capture/DesktopDuplicationCapture.h"
 
+#include "capture/GpuPoolBuilder.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -457,43 +458,40 @@ bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t heigh
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
     haveContent_ = false;
-    poolSize = std::clamp<uint32_t>(poolSize, kMinTexturePoolSize, kMaxTexturePoolSize);
 
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = format;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
     // RENDER_TARGET lets us blend the cursor into the slot; the downstream scaler
     // consumes slots as a video-processor input surface, so the extra bind flag is
     // free. SHADER_RESOURCE is retained for parity with the previous pool.
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    desc.CPUAccessFlags = 0;
-    desc.MiscFlags = 0;
-
-    for (uint32_t index = 0; index < poolSize; ++index) {
+    GpuPoolBuildOptions poolOptions;
+    poolOptions.wantRtv = true;
+    poolOptions.wantSrv = true;
+    std::vector<ComPtr<ID3D11Texture2D>> textures;
+    if (!GpuPoolBuilder::build(device_->device(), width, height, format,
+            poolOptions, poolSize, textures, L"capture pool")) {
+        return false;
+    }
+    for (auto& texture : textures) {
         auto slot = std::make_shared<TextureSlot>();
-        HRESULT hr = device_->device()->CreateTexture2D(&desc, nullptr, &slot->texture);
-        if (FAILED(hr)) {
-            Logger::instance().error(L"capture", L"CreateTexture2D for capture pool failed: " + hresultToString(hr));
-            pool_.clear();
-            return false;
-        }
-        hr = device_->device()->CreateRenderTargetView(slot->texture.Get(), nullptr, &slot->renderTargetView);
+        HRESULT hr = device_->device()->CreateRenderTargetView(texture.Get(), nullptr, &slot->renderTargetView);
         if (FAILED(hr)) {
             Logger::instance().error(L"capture", L"CreateRenderTargetView for capture pool failed: " + hresultToString(hr));
             pool_.clear();
             return false;
         }
+        slot->texture = std::move(texture);
         pool_.push_back(std::move(slot));
     }
 
     // Persistent desktop image feeds both slot copies and cursor's destination
     // pixel logic, so it requires a shader-resource view.
-    D3D11_TEXTURE2D_DESC copyDesc = desc;
+    D3D11_TEXTURE2D_DESC copyDesc{};
+    copyDesc.Width = width;
+    copyDesc.Height = height;
+    copyDesc.MipLevels = 1;
+    copyDesc.ArraySize = 1;
+    copyDesc.Format = format;
+    copyDesc.SampleDesc.Count = 1;
+    copyDesc.Usage = D3D11_USAGE_DEFAULT;
     copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     HRESULT hr = device_->device()->CreateTexture2D(&copyDesc, nullptr, &desktopCopy_);
     if (FAILED(hr)) {

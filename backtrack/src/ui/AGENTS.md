@@ -34,8 +34,9 @@ icon.
   `UiIds.h`. Never inline a control id or a color in a `.cpp`; a literal cannot
   be found, renamed, or themed. Per-page row geometry (label and control x,
   row height, section gaps) stays a function-local `constexpr` in the builder.
-- `captureBackendDisplayName` is `UiHelpers.h`'s, and `app/RecorderController.cpp`
-  calls it rather than keeping its own copy: the backend name lands in
+- `captureBackendDisplayName` is `platform/Win32Util.h`'s, and both
+  `app/RecorderController.cpp` and the Diagnostics page call it rather than
+  keeping their own copies: the backend name lands in
   `captureBackendStatus`, which the Diagnostics page writes to the same log the
   status bar shows. Two copies of that switch meant the status line and the
   diagnostics export could name the same backend differently.
@@ -84,8 +85,10 @@ icon.
   `computeSettingsDirty`, which is why every settings struct in `core/Types.h`
   has a defaulted `operator==`. Do not hand-roll a per-field comparison, and do
   not touch the filesystem from the dirty pass: it runs per keystroke, so the
-  clip-folder and ring-folder checks live behind `readVisibleSettingsInto`'s
-  `allowFilesystemEffects`.
+  clip-folder and ring-folder checks live in `ensureFoldersExist`, which only
+  the save path calls. `commitSettings` owns sanitize plus startup registration
+  plus save plus the dirty baseline, so every save site routes through it
+  instead of repeating the sequence.
 - Dark theme is applied by hand: `applyDarkTheme` per control (DWM dark mode
   plus `SetWindowTheme`) and the owner-draw and `WM_CTLCOLOR*` handlers, which
   return the brushes created in `create`. There is no theming API to hook.
@@ -143,6 +146,9 @@ icon.
   it never marks the page dirty, an `addControl` call that records its design
   rect, a read in `readVisibleSettingsInto`, and a reset plus rebind in
   `rebindPageControlPointers` if it gets a member pointer.
+- Enum combo boxes share one `{value, label}` table in `UiHelpers.h` between
+  the page builder (`fillEnumCombo`) and the reader (`readEnumCombo`); extend
+  the table when the enum grows, never raw-cast a combo index.
 - `readVisibleSettingsInto` reads controls raw and never clamps:
   `sanitizeSettings` is the sole clamp (stash, save, and dirty all run through
   it). The follow-mouse read applies the full
@@ -168,8 +174,11 @@ icon.
 - `applyVisibleSettings` checks the controller busy flag before persisting
   anything, so a save that loses the race cannot leave disk saved without the
   recorder ever receiving `ApplySettings`.
-- Row rebuilds (`destroySoundSeparationRows`, `destroyAutoRecordRows`) reset
-  button hover and help-hover state before destroying the controls, mirroring
+- The two executable lists share one row core (`refreshAvailableApps`,
+  `buildAppRowCommon`, `destroyAppRowCommon`, `resetAppRowHover`,
+  `pickAppExecutable`, `selectedAvailableApp`, `commitAppListEdit`): a third
+  list reuses it instead of copying the pattern. Row teardown resets button
+  hover and help-hover state before destroying the controls, mirroring
   `clearPageControls`; `clearPageControls` also clears `sectionPanels_`, and
   the Gallery layout branch clears them on entry, so a previous page's cards
   can never paint behind the Library. `rebuildSettingsCategoryBody` restores

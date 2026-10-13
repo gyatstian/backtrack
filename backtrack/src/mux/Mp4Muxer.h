@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Types.h"
+#include "mux/MuxedInputs.h"
 #include "mux/WavWriter.h"
 
 #include <filesystem>
@@ -10,46 +11,6 @@
 #include <vector>
 
 namespace backtrack {
-
-struct MuxedInputs {
-    std::filesystem::path videoPath;
-    std::filesystem::path systemAudioPath;
-    std::filesystem::path microphoneAudioPath;
-    struct VideoSample {
-        uint64_t offset = 0;
-        uint32_t size = 0;
-        int64_t pts100ns = 0;
-        // Decode timestamp (<= pts100ns); differs from the PTS only when the
-        // encoder used B-frames.
-        int64_t dts100ns = 0;
-        // Explicit validity flag: decode timestamps can legitimately be zero
-        // or negative, so no value works as a "no DTS" sentinel.
-        bool hasDts = false;
-        int64_t duration100ns = 0;
-        bool keyFrame = false;
-    };
-    std::vector<VideoSample> videoSamples;
-    VideoCodec codec = VideoCodec::H264;
-    uint32_t fps = 60;
-    uint32_t width = 1920;
-    uint32_t height = 1080;
-    uint32_t bitrateKbps = 24000;
-    ResolutionMode resolutionMode = ResolutionMode::P1080;
-};
-
-// Effective decode timestamp for one sample: valid only when explicitly
-// flagged and not past the presentation time (the encoders never produce a
-// DTS past PTS); otherwise the presentation time stands in. Zero and negative
-// timestamps are legal values, so validity comes from the flag alone. Shared
-// by the recording path and ReplayBuffer::saveTo, which must agree exactly,
-// or the same packet muxes with different timing depending on the path.
-inline int64_t effectiveDts(int64_t pts100ns, int64_t dts100ns, bool hasDts) {
-    return (hasDts && dts100ns <= pts100ns) ? dts100ns : pts100ns;
-}
-
-inline bool hasEffectiveDts(int64_t pts100ns, int64_t dts100ns, bool hasDts) {
-    return hasDts && dts100ns <= pts100ns;
-}
 
 class Mp4Muxer {
 public:

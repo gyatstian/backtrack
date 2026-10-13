@@ -971,9 +971,7 @@ void MainWindow::buildSettingsVideoPage() {
     addSection(L"Quality");
     HWND resolutionLabel = addRowLabel(L"Resolution");
     resolutionModeCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 220, kResolutionModeComboId);
-    for (const wchar_t* label : {L"240p", L"480p", L"720p", L"1080p", L"2K", L"4K", L"Custom size"}) {
-        SendMessageW(resolutionModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-    }
+    fillEnumCombo(resolutionModeCombo_, kResolutionPresetComboEntries, static_cast<int>(settings_.video.resolutionMode));
     // Append one entry per monitor after the presets. Selecting one sets encode
     // width/height to that monitor's native size (resolution shortcut only; it
     // does not change which monitor is captured).
@@ -986,7 +984,6 @@ void MainWindow::buildSettingsVideoPage() {
         }
         SendMessageW(resolutionModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
     }
-    SendMessageW(resolutionModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.resolutionMode), 0);
     addRowHelp(resolutionLabel, resolutionModeCombo_, L"Presets scale to fixed 16:9 encode sizes. Monitor entries match that display's native size. Custom enables Width and Height.");
     y += kRowHeight;
 
@@ -1025,8 +1022,7 @@ void MainWindow::buildSettingsVideoPage() {
     addSection(L"GPU");
     HWND adaptiveGpuLabel = addRowLabel(L"Adaptive GPU");
     gpuAdaptiveCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kGpuAdaptiveComboId);
-    for (const wchar_t* label : {L"Disabled", L"Conservative", L"Aggressive"}) SendMessageW(gpuAdaptiveCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-    SendMessageW(gpuAdaptiveCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.gpu.adaptiveMode), 0);
+    fillEnumCombo(gpuAdaptiveCombo_, kGpuAdaptiveComboEntries, static_cast<int>(settings_.gpu.adaptiveMode));
     addRowHelp(
         adaptiveGpuLabel,
         gpuAdaptiveCombo_,
@@ -1052,18 +1048,13 @@ void MainWindow::buildSettingsVideoPage() {
     addSection(L"Format");
     HWND codecLabel = addRowLabel(L"Codec");
     codecCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 120, kCodecComboId);
-    SendMessageW(codecCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"H.264"));
-    SendMessageW(codecCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"HEVC"));
-    SendMessageW(codecCombo_, CB_SETCURSEL, settings_.video.codec == VideoCodec::H264 ? 0 : 1, 0);
+    fillEnumCombo(codecCombo_, kVideoCodecComboEntries, static_cast<int>(settings_.video.codec));
     addRowHelp(codecLabel, codecCombo_, L"Video codec for hardware encoder output. H.264 has broad compatibility; HEVC can improve quality per bit but may be less compatible. Both run on the same GPU encode block, so GPU cost is similar.");
     y += kRowHeight;
 
     HWND encoderProfileLabel = addRowLabel(L"Encoder profile");
     encoderProfileCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kEncoderProfileComboId);
-    for (const wchar_t* label : {L"Lowest GPU", L"Balanced", L"Custom"}) {
-        SendMessageW(encoderProfileCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-    }
-    SendMessageW(encoderProfileCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderProfile), 0);
+    fillEnumCombo(encoderProfileCombo_, kEncoderProfileComboEntries, static_cast<int>(settings_.video.encoderProfile));
     addRowHelp(
         encoderProfileLabel,
         encoderProfileCombo_,
@@ -1078,8 +1069,7 @@ void MainWindow::buildSettingsVideoPage() {
     addSection(L"Encoder");
     HWND presetLabel = addRowLabel(L"Preset");
     encoderPresetCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 180, kEncoderPresetComboId);
-    for (const wchar_t* label : {L"P1 fastest", L"P2 faster", L"P3 fast", L"P4 medium", L"P5 slow", L"P6 slower", L"P7 slowest"}) SendMessageW(encoderPresetCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-    SendMessageW(encoderPresetCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderPreset), 0);
+    fillEnumCombo(encoderPresetCombo_, kEncoderPresetComboEntries, static_cast<int>(settings_.video.encoderPreset));
     addRowHelp(
         presetLabel,
         encoderPresetCombo_,
@@ -1087,8 +1077,7 @@ void MainWindow::buildSettingsVideoPage() {
     y += kRowHeight;
     HWND tuningLabel = addRowLabel(L"Tuning mode");
     encoderModeCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 160, kEncoderModeComboId);
-    for (const wchar_t* label : {L"High quality", L"Low latency", L"Ultra low latency", L"Lossless", L"Ultra high quality"}) SendMessageW(encoderModeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-    SendMessageW(encoderModeCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderMode), 0);
+    fillEnumCombo(encoderModeCombo_, kEncoderModeComboEntries, static_cast<int>(settings_.video.encoderMode));
     addRowHelp(
         tuningLabel,
         encoderModeCombo_,
@@ -1096,8 +1085,7 @@ void MainWindow::buildSettingsVideoPage() {
     y += kRowHeight;
     HWND multipassLabel = addRowLabel(L"Multipass");
     encoderMultipassCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 110, kEncoderMultipassComboId);
-    for (const wchar_t* label : {L"Disabled", L"Quarter resolution", L"Full resolution"}) SendMessageW(encoderMultipassCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label));
-    SendMessageW(encoderMultipassCombo_, CB_SETCURSEL, static_cast<WPARAM>(settings_.video.encoderMultipass), 0);
+    fillEnumCombo(encoderMultipassCombo_, kEncoderMultipassComboEntries, static_cast<int>(settings_.video.encoderMultipass));
     addRowHelp(
         multipassLabel,
         encoderMultipassCombo_,
@@ -1225,13 +1213,7 @@ void MainWindow::buildSettingsCapturePage() {
     y += kRowHeight;
     HWND captureMethodLabel = addRowLabel(L"Capture method");
     captureMethodCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kCaptureMethodComboId);
-    SendMessageW(captureMethodCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"WGC"));
-    SendMessageW(captureMethodCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"DXGI"));
-    SendMessageW(
-        captureMethodCombo_,
-        CB_SETCURSEL,
-        settings_.preferredCaptureBackend == CaptureBackend::DesktopDuplication ? 1 : 0,
-        0);
+    fillEnumCombo(captureMethodCombo_, kCaptureBackendComboEntries, static_cast<int>(settings_.preferredCaptureBackend));
     addRowHelp(
         captureMethodLabel,
         captureMethodCombo_,
@@ -1526,14 +1508,7 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         kControlWidth,
         120,
         kVoiceCommandComboId);
-    SendMessageW(voiceCommandCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Off"));
-    SendMessageW(voiceCommandCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Backtrack clip that"));
-    SendMessageW(voiceCommandCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Record video"));
-    SendMessageW(
-        voiceCommandCombo_,
-        CB_SETCURSEL,
-        static_cast<int>(settings_.gameIntegrations.voiceCommand),
-        0);
+    fillEnumCombo(voiceCommandCombo_, kVoiceCommandComboEntries, static_cast<int>(settings_.gameIntegrations.voiceCommand));
     addRowHelp(
         triggerPhraseLabel,
         voiceCommandCombo_,
@@ -1552,14 +1527,8 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
         kControlWidth,
         120,
         kDiscordRichPresenceComboId);
-    SendMessageW(discordRichPresenceCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Always"));
-    SendMessageW(discordRichPresenceCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Only on fullscreen apps/games"));
-    SendMessageW(discordRichPresenceCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Never"));
-    SendMessageW(
-        discordRichPresenceCombo_,
-        CB_SETCURSEL,
-        static_cast<int>(settings_.gameIntegrations.discordRichPresence),
-        0);
+    fillEnumCombo(
+        discordRichPresenceCombo_, kDiscordPresenceComboEntries, static_cast<int>(settings_.gameIntegrations.discordRichPresence));
     addRowHelp(
         richPresenceLabel,
         discordRichPresenceCombo_,
@@ -1730,10 +1699,7 @@ void MainWindow::buildStatsPage() {
     capsLabel_ = addControl(L"STATIC", L"", SS_LEFT, 464, 112, 350, 330, kCapsLabelId);
     addSectionLabel(L"Recent Log", 44, 484, 220);
     HWND logLevel = addControl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 416, 480, 132, 160, kLogLevelComboId);
-    for (const wchar_t* level : {L"Trace", L"Debug", L"Info", L"Warn", L"Error"}) {
-        SendMessageW(logLevel, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(level));
-    }
-    SendMessageW(logLevel, CB_SETCURSEL, static_cast<int>(settings_.logLevel), 0);
+    fillEnumCombo(logLevel, kLogLevelComboEntries, static_cast<int>(settings_.logLevel));
     addControl(L"BUTTON", L"Open Folder", BS_PUSHBUTTON | WS_TABSTOP, 560, 480, 132, 30, kOpenLogFolderButtonId);
     addControl(L"BUTTON", L"Save Log", BS_PUSHBUTTON | WS_TABSTOP, 704, 480, 120, 30, kSaveLogButtonId);
     diagnosticLogLabel_ = addControl(L"STATIC", L"", SS_LEFT, 44, 518, 780, 150, kDiagnosticLogLabelId);

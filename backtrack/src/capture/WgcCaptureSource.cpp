@@ -1,6 +1,7 @@
 #include "capture/WgcCaptureSource.h"
 
 #include "capture/D3DDevice.h"
+#include "capture/GpuPoolBuilder.h"
 #include "capture/GpuTexturePool.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
@@ -536,28 +537,23 @@ struct WgcCaptureSource::Impl {
     bool createTexturePool(uint32_t newWidth, uint32_t newHeight) {
         pool.clear();
 
-        D3D11_TEXTURE2D_DESC desc{};
-        desc.Width = newWidth;
-        desc.Height = newHeight;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
         // RENDER_TARGET is required by some NVIDIA drivers before NVENC accepts
         // the texture as a registered input (NV_ENC_ERR_RESOURCE_REGISTER_FAILED
         // otherwise); SHADER_RESOURCE keeps the downstream scaler happy. This
         // mirrors the other capture pools.
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-
-        for (uint32_t index = 0; index < texturePoolSize; ++index) {
+        GpuPoolBuildOptions options;
+        options.wantRtv = true;
+        options.wantSrv = true;
+        std::vector<ComPtr<ID3D11Texture2D>> textures;
+        if (!GpuPoolBuilder::build(
+                device->device(), newWidth, newHeight,
+                DXGI_FORMAT_B8G8R8A8_UNORM, options, texturePoolSize,
+                textures, L"WGC pool")) {
+            return false;
+        }
+        for (auto& texture : textures) {
             auto slot = std::make_shared<TextureSlot>();
-            HRESULT hr = device->device()->CreateTexture2D(&desc, nullptr, &slot->texture);
-            if (FAILED(hr)) {
-                Logger::instance().error(L"capture", L"CreateTexture2D for WGC pool failed: " + hresultToString(hr));
-                pool.clear();
-                return false;
-            }
+            slot->texture = std::move(texture);
             pool.push_back(std::move(slot));
         }
         pool.setFootprintBytes(

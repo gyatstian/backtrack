@@ -64,8 +64,8 @@ and the crash recovery store that keeps a killed recording recoverable.
   streams underneath it (the replay save path does, via
   `RecoveryStore::clearStaleManifest`) must delete both files
   first and republish a fresh manifest before muxing, or a stale table would
-  describe bytes that no longer exist. The publish retries a sharing or lock
-  violation on the same bounded budget as the staged MP4 (`publishWithRetry`),
+  describe bytes that no longer exist. The publish retries a sharing, lock, or
+  access-denied violation on the same bounded budget as the staged MP4 (`publishWithRetry`),
   because the manifest is already written and flushed when it runs and a
   scanner holding `recovery.tsv` would otherwise cost a complete recording. A
   `false` return therefore means a real write failure (full disk, denied or
@@ -119,11 +119,13 @@ and the crash recovery store that keeps a killed recording recoverable.
   which is how a claimed clip name is distinguished from a user's own empty
   `.mp4`. Real content is never removed. Any change here risks deleting user
   data.
-- `MuxedInputs` is the shared hand-off shape between the muxer, the recovery
+- `MuxedInputs` (`mux/MuxedInputs.h`) is the shared hand-off shape between the muxer, the recovery
   store, and `audio/AudioMix.h`. Extending it means updating all three.
-  `effectiveDts` / `hasEffectiveDts` (`mux/Mp4Muxer.h`) is the one DTS-validity
+  `effectiveDts` / `hasEffectiveDts` (`mux/MuxedInputs.h`) is the one DTS-validity
   rule both the recording path and `ReplayBuffer::saveTo` use
-  (`hasDts && dts <= pts`, else PTS). The `dts != pts` test stays where
+  (`hasDts && dts <= pts`, else PTS), called as `(pts, dts, flag)`. The same
+  header owns the canonical duration clamp/coalesce
+  (`coalesceVideoDuration100ns`, 60 s ceiling) both writers use. The `dts != pts` test stays where
   detection, not validity, is meant: the sink's `hasDecodeTimestamps` flag and
   the legacy-manifest `hasDts` inference in `RecoveryStore`.
 - `RecoveryStore::flushFileToDisk` is the one disk-flush helper, declared in
@@ -132,6 +134,9 @@ and the crash recovery store that keeps a killed recording recoverable.
   a full disk or a denied write; the manifest publish logs that error, because
   `writeManifest`'s `false` return tells its caller the directory is
   unrecoverable and the Win32 reason is the only evidence of why.
+- `RecoveryStore::ensureFreeDiskSpace` is the one free-space preflight for both
+  save paths (`Mp4Muxer::muxToMp4` with real file sizes, `ReplayBuffer::saveTo`
+  with snapshot byte totals before writing streams).
 
 ## Work Guidance
 

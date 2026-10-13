@@ -18,6 +18,7 @@ public:
     void requestKeyFrame() override;
     void resetInputResources() override;
     bool encodeFrame(const GpuFrame& frame, EncodedPacket& packet) override;
+    void encodeFrame(const GpuFrame& frame, std::vector<EncodedPacket>& packets) override;
     void drain(std::vector<EncodedPacket>& packets) override;
     void shutdown() override;
     EncoderCapabilities capabilities() const override;

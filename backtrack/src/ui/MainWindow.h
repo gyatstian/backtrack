@@ -216,7 +216,16 @@ private:
     void buildClipsPage();
     void switchSettingsCategory(SettingsCategory category);
 
-    bool readVisibleSettingsInto(AppSettings& target, bool allowFilesystemEffects = true);
+    void readVisibleSettingsInto(AppSettings& target);
+    // Folder validation plus creation for the save path only. Kept out of
+    // readVisibleSettingsInto so the per-keystroke dirty pass never touches
+    // the filesystem. Reads the folders readVisibleSettingsInto just stored.
+    bool ensureFoldersExist();
+    // Single owner of sanitize + startup registration + save + dirty baseline,
+    // so no save site can persist without normalizing or leave dirty tracking
+    // stale. Hotkey registration stays in applyVisibleSettings: its result
+    // feeds the ApplySettings controller action, not persistence.
+    void commitSettings();
     bool computeSettingsDirty();
     void stashVisibleSettings();
     void applyVisibleSettings();
@@ -238,6 +247,32 @@ private:
     bool handleClipListMouseWheel(WPARAM wParam);
     void updateDiagnosticsTimer();
     void loadAudioDeviceCombos();
+    // Shared executable-list core so a third list reuses instead of copying:
+    // refreshAvailableApps fills the picker combo (hasMuteToggle selects audio-
+    // session enumeration like sound separation uses; without it only visible
+    // windows are listed like auto record), build/destroyAppRowCommon own the
+    // icon + name + Remove row, and pick/selected/commit own the add paths.
+    void refreshAvailableApps(HWND combo, std::vector<AudioSessionAppInfo>& available, bool hasMuteToggle);
+    const AudioSessionAppInfo* selectedAvailableApp(HWND combo, const std::vector<AudioSessionAppInfo>& available);
+    bool pickAppExecutable(std::filesystem::path& out);
+    bool validateAppExecutablePath(const std::filesystem::path& executablePath);
+    void commitAppListEdit(void (MainWindow::*rebuild)(), const wchar_t* status);
+    void buildAppRowCommon(
+        int x,
+        int y,
+        const std::wstring& displayName,
+        const std::filesystem::path& executablePath,
+        int removeButtonId,
+        const wchar_t* removeHelp,
+        bool hasMuteToggle,
+        HWND& iconControl,
+        HICON& icon,
+        HWND& nameLabel,
+        HWND& removeButton);
+    void destroyAppRowCommon(HWND iconControl, HWND nameLabel, HWND removeButton, HICON& icon);
+    void resetAppRowHover();
+    template <typename Row>
+    void buildEmptyAppListRow(std::vector<Row>& rows, int y, HWND combo);
     void refreshSoundSeparationApps();
     void addSelectedSoundSeparationApp();
     void addManualSoundSeparationApp();
@@ -408,12 +443,10 @@ private:
     HWND renameEditButton_ = nullptr;
     HWND fpsEdit_ = nullptr;
     HWND resolutionModeCombo_ = nullptr;
-    // Number of preset items (P240..Custom) that precede the monitor entries in
-    // resolutionModeCombo_. Custom is the last enum value, so count is +1.
-    static constexpr int kResolutionPresetCount = static_cast<int>(ResolutionMode::Custom) + 1;
-    // Monitor entries appended after the preset items in resolutionModeCombo_.
-    // Combo index for entry i is kResolutionPresetCount + i. Selecting one sets
-    // encode width/height to that monitor's native size (mode stays Custom).
+    // Preset items (from kResolutionPresetComboEntries) precede the monitor
+    // entries in resolutionModeCombo_. Combo index for monitor entry i is the
+    // preset table size + i. Selecting one sets encode width/height to that
+    // monitor's native size (mode stays Custom).
     std::vector<MonitorEnumEntry> resolutionMonitorEntries_;
     HWND widthEdit_ = nullptr;
     HWND heightEdit_ = nullptr;

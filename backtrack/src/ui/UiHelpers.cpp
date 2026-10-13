@@ -511,6 +511,11 @@ size_t soundSeparationIndexFromButtonId(int controlId, int baseId) {
 }
 
 bool isSettingsControlId(int controlId) {
+    // Deferred-settings controls only. The log-level combo and the library view
+    // buttons persist immediately on selection, and the app-picker combos plus
+    // every browse/refresh/manual/action button edit transient state or run an
+    // action, so they stay out: adding one would park (or clear) the Save
+    // button for a value that is already on disk.
     switch (controlId) {
     case kFpsEditId:
     case kResolutionModeComboId:
@@ -703,16 +708,6 @@ std::wstring hotkeyDisplay(uint32_t modifiers, uint32_t virtualKey) {
 
 const wchar_t* yesNo(bool value) {
     return value ? L"yes" : L"no";
-}
-
-const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
-    switch (backend) {
-    case CaptureBackend::WindowsGraphicsCapture:
-        return L"Windows Graphics Capture";
-    case CaptureBackend::DesktopDuplication:
-        return L"Desktop Duplication";
-    }
-    return L"Unknown";
 }
 
 std::wstring actionFailureStatus(const wchar_t* summary, const EncoderCapabilities& caps, const RecordingStats& stats) {

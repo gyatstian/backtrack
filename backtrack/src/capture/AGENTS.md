@@ -9,7 +9,7 @@ GPU scaler that converts frames to whatever the active encoder wants.
 ## Ownership
 
 - Owns: `ICaptureSource`, `WgcCaptureSource`, `DesktopDuplicationCapture`,
-  `D3DDevice`, `D3D11FrameScaler`, `GpuTexturePool.h`.
+  `D3DDevice`, `D3D11FrameScaler`, `GpuTexturePool.h`, `GpuPoolBuilder.h`.
 - Does not own: encoder input format decisions (the encoder declares its
   preference through `IEncoder::preferredInputFormat`) or the frame queue, which
   belongs to `app`.
@@ -111,7 +111,9 @@ GPU scaler that converts frames to whatever the active encoder wants.
   `texturePoolSizeForQueueLimit` (`frameQueueLimit + 4`, clamped 5..16; the
   sanitize 1..8 limit makes the live range 5..12), headroom over the queue
   limit because the capture loop pins one slot as `lastFrame`, and `app` feeds
-  the same value to the scaler through `setPoolSize`. Pool exhaustion is a drop,
+  the same value to the scaler through `setPoolSize`. `GpuPoolBuilder` is the
+  single clamp and texture factory for all four pool builds (owners keep only
+  views and sidecars); its comment owns the bind-flag matrix. Pool exhaustion is a drop,
   counted as such, never a blocking wait on the capture thread; every pool logs
   through `acquireOrLog` (1st + every 300th). WGC zero-copy
   has a second cap, `wgcMaxZeroCopyLeases` (`framePoolSize - 1`, the frame pool

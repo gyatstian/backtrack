@@ -37,6 +37,114 @@ struct WindowMove {
 // so the fallback is always safe.
 bool applyWindowMoves(const std::vector<WindowMove>& moves);
 uint32_t readUIntControl(HWND control, uint32_t fallback);
+// One {enum value, display label} row for a settings combo box. The page
+// builders fill from the same table the reader maps back through, so inserting
+// a value in the middle of an enum cannot silently misread saves the way a raw
+// static_cast<Enum>(selected) does. Tables live here (not core/Types.h) because
+// these spellings are display labels; the file format keeps its own xxxName
+// pairs in settings/SettingsStore.h.
+struct EnumComboEntry {
+    int value;
+    const wchar_t* label;
+};
+
+inline constexpr EnumComboEntry kResolutionPresetComboEntries[] = {
+    {static_cast<int>(ResolutionMode::P240), L"240p"},
+    {static_cast<int>(ResolutionMode::P480), L"480p"},
+    {static_cast<int>(ResolutionMode::P720), L"720p"},
+    {static_cast<int>(ResolutionMode::P1080), L"1080p"},
+    {static_cast<int>(ResolutionMode::P2K), L"2K"},
+    {static_cast<int>(ResolutionMode::P4K), L"4K"},
+    {static_cast<int>(ResolutionMode::Custom), L"Custom size"},
+};
+inline constexpr EnumComboEntry kVideoCodecComboEntries[] = {
+    {static_cast<int>(VideoCodec::H264), L"H.264"},
+    {static_cast<int>(VideoCodec::Hevc), L"HEVC"},
+};
+inline constexpr EnumComboEntry kEncoderPresetComboEntries[] = {
+    {static_cast<int>(EncoderPreset::P1), L"P1 fastest"},
+    {static_cast<int>(EncoderPreset::P2), L"P2 faster"},
+    {static_cast<int>(EncoderPreset::P3), L"P3 fast"},
+    {static_cast<int>(EncoderPreset::P4), L"P4 medium"},
+    {static_cast<int>(EncoderPreset::P5), L"P5 slow"},
+    {static_cast<int>(EncoderPreset::P6), L"P6 slower"},
+    {static_cast<int>(EncoderPreset::P7), L"P7 slowest"},
+};
+inline constexpr EnumComboEntry kEncoderModeComboEntries[] = {
+    {static_cast<int>(EncoderMode::HighQuality), L"High quality"},
+    {static_cast<int>(EncoderMode::LowLatency), L"Low latency"},
+    {static_cast<int>(EncoderMode::UltraLowLatency), L"Ultra low latency"},
+    {static_cast<int>(EncoderMode::Lossless), L"Lossless"},
+    {static_cast<int>(EncoderMode::UltraHighQuality), L"Ultra high quality"},
+};
+inline constexpr EnumComboEntry kEncoderProfileComboEntries[] = {
+    {static_cast<int>(EncoderProfile::LowestGpu), L"Lowest GPU"},
+    {static_cast<int>(EncoderProfile::Balanced), L"Balanced"},
+    {static_cast<int>(EncoderProfile::Custom), L"Custom"},
+};
+inline constexpr EnumComboEntry kEncoderMultipassComboEntries[] = {
+    {static_cast<int>(EncoderMultipass::Disabled), L"Disabled"},
+    {static_cast<int>(EncoderMultipass::QuarterResolution), L"Quarter resolution"},
+    {static_cast<int>(EncoderMultipass::FullResolution), L"Full resolution"},
+};
+inline constexpr EnumComboEntry kGpuAdaptiveComboEntries[] = {
+    {static_cast<int>(GpuAdaptiveMode::Disabled), L"Disabled"},
+    {static_cast<int>(GpuAdaptiveMode::Conservative), L"Conservative"},
+    {static_cast<int>(GpuAdaptiveMode::Aggressive), L"Aggressive"},
+};
+inline constexpr EnumComboEntry kCaptureBackendComboEntries[] = {
+    {static_cast<int>(CaptureBackend::WindowsGraphicsCapture), L"WGC"},
+    {static_cast<int>(CaptureBackend::DesktopDuplication), L"DXGI"},
+};
+inline constexpr EnumComboEntry kVoiceCommandComboEntries[] = {
+    {static_cast<int>(GameIntegrationSettings::VoiceCommandMode::Disabled), L"Off"},
+    {static_cast<int>(GameIntegrationSettings::VoiceCommandMode::ClipThat), L"Backtrack clip that"},
+    {static_cast<int>(GameIntegrationSettings::VoiceCommandMode::RecordVideo), L"Record video"},
+};
+inline constexpr EnumComboEntry kDiscordPresenceComboEntries[] = {
+    {static_cast<int>(GameIntegrationSettings::DiscordRichPresenceMode::Always), L"Always"},
+    {static_cast<int>(GameIntegrationSettings::DiscordRichPresenceMode::FullscreenOnly), L"Only on fullscreen apps/games"},
+    {static_cast<int>(GameIntegrationSettings::DiscordRichPresenceMode::Off), L"Never"},
+};
+inline constexpr EnumComboEntry kLogLevelComboEntries[] = {
+    {static_cast<int>(LogLevel::Trace), L"Trace"},
+    {static_cast<int>(LogLevel::Debug), L"Debug"},
+    {static_cast<int>(LogLevel::Info), L"Info"},
+    {static_cast<int>(LogLevel::Warning), L"Warn"},
+    {static_cast<int>(LogLevel::Error), L"Error"},
+};
+
+// Fills a fresh combo from a table and selects the row holding currentValue.
+// An unknown value falls back to the first row rather than leaving no selection.
+template <size_t Count>
+void fillEnumCombo(HWND combo, const EnumComboEntry (&entries)[Count], int currentValue) {
+    if (!combo) {
+        return;
+    }
+    int selected = 0;
+    for (size_t index = 0; index < Count; ++index) {
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(entries[index].label));
+        if (entries[index].value == currentValue) {
+            selected = static_cast<int>(index);
+        }
+    }
+    SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+}
+
+// Maps the combo selection back through the same table. Returns false (and
+// keeps value) when nothing valid is selected, so CB_ERR can never silently
+// become enum value 0 the way the old selected==1?B:A reads did.
+template <size_t Count>
+bool readEnumCombo(HWND combo, const EnumComboEntry (&entries)[Count], int& value) {
+    const LRESULT selected = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (selected < 0 || static_cast<size_t>(selected) >= Count) {
+        return false;
+    }
+    value = entries[static_cast<size_t>(selected)].value;
+    return true;
+}
+
+// shortcut: bytesToText/durationToText stay UI-local until a non-ui caller needs them (then join captureBackendDisplayName in platform/).
 std::wstring bytesToText(uintmax_t bytes);
 bool isButtonId(WPARAM id);
 bool isSoundSeparationMuteButtonId(int controlId);
@@ -55,7 +163,6 @@ bool shellExecuteSucceeded(HINSTANCE result);
 std::wstring keyName(uint32_t virtualKey);
 std::wstring hotkeyDisplay(uint32_t modifiers, uint32_t virtualKey);
 const wchar_t* yesNo(bool value);
-const wchar_t* captureBackendDisplayName(CaptureBackend backend);
 std::wstring actionFailureStatus(const wchar_t* summary, const EncoderCapabilities& caps, const RecordingStats& stats);
 std::wstring withHotkeyWarning(std::wstring status, bool hotkeysOk, const std::wstring& hotkeyError);
 void playActionIndicator(

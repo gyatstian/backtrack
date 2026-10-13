@@ -73,8 +73,7 @@ void MainWindow::setLibraryViewMode(LibraryViewMode mode) {
     // still holds pre-save values, and saving them here used to revert the
     // settings file the user had just written.
     settings_.libraryGalleryView = mode == LibraryViewMode::Gallery;
-    settingsStore_.save(settings_);
-    savedSettings_ = settings_;
+    commitSettings();
     Logger::instance().info(L"ui", std::wstring(L"Library view changed to ") + (mode == LibraryViewMode::Gallery ? L"gallery" : L"list"));
     if (clipList_) {
         setListItemHeightIfChanged(clipList_, clipListItemHeight_, mode == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);

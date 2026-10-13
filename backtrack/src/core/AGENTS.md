@@ -7,7 +7,7 @@ the lock-free queue used between threads, and the app version constant.
 
 ## Ownership
 
-- Owns: `core/Types.h`, `core/Logger.*`, `core/SpscQueue.h`,
+- Owns: `core/Types.h`, `core/Clock.h`, `core/Logger.*`, `core/SpscQueue.h`,
   `core/AppVersion.h`.
 - Does not own: any behavior that belongs to a domain. `Types.h` describes data,
   it does not act on it.
@@ -37,7 +37,9 @@ the lock-free queue used between threads, and the app version constant.
   clamp in `sanitizeSettings`. A field behind `BACKTRACK_HAS_NOISE_SUPPRESSION`
   is wrapped in that `#ifdef` at every site that touches it.
 - `kHundredNanosecondsPerSecond` and `secondsTo100ns` are the only conversion
-  helpers. Timestamps are signed 100 ns units and may legitimately be zero or
+  helpers, plus `core/Clock.h`'s QPC/steady-clock converters (`qpcTo100ns`,
+  `qpcNow100ns`, `steadyNow100ns`, `steadyTimePoint100ns`,
+  `steadyPointFrom100ns`). Timestamps are signed 100 ns units and may legitimately be zero or
   negative, so nothing in this folder may use a sentinel value; see
   `src/AGENTS.md` for the boundary rule.
 - `Logger` is a process singleton, safe from any thread. `initialize` once at

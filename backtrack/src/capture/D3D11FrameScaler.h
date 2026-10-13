@@ -55,6 +55,28 @@ private:
         uint32_t width,
         uint32_t height,
         DXGI_FORMAT format);
+    // One VP attempt. RetrySdr latches the HDR SDR-fallback (never BGRA);
+    // DowngradeBgra latches the NV12->BGRA fallback; a failure yields exactly
+    // one of them. No teardown runs under the context lock; the caller retries
+    // with plain sequential calls.
+    enum class VpBltOutcome { Ok, Drop, RetrySdr, DowngradeBgra };
+    VpBltOutcome tryVpBlt(
+        D3DDevice& device,
+        const GpuFrame& input,
+        uint32_t outputWidth,
+        uint32_t outputHeight,
+        DXGI_FORMAT outputFormat,
+        GpuFrame& output,
+        bool fitWithBars,
+        bool& hdrRetryAfterCooldown);
+    // Same-size, same-format CopyResource path. Outside the VP retry budget.
+    bool tryFastCopy(
+        D3DDevice& device,
+        const GpuFrame& input,
+        uint32_t outputWidth,
+        uint32_t outputHeight,
+        DXGI_FORMAT outputFormat,
+        GpuFrame& output);
     void releaseResources();
     ID3D11VideoProcessorInputView* inputViewFor(D3DDevice& device, ID3D11Texture2D* texture);
     ID3D11VideoProcessorInputView* copiedInputViewFor(D3DDevice& device, ID3D11Texture2D* texture);

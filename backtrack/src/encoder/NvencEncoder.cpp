@@ -1,5 +1,6 @@
 #include "encoder/NvencEncoder.h"
 
+#include "capture/D3DDevice.h"
 #include "core/Logger.h"
 #include "encoder/DecodeOrderTimestamps.h"
 #include "encoder/EncoderCommon.h"
@@ -183,6 +184,14 @@ struct NvencEncoder::Impl {
     EncoderCapabilities caps;
     EncoderStats encoderStats;
     mutable std::mutex mutex;
+    // Last stats/capabilities copied while mutex was free. stats() and
+    // capabilities() serve these when try_lock fails so a diagnostics poll
+    // never queues behind a driver call (encode/drain hold mutex across
+    // sleeps and blocking locks). Slightly stale under load; the lock-free
+    // availableAtomic stays the health signal.
+    mutable std::mutex snapshotMutex;
+    EncoderStats statsSnapshot;
+    EncoderCapabilities capsSnapshot;
     // Lock-free mirror of encoderStats.encoderAvailable for the capture loop's
     // per-iteration health probe (IEncoder::encoderAvailable). Written only on
     // paths that already hold mutex, so the pair never disagrees observably.
@@ -718,6 +727,20 @@ struct NvencEncoder::Impl {
         return true;
     }
 
+    // Vector form of encode: encode() harvests into readyPackets and pops at
+    // most one, so move the remainder too. A submission that completes several
+    // outputs must not strand its tail behind a single-packet return.
+    void encodeDrain(const GpuFrame& frame, std::vector<EncodedPacket>& out) {
+        EncodedPacket packet;
+        if (encode(frame, packet)) {
+            out.push_back(std::move(packet));
+        }
+        EncodedPacket rest;
+        while (popReadyPacket(rest)) {
+            out.push_back(std::move(rest));
+        }
+    }
+
     bool harvestPendingOutputs(bool waitForCompletion) {
         // Drain mode uses an idle bound refreshed on every successfully locked
         // output instead of one absolute budget: a large queue of completed
@@ -826,10 +849,13 @@ struct NvencEncoder::Impl {
             const auto* begin = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
             // Only the picture-type read stays backend-specific; timestamps,
             // keyframe rule, headers, and stats live in finalizePacket.
+            // outputTimeStamp echoes the submitted inputTimeStamp, so driver
+            // timestamps are always present; validity is explicit (zero is a
+            // legal timestamp, never a sentinel).
             const bool metadataIdr = lock.pictureType == NV_ENC_PIC_TYPE_IDR;
             const bool finalized = finalizePacket(
                 settings.codec, begin, lock.bitstreamSizeInBytes,
-                static_cast<int64_t>(lock.outputTimeStamp),
+                static_cast<int64_t>(lock.outputTimeStamp), true,
                 static_cast<int64_t>(lock.outputDuration),
                 pending.fallbackPts100ns, pending.fallbackDuration100ns,
                 metadataIdr, decodeTimestamps, cachedParameterSets,
@@ -881,7 +907,9 @@ struct NvencEncoder::Impl {
             // the stream never continues from a broken reference chain.
             forceKeyFrame = true;
             ++encoderStats.droppedFrames;
-            return false;
+            // Pop rather than returning false: a ready tail from earlier
+            // harvests must not strand behind this drop.
+            return popReadyPacket(packet);
         }
 
         // Lazy one-time map: the address binding stays valid for the whole
@@ -1089,6 +1117,9 @@ struct NvencEncoder::Impl {
     EncoderCapabilities caps;
     EncoderStats encoderStats;
     mutable std::mutex mutex;
+    mutable std::mutex snapshotMutex;
+    EncoderStats statsSnapshot;
+    EncoderCapabilities capsSnapshot;
     std::atomic<bool> forceKeyFrame{false};
 };
 
@@ -1153,6 +1184,14 @@ bool NvencEncoder::encodeFrame(const GpuFrame& frame, EncodedPacket& packet) {
 #endif
 }
 
+void NvencEncoder::encodeFrame(const GpuFrame& frame, std::vector<EncodedPacket>& packets) {
+    std::scoped_lock lock(impl_->mutex);
+    packets.clear();
+#if BACKTRACK_HAS_NVENC
+    impl_->encodeDrain(frame, packets);
+#endif
+}
+
 void NvencEncoder::drain(std::vector<EncodedPacket>& packets) {
     std::scoped_lock lock(impl_->mutex);
     packets.clear();
@@ -1180,13 +1219,21 @@ bool NvencEncoder::encoderAvailable() const noexcept {
 }
 
 EncoderCapabilities NvencEncoder::capabilities() const {
-    std::scoped_lock lock(impl_->mutex);
-    return impl_->caps;
+    std::unique_lock lock(impl_->mutex, std::try_to_lock);
+    std::scoped_lock snap(impl_->snapshotMutex);
+    if (lock.owns_lock()) {
+        impl_->capsSnapshot = impl_->caps;
+    }
+    return impl_->capsSnapshot;
 }
 
 EncoderStats NvencEncoder::stats() const {
-    std::scoped_lock lock(impl_->mutex);
-    return impl_->encoderStats;
+    std::unique_lock lock(impl_->mutex, std::try_to_lock);
+    std::scoped_lock snap(impl_->snapshotMutex);
+    if (lock.owns_lock()) {
+        impl_->statsSnapshot = impl_->encoderStats;
+    }
+    return impl_->statsSnapshot;
 }
 
 DXGI_FORMAT NvencEncoder::preferredInputFormat() const {

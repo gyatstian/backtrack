@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
@@ -33,7 +34,7 @@
 #include <utility>
 
 namespace backtrack {
-bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesystemEffects) {
+void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (bitrateEdit_) {
         target.video.bitrateKbps = readUIntControl(bitrateEdit_, target.video.bitrateKbps);
     }
@@ -43,12 +44,18 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
     bool monitorEntrySelected = false;
     if (resolutionModeCombo_) {
         const auto selected = SendMessageW(resolutionModeCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= static_cast<LRESULT>(ResolutionMode::Custom)) {
-            target.video.resolutionMode = static_cast<ResolutionMode>(selected);
-        } else if (selected >= static_cast<LRESULT>(kResolutionPresetCount)) {
+        // Preset indices map back through the same table the builder filled;
+        // higher indices are monitor shortcuts appended after the presets.
+        constexpr size_t kPresetCount = std::size(kResolutionPresetComboEntries);
+        if (selected >= 0 && static_cast<size_t>(selected) < kPresetCount) {
+            int mode = static_cast<int>(target.video.resolutionMode);
+            if (readEnumCombo(resolutionModeCombo_, kResolutionPresetComboEntries, mode)) {
+                target.video.resolutionMode = static_cast<ResolutionMode>(mode);
+            }
+        } else if (selected >= static_cast<LRESULT>(kPresetCount)) {
             // Monitor entry: resolution shortcut. Persist as Custom with that
             // monitor's native size. Capture target is unaffected.
-            const size_t monitorIdx = static_cast<size_t>(selected) - kResolutionPresetCount;
+            const size_t monitorIdx = static_cast<size_t>(selected) - kPresetCount;
             if (monitorIdx < resolutionMonitorEntries_.size()) {
                 const MonitorEnumEntry& monitor = resolutionMonitorEntries_[monitorIdx];
                 target.video.resolutionMode = ResolutionMode::Custom;
@@ -81,8 +88,10 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.captureCursor = SendMessageW(captureCursorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (codecCombo_) {
-        const auto selected = SendMessageW(codecCombo_, CB_GETCURSEL, 0, 0);
-        target.video.codec = selected == 1 ? VideoCodec::Hevc : VideoCodec::H264;
+        int codec = static_cast<int>(target.video.codec);
+        if (readEnumCombo(codecCombo_, kVideoCodecComboEntries, codec)) {
+            target.video.codec = static_cast<VideoCodec>(codec);
+        }
     }
     if (systemAudioCheck_) {
         target.captureSystemAudio = SendMessageW(systemAudioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
@@ -131,21 +140,21 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.customNotificationSoundPath = trimText(readText(customNotificationSoundEdit_));
     }
     if (encoderPresetCombo_) {
-        const auto selected = SendMessageW(encoderPresetCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= 6) {
-            target.video.encoderPreset = static_cast<EncoderPreset>(selected);
+        int preset = static_cast<int>(target.video.encoderPreset);
+        if (readEnumCombo(encoderPresetCombo_, kEncoderPresetComboEntries, preset)) {
+            target.video.encoderPreset = static_cast<EncoderPreset>(preset);
         }
     }
     if (encoderModeCombo_) {
-        const auto selected = SendMessageW(encoderModeCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= 4) {
-            target.video.encoderMode = static_cast<EncoderMode>(selected);
+        int mode = static_cast<int>(target.video.encoderMode);
+        if (readEnumCombo(encoderModeCombo_, kEncoderModeComboEntries, mode)) {
+            target.video.encoderMode = static_cast<EncoderMode>(mode);
         }
     }
     if (encoderProfileCombo_) {
-        const auto selected = SendMessageW(encoderProfileCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= 2) {
-            target.video.encoderProfile = static_cast<EncoderProfile>(selected);
+        int profile = static_cast<int>(target.video.encoderProfile);
+        if (readEnumCombo(encoderProfileCombo_, kEncoderProfileComboEntries, profile)) {
+            target.video.encoderProfile = static_cast<EncoderProfile>(profile);
         }
     }
     if (encoderLookaheadCheck_) {
@@ -164,9 +173,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.video.encoderTemporalAQ = SendMessageW(encoderTemporalAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (encoderMultipassCombo_) {
-        const auto selected = SendMessageW(encoderMultipassCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= 2) {
-            target.video.encoderMultipass = static_cast<EncoderMultipass>(selected);
+        int multipass = static_cast<int>(target.video.encoderMultipass);
+        if (readEnumCombo(encoderMultipassCombo_, kEncoderMultipassComboEntries, multipass)) {
+            target.video.encoderMultipass = static_cast<EncoderMultipass>(multipass);
         }
     }
     if (encoderBFramesCheck_) {
@@ -188,9 +197,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.video.encoderReferenceFrames = readUIntControl(encoderReferenceFramesEdit_, target.video.encoderReferenceFrames);
     }
     if (gpuAdaptiveCombo_) {
-        const auto selected = SendMessageW(gpuAdaptiveCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= 2) {
-            target.gpu.adaptiveMode = static_cast<GpuAdaptiveMode>(selected);
+        int adaptive = static_cast<int>(target.gpu.adaptiveMode);
+        if (readEnumCombo(gpuAdaptiveCombo_, kGpuAdaptiveComboEntries, adaptive)) {
+            target.gpu.adaptiveMode = static_cast<GpuAdaptiveMode>(adaptive);
         }
     }
     if (gpuFrameQueueLimitEdit_) {
@@ -201,11 +210,9 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
             SendMessageW(idleFrameCoalescingCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (captureMethodCombo_) {
-        const auto selected = SendMessageW(captureMethodCombo_, CB_GETCURSEL, 0, 0);
-        if (selected == 0) {
-            target.preferredCaptureBackend = CaptureBackend::WindowsGraphicsCapture;
-        } else if (selected == 1) {
-            target.preferredCaptureBackend = CaptureBackend::DesktopDuplication;
+        int backend = static_cast<int>(target.preferredCaptureBackend);
+        if (readEnumCombo(captureMethodCombo_, kCaptureBackendComboEntries, backend)) {
+            target.preferredCaptureBackend = static_cast<CaptureBackend>(backend);
         }
     }
     if (stableMultimonitorFramesCheck_) {
@@ -227,37 +234,8 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
             SendMessageW(replayDiskBackedAudioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (replayRingDirEdit_) {
-        const auto folder = trimText(readText(replayRingDirEdit_));
-        // Validated like clipDirectory, and for the same reason: an unusable
-        // ring folder otherwise reaches ReplayBuffer::openRingLocked, which
-        // degrades to RAM buffering and leaves the checkbox looking healthy.
-        // Only checked while the feature is on - unchecking it tears this row
-        // down, and failing a save over a folder that is about to be unused
-        // would be wrong. The path is always stored, so re-checking restores it.
-        if (!folder.empty() && (target.replay.diskBackedVideo || target.replay.diskBackedAudio)) {
-            // Dirty detection re-reads this per keystroke and only compares
-            // values, so the filesystem check belongs to the save path alone.
-            if (allowFilesystemEffects) {
-                std::error_code folderError;
-                const std::filesystem::path folderPath(folder);
-                if (std::filesystem::exists(folderPath, folderError) && !std::filesystem::is_directory(folderPath, folderError)) {
-                    setStatus(L"Replay buffer folder must be a folder, not a file");
-                    return false;
-                }
-                if (folderError) {
-                    setStatus(L"Replay buffer folder could not be checked");
-                    return false;
-                }
-                // Create it now so the first encode push does not discover an
-                // unwritable location after the session is already running.
-                std::filesystem::create_directories(folderPath, folderError);
-                if (folderError) {
-                    setStatus(L"Replay buffer folder could not be created");
-                    return false;
-                }
-            }
-        }
-        target.replayRingDirectory = folder;
+        // Stored raw; ensureFoldersExist validates and creates on the save path.
+        target.replayRingDirectory = trimText(readText(replayRingDirEdit_));
     }
     if (leagueKillReminderCheck_) {
         target.gameIntegrations.leagueOfLegendsKillReminder =
@@ -268,17 +246,17 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
             SendMessageW(autoRecordEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     if (voiceCommandCombo_) {
-        const LRESULT selected = SendMessageW(voiceCommandCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= 2) {
+        int voiceCommand = static_cast<int>(target.gameIntegrations.voiceCommand);
+        if (readEnumCombo(voiceCommandCombo_, kVoiceCommandComboEntries, voiceCommand)) {
             target.gameIntegrations.voiceCommand =
-                static_cast<GameIntegrationSettings::VoiceCommandMode>(selected);
+                static_cast<GameIntegrationSettings::VoiceCommandMode>(voiceCommand);
         }
     }
     if (discordRichPresenceCombo_) {
-        const LRESULT selected = SendMessageW(discordRichPresenceCombo_, CB_GETCURSEL, 0, 0);
-        if (selected >= 0 && selected <= 2) {
+        int presence = static_cast<int>(target.gameIntegrations.discordRichPresence);
+        if (readEnumCombo(discordRichPresenceCombo_, kDiscordPresenceComboEntries, presence)) {
             target.gameIntegrations.discordRichPresence =
-                static_cast<GameIntegrationSettings::DiscordRichPresenceMode>(selected);
+                static_cast<GameIntegrationSettings::DiscordRichPresenceMode>(presence);
         }
     }
     if (discordPresenceTimerCombo_) {
@@ -299,45 +277,80 @@ bool MainWindow::readVisibleSettingsInto(AppSettings& target, bool allowFilesyst
         target.hotkeys.saveReplayVirtualKey = replayHotkeyVirtualKey_;
     }
     if (clipFolderEdit_) {
-        const auto folder = trimText(readText(clipFolderEdit_));
         // Stored even when empty, like the ring folder, so clearing the box is
         // a visible edit; sanitizeSettings turns the empty value back into
-        // defaultClipDirectory() on save.
-        if (!folder.empty()) {
-            // Same as the ring folder above: the dirty pass only compares the
-            // text, so it must not stat the path on every keystroke.
-            if (allowFilesystemEffects) {
-                std::error_code folderError;
-                const std::filesystem::path folderPath(folder);
-                if (std::filesystem::exists(folderPath, folderError) && !std::filesystem::is_directory(folderPath, folderError)) {
-                    setStatus(L"Clip folder must be a folder, not a file");
-                    return false;
-                }
-                if (folderError) {
-                    setStatus(L"Clip folder could not be checked");
-                    return false;
-                }
-                std::filesystem::create_directories(folderPath, folderError);
-                if (folderError) {
-                    setStatus(L"Clip folder could not be created");
-                    return false;
-                }
-            }
-        }
-        target.clipDirectory = folder;
+        // defaultClipDirectory() on save. Validated by ensureFoldersExist.
+        target.clipDirectory = trimText(readText(clipFolderEdit_));
     }
     if (organizeClipsByGameCheck_) {
         target.organizeClipsByGame =
             SendMessageW(organizeClipsByGameCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
     }
     target.libraryGalleryView = libraryViewMode_ == LibraryViewMode::Gallery;
+}
+
+bool MainWindow::ensureFoldersExist() {
+    // Save-path-only folder validation plus creation for the paths
+    // readVisibleSettingsInto just stored. An unusable ring folder otherwise
+    // reaches ReplayBuffer::openRingLocked, which degrades to RAM buffering
+    // and leaves the checkbox looking healthy, so create it now rather than
+    // letting the first encode push discover an unwritable location.
+    auto ensureFolder = [&](const std::filesystem::path& folder,
+                            const wchar_t* notFolderStatus,
+                            const wchar_t* notCheckableStatus,
+                            const wchar_t* notCreatableStatus) {
+        std::error_code folderError;
+        if (std::filesystem::exists(folder, folderError) && !std::filesystem::is_directory(folder, folderError)) {
+            setStatus(notFolderStatus);
+            return false;
+        }
+        if (folderError) {
+            setStatus(notCheckableStatus);
+            return false;
+        }
+        std::filesystem::create_directories(folder, folderError);
+        if (folderError) {
+            setStatus(notCreatableStatus);
+            return false;
+        }
+        return true;
+    };
+    // Only checked while the feature is on - unchecking it tears this row
+    // down, and failing a save over a folder that is about to be unused would
+    // be wrong. The path is always stored, so re-checking restores it.
+    if (!settings_.replayRingDirectory.empty() &&
+        (settings_.replay.diskBackedVideo || settings_.replay.diskBackedAudio)) {
+        if (!ensureFolder(
+                settings_.replayRingDirectory,
+                L"Replay buffer folder must be a folder, not a file",
+                L"Replay buffer folder could not be checked",
+                L"Replay buffer folder could not be created")) {
+            return false;
+        }
+    }
+    if (!settings_.clipDirectory.empty()) {
+        if (!ensureFolder(
+                settings_.clipDirectory,
+                L"Clip folder must be a folder, not a file",
+                L"Clip folder could not be checked",
+                L"Clip folder could not be created")) {
+            return false;
+        }
+    }
     return true;
 }
 
+void MainWindow::commitSettings() {
+    settings_ = sanitizeSettings(settings_);
+    updateStartupRegistration();
+    settingsStore_.save(settings_);
+    // Persisted: the pristine baseline the Save button diffs against, so
+    // further edits reverted to these values hide it.
+    savedSettings_ = settings_;
+}
+
 void MainWindow::stashVisibleSettings() {
-    if (!readVisibleSettingsInto(settings_)) {
-        return;
-    }
+    readVisibleSettingsInto(settings_);
     settings_ = sanitizeSettings(settings_);
 }
 
@@ -350,15 +363,11 @@ void MainWindow::applyVisibleSettings() {
         playActionIndicator(MB_ICONHAND, settings_.notificationSoundVolumePercent);
         return;
     }
-    if (!readVisibleSettingsInto(settings_)) {
+    readVisibleSettingsInto(settings_);
+    if (!ensureFoldersExist()) {
         return;
     }
-    settings_ = sanitizeSettings(settings_);
-    updateStartupRegistration();
-    settingsStore_.save(settings_);
-    // Settings are now persisted; this becomes the pristine baseline the Save
-    // button diffs against, so further edits reverted to these values hide it.
-    savedSettings_ = settings_;
+    commitSettings();
     clipManager_.setDirectory(settings_.clipDirectory);
     const bool hotkeysOk = hotkeys_.registerHotkeys(window_, settings_.hotkeys);
     const std::wstring hotkeyError = hotkeys_.lastErrorMessage();
@@ -411,14 +420,11 @@ void MainWindow::updateSaveSettingsButton() {
 bool MainWindow::computeSettingsDirty() {
     // Overlay the currently visible controls onto a copy of the live settings
     // (which already holds non-visible fields and the sound-separation list),
-    // then compare against the pristine saved baseline. Skip filesystem side
-    // effects: this runs on every keystroke and must not create folders.
+    // then compare against the pristine saved baseline. The read is pure with
+    // no filesystem effects: this runs on every keystroke and must not create
+    // folders.
     AppSettings candidate = settings_;
-    if (!readVisibleSettingsInto(candidate, /*allowFilesystemEffects=*/false)) {
-        // Could not read a coherent snapshot (e.g. clip folder is a file);
-        // treat that as dirty so the user can see/fix it via Save.
-        return true;
-    }
+    readVisibleSettingsInto(candidate);
     candidate = sanitizeSettings(candidate);
     return !(candidate == sanitizeSettings(savedSettings_));
 }
@@ -623,7 +629,9 @@ void MainWindow::loadAudioDeviceCombos() {
     }
 }
 
-void MainWindow::refreshSoundSeparationApps() {
+void MainWindow::refreshAvailableApps(HWND combo, std::vector<AudioSessionAppInfo>& available, bool hasMuteToggle) {
+    // Sound separation watches audio sessions as well as visible windows;
+    // auto record only matches visible windows by executable path.
     std::map<std::wstring, AudioSessionAppInfo> appsByPath;
     auto addApps = [&](std::vector<AudioSessionAppInfo> apps) {
         for (auto& app : apps) {
@@ -634,71 +642,162 @@ void MainWindow::refreshSoundSeparationApps() {
             appsByPath.emplace(key, std::move(app));
         }
     };
-    addApps(WasapiCapture::enumerateAudioSessionApps());
+    if (hasMuteToggle) {
+        addApps(WasapiCapture::enumerateAudioSessionApps());
+    }
     addApps(WasapiCapture::enumerateOpenApps());
 
-    soundSeparationAvailableApps_.clear();
-    soundSeparationAvailableApps_.reserve(appsByPath.size());
+    available.clear();
+    available.reserve(appsByPath.size());
     for (auto& [_, app] : appsByPath) {
-        soundSeparationAvailableApps_.push_back(std::move(app));
+        available.push_back(std::move(app));
     }
-    std::sort(soundSeparationAvailableApps_.begin(), soundSeparationAvailableApps_.end(), [](const AudioSessionAppInfo& left, const AudioSessionAppInfo& right) {
+    std::sort(available.begin(), available.end(), [](const AudioSessionAppInfo& left, const AudioSessionAppInfo& right) {
         return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
     });
 
-    if (soundSeparationAppCombo_) {
-        ScopedRedrawLock redraw(soundSeparationAppCombo_);
-        SendMessageW(soundSeparationAppCombo_, CB_RESETCONTENT, 0, 0);
-        SendMessageW(soundSeparationAppCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Choose active app"));
-        for (const auto& app : soundSeparationAvailableApps_) {
+    if (combo) {
+        ScopedRedrawLock redraw(combo);
+        SendMessageW(combo, CB_RESETCONTENT, 0, 0);
+        SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Choose active app"));
+        for (const auto& app : available) {
             std::wstring label = app.name.empty() ? appNameFromPath(app.executablePath) : app.name;
             const std::wstring fileName = app.executablePath.filename().wstring();
             if (!fileName.empty() && label.find(fileName) == std::wstring::npos) {
                 label += L" (" + fileName + L")";
             }
-            SendMessageW(soundSeparationAppCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+            SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
         }
-        SendMessageW(soundSeparationAppCombo_, CB_SETCURSEL, 0, 0);
+        SendMessageW(combo, CB_SETCURSEL, 0, 0);
     }
 
     if (!buildingPage_) {
-        setStatus(L"Found " + std::to_wstring(soundSeparationAvailableApps_.size()) +
-                  (soundSeparationAvailableApps_.size() == 1 ? L" selectable app" : L" selectable apps"));
+        setStatus(L"Found " + std::to_wstring(available.size()) +
+                  (available.size() == 1 ? L" selectable app" : L" selectable apps"));
     }
 }
 
-void MainWindow::addSelectedSoundSeparationApp() {
-    if (!soundSeparationAppCombo_) {
-        return;
+const AudioSessionAppInfo* MainWindow::selectedAvailableApp(
+    HWND combo, const std::vector<AudioSessionAppInfo>& available) {
+    if (!combo) {
+        return nullptr;
     }
-    const auto selected = SendMessageW(soundSeparationAppCombo_, CB_GETCURSEL, 0, 0);
+    const auto selected = SendMessageW(combo, CB_GETCURSEL, 0, 0);
     if (selected <= 0) {
-        return;
+        return nullptr;
     }
     const size_t index = static_cast<size_t>(selected - 1);
-    if (index >= soundSeparationAvailableApps_.size()) {
-        return;
-    }
-    const auto& app = soundSeparationAvailableApps_[index];
-    addSoundSeparationApp(app.name, app.executablePath);
-    SendMessageW(soundSeparationAppCombo_, CB_SETCURSEL, 0, 0);
+    return index < available.size() ? &available[index] : nullptr;
 }
 
-void MainWindow::addManualSoundSeparationApp() {
+bool MainWindow::pickAppExecutable(std::filesystem::path& out) {
     COMDLG_FILTERSPEC filters[] = {
         {L"Applications", L"*.exe"},
         {L"All files", L"*.*"},
     };
+    return pickFileForOpen(window_, L"Choose app executable", filters, static_cast<UINT>(_countof(filters)), L"exe", out);
+}
+
+bool MainWindow::validateAppExecutablePath(const std::filesystem::path& executablePath) {
+    if (!executablePath.empty()) {
+        return true;
+    }
+    setStatus(L"Selected app has no executable path");
+    return false;
+}
+
+void MainWindow::commitAppListEdit(void (MainWindow::*rebuild)(), const wchar_t* status) {
+    (this->*rebuild)();
+    markSettingsDirty();
+    setStatus(status);
+}
+
+void MainWindow::buildAppRowCommon(
+    int x,
+    int y,
+    const std::wstring& displayName,
+    const std::filesystem::path& executablePath,
+    int removeButtonId,
+    const wchar_t* removeHelp,
+    bool hasMuteToggle,
+    HWND& iconControl,
+    HICON& icon,
+    HWND& nameLabel,
+    HWND& removeButton) {
+    constexpr int kIconSize = 24;
+    constexpr int kNameWidth = 300;
+    constexpr int kRemoveWidth = 88;
+    // Rows with a mute toggle reserve the leading column for it, so their
+    // icon and name shift right; plain rows start at the icon.
+    const int iconX = x + (hasMuteToggle ? 44 : 0);
+    const int nameX = x + (hasMuteToggle ? 80 : 36);
+    iconControl = addControl(L"STATIC", L"", SS_ICON, iconX, y, kIconSize, kIconSize, -1);
+    icon = loadExecutableIcon(executablePath);
+    if (icon) {
+        SendMessageW(iconControl, STM_SETIMAGE, IMAGE_ICON, reinterpret_cast<LPARAM>(icon));
+    }
+    nameLabel = addControl(L"STATIC", displayName.c_str(), SS_LEFT | SS_NOPREFIX, nameX, y + 4, kNameWidth, 22, -1);
+    addStatusHelp(nameLabel, executablePath.wstring());
+    removeButton = addControl(
+        L"BUTTON", L"Remove", BS_PUSHBUTTON | WS_TABSTOP, x + 484, y - 2, kRemoveWidth, 30, removeButtonId);
+    addStatusHelp(removeButton, removeHelp);
+}
+
+void MainWindow::destroyAppRowCommon(HWND iconControl, HWND nameLabel, HWND removeButton, HICON& icon) {
+    // detachPageControl also unregisters mutedLabels_, so both lists keep the
+    // muted-theme membership correct through the same path.
+    detachPageControl(iconControl);
+    detachPageControl(nameLabel);
+    detachPageControl(removeButton);
+    if (icon) {
+        DestroyIcon(icon);
+        icon = nullptr;
+    }
+}
+
+void MainWindow::resetAppRowHover() {
+    // Reset hover while the old controls are still alive so they repaint
+    // un-hovered; otherwise hoveredHelpControl_/hoveredButton_ dangle and the
+    // status bar can stick tall until the next mousemove.
+    clearButtonHover();
+    hoveredHelpControl_ = nullptr;
+    hoverStickyStatusHeight_ = 0;
+}
+
+template <typename Row>
+void MainWindow::buildEmptyAppListRow(std::vector<Row>& rows, int y, HWND combo) {
+    constexpr int kX = 224;
+    Row row;
+    row.nameLabel = addControl(L"STATIC", L"No apps selected", SS_LEFT, kX, y + 4, 360, 22, -1);
+    rows.push_back(row);
+    parkFocusOnCombo(combo);
+    layoutCurrentPage();
+    redrawWindowAndChildren(pageHost_);
+}
+
+void MainWindow::refreshSoundSeparationApps() {
+    refreshAvailableApps(soundSeparationAppCombo_, soundSeparationAvailableApps_, /*hasMuteToggle=*/true);
+}
+
+void MainWindow::addSelectedSoundSeparationApp() {
+    const auto* app = selectedAvailableApp(soundSeparationAppCombo_, soundSeparationAvailableApps_);
+    if (!app) {
+        return;
+    }
+    addSoundSeparationApp(app->name, app->executablePath);
+    SendMessageW(soundSeparationAppCombo_, CB_SETCURSEL, 0, 0);
+}
+
+void MainWindow::addManualSoundSeparationApp() {
     std::filesystem::path executablePath;
-    if (!pickFileForOpen(window_, L"Choose app executable", filters, static_cast<UINT>(_countof(filters)), L"exe", executablePath)) {
+    if (!pickAppExecutable(executablePath)) {
         return;
     }
     addSoundSeparationApp(appNameFromPath(executablePath), executablePath);
 }
 
 void MainWindow::addSoundSeparationApp(std::wstring name, std::filesystem::path executablePath) {
-    if (executablePath.empty()) {
-        setStatus(L"Selected app has no executable path");
+    if (!validateAppExecutablePath(executablePath)) {
         return;
     }
 
@@ -709,9 +808,7 @@ void MainWindow::addSoundSeparationApp(std::wstring name, std::filesystem::path 
             if (app.name.empty()) {
                 app.name = name.empty() ? appNameFromPath(executablePath) : std::move(name);
             }
-            rebuildSoundSeparationRows();
-            markSettingsDirty();
-            setStatus(L"App already listed; muted");
+            commitAppListEdit(&MainWindow::rebuildSoundSeparationRows, L"App already listed; muted");
             return;
         }
     }
@@ -721,9 +818,7 @@ void MainWindow::addSoundSeparationApp(std::wstring name, std::filesystem::path 
     app.executablePath = std::move(executablePath);
     app.muted = true;
     settings_.soundSeparationApps.push_back(std::move(app));
-    rebuildSoundSeparationRows();
-    markSettingsDirty();
-    setStatus(L"App added to sound separation");
+    commitAppListEdit(&MainWindow::rebuildSoundSeparationRows, L"App added to sound separation");
 }
 
 void MainWindow::rebuildSoundSeparationRows() {
@@ -734,20 +829,12 @@ void MainWindow::rebuildSoundSeparationRows() {
 
     constexpr int kX = 224;
     constexpr int kMicSize = 30;
-    constexpr int kIconSize = 24;
-    constexpr int kNameWidth = 300;
     constexpr int kMutedWidth = 70;
-    constexpr int kRemoveWidth = 88;
     constexpr int kRowHeight = 42;
     int y = soundSeparationRowsY_;
 
     if (settings_.soundSeparationApps.empty()) {
-        SoundSeparationRowControls row;
-        row.nameLabel = addControl(L"STATIC", L"No apps selected", SS_LEFT, kX, y + 4, 360, 22, -1);
-        soundSeparationRows_.push_back(row);
-        parkFocusOnCombo(soundSeparationAppCombo_);
-        layoutCurrentPage();
-        redrawWindowAndChildren(pageHost_);
+        buildEmptyAppListRow(soundSeparationRows_, y, soundSeparationAppCombo_);
         return;
     }
 
@@ -765,31 +852,19 @@ void MainWindow::rebuildSoundSeparationRows() {
             kSoundSeparationMuteButtonBaseId + static_cast<int>(index));
         addStatusHelp(row.micButton, app.muted ? L"Unmute this app in future clips." : L"Mute this app in future clips.");
 
-        row.iconControl = addControl(
-            L"STATIC",
-            L"",
-            SS_ICON,
-            kX + 44,
-            y,
-            kIconSize,
-            kIconSize,
-            -1);
-        row.icon = loadExecutableIcon(app.executablePath);
-        if (row.icon) {
-            SendMessageW(row.iconControl, STM_SETIMAGE, IMAGE_ICON, reinterpret_cast<LPARAM>(row.icon));
-        }
-
         const std::wstring name = app.name.empty() ? appNameFromPath(app.executablePath) : app.name;
-        row.nameLabel = addControl(
-            L"STATIC",
-            name.c_str(),
-            SS_LEFT | SS_NOPREFIX,
-            kX + 80,
-            y + 4,
-            kNameWidth,
-            22,
-            -1);
-        addStatusHelp(row.nameLabel, app.executablePath.wstring());
+        buildAppRowCommon(
+            kX,
+            y,
+            name,
+            app.executablePath,
+            kSoundSeparationRemoveButtonBaseId + static_cast<int>(index),
+            L"Remove this app from sound separation.",
+            /*hasMuteToggle=*/true,
+            row.iconControl,
+            row.icon,
+            row.nameLabel,
+            row.removeButton);
 
         row.mutedLabel = addControl(
             L"STATIC",
@@ -803,17 +878,6 @@ void MainWindow::rebuildSoundSeparationRows() {
         if (app.muted && row.mutedLabel) {
             mutedLabels_.insert(row.mutedLabel);
         }
-
-        row.removeButton = addControl(
-            L"BUTTON",
-            L"Remove",
-            BS_PUSHBUTTON | WS_TABSTOP,
-            kX + 484,
-            y - 2,
-            kRemoveWidth,
-            30,
-            kSoundSeparationRemoveButtonBaseId + static_cast<int>(index));
-        addStatusHelp(row.removeButton, L"Remove this app from sound separation.");
 
         soundSeparationRows_.push_back(row);
         y += kRowHeight;
@@ -835,22 +899,11 @@ void MainWindow::parkFocusOnCombo(HWND combo) {
 }
 
 void MainWindow::destroySoundSeparationRows() {
-    // Reset hover while the old controls are still alive so they repaint
-    // un-hovered; otherwise hoveredHelpControl_/hoveredButton_ dangle and the
-    // status bar can stick tall until the next mousemove.
-    clearButtonHover();
-    hoveredHelpControl_ = nullptr;
-    hoverStickyStatusHeight_ = 0;
+    resetAppRowHover();
     for (auto& row : soundSeparationRows_) {
         detachPageControl(row.micButton);
-        detachPageControl(row.iconControl);
-        detachPageControl(row.nameLabel);
+        destroyAppRowCommon(row.iconControl, row.nameLabel, row.removeButton, row.icon);
         detachPageControl(row.mutedLabel);
-        detachPageControl(row.removeButton);
-        if (row.icon) {
-            DestroyIcon(row.icon);
-            row.icon = nullptr;
-        }
     }
     soundSeparationRows_.clear();
 }
@@ -870,9 +923,9 @@ void MainWindow::toggleSoundSeparationApp(size_t index) {
         return;
     }
     settings_.soundSeparationApps[index].muted = !settings_.soundSeparationApps[index].muted;
-    rebuildSoundSeparationRows();
-    markSettingsDirty();
-    setStatus(settings_.soundSeparationApps[index].muted ? L"App muted" : L"App unmuted");
+    commitAppListEdit(
+        &MainWindow::rebuildSoundSeparationRows,
+        settings_.soundSeparationApps[index].muted ? L"App muted" : L"App unmuted");
 }
 
 void MainWindow::removeSoundSeparationApp(size_t index) {
@@ -880,9 +933,7 @@ void MainWindow::removeSoundSeparationApp(size_t index) {
         return;
     }
     settings_.soundSeparationApps.erase(settings_.soundSeparationApps.begin() + static_cast<std::ptrdiff_t>(index));
-    rebuildSoundSeparationRows();
-    markSettingsDirty();
-    setStatus(L"App removed from sound separation");
+    commitAppListEdit(&MainWindow::rebuildSoundSeparationRows, L"App removed from sound separation");
 }
 
 void MainWindow::rebuildAutoRecordRows() {
@@ -892,61 +943,30 @@ void MainWindow::rebuildAutoRecordRows() {
     }
 
     constexpr int kX = 224;
-    constexpr int kIconSize = 24;
-    constexpr int kNameWidth = 300;
-    constexpr int kRemoveWidth = 88;
     constexpr int kRowHeight = 42;
     int y = autoRecordRowsY_;
 
     if (settings_.autoRecordApps.empty()) {
-        AppListRowControls row;
-        row.nameLabel = addControl(L"STATIC", L"No apps selected", SS_LEFT, kX, y + 4, 360, 22, -1);
-        autoRecordRows_.push_back(row);
-        parkFocusOnCombo(autoRecordAppCombo_);
-        layoutCurrentPage();
-        redrawWindowAndChildren(pageHost_);
+        buildEmptyAppListRow(autoRecordRows_, y, autoRecordAppCombo_);
         return;
     }
 
     for (size_t index = 0; index < settings_.autoRecordApps.size(); ++index) {
         const auto& app = settings_.autoRecordApps[index];
         AppListRowControls row;
-        row.iconControl = addControl(
-            L"STATIC",
-            L"",
-            SS_ICON,
+        const std::wstring name = app.name.empty() ? appNameFromPath(app.executablePath) : app.name;
+        buildAppRowCommon(
             kX,
             y,
-            kIconSize,
-            kIconSize,
-            -1);
-        row.icon = loadExecutableIcon(app.executablePath);
-        if (row.icon) {
-            SendMessageW(row.iconControl, STM_SETIMAGE, IMAGE_ICON, reinterpret_cast<LPARAM>(row.icon));
-        }
-
-        const std::wstring name = app.name.empty() ? appNameFromPath(app.executablePath) : app.name;
-        row.nameLabel = addControl(
-            L"STATIC",
-            name.c_str(),
-            SS_LEFT | SS_NOPREFIX,
-            kX + 36,
-            y + 4,
-            kNameWidth,
-            22,
-            -1);
-        addStatusHelp(row.nameLabel, app.executablePath.wstring());
-
-        row.removeButton = addControl(
-            L"BUTTON",
-            L"Remove",
-            BS_PUSHBUTTON | WS_TABSTOP,
-            kX + 484,
-            y - 2,
-            kRemoveWidth,
-            30,
-            kAutoRecordRemoveButtonBaseId + static_cast<int>(index));
-        addStatusHelp(row.removeButton, L"Remove this app from auto record.");
+            name,
+            app.executablePath,
+            kAutoRecordRemoveButtonBaseId + static_cast<int>(index),
+            L"Remove this app from auto record.",
+            /*hasMuteToggle=*/false,
+            row.iconControl,
+            row.icon,
+            row.nameLabel,
+            row.removeButton);
 
         autoRecordRows_.push_back(row);
         y += kRowHeight;
@@ -960,17 +980,9 @@ void MainWindow::rebuildAutoRecordRows() {
 void MainWindow::destroyAutoRecordRows() {
     // Same hover reset as destroySoundSeparationRows: the clicked Remove
     // button dies here, so clear hover state before it dangles.
-    clearButtonHover();
-    hoveredHelpControl_ = nullptr;
-    hoverStickyStatusHeight_ = 0;
+    resetAppRowHover();
     for (auto& row : autoRecordRows_) {
-        detachPageControl(row.iconControl);
-        detachPageControl(row.nameLabel);
-        detachPageControl(row.removeButton);
-        if (row.icon) {
-            DestroyIcon(row.icon);
-            row.icon = nullptr;
-        }
+        destroyAppRowCommon(row.iconControl, row.nameLabel, row.removeButton, row.icon);
     }
     autoRecordRows_.clear();
 }
@@ -990,76 +1002,39 @@ void MainWindow::removeAutoRecordApp(size_t index) {
         return;
     }
     settings_.autoRecordApps.erase(settings_.autoRecordApps.begin() + static_cast<std::ptrdiff_t>(index));
-    rebuildAutoRecordRows();
-    markSettingsDirty();
-    setStatus(L"App removed from auto record");
+    commitAppListEdit(&MainWindow::rebuildAutoRecordRows, L"App removed from auto record");
 }
 
 void MainWindow::refreshAutoRecordApps() {
-    autoRecordAvailableApps_ = WasapiCapture::enumerateOpenApps();
-
-    if (autoRecordAppCombo_) {
-        ScopedRedrawLock redraw(autoRecordAppCombo_);
-        SendMessageW(autoRecordAppCombo_, CB_RESETCONTENT, 0, 0);
-        SendMessageW(autoRecordAppCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Choose active app"));
-        for (const auto& app : autoRecordAvailableApps_) {
-            std::wstring label = app.name.empty() ? appNameFromPath(app.executablePath) : app.name;
-            const std::wstring fileName = app.executablePath.filename().wstring();
-            if (!fileName.empty() && label.find(fileName) == std::wstring::npos) {
-                label += L" (" + fileName + L")";
-            }
-            SendMessageW(autoRecordAppCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
-        }
-        SendMessageW(autoRecordAppCombo_, CB_SETCURSEL, 0, 0);
-    }
-
-    if (!buildingPage_) {
-        setStatus(L"Found " + std::to_wstring(autoRecordAvailableApps_.size()) +
-                  (autoRecordAvailableApps_.size() == 1 ? L" selectable app" : L" selectable apps"));
-    }
+    refreshAvailableApps(autoRecordAppCombo_, autoRecordAvailableApps_, /*hasMuteToggle=*/false);
 }
 
 void MainWindow::addSelectedAutoRecordApp() {
-    if (!autoRecordAppCombo_) {
+    const auto* app = selectedAvailableApp(autoRecordAppCombo_, autoRecordAvailableApps_);
+    if (!app) {
         return;
     }
-    const auto selected = SendMessageW(autoRecordAppCombo_, CB_GETCURSEL, 0, 0);
-    if (selected <= 0) {
-        return;
-    }
-    const size_t index = static_cast<size_t>(selected - 1);
-    if (index >= autoRecordAvailableApps_.size()) {
-        return;
-    }
-    const auto& app = autoRecordAvailableApps_[index];
-    addAutoRecordApp(app.name, app.executablePath);
+    addAutoRecordApp(app->name, app->executablePath);
     SendMessageW(autoRecordAppCombo_, CB_SETCURSEL, 0, 0);
 }
 
 void MainWindow::addManualAutoRecordApp() {
-    COMDLG_FILTERSPEC filters[] = {
-        {L"Applications", L"*.exe"},
-        {L"All files", L"*.*"},
-    };
     std::filesystem::path executablePath;
-    if (!pickFileForOpen(window_, L"Choose app executable", filters, static_cast<UINT>(_countof(filters)), L"exe", executablePath)) {
+    if (!pickAppExecutable(executablePath)) {
         return;
     }
     addAutoRecordApp(appNameFromPath(executablePath), executablePath);
 }
 
 void MainWindow::addAutoRecordApp(std::wstring name, std::filesystem::path executablePath) {
-    if (executablePath.empty()) {
-        setStatus(L"Selected app has no executable path");
+    if (!validateAppExecutablePath(executablePath)) {
         return;
     }
 
     const std::wstring key = normalizedPathKey(executablePath);
     for (const auto& existing : settings_.autoRecordApps) {
         if (normalizedPathKey(existing.executablePath) == key) {
-            rebuildAutoRecordRows();
-            markSettingsDirty();
-            setStatus(L"App already listed");
+            commitAppListEdit(&MainWindow::rebuildAutoRecordRows, L"App already listed");
             return;
         }
     }
@@ -1068,9 +1043,7 @@ void MainWindow::addAutoRecordApp(std::wstring name, std::filesystem::path execu
     app.name = name.empty() ? appNameFromPath(executablePath) : std::move(name);
     app.executablePath = std::move(executablePath);
     settings_.autoRecordApps.push_back(std::move(app));
-    rebuildAutoRecordRows();
-    markSettingsDirty();
-    setStatus(L"App added to auto record");
+    commitAppListEdit(&MainWindow::rebuildAutoRecordRows, L"App added to auto record");
 }
 
 bool MainWindow::isSoundSeparationMutedLabel(HWND control) const {

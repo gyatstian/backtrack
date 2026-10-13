@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/Types.h"
+
 #include <Windows.h>
 #include <avrt.h>
 #include <dxgi.h>
@@ -107,6 +109,59 @@ bool dxgiAdapterSupportsHardwareEncode(uint32_t adapterIndex);
 // Returns preferred adapter when it can encode, otherwise first supported one.
 uint32_t dxgiHardwareEncoderAdapterOr(uint32_t preferredAdapterIndex);
 UINT backtrackActivationMessage();
+
+// Display name for the capture backend, shared by app status lines and the UI
+// so both name the same backend the same way. Inline like trimText below: some
+// suites link sources without Win32Util.cpp.
+inline const wchar_t* captureBackendDisplayName(CaptureBackend backend) {
+    switch (backend) {
+    case CaptureBackend::WindowsGraphicsCapture:
+        return L"Windows Graphics Capture";
+    case CaptureBackend::DesktopDuplication:
+        return L"Desktop Duplication";
+    }
+    return L"Unknown";
+}
+
+// Guard inputs for the RecorderController backend candidate chain. Read-only
+// mirror: app still owns the chain and its order; these answer only whether a
+// candidate may be attempted. Header-only like captureBackendDisplayName so
+// test suites that stub Win32Util.cpp still link.
+struct CaptureCandidateState {
+    CaptureBackend selected = CaptureBackend::WindowsGraphicsCapture;
+    bool exclusiveRecovery = false;
+    bool hasWindowTarget = false;
+    bool monitorHdr = false;
+    bool dxgiTargetOnActiveAdapter = false;
+};
+inline bool captureDdExplicitEligible(const CaptureCandidateState& s) {
+    return s.selected == CaptureBackend::DesktopDuplication &&
+        !s.exclusiveRecovery && s.dxgiTargetOnActiveAdapter;
+}
+inline bool captureWgcWindowEligible(const CaptureCandidateState& s) {
+    return s.hasWindowTarget && !s.exclusiveRecovery &&
+        s.selected != CaptureBackend::DesktopDuplication;
+}
+inline bool captureDdRecoveryEligible(const CaptureCandidateState& s) {
+    return s.exclusiveRecovery && s.dxgiTargetOnActiveAdapter;
+}
+inline bool captureDdHdrPreferredEligible(const CaptureCandidateState& s) {
+    return s.selected == CaptureBackend::WindowsGraphicsCapture &&
+        !s.exclusiveRecovery && s.monitorHdr && s.dxgiTargetOnActiveAdapter;
+}
+inline bool captureWgcMonitorEligible(const CaptureCandidateState& s) {
+    return s.selected == CaptureBackend::WindowsGraphicsCapture && !s.exclusiveRecovery;
+}
+inline bool captureWgcWindowFallbackEligible(const CaptureCandidateState& s) {
+    return s.selected == CaptureBackend::DesktopDuplication && s.hasWindowTarget;
+}
+inline bool captureWgcMonitorFallbackEligible(const CaptureCandidateState& s) {
+    return s.selected == CaptureBackend::DesktopDuplication;
+}
+inline bool captureDdFallbackEligible(const CaptureCandidateState& s) {
+    return s.selected == CaptureBackend::WindowsGraphicsCapture &&
+        !s.exclusiveRecovery && s.dxgiTargetOnActiveAdapter;
+}
 
 // Strips leading and trailing whitespace. Inline rather than exported:
 // SettingsClipGuardTests links SettingsStore.cpp without Win32Util.cpp (DXGI,

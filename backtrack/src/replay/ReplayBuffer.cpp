@@ -1,9 +1,11 @@
 #include "replay/ReplayBuffer.h"
 
 #include "audio/AudioConvert.h"
+#include "core/Clock.h"
 #include "core/Logger.h"
 #include "encoder/BitstreamUtils.h"
 #include "mux/AudioTimeline.h"
+#include "mux/MuxedInputs.h"
 #include "mux/Mp4Muxer.h"
 #include "mux/RecoveryStore.h"
 #include "mux/WavWriter.h"
@@ -58,16 +60,6 @@ public:
 private:
     std::filesystem::path path_;
 };
-
-// Single-sample duration ceiling: storage-level backstop for wall-clock
-// durations from coalesced hold intervals. Covers the largest healthy
-// heartbeat (30 s max GOP plus low-fps coalesce slop) yet stays ~1400x below
-// a day-long exclusive-fullscreen hold.
-constexpr int64_t kMaxSingleVideoDuration100ns = 60 * kHundredNanosecondsPerSecond;
-
-int64_t clampSingleVideoDuration100ns(int64_t duration100ns) {
-    return duration100ns > kMaxSingleVideoDuration100ns ? kMaxSingleVideoDuration100ns : duration100ns;
-}
 
 // One GOP of tolerance: a cut may start up to a GOP before the window so the
 // clip still begins at a keyframe.
@@ -478,12 +470,10 @@ void ReplayBuffer::pushVideo(EncodedPacket packet) {
     if (!settings_.enabled) {
         return;
     }
-    // Storage backstop: upstream durations are wall-clock and a coalesced hold
-    // may arrive oversized; healthy frames are milliseconds, so this only bites
-    // rogue tails.
-    if (packet.duration100ns > kMaxSingleVideoDuration100ns) {
-        packet.duration100ns = kMaxSingleVideoDuration100ns;
-    }
+    // Storage backstop, canonical in mux/MuxedInputs.h: upstream durations are
+    // wall-clock and a coalesced hold may arrive oversized; healthy frames are
+    // milliseconds, so this only bites rogue tails.
+    packet.duration100ns = clampSingleVideoDuration100ns(packet.duration100ns);
     // Capture the codec parameter sets from the first keyframe that carried
     // them (typically the session-start IDR) so later saves can patch a cut
     // point whose start packet lacks decodable headers.
@@ -534,8 +524,9 @@ bool ReplayBuffer::extendLastVideoDuration(int64_t expectedPts100ns, int64_t dur
         if (diskVideo_.empty() || diskVideo_.back().meta.pts100ns != expectedPts100ns) {
             return false;
         }
-        diskVideo_.back().meta.duration100ns = clampSingleVideoDuration100ns(
-            (std::max)(diskVideo_.back().meta.duration100ns, duration100ns));
+        // Same canonical coalescing as the recording path: stretch, then ceil.
+        diskVideo_.back().meta.duration100ns = coalesceVideoDuration100ns(
+            diskVideo_.back().meta.duration100ns, duration100ns);
         return true;
     }
     if (video_.empty() || video_.back()->pts100ns != expectedPts100ns) {
@@ -547,8 +538,7 @@ bool ReplayBuffer::extendLastVideoDuration(int64_t expectedPts100ns, int64_t dur
     // trim) goes through mutex_, so copying the whole packet - keyframes are
     // megabytes - per emitted interval bought nothing but allocation spikes.
     EncodedPacket& packet = *video_.back();
-    packet.duration100ns =
-        clampSingleVideoDuration100ns((std::max)(packet.duration100ns, duration100ns));
+    packet.duration100ns = coalesceVideoDuration100ns(packet.duration100ns, duration100ns);
     return true;
 }
 
@@ -594,6 +584,7 @@ bool ReplayBuffer::saveTo(
         Logger::instance().warning(L"replay", std::wstring(reason));
         return false;
     };
+    const int64_t saveStart100ns = steadyNow100ns();
 
     // Backend-neutral view of one buffered video packet. In RAM mode `ram`
     // owns the bytes; in disk mode the extents address them inside the ring.
@@ -809,15 +800,12 @@ bool ReplayBuffer::saveTo(
 
     const auto videoPath = tempDirectory / (videoSettings.codec == VideoCodec::H264 ? L"replay.h264" : L"replay.hevc");
 
-    std::ofstream videoStream(videoPath, std::ios::binary | std::ios::out | std::ios::trunc);
-    if (!videoStream.is_open()) {
-        return fail(L"could not open temporary replay video stream " + videoPath.wstring());
-    }
-
-    // Copies one packet's bytes from whichever backend holds them into the
-    // elementary stream. Ring reads happen without holding mutex_: the pin
-    // guarantees the referenced extents cannot be overwritten while they are
-    // being consumed.
+    // Backend-agnostic payload reader for the cut snapshots below. A RAM
+    // snapshot owns its bytes; a disk snapshot pins ring extents, and the pin
+    // taken above guarantees they cannot be overwritten while consumed. Ring
+    // reads happen without holding mutex_. Both the parameter-set probe and
+    // the dump loop read through this one function, so the cut/patch/mux path
+    // never branches on the backend.
     std::vector<uint8_t> ringScratch;
     // A ring read failure means those packet bytes are gone for good, which is
     // a different failure from a full disk: the elementary stream is still
@@ -827,19 +815,16 @@ bool ReplayBuffer::saveTo(
     // rather than folded into the stream state because the two need different
     // user-facing reasons.
     bool ringReadFailed = false;
-    auto appendSampleBytes = [&](const SnapshottedVideo& snapshot) -> bool {
+    auto snapshotPayload = [&](const SnapshottedVideo& snapshot) -> const std::vector<uint8_t>* {
         if (snapshot.ram) {
-            videoStream.write(
-                reinterpret_cast<const char*>(snapshot.ram->bytes.data()),
-                static_cast<std::streamsize>(snapshot.ram->bytes.size()));
-            return static_cast<bool>(videoStream);
+            return &snapshot.ram->bytes;
         }
         const uint32_t totalBytes = snapshot.first.byteCount + snapshot.second.byteCount;
         ringScratch.resize(totalBytes);
         if (snapshot.first.byteCount != 0 &&
             !videoRing_.read(snapshot.first.offset, ringScratch.data(), snapshot.first.byteCount)) {
             ringReadFailed = true;
-            return false;
+            return nullptr;
         }
         if (snapshot.second.byteCount != 0 &&
             !videoRing_.read(
@@ -847,10 +832,13 @@ bool ReplayBuffer::saveTo(
                 ringScratch.data() + snapshot.first.byteCount,
                 snapshot.second.byteCount)) {
             ringReadFailed = true;
-            return false;
+            return nullptr;
         }
-        videoStream.write(reinterpret_cast<const char*>(ringScratch.data()), static_cast<std::streamsize>(totalBytes));
-        return static_cast<bool>(videoStream);
+        return &ringScratch;
+    };
+    auto snapshotPayloadSize = [](const SnapshottedVideo& snapshot) -> uint64_t {
+        return snapshot.ram ? snapshot.ram->bytes.size()
+                            : static_cast<uint64_t>(snapshot.first.byteCount) + snapshot.second.byteCount;
     };
 
     // The clip starts at an IDR, but a driver that ignored header insertion
@@ -858,55 +846,86 @@ bool ReplayBuffer::saveTo(
     // bootstrap. Merge the cached parameter sets into the FIRST sample (the
     // MP4 sample table only exposes bytes covered by samples) so the clip is
     // decodable from its first frame.
-    bool firstSampleHasHeaders = video.empty();
-    if (!firstSampleHasHeaders && diskMode) {
-        // Peek the first packet's bytes for the parameter-set probe; the dump
-        // loop below re-reads them through the same pinned extents.
-        const SnapshottedVideo& first = video.front();
-        const uint32_t totalBytes = first.first.byteCount + first.second.byteCount;
-        ringScratch.resize(totalBytes);
-        const bool probeRead =
-            videoRing_.read(first.first.offset, ringScratch.data(), first.first.byteCount) &&
-            (first.second.byteCount == 0 ||
-             videoRing_.read(
-                 first.second.offset,
-                 ringScratch.data() + first.first.byteCount,
-                 first.second.byteCount));
-        // A failed probe would otherwise read as "this frame carries no
-        // parameter sets" and prepend sets the dump loop is about to write
-        // anyway, duplicating them in the first sample.
-        ringReadFailed = !probeRead;
-        firstSampleHasHeaders = probeRead && bitstreamContainsParameterSets(videoSettings.codec, ringScratch);
-    } else if (!video.empty()) {
-        firstSampleHasHeaders = bitstreamContainsParameterSets(videoSettings.codec, video.front().ram->bytes);
-    }
-    if (!firstSampleHasHeaders && codecHeaderBytes.empty()) {
+    const std::vector<uint8_t>* firstPayload = snapshotPayload(video.front());
+    // A failed probe would otherwise read as "this frame carries no
+    // parameter sets" and prepend sets the dump loop is about to write
+    // anyway, duplicating them in the first sample.
+    const bool firstSampleHasHeaders =
+        firstPayload != nullptr && bitstreamContainsParameterSets(videoSettings.codec, *firstPayload);
+    if (!firstSampleHasHeaders && !ringReadFailed && codecHeaderBytes.empty()) {
         Logger::instance().warning(L"replay",
             L"Replay starts at a keyframe without codec headers and no cached headers are available");
     }
-    const uint64_t prependedHeaderBytes =
-        !firstSampleHasHeaders && !codecHeaderBytes.empty() ? codecHeaderBytes.size() : 0;
-    if (prependedHeaderBytes > 0) {
+    const uint64_t headersToWrite =
+        !firstSampleHasHeaders && !ringReadFailed && !codecHeaderBytes.empty() ? codecHeaderBytes.size() : 0;
+
+    // Fail fast on a full disk before writing hundreds of megabytes of
+    // elementary streams: the estimate covers the cut video, the buffered
+    // audio of both tracks, and the mux overhead. Best effort (silence fill
+    // can grow audio past it); muxToMp4 re-checks with real file sizes.
+    {
+        uint64_t estimatedBytes = headersToWrite + RecoveryStore::kSaveFreeSpaceSlackBytes;
+        for (const auto& snapshot : video) {
+            estimatedBytes += snapshotPayloadSize(snapshot);
+        }
+        for (const auto& packet : systemAudio) {
+            estimatedBytes += packet->bytes.size();
+        }
+        for (const auto& packet : microphoneAudio) {
+            estimatedBytes += packet->bytes.size();
+        }
+        for (const auto& entry : diskSystemAudio) {
+            estimatedBytes += static_cast<uint64_t>(entry.first.byteCount) + entry.second.byteCount;
+        }
+        for (const auto& entry : diskMicrophoneAudio) {
+            estimatedBytes += static_cast<uint64_t>(entry.first.byteCount) + entry.second.byteCount;
+        }
+        std::wstring spaceDetail;
+        if (!RecoveryStore::ensureFreeDiskSpace(outputPath, estimatedBytes, spaceDetail)) {
+            return fail(spaceDetail);
+        }
+    }
+
+    std::ofstream videoStream(videoPath, std::ios::binary | std::ios::out | std::ios::trunc);
+    if (!videoStream.is_open()) {
+        return fail(L"could not open temporary replay video stream " + videoPath.wstring());
+    }
+
+    // Sized from the bytes actually written: sample 0's table entry must cover
+    // exactly what is on disk, or every later sample offset shifts.
+    uint32_t headersWritten = 0;
+    if (headersToWrite > 0) {
         videoStream.write(
             reinterpret_cast<const char*>(codecHeaderBytes.data()),
             static_cast<std::streamsize>(codecHeaderBytes.size()));
+        if (videoStream) {
+            headersWritten = static_cast<uint32_t>(codecHeaderBytes.size());
+        }
     }
     std::vector<MuxedInputs::VideoSample> videoSamples;
     uint64_t videoOffset = 0;
     for (size_t index = 0; index < video.size(); ++index) {
         const SnapshottedVideo& snapshot = video[index];
-        // Shared validity rule with the recording path (mux/Mp4Muxer.h): a
-        // decode timestamp counts only when explicitly flagged, and values
-        // can legitimately be zero or negative, so no numeric sentinel works.
+        // Shared validity rule with the recording path (mux/MuxedInputs.h):
+        // argument order is (pts, dts, flag). A decode timestamp counts only
+        // when explicitly flagged, and values can legitimately be zero or
+        // negative, so no numeric sentinel works.
         const bool hasDts = hasEffectiveDts(snapshot.meta.pts100ns, snapshot.meta.dts100ns, snapshot.meta.hasDts);
-        const uint32_t payloadBytes = snapshot.ram
-            ? static_cast<uint32_t>(snapshot.ram->bytes.size())
-            : snapshot.first.byteCount + snapshot.second.byteCount;
-        const uint32_t sampleBytes =
-            payloadBytes + static_cast<uint32_t>(index == 0 ? prependedHeaderBytes : 0);
-        if (!appendSampleBytes(snapshot)) {
+        // One fetch feeds both the write and the table entry, so the recorded
+        // size can never drift from the bytes on disk; sample 0 additionally
+        // covers the headers written above.
+        const std::vector<uint8_t>* payload = snapshotPayload(snapshot);
+        if (payload == nullptr) {
             break;
         }
+        videoStream.write(
+            reinterpret_cast<const char*>(payload->data()),
+            static_cast<std::streamsize>(payload->size()));
+        if (!videoStream) {
+            break;
+        }
+        const uint32_t sampleBytes =
+            static_cast<uint32_t>(payload->size()) + (index == 0 ? headersWritten : 0);
         videoSamples.push_back(MuxedInputs::VideoSample{
             videoOffset,
             sampleBytes,
@@ -921,7 +940,9 @@ bool ReplayBuffer::saveTo(
     // Reassemble disk-backed audio the same way: the pin guarantees the
     // referenced extents cannot be overwritten while they are consumed.
     bool audioRingReadFailed = false;
-    if (diskAudioMode) {
+    // Unconditional: the disk queues are empty in RAM mode, so this no-ops
+    // there and the save path never branches on the audio backend.
+    {
         auto reassembleAudio = [&](const std::vector<DiskAudioPacket>& disk,
                                    std::vector<std::shared_ptr<const AudioPacket>>& out) {
             for (const DiskAudioPacket& entry : disk) {
@@ -1049,7 +1070,9 @@ bool ReplayBuffer::saveTo(
             {
                 std::scoped_lock lock(mutex_);
                 lastSaveEndPts100ns_ = newestVideoEndPts;
-                Logger::instance().info(L"replay", L"Replay saved: " + outputPath.wstring());
+                Logger::instance().info(L"replay",
+                    L"Replay saved: " + outputPath.wstring() +
+                    L" in " + std::to_wstring((steadyNow100ns() - saveStart100ns) / 10000) + L"ms");
             }
             return true;
         case RecoveryStore::MuxPublishResult::kPreservedForRecovery:
@@ -1094,76 +1117,58 @@ size_t ReplayBuffer::videoKeyFrameCount() const {
 
 int64_t ReplayBuffer::videoSpan100ns() const {
     std::scoped_lock lock(mutex_);
+    // Backend-agnostic span: collect the metadata once, then run the same
+    // window cut saveTo applies so the reported span never exceeds what a save
+    // would publish. Keyed on the last GOP saveTo observed.
+    std::vector<VideoPacketMeta> metas;
     if (videoBackend_ == VideoBackend::Disk) {
-        if (diskVideo_.empty()) {
-            return 0;
+        metas.reserve(diskVideo_.size());
+        for (const auto& entry : diskVideo_) {
+            metas.push_back(entry.meta);
         }
-        const auto firstKeyFrame = std::find_if(diskVideo_.begin(), diskVideo_.end(), [](const DiskVideoPacket& packet) {
-            return packet.meta.keyFrame;
-        });
-        if (firstKeyFrame == diskVideo_.end()) {
-            return 0;
+    } else {
+        metas.reserve(video_.size());
+        for (const auto& packet : video_) {
+            VideoPacketMeta meta;
+            meta.pts100ns = packet->pts100ns;
+            meta.dts100ns = packet->dts100ns;
+            meta.duration100ns = packet->duration100ns;
+            meta.hasDts = packet->hasDts;
+            meta.keyFrame = packet->keyFrame;
+            metas.push_back(meta);
         }
-        const DiskVideoPacket& newest = diskVideo_.back();
-        const int64_t newestVideoEndPts = newest.meta.pts100ns +
-            (std::max<int64_t>)(clampSingleVideoDuration100ns(newest.meta.duration100ns), 0);
-        // Same window cut saveTo applies, so the reported span never exceeds
-        // what a save would publish; keyed on the last GOP saveTo observed.
-        const int64_t oldestAllowedEndPts = newestVideoEndPts - secondsTo100ns(settings_.seconds) -
-            gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_));
-        auto windowBegin = diskVideo_.end();
-        for (auto it = diskVideo_.begin(); it != diskVideo_.end(); ++it) {
-            if (it->meta.pts100ns + (std::max<int64_t>)(it->meta.duration100ns, 0) > oldestAllowedEndPts) {
-                windowBegin = it;
-                break;
-            }
-        }
-        if (windowBegin != diskVideo_.end()) {
-            const auto windowKeyFrame = std::find_if(
-                windowBegin, diskVideo_.end(), [](const DiskVideoPacket& packet) { return packet.meta.keyFrame; });
-            if (windowKeyFrame != diskVideo_.end()) {
-                return (std::max<int64_t>)(0, newestVideoEndPts - windowKeyFrame->meta.pts100ns);
-            }
-        }
-        return (std::min)(
-            (std::max<int64_t>)(0, newestVideoEndPts - firstKeyFrame->meta.pts100ns),
-            secondsTo100ns(settings_.seconds) +
-                gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_)));
     }
-
-    if (video_.empty()) {
+    if (metas.empty()) {
         return 0;
     }
-    const auto firstKeyFrame = std::find_if(video_.begin(), video_.end(), [](const auto& packet) {
-        return packet->keyFrame;
+    const auto firstKeyFrame = std::find_if(metas.begin(), metas.end(), [](const VideoPacketMeta& meta) {
+        return meta.keyFrame;
     });
-    if (firstKeyFrame == video_.end()) {
+    if (firstKeyFrame == metas.end()) {
         return 0;
     }
-    const int64_t newestVideoEndPts = video_.back()->pts100ns +
-        (std::max<int64_t>)(clampSingleVideoDuration100ns(video_.back()->duration100ns), 0);
-    // Same window cut saveTo applies, so the reported span never exceeds what
-    // a save would publish; keyed on the last GOP saveTo observed.
-    const int64_t oldestAllowedEndPts = newestVideoEndPts - secondsTo100ns(settings_.seconds) -
-        gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_));
-    auto windowBegin = video_.end();
-    for (auto it = video_.begin(); it != video_.end(); ++it) {
-        if ((*it)->pts100ns + (std::max<int64_t>)((*it)->duration100ns, 0) > oldestAllowedEndPts) {
+    const int64_t newestVideoEndPts = metas.back().pts100ns +
+        (std::max<int64_t>)(clampSingleVideoDuration100ns(metas.back().duration100ns), 0);
+    const uint32_t gopSeconds = (std::max<uint32_t>)(1, lastGopSeconds_);
+    const int64_t oldestAllowedEndPts =
+        newestVideoEndPts - secondsTo100ns(settings_.seconds) - gopTolerance100ns(gopSeconds);
+    auto windowBegin = metas.end();
+    for (auto it = metas.begin(); it != metas.end(); ++it) {
+        if (it->pts100ns + (std::max<int64_t>)(it->duration100ns, 0) > oldestAllowedEndPts) {
             windowBegin = it;
             break;
         }
     }
-    if (windowBegin != video_.end()) {
-        const auto windowKeyFrame =
-            std::find_if(windowBegin, video_.end(), [](const auto& packet) { return packet->keyFrame; });
-        if (windowKeyFrame != video_.end()) {
-            return (std::max<int64_t>)(0, newestVideoEndPts - (*windowKeyFrame)->pts100ns);
+    if (windowBegin != metas.end()) {
+        const auto windowKeyFrame = std::find_if(
+            windowBegin, metas.end(), [](const VideoPacketMeta& meta) { return meta.keyFrame; });
+        if (windowKeyFrame != metas.end()) {
+            return (std::max<int64_t>)(0, newestVideoEndPts - windowKeyFrame->pts100ns);
         }
     }
     return (std::min)(
-        (std::max<int64_t>)(0, newestVideoEndPts - (*firstKeyFrame)->pts100ns),
-        secondsTo100ns(settings_.seconds) +
-            gopTolerance100ns((std::max<uint32_t>)(1, lastGopSeconds_)));
+        (std::max<int64_t>)(0, newestVideoEndPts - firstKeyFrame->pts100ns),
+        secondsTo100ns(settings_.seconds) + gopTolerance100ns(gopSeconds));
 }
 
 int64_t ReplayBuffer::newestVideoPts100ns() const {

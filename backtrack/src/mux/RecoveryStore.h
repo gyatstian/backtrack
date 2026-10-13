@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mux/Mp4Muxer.h"
+#include "mux/MuxedInputs.h"
 
 #include <chrono>
 #include <filesystem>
@@ -35,6 +35,16 @@ void writeReadme(const MuxedInputs& inputs, const std::filesystem::path& tempDir
 // its streams and rewrites the manifest atomically, so deleting first would
 // trade a complete incremental manifest for a crash window with none.
 void clearStaleManifest(const std::filesystem::path& tempDirectory);
+// Shared free-space preflight for both save paths (recording finalize via
+// Mp4Muxer::muxToMp4, replay via ReplayBuffer::saveTo): fails fast with a
+// readable reason instead of an opaque Media Foundation HRESULT or a truncated
+// elementary stream. neededBytes is the caller's estimate (elementary streams
+// plus slack below); the mux re-checks with real file sizes before writing.
+inline constexpr uint64_t kSaveFreeSpaceSlackBytes = 256ull * 1024 * 1024;
+bool ensureFreeDiskSpace(
+    const std::filesystem::path& outputPath,
+    uint64_t neededBytes,
+    std::wstring& detail);
 // Shared mux-publish tail for Mp4Muxer::finalize and ReplayBuffer::saveTo:
 // writes manifest+readme, muxes with retry, then reports how the temp
 // directory was left. Returns kPublished (caller deletes the temp directory),

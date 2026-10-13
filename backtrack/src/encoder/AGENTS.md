@@ -16,8 +16,12 @@ share.
 ## Local Contracts
 
 - `IEncoder` is the only encoder surface `RecorderController` touches; it never
-  includes a backend header. Add virtuals with a default body rather than
-  forcing every backend and call site to change.
+  includes a backend header. Its header forward-declares `D3DDevice` (the
+  backends include `capture/D3DDevice.h` in their own `.cpp`). Add virtuals with a default body rather than
+  forcing every backend and call site to change. `encodeFrame` has a
+  drain-to-vector overload that appends every ready packet (default pops at
+  most one through the single-packet form); the single-packet form returns
+  false when no output is ready.
 - Codecs are H.264 and HEVC only (`core/Types.h` `VideoCodec`), both configured
   8-bit. NVENC maps the enum onto `NV_ENC_CODEC_H264_GUID` /
   `NV_ENC_CODEC_HEVC_GUID`, AMF onto the `AMFVideoEncoderVCE_AVC` /
@@ -82,7 +86,9 @@ share.
   do not read back after `Init`, because a silently half-configured session is
   worse than none.
 - `IEncoder::encoderAvailable()` is polled by the capture loop and must be
-  lock-free. Do not implement it in terms of `stats()`.
+  lock-free. Do not implement it in terms of `stats()`. `stats()` and
+  `capabilities()` serve a snapshot when the state mutex is held across a
+  driver call instead of waiting, so diagnostics never block the encode.
 - Packets come out in decode order, with `pts100ns` in presentation order and
   `dts100ns` valid only with `hasDts`. Both backends set `hasDts` on every
   packet and take DTS from `DecodeOrderTimestamps`, which equals PTS when
@@ -104,9 +110,10 @@ share.
 - `EncoderCommon` is the single source for what both backends do
   identically: `effectiveSettingsFor` (profile mapping plus the dependent
   lookahead/AQ/B-frame resets; capability gating stays per-backend),
-  `finalizePacket` (driver-timestamp fallback, decode-order DTS, the
+  `finalizePacket` (explicit driver-timestamp validity plus fallback,
+  decode-order DTS, the
   IDR-or-bitstream keyframe rule, header patching, parameter-set caching, EMA
-  stats), `ensureKeyFrameCarriesHeaders`, `effectiveDts` for consumers, and
+  stats), `ensureKeyFrameCarriesHeaders`, and
   the shared escalation budgets (`kEncoderMaxConsecutiveFailures`,
   `kEncoderOutputTimeout`, `kEncoderInFlightMaxAge`). Only the keyframe
   picture-type read stays per-backend (NVENC `pictureType`, AMF

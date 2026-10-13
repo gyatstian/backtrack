@@ -27,11 +27,6 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-// The MP4 is written here first and moved into place only after Finalize plus a
-// forced disk flush, so a crash mid-save can never leave a partial file at the
-// final clip path. Same volume as the output -> MoveFileEx stays atomic.
-constexpr uint64_t kMuxFreeSpaceSlackBytes = 256ull * 1024 * 1024;
-
 std::wstring formatHresult(HRESULT hr) {
     std::wstringstream stream;
     stream << L"0x" << std::uppercase << std::hex
@@ -44,17 +39,6 @@ std::wstring formatHresult(HRESULT hr) {
 // vs. a direct CreateFile/MoveFile call).
 DWORD win32CodeOfHresult(HRESULT hr) {
     return HRESULT_FACILITY(hr) == FACILITY_WIN32 ? HRESULT_CODE(hr) : ERROR_SUCCESS;
-}
-
-double bytesToGiB(uint64_t bytes) {
-    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-    return static_cast<double>(bytes) / kGiB;
-}
-
-std::wstring formatGiB(uint64_t bytes) {
-    std::wstringstream stream;
-    stream << std::fixed << std::setprecision(1) << bytesToGiB(bytes) << L" GB";
-    return stream.str();
 }
 
 // Removes the staged file unless the publish already disarmed the guard.
@@ -103,34 +87,14 @@ bool isEmptyOutputReservation(const std::filesystem::path& path) {
     return !error && size == 0;
 }
 
-// Preflight so an obviously full disk fails fast with a readable reason instead
-// of an opaque Media Foundation HRESULT deep inside WriteSample/Finalize.
-// Estimate covers the elementary streams, the mixed PCM copy, and the MP4.
-bool ensureFreeDiskSpaceForMux(
-    const MuxedInputs& inputs,
-    const std::filesystem::path& outputPath,
-    std::wstring& detail) {
-    const uint64_t needed =
-        fileSizeOrZero(inputs.videoPath) +
+// Preflight estimate so an obviously full disk fails fast with a readable
+// reason instead of an opaque Media Foundation HRESULT deep inside
+// WriteSample/Finalize. Covers the elementary streams, the mixed PCM copy,
+// and the MP4; the volume check itself is the shared RecoveryStore helper.
+uint64_t estimateMuxBytesNeeded(const MuxedInputs& inputs) {
+    return fileSizeOrZero(inputs.videoPath) +
         2 * (fileSizeOrZero(inputs.systemAudioPath) + fileSizeOrZero(inputs.microphoneAudioPath)) +
-        kMuxFreeSpaceSlackBytes;
-
-    ULARGE_INTEGER freeToCaller{};
-    ULARGE_INTEGER totalBytes{};
-    ULARGE_INTEGER totalFree{};
-    const std::filesystem::path volumeRoot = outputPath.parent_path().empty()
-        ? std::filesystem::path(L".")
-        : outputPath.parent_path();
-    if (!GetDiskFreeSpaceExW(volumeRoot.c_str(), &freeToCaller, &totalBytes, &totalFree)) {
-        return true; // Volume query failed; let Media Foundation surface any real problem.
-    }
-    if (freeToCaller.QuadPart >= needed) {
-        return true;
-    }
-
-    detail = L"not enough free disk space (need about " + formatGiB(needed) +
-             L", have " + formatGiB(freeToCaller.QuadPart) + L")";
-    return false;
+        RecoveryStore::kSaveFreeSpaceSlackBytes;
 }
 
 struct ScopedComInitialization {
@@ -565,7 +529,9 @@ bool Mp4Muxer::extendLastVideoDuration(int64_t expectedPts100ns, int64_t duratio
     if (sample.pts100ns != expectedPts100ns) {
         return false;
     }
-    sample.duration100ns = std::max(sample.duration100ns, duration100ns);
+    // Canonical coalescing shared with the replay path: the tail only ever
+    // stretches, then the 60 s ceiling applies.
+    sample.duration100ns = coalesceVideoDuration100ns(sample.duration100ns, duration100ns);
     return true;
 }
 
@@ -894,7 +860,7 @@ bool Mp4Muxer::muxToMp4(
     }
 
     std::wstring spaceDetail;
-    if (!ensureFreeDiskSpaceForMux(inputs, outputPath, spaceDetail)) {
+    if (!RecoveryStore::ensureFreeDiskSpace(outputPath, estimateMuxBytesNeeded(inputs), spaceDetail)) {
         return fail(L"Disk full: " + spaceDetail);
     }
 

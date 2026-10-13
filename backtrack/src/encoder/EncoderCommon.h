@@ -21,10 +21,6 @@ inline constexpr auto kEncoderInFlightMaxAge = std::chrono::seconds(30);
 // the caps each vendor reports differ.
 EncoderEffectiveSettings effectiveSettingsFor(const VideoSettings& settings);
 
-// Consumer-side decode-timestamp clamp: without a valid DTS, or when a
-// reordered DTS runs past PTS, decode time equals presentation time.
-int64_t effectiveDts(bool hasDts, int64_t dts100ns, int64_t pts100ns);
-
 // Prepends cached parameter sets to a keyframe that lacks them so every replay
 // cut point is self-contained even when a driver drops header insertion.
 void ensureKeyFrameCarriesHeaders(
@@ -32,9 +28,10 @@ void ensureKeyFrameCarriesHeaders(
     EncodedPacket& packet,
     const std::vector<uint8_t>& cachedParameterSets);
 
-// Single-source packet finalize shared by both backends: driver-timestamp
-// fallback, decode-order DTS, IDR-or-bitstream keyframe rule, header patching,
-// parameter-set caching, and EMA encode-time stats. Returns false for an empty
+// Single-source packet finalize shared by both backends: explicit
+// driver-timestamp validity plus fallback, decode-order DTS, the
+// IDR-or-bitstream keyframe rule, header patching, parameter-set caching, and
+// EMA encode-time stats. Returns false for an empty
 // payload (counts a drop); the caller then skips its ready queue. The
 // keyframe-metadata read stays per-backend; pass it in as metadataIdr.
 bool finalizePacket(
@@ -42,6 +39,7 @@ bool finalizePacket(
     const uint8_t* data,
     size_t size,
     int64_t driverPts100ns,
+    bool hasDriverPts,
     int64_t driverDuration100ns,
     int64_t fallbackPts100ns,
     int64_t fallbackDuration100ns,

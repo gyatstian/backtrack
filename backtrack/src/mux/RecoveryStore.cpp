@@ -1,3 +1,4 @@
+#include "mux/Mp4Muxer.h"
 #include "mux/RecoveryStore.h"
 
 #include "core/Logger.h"
@@ -5,8 +6,10 @@
 #include <charconv>
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -58,6 +61,17 @@ std::filesystem::path manifestPathFor(const std::filesystem::path& tempDirectory
 
 std::filesystem::path manifestTempPathFor(const std::filesystem::path& tempDirectory) {
     return tempDirectory / (std::wstring(kRecoveryManifestName) + L".tmp");
+}
+
+double bytesToGiB(uint64_t bytes) {
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    return static_cast<double>(bytes) / kGiB;
+}
+
+std::wstring formatGiB(uint64_t bytes) {
+    std::wstringstream stream;
+    stream << std::fixed << std::setprecision(1) << bytesToGiB(bytes) << L" GB";
+    return stream.str();
 }
 
 // Full-token numeric parsing. std::stoull happily converts the "123" prefix of
@@ -477,6 +491,31 @@ void clearStaleManifest(const std::filesystem::path& tempDirectory) {
         std::error_code removeError;
         std::filesystem::remove(tempDirectory / staleName, removeError);
     }
+}
+
+// Estimate covers the caller's byte count plus unmeasured container overhead.
+// A failed volume query is not a failure: let the writers surface any real
+// problem instead of blocking a save on a transient query error.
+bool ensureFreeDiskSpace(
+    const std::filesystem::path& outputPath,
+    uint64_t neededBytes,
+    std::wstring& detail) {
+    ULARGE_INTEGER freeToCaller{};
+    ULARGE_INTEGER totalBytes{};
+    ULARGE_INTEGER totalFree{};
+    const std::filesystem::path volumeRoot = outputPath.parent_path().empty()
+        ? std::filesystem::path(L".")
+        : outputPath.parent_path();
+    if (!GetDiskFreeSpaceExW(volumeRoot.c_str(), &freeToCaller, &totalBytes, &totalFree)) {
+        return true;
+    }
+    if (freeToCaller.QuadPart >= neededBytes) {
+        return true;
+    }
+
+    detail = L"not enough free disk space (need about " + formatGiB(neededBytes) +
+             L", have " + formatGiB(freeToCaller.QuadPart) + L")";
+    return false;
 }
 
 MuxPublishResult publishMuxedInputs(

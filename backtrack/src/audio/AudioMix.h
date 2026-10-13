@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mux/Mp4Muxer.h"
+#include "mux/MuxedInputs.h"
 
 #include <cstdint>
 #include <filesystem>

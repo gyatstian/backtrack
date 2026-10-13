@@ -409,16 +409,15 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         case kLogLevelComboId:
             if (notification == CBN_SELCHANGE) {
-                const LRESULT selection = SendMessageW(reinterpret_cast<HWND>(lParam), CB_GETCURSEL, 0, 0);
-                if (selection >= static_cast<LRESULT>(LogLevel::Trace) && selection <= static_cast<LRESULT>(LogLevel::Error)) {
-                    settings_.logLevel = static_cast<LogLevel>(selection);
+                int level = static_cast<int>(settings_.logLevel);
+                if (readEnumCombo(reinterpret_cast<HWND>(lParam), kLogLevelComboEntries, level)) {
+                    settings_.logLevel = static_cast<LogLevel>(level);
                     Logger::instance().setMinLevel(settings_.logLevel);
-                    settingsStore_.save(settings_);
                     // Same immediate-save contract as the Library view buttons:
                     // the write is the save, so it becomes the dirty-check
                     // baseline. Without this the tab stays dirty forever for a
                     // value already on disk.
-                    savedSettings_ = settings_;
+                    commitSettings();
                     Logger::instance().info(L"ui", std::wstring(L"Log level changed to ") + logLevelName(settings_.logLevel));
                     setStatus(std::wstring(L"Log level: ") + logLevelName(settings_.logLevel));
                 }

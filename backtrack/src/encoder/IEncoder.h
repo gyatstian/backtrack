@@ -1,11 +1,12 @@
 #pragma once
 
-#include "capture/D3DDevice.h"
 #include "core/Types.h"
 
 #include <vector>
 
 namespace backtrack {
+
+class D3DDevice;
 
 class IEncoder {
 public:
@@ -14,7 +15,21 @@ public:
     virtual bool initialize(D3DDevice& device, const VideoSettings& settings) = 0;
     virtual void requestKeyFrame() = 0;
     virtual void resetInputResources() {}
+    // Single-packet form: true means `packet` holds one output, false means no
+    // output was ready (never an error signal on its own).
     virtual bool encodeFrame(const GpuFrame& frame, EncodedPacket& packet) = 0;
+    // Drain-to-vector form: appends every packet ready after this frame. A
+    // submission can complete several outputs while reordering/lookahead
+    // drains, so callers that only take the first strand the tail. Clears
+    // `out` first, matching drain(). The default body pops at most one through
+    // the single-packet form; backends override it to drain fully.
+    virtual void encodeFrame(const GpuFrame& frame, std::vector<EncodedPacket>& out) {
+        out.clear();
+        EncodedPacket packet;
+        if (encodeFrame(frame, packet)) {
+            out.push_back(std::move(packet));
+        }
+    }
     virtual void drain(std::vector<EncodedPacket>& packets) = 0;
     virtual void shutdown() = 0;
     virtual EncoderCapabilities capabilities() const = 0;

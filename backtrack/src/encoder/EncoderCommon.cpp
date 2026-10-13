@@ -54,11 +54,6 @@ EncoderEffectiveSettings effectiveSettingsFor(const VideoSettings& settings) {
     return effective;
 }
 
-int64_t effectiveDts(bool hasDts, int64_t dts100ns, int64_t pts100ns) {
-    // DTS must never run past PTS (negative ctts breaks the MP4 mux).
-    return (hasDts && dts100ns <= pts100ns) ? dts100ns : pts100ns;
-}
-
 void ensureKeyFrameCarriesHeaders(
     VideoCodec codec,
     EncodedPacket& packet,
@@ -81,6 +76,7 @@ bool finalizePacket(
     const uint8_t* data,
     size_t size,
     int64_t driverPts100ns,
+    bool hasDriverPts,
     int64_t driverDuration100ns,
     int64_t fallbackPts100ns,
     int64_t fallbackDuration100ns,
@@ -94,10 +90,10 @@ bool finalizePacket(
     if (data != nullptr && size > 0) {
         packet.bytes.assign(data, data + size);
     }
-    // Driver timestamps echo the submitted PTS (QPC-derived, never zero in
-    // practice); decode timestamps CAN be zero/negative so they carry hasDts.
-    const bool driverPtsValid = driverPts100ns != 0;
-    packet.pts100ns = driverPtsValid ? driverPts100ns : fallbackPts100ns;
+    // Driver timestamps echo the submitted PTS; validity arrives as an
+    // explicit flag because timestamps can legitimately be zero or negative
+    // and no sentinel value works.
+    packet.pts100ns = hasDriverPts ? driverPts100ns : fallbackPts100ns;
     packet.duration100ns =
         driverDuration100ns != 0 ? driverDuration100ns : fallbackDuration100ns;
     packet.dts100ns = timestamps.onOutput(packet.pts100ns, packet.duration100ns);

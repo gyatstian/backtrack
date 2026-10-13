@@ -71,7 +71,13 @@ process memory when the user opts out per track (`replay_video.bin` and
   sets the dump loop is about to write anyway.
 - Save-path logic must stay backend agnostic. `VideoPacketMeta` exists so the
   trimming, cut, and parameter-set logic reads the same for both backends; do
-  not branch on the backend where metadata is enough.
+  not branch on the backend where metadata is enough. `saveTo` snapshots once
+  into a RAM-or-pinned-extents view and the cut, header probe/prepend, sample
+  table, and audio reassembly all read through that one reader; `videoSpan100ns`
+  collects the metadata once and runs the same window cut. Duration coalescing
+  is canonical in `mux/MuxedInputs.h` (`coalesceVideoDuration100ns`, 60 s
+  ceiling): both `extendLastVideoDuration` bodies and `pushVideo` use it, same
+  as the recording path.
 - Cut points are the packets flagged `keyFrame`, which both encoders set from
   `BitstreamUtils::bitstreamContainsKeyFrame`; the buffer never scans
   bitstreams itself. `trimLocked` and `freeRingSpaceLocked` both realign to the
@@ -84,7 +90,11 @@ process memory when the user opts out per track (`replay_video.bin` and
   publishes, so a failed save re-cuts the same range instead of losing it.
 - `codecHeaderBytes_` caches the parameter sets from the first keyframe that
   carried them and is prepended to a cut whose start packet lacks headers,
-  because a driver can ignore header insertion.
+  because a driver can ignore header insertion. Sample 0's table size counts
+  only headers actually written, so the offsets behind it cannot shift.
+- `saveTo` preflights free space (`RecoveryStore::ensureFreeDiskSpace`) from
+  snapshot byte totals before writing streams; the mux re-checks with real
+  file sizes. `MuxPublishResult` is the unified RAM/disk save outcome.
 - `extendLastVideoDuration` mutates the newest packet in place under the mutex
   instead of copying a full payload per emitted interval. `saveTo` snapshots
   metadata under the same mutex, so no reader sees it unsynchronized. Keep both

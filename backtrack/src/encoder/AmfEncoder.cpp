@@ -1,5 +1,6 @@
 #include "encoder/AmfEncoder.h"
 
+#include "capture/D3DDevice.h"
 #include "core/Logger.h"
 #include "encoder/DecodeOrderTimestamps.h"
 #include "encoder/EncoderCommon.h"
@@ -181,6 +182,14 @@ struct AmfEncoder::Impl {
     EncoderCapabilities caps;
     EncoderStats encoderStats;
     mutable std::mutex mutex;
+    // Last stats/capabilities copied while mutex was free. stats() and
+    // capabilities() serve these when try_lock fails so a diagnostics poll
+    // never queues behind a driver call (encode/drain hold mutex across
+    // QueryOutput sweeps and the Drain helper join). Slightly stale under
+    // load; the lock-free availableAtomic stays the health signal.
+    mutable std::mutex snapshotMutex;
+    EncoderStats statsSnapshot;
+    EncoderCapabilities capsSnapshot;
     // Lock-free mirror of encoderStats.encoderAvailable for the capture loop's
     // per-iteration health probe (IEncoder::encoderAvailable). Written only on
     // paths that already hold mutex, so the pair never disagrees observably.
@@ -821,6 +830,20 @@ struct AmfEncoder::Impl {
         return true;
     }
 
+    // Vector form of encode: encode() harvests into readyPackets and pops at
+    // most one, so move the remainder too. A submission that completes several
+    // outputs must not strand its tail behind a single-packet return.
+    void encodeDrain(const GpuFrame& frame, std::vector<EncodedPacket>& out) {
+        EncodedPacket packet;
+        if (encode(frame, packet)) {
+            out.push_back(std::move(packet));
+        }
+        EncodedPacket rest;
+        while (popReadyPacket(rest)) {
+            out.push_back(std::move(rest));
+        }
+    }
+
     // Retrieves any available encoded output. Non-blocking unless waitForAll
     // (final drain). While draining, some drivers answer NEED_MORE_INPUT or
     // REPEAT until the last packets are flushed; polling continues as long as
@@ -886,13 +909,11 @@ struct AmfEncoder::Impl {
 
             const int64_t outputPts = static_cast<int64_t>(buffer->GetPts());
             const int64_t outputDuration = static_cast<int64_t>(buffer->GetDuration());
-            // Driver-timestamp validity is explicit: GetPts() echoes the
-            // surface->SetPts(frame.pts100ns) we submitted (QPC-derived
-            // steady-clock time since boot), which can never legitimately be
-            // zero by the time frames reach the encoder. Unlike decode
-            // timestamps - which CAN be zero or negative and therefore carry
-            // hasDts (see Types.h) - this sentinel-free comparison is safe.
-            const bool driverPtsValid = outputPts != 0;
+            // Gate PTS matching on nonzero output: a zero echo must not match
+            // a legitimately-zero submission PTS below. This gates matching
+            // only; timestamp validity is the explicit hasDriverPts passed to
+            // finalizePacket (GetPts echoes the SetPts every submit carries).
+            const bool canMatchByPts = outputPts != 0;
 
             // Match by PTS when B-frames reorder output; the oldest matching
             // entry wins so duplicate timestamps keep decode order. When no
@@ -901,7 +922,7 @@ struct AmfEncoder::Impl {
             // whenever present instead of splicing unrelated metadata in.
             PendingInput pending;
             bool matched = false;
-            if (driverPtsValid) {
+            if (canMatchByPts) {
                 for (auto it = inFlight.begin(); it != inFlight.end(); ++it) {
                     if (it->fallbackPts100ns == outputPts) {
                         pending = std::move(*it);
@@ -921,11 +942,13 @@ struct AmfEncoder::Impl {
             const size_t size = buffer->GetSize();
             // Only the OUTPUT_DATA_TYPE read stays backend-specific;
             // timestamps, keyframe rule, headers, and stats live in
-            // finalizePacket.
+            // finalizePacket. hasDriverPts is explicit: every submit carries
+            // SetPts, so the echo is always present (zero stays a legal
+            // timestamp, never a sentinel).
             const bool metadataIdr = outputIsKeyFrame(buffer);
             const bool finalized = finalizePacket(
                 settings.codec, begin, size,
-                outputPts, outputDuration,
+                outputPts, true, outputDuration,
                 pending.fallbackPts100ns, pending.fallbackDuration100ns,
                 metadataIdr, decodeTimestamps, cachedParameterSets,
                 encoderStats, pending.submittedAt, packet);
@@ -1209,6 +1232,9 @@ struct AmfEncoder::Impl {
     EncoderCapabilities caps;
     EncoderStats encoderStats;
     mutable std::mutex mutex;
+    mutable std::mutex snapshotMutex;
+    EncoderStats statsSnapshot;
+    EncoderCapabilities capsSnapshot;
     std::atomic<bool> forceKeyFrame{false};
 };
 
@@ -1279,6 +1305,14 @@ bool AmfEncoder::encodeFrame(const GpuFrame& frame, EncodedPacket& packet) {
 #endif
 }
 
+void AmfEncoder::encodeFrame(const GpuFrame& frame, std::vector<EncodedPacket>& packets) {
+    std::scoped_lock lock(impl_->mutex);
+    packets.clear();
+#if BACKTRACK_HAS_AMF
+    impl_->encodeDrain(frame, packets);
+#endif
+}
+
 void AmfEncoder::drain(std::vector<EncodedPacket>& packets) {
     std::scoped_lock lock(impl_->mutex);
     packets.clear();
@@ -1306,13 +1340,21 @@ bool AmfEncoder::encoderAvailable() const noexcept {
 }
 
 EncoderCapabilities AmfEncoder::capabilities() const {
-    std::scoped_lock lock(impl_->mutex);
-    return impl_->caps;
+    std::unique_lock lock(impl_->mutex, std::try_to_lock);
+    std::scoped_lock snap(impl_->snapshotMutex);
+    if (lock.owns_lock()) {
+        impl_->capsSnapshot = impl_->caps;
+    }
+    return impl_->capsSnapshot;
 }
 
 EncoderStats AmfEncoder::stats() const {
-    std::scoped_lock lock(impl_->mutex);
-    return impl_->encoderStats;
+    std::unique_lock lock(impl_->mutex, std::try_to_lock);
+    std::scoped_lock snap(impl_->snapshotMutex);
+    if (lock.owns_lock()) {
+        impl_->statsSnapshot = impl_->encoderStats;
+    }
+    return impl_->statsSnapshot;
 }
 
 DXGI_FORMAT AmfEncoder::preferredInputFormat() const {

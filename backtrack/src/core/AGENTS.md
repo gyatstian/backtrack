@@ -18,10 +18,14 @@ the lock-free queue used between threads, and the app version constant.
   `GpuOptimizationSettings`, `HotkeySettings`, `GameIntegrationSettings`,
   `AppSettings`) and the wire structs (`GpuFrame`, `EncodedPacket`,
   `AudioPacket`, `CaptureTarget`, plus the stats and capability structs).
-  `RecordingStats::hdrActive` / `hdrRejected` are diagnostics-only mirrors with
+  `RecordingStats::hdrActive` / `hdrRejected` / `hdrFlipCount` / `hdrFormat` /
+  `hdrPinned` / `hdrBridgedFrames` are
+  diagnostics-only mirrors with
   no settings backing (HDR stays automatic): active means HDR frames are
   flowing, rejected means tone-mapping was refused or an HDR desktop is read as
-  SDR. The Diagnostics page renders them as one `HDR:` line and `saveLog`
+  SDR, flip count tracks hdr/format flips per pipeline run, format is the last
+  observed frame format, pinned means the capture session locked the single
+  HDR mapping, bridged counts the SDR surfaces normalized into it. The Diagnostics page renders them as one `HDR:` line and `saveLog`
   appends the same chain to the saved copy.
 - Every settings struct has a defaulted `operator==`. The UI dirty check
   (`MainWindow::computeSettingsDirty`) compares whole structs, so a new

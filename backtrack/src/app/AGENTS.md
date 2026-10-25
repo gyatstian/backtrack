@@ -96,29 +96,47 @@ frame-cadence logic.
   Desktop Duplication on an advanced-color monitor (WGC stays fixed-BGRA and
   leans on DWM pre-tonemap, which washes out); WGC remains the fallback when DD
   is unavailable or fails, and `exclusiveRecovery` keeps its monitor-only DD
-  path untouched. The capture loop watches every acquired frame's `hdr` flag
-  and format: a flip opens a new GOP (`requestKeyFrame` plus an `L"app"` log
-  line) so whitened frames never stretch into a running GOP. A DD-side HDR flip
-  also bumps `resolutionChangeCount`, which the existing resize hook turns into
-  the same keyframe.
-- `RecordingStats::hdrActive` / `hdrRejected` are lock-free mirrors for the
+  path untouched. Once DD is live on an HDR monitor the session is sticky: a
+  single ACCESS_LOST/INVALID_CALL retries DD once before the WGC fallback, so
+  one transient loss never flaps the backend. A DD session also pins one HDR
+  interpretation for its whole lifetime (capture owns the ratchet): SDR
+  surfaces bridge into the HDR mapping with no pool recreate and no GOP break,
+  so the capture loop's flip watch only ever fires on the one-time SDR->HDR
+  upgrade, never on the surface oscillation. The watch itself stays - a flip
+  still opens a new GOP (`requestKeyFrame` plus an `L"app"` log line) so a
+  genuine interpretation change never stretches into a running GOP - with flips
+  coalesced to one GOP restart per 2 s window and a >5-flips/min storm logging
+  one `L"app"` warning per minute window.
+- `RecordingStats::hdrActive` / `hdrRejected` / `hdrFlipCount` / `hdrFormat` /
+  `hdrPinned` / `hdrBridgedFrames`
+  are lock-free mirrors for the
   Diagnostics page. `hdrMonitorActive_` caches the `monitorHasAdvancedColor`
   probe at source creation; `hdrActive_` follows the last acquired frame's
-  `GpuFrame::hdr`. `stats()` ORs the scaler's sticky rejection - read inside
+  `GpuFrame::hdr`, `hdrFormat` its format, `hdrPinned_` the source pin and
+  `hdrBridgedFrames_` the source bridge count (both read through the
+  `ICaptureSource` defaults on WGC, so they stay false/0 there); `hdrFlipCount`
+  counts flips per pipeline run (reset at pipeline start, never on handoff, so
+  history survives, as does the bridged count). `stats()` ORs the scaler's sticky rejection - read inside
   the existing `try_to_lock` won-lock scope, race-free because the scaler is
   only touched under `pipelineGpuMutex_` - gated on live HDR input so a stale
   latch cannot paint SDR content as rejected, with the monitor-probe-no-frame
-  case covering WGC/SDR interpretation. Both mirrors reset on every video
+  case covering WGC/SDR interpretation. `hdrActive_`/`hdrFormat`/`hdrPinned_`
+  reset on every video
   handoff (`resetVideoHandoff`, `switchCaptureTarget`) so a DD(hdr=true)
-  freeze frame never poisons a WGC session: the privatized copy is already
-  SDR, and its `hdr` flag is cleared when the new source is WGC so
-  `emitFrame` does not tone-map twice. The monitor probe is creation-time
+  freeze frame never poisons a WGC session: the privatized fast-copy keeps
+  native HDR pixels without tone-mapping, so an HDR freeze frame is dropped
+  outright when the new source is WGC rather than reflagged SDR (which would
+  emit one washed-out frame). The monitor probe is creation-time
   only; an OS HDR toggle mid-session on WGC stays invisible until the next
-  rebind (diagnostics-only known limit), while DD toggles still arrive via the
-  per-frame flag. The Diagnostics page splits `hdrRejected` for display -
+  rebind (diagnostics-only known limit), while a DD session absorbs the toggle
+  by bridging (the one-time SDR->HDR upgrade still arrives via the per-frame
+  flag plus the resolution hook). The Diagnostics page splits `hdrRejected` for display -
   scaler refusal on live HDR input reads as rejected, monitor-probe-no-frame
   reads as SDR-on-HDR-monitor (WGC/DWM) - so the washout witness never looks
-  like a driver refusal and `stats()` fields stay stable.
+  like a driver refusal and `stats()` fields stay stable. The HDR line appends
+  backend + format + flip count (`hdrFlipCount`/`hdrFormat`), plus `pinned` and
+  the bridged count on a pinned session, so stability is
+  self-serve; no new setting, HDR stays automatic.
 - `stats()` and `encoderCapabilities()` run on two threads at once - the UI
   thread (diagnostics timer, page refresh) and the controller worker thread
   `MainWindow` uses for blocking actions - and must never block on

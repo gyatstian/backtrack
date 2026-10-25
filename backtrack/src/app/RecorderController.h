@@ -317,9 +317,19 @@ private:
     std::atomic<uint32_t> encodeHeight_{0};
     // HDR telemetry mirrors (see RecordingStats::hdrActive/hdrRejected).
     // hdrMonitorActive_ is written on pipeline (re)build; hdrActive_ follows
-    // the last acquired frame. Both read lock-free from stats().
+    // the last acquired frame. hdrFlipCount_ counts flips per pipeline run
+    // (never reset on handoff, so Diagnostics keeps history); hdrFormatCode_
+    // resets to UNKNOWN on every handoff like hdrActive_. hdrPinned_ follows
+    // the source pin (Desktop Duplication single-mapping; WGC reports false)
+    // and resets on handoff with hdrActive_; hdrBridgedFrames_ counts bridged
+    // surfaces per pipeline run like hdrFlipCount_. All read lock-free
+    // from stats().
     std::atomic<bool> hdrActive_{false};
     std::atomic<bool> hdrMonitorActive_{false};
+    std::atomic<uint64_t> hdrFlipCount_{0};
+    std::atomic<int> hdrFormatCode_{static_cast<int>(DXGI_FORMAT_UNKNOWN)};
+    std::atomic<bool> hdrPinned_{false};
+    std::atomic<uint64_t> hdrBridgedFrames_{0};
 };
 
 } // namespace backtrack

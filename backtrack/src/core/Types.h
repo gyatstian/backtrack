@@ -361,9 +361,18 @@ struct RecordingStats {
     // cleared on every video handoff so a stale DD flag never leaks into WGC;
     // hdrRejected means the scaler refused tone-mapping on live HDR input or
     // the monitor reports advanced color but no HDR frame was observed
-    // (WGC/SDR interpretation of an HDR desktop). Output stays SDR either way.
+    // (WGC/SDR interpretation of an HDR desktop). hdrFlipCount counts stable
+    // hdr/format flips per pipeline run; hdrFormat is the last observed frame
+    // format (UNKNOWN across handoffs until a new frame lands). hdrPinned is
+    // the Desktop Duplication single-mapping pin (session interprets every
+    // frame as HDR, bridging SDR surfaces); hdrBridgedFrames counts those
+    // bridged surfaces per pipeline run. Output stays SDR either way.
     bool hdrActive = false;
     bool hdrRejected = false;
+    uint64_t hdrFlipCount = 0;
+    DXGI_FORMAT hdrFormat = DXGI_FORMAT_UNKNOWN;
+    bool hdrPinned = false;
+    uint64_t hdrBridgedFrames = 0;
     uint64_t capturedFrames = 0;
     uint64_t sourceFrames = 0;
     uint64_t sourceFramesPerSecond = 0;

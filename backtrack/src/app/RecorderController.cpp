@@ -47,6 +47,22 @@ uint32_t captureTexturePoolSize(const GpuOptimizationSettings& settings) {
     return GpuPoolBuilder::normalizePoolSize(settings.frameQueueLimit + 4);
 }
 
+// Short HDR surface name for logs/Diagnostics. Local (not platform-shared):
+// only app logging and the ui HDR line need it, and the platform contract
+// stays limited to the backend display name.
+const wchar_t* hdrFormatName(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return L"R10G10B10A2";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return L"scRGB";
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return L"BGRA";
+    default:
+        return L"unknown";
+    }
+}
+
 CaptureTarget captureTargetForSettings(const AppSettings& settings) {
     CaptureTarget target;
     target.monitorIndex = settings.monitorIndex;
@@ -788,6 +804,10 @@ RecordingStats RecorderController::stats() const {
     // latch from painting SDR content as rejected); the monitor probe covers
     // the WGC/SDR-interpretation case instead.
     stats.hdrRejected = (stats.hdrActive && scalerHdrRejected) || (hdrMonitor && !stats.hdrActive);
+    stats.hdrFlipCount = hdrFlipCount_.load(std::memory_order_relaxed);
+    stats.hdrFormat = static_cast<DXGI_FORMAT>(hdrFormatCode_.load(std::memory_order_relaxed));
+    stats.hdrPinned = hdrPinned_.load(std::memory_order_relaxed);
+    stats.hdrBridgedFrames = hdrBridgedFrames_.load(std::memory_order_relaxed);
     stats.encoder.queueDepth = static_cast<uint32_t>(frameQueue_.size());
     detectVideoPipelineStall();
     return stats;
@@ -927,6 +947,10 @@ bool RecorderController::ensurePipeline() {
     cursorOnlyFrames_ = 0;
     systemAudioQueueDrops_ = 0;
     microphoneAudioQueueDrops_ = 0;
+    hdrFlipCount_ = 0;
+    hdrFormatCode_.store(static_cast<int>(DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
+    hdrPinned_ = false;
+    hdrBridgedFrames_ = 0;
     // Audio-liveness clocks start at pipeline start so a never-delivering
     // input shows a growing silence age instead of 0.
     systemAudioLastPacketAt100ns_.store(steadyNow100ns(), std::memory_order_relaxed);
@@ -1229,6 +1253,14 @@ bool RecorderController::createCaptureSource(
     bool exclusiveRecovery) {
     AppSettings snapshot = settings();
     const CaptureBackend selectedBackend = selectedBackendForSettings(snapshot);
+    // Sticky-HDR input: what was live before this (re)bind. Read before the
+    // reset below overwrites it; a DD session on an HDR monitor retries DD
+    // before falling back to WGC so one ACCESS_LOST never flaps the backend.
+    CaptureBackend prevActiveBackend = CaptureBackend::WindowsGraphicsCapture;
+    {
+        std::scoped_lock lock(captureStatusMutex_);
+        prevActiveBackend = activeCaptureBackend_;
+    }
 
     {
         std::scoped_lock lock(captureStatusMutex_);
@@ -1271,6 +1303,12 @@ bool RecorderController::createCaptureSource(
     // carry no hdr flag); DD toggles still surface via the per-frame flag.
     const bool monitorHdr = monitor && monitorHasAdvancedColor(monitor);
     hdrMonitorActive_.store(monitorHdr, std::memory_order_relaxed);
+    // Sticky while an HDR DD session is live: the rebind path already waited
+    // (WaitStable + cooldown), so one immediate DD retry here costs nothing and
+    // keeps a transient loss from washing out through a WGC fallback.
+    // exclusiveRecovery keeps its monitor-only DD path untouched (not gated here).
+    const bool stickyDdRetry = !exclusiveRecovery && monitorHdr &&
+        prevActiveBackend == CaptureBackend::DesktopDuplication;
 
     CaptureTarget monitorTarget = target;
     monitorTarget.window = nullptr;
@@ -1349,6 +1387,15 @@ bool RecorderController::createCaptureSource(
             Logger::instance().info(L"recorder", candidate.attemptNote);
         }
         initialized = tryInitialize(candidate.create(), candidate.name, candidate.target);
+        if (!initialized && stickyDdRetry &&
+            (candidate.eligible == captureDdHdrPreferredEligible ||
+             candidate.eligible == captureDdExplicitEligible)) {
+            // One transient DD loss (ACCESS_LOST/INVALID_CALL) must not flap
+            // an HDR session to WGC: retry DD once before the WGC fallback below.
+            Logger::instance().info(L"recorder",
+                L"Retrying Desktop Duplication before WGC fallback (HDR session sticky)");
+            initialized = tryInitialize(candidate.create(), candidate.name, candidate.target);
+        }
         if (initialized) {
             break;
         }
@@ -1494,12 +1541,20 @@ void RecorderController::captureLoopImpl() {
     // resized in place and the next accepted frame must open a new GOP.
     uint64_t prevResolutionChanges = 0;
     // Tracks the duplication surface HDR identity (GpuFrame::hdr + format). A
-    // mid-session HDR toggle flips them in place without a rebind; the next
+    // mid-session SDR->HDR upgrade flips them in place without a rebind; the next
     // accepted frame must open a new GOP so the tone-map switch never lands
     // mid-GOP. Seeded from the first acquired frame after each rebind.
+    // Capture pins one interpretation per session, so at most the one-time
+    // upgrade arrives here; rapid flaps coalesce into one GOP restart per 2 s
+    // window, and a
+    // >5-flips/min storm logs one warning per minute window.
     bool prevHdrSeen = false;
     bool prevHdr = false;
     DXGI_FORMAT prevHdrFormat = DXGI_FORMAT_UNKNOWN;
+    SteadyClock::time_point lastHdrFlipAt = SteadyClock::time_point::min();
+    SteadyClock::time_point hdrFlipWindowStart = SteadyClock::time_point::min();
+    uint64_t hdrFlipWindowCount = 0;
+    bool hdrFlipStormWarned = false;
     bool exclusiveCoverActive = false;
     // A monitor-sized borderless game remains an exclusive-cover candidate:
     // session.recoveryProbe periodically retries desktop capture while holding
@@ -1795,8 +1850,11 @@ void RecorderController::captureLoopImpl() {
         requestKeyFrameAfterAcceptedFrame = true;
         prevHdrSeen = false;
         // A DD(hdr=true) mirror must not survive the handoff gap: no HDR frame
-        // flows again until the new source delivers one.
+        // flows again until the new source delivers one. Format resets with it;
+        // the flip count stays cumulative per pipeline run for Diagnostics.
         hdrActive_.store(false, std::memory_order_relaxed);
+        hdrFormatCode_.store(static_cast<int>(DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
+        hdrPinned_.store(false, std::memory_order_relaxed);
     };
 
     auto switchCaptureTarget = [&](const CaptureTarget& target,
@@ -1833,13 +1891,16 @@ void RecorderController::captureLoopImpl() {
             }
             prevResolutionChanges = capture_->resolutionChangeCount();
             prevHdrSeen = false;
-            // Stale DD(hdr=true) must not survive the gap: the privatized freeze
-            // frame is already SDR after its scaler copy, and WGC emits SDR
-            // only, so re-flagging it HDR would tone-map twice.
-            if (capture_->backend() == CaptureBackend::WindowsGraphicsCapture) {
-                lastFrame.hdr = false;
+            // privatizeLastFrame fast-copies at the native HDR format without
+            // tone-mapping, so its pixels are still HDR: reflagging them SDR
+            // would emit one washed-out freeze frame. Drop it instead; the next
+            // live frame seeds continuity.
+            if (capture_->backend() == CaptureBackend::WindowsGraphicsCapture && lastFrame.hdr) {
+                lastFrame = {};
             }
             hdrActive_.store(false, std::memory_order_relaxed);
+            hdrFormatCode_.store(static_cast<int>(DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
+            hdrPinned_.store(false, std::memory_order_relaxed);
             if (encoder_) {
                 encoder_->resetInputResources();
             }
@@ -1856,7 +1917,14 @@ void RecorderController::captureLoopImpl() {
             SetEvent(frameEvent_);
         }
         refreshCaptureDimensions();
-        Logger::instance().info(L"recorder", std::wstring(L"Capture source switched: ") + reason);
+        // Backend-switch proof: reason plus the resulting status the
+        // Diagnostics page shows (carries selected/active names + fallback cause).
+        std::wstring switchStatus;
+        {
+            std::scoped_lock lock(captureStatusMutex_);
+            switchStatus = captureBackendStatus_;
+        }
+        Logger::instance().info(L"recorder", std::wstring(L"Capture source switched: ") + reason + L"; " + switchStatus);
         return true;
     };
 
@@ -1986,10 +2054,17 @@ void RecorderController::captureLoopImpl() {
             session.softStallBeganAt = SteadyClock::time_point::min();
             session.softStallRecreates = 0;
             session.deadTargetFailures = 0;
-            // Mid-session HDR toggle flips the duplication surface in place
-            // (no rebind, no isDeviceLost). A silent flip would stretch
+            // Mid-session SDR->HDR upgrade changes the duplication surface in
+            // place (no rebind, no isDeviceLost). A silent change would stretch
             // whitened frames into the running GOP, so open a new one.
+            // Frames keep flowing (the scaler tone-maps live per frame); only
+            // the GOP restart coalesces, so a flap storm costs one GOP, not
+            // one per frame.
             hdrActive_.store(frame.hdr, std::memory_order_relaxed);
+            hdrFormatCode_.store(static_cast<int>(frame.format), std::memory_order_relaxed);
+            hdrPinned_.store(capture_ ? capture_->hdrPinned() : false, std::memory_order_relaxed);
+            hdrBridgedFrames_.store(
+                capture_ ? capture_->hdrBridgedFrames() : 0, std::memory_order_relaxed);
             if (!prevHdrSeen) {
                 prevHdr = frame.hdr;
                 prevHdrFormat = frame.format;
@@ -1997,10 +2072,41 @@ void RecorderController::captureLoopImpl() {
             } else if (frame.hdr != prevHdr || frame.format != prevHdrFormat) {
                 prevHdr = frame.hdr;
                 prevHdrFormat = frame.format;
-                requestKeyFrameAfterAcceptedFrame = true;
-                Logger::instance().info(L"app",
-                    std::wstring(L"HDR state changed mid-session (hdr=") +
-                    (frame.hdr ? L"on" : L"off") + L"); keyframe requested");
+                hdrFlipCount_.fetch_add(1, std::memory_order_relaxed);
+                const auto flipNow = SteadyClock::now();
+                // Flip-rate guard: >5 flips/min logs one warning per minute
+                // window (fixed text except counts; logger rate-limit is backup).
+                if (hdrFlipWindowStart == SteadyClock::time_point::min() ||
+                    flipNow - hdrFlipWindowStart >= std::chrono::minutes(1)) {
+                    hdrFlipWindowStart = flipNow;
+                    hdrFlipWindowCount = 1;
+                    hdrFlipStormWarned = false;
+                } else {
+                    ++hdrFlipWindowCount;
+                }
+                if (hdrFlipWindowCount > 5 && !hdrFlipStormWarned) {
+                    hdrFlipStormWarned = true;
+                    Logger::instance().warning(L"app",
+                        std::wstring(L"HDR flip storm: ") + std::to_wstring(hdrFlipWindowCount) +
+                        L" flips in the last minute (backend=" +
+                        captureBackendDisplayName(capture_ ? capture_->backend() : CaptureBackend::WindowsGraphicsCapture) +
+                        L", format=" + hdrFormatName(frame.format) +
+                        L", hdr=" + (frame.hdr ? L"on" : L"off") +
+                        L"); coalescing keyframes to one per 2s window");
+                }
+                // Single GOP per transition: coalesce rapid flips within a 2 s
+                // window into the first flip's restart (capture pins one
+                // interpretation, so this is a guard, not the hot path).
+                if (lastHdrFlipAt == SteadyClock::time_point::min() ||
+                    flipNow - lastHdrFlipAt >= std::chrono::seconds(2)) {
+                    lastHdrFlipAt = flipNow;
+                    requestKeyFrameAfterAcceptedFrame = true;
+                    Logger::instance().info(L"app",
+                        std::wstring(L"HDR state changed mid-session (hdr=") +
+                        (frame.hdr ? L"on" : L"off") + L", backend=" +
+                        captureBackendDisplayName(capture_ ? capture_->backend() : CaptureBackend::WindowsGraphicsCapture) +
+                        L", format=" + hdrFormatName(frame.format) + L"); keyframe requested");
+                }
             }
             // Exclusive + stall/hold/blind: desktop WGC/DXGI frames are sparse or
             // stale. Do not promote them into lastFrame (slideshow). Healthy

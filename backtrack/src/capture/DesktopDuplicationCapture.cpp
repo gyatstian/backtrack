@@ -15,6 +15,21 @@ namespace backtrack {
 namespace {
 
 
+// Short pool-format note for the init line so a log shows the session's
+// interpretation at a glance (BGRA = SDR path, scRGB/R10 = pinned HDR pool).
+const wchar_t* poolFormatName(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return L"R10G10B10A2";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return L"scRGB";
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return L"BGRA";
+    default:
+        return L"unknown";
+    }
+}
+
 // Minimal quad pipeline. The vertex shader synthesises a triangle strip from
 // SV_VertexID (no vertex/index buffers) and positions it using a clip-space
 // rect supplied through the constant buffer. The pixel shader samples cursor
@@ -68,6 +83,26 @@ constexpr char kCursorShaderHlsl[] =
     "    return float4(lerp(desktop.rgb, cursor.rgb, cursor.a), 1.0f);\n"
     "}\n";
 
+// SDR->scRGB bridge for a pinned HDR session. A fullscreen triangle loads the
+// staged SDR surface and normalizes it to scRGB-linear with the exact transfer
+// HdrStability.h mirrors on CPU (srgbChannelToLinear, unit-tested): black and
+// paper white pass through bit-identical, so a bridged frame encodes
+// identically to a native HDR frame of the same desktop and the surface
+// oscillation cannot flicker. Alpha is opaque; only .rgb crosses the bridge.
+constexpr char kBridgeShaderHlsl[] =
+    "Texture2D gSrc : register(t0);\n"
+    "float4 VSMain(uint id : SV_VertexID) : SV_Position {\n"
+    "    float2 p = float2(id == 1 ? 3.0f : -1.0f, id == 2 ? -3.0f : 1.0f);\n"
+    "    return float4(p, 0.0f, 1.0f);\n"
+    "}\n"
+    "float srgbToLinear(float c) {\n"
+    "    return c <= 0.04045f ? c / 12.92f : pow((c + 0.055f) / 1.055f, 2.4f);\n"
+    "}\n"
+    "float4 PSMain(float4 pos : SV_Position) : SV_Target {\n"
+    "    float3 c = gSrc.Load(int3(int2(pos.xy), 0)).rgb;\n"
+    "    return float4(srgbToLinear(c.r), srgbToLinear(c.g), srgbToLinear(c.b), 1.0f);\n"
+    "}\n";
+
 } // namespace
 
 void DesktopDuplicationCapture::releaseHeldFrame() {
@@ -115,24 +150,19 @@ bool DesktopDuplicationCapture::queryAdvancedColor() {
             return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
                 desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
         }
-        return hdrActive_; // transient failure: hold the last state, never flap.
+        return hdrPollState_; // transient failure: hold the last state, never flap.
     }
     return monitorHasAdvancedColor(monitor_);
 }
 
-bool DesktopDuplicationCapture::applyHdrState(bool advanced) {
-    if (advanced == hdrActive_) {
-        return false;
-    }
-    hdrActive_ = advanced;
+void DesktopDuplicationCapture::applyHdrUpgrade() {
+    // Ratcheted pin, called once when an HDR surface upgrades an SDR-pinned
+    // session (HdrSessionPin already moved). An interpretation change reads
+    // like a resize downstream, so it opens a new GOP through the same hook.
     ++hdrChangeCount_;
-    // A color-space flip changes frame interpretation like a resize does; the
-    // app already opens a new GOP whenever resolutionChangeCount advances.
     ++resolutionChanges_;
-    Logger::instance().warning(L"capture",
-        advanced ? L"Desktop Duplication HDR turned on; flagging HDR frames"
-                 : L"Desktop Duplication HDR turned off; flagging SDR frames");
-    return true;
+    Logger::instance().info(L"capture",
+        L"Desktop Duplication HDR pinned mid-session; single tone-map mapping from here (no flips)");
 }
 
 bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings& settings, const CaptureTarget& target) {
@@ -142,11 +172,19 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     cursorOnlyFrames_ = 0;
     resolutionChanges_ = 0;
     hdrChangeCount_ = 0;
-    hdrActive_ = false;
+    hdrPin_.reset();
+    hdrPollState_ = false;
+    bridgedFrames_ = 0;
     colorProbe_.Reset();
     pool_.clear();
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
+    desktopCopyRtv_.Reset();
+    bridgeStaging_.Reset();
+    bridgeStagingSrv_.Reset();
+    bridgeStagingFormat_ = DXGI_FORMAT_UNKNOWN;
+    bridgeVs_.Reset();
+    bridgePs_.Reset();
     cursorOnlyFrameInterval_ = std::chrono::nanoseconds(
         1'000'000'000 / std::max<uint32_t>(1, settings.video.fps));
     nextCursorOnlyFrameAt_ = {};
@@ -211,7 +249,9 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     // factory walk). Failure is non-fatal: queries fall back to
     // monitorHasAdvancedColor.
     output.As(&colorProbe_);
-    hdrActive_ = queryAdvancedColor();
+    hdrPollState_ = queryAdvancedColor();
+    // The pool stays empty until the first surface pins the session
+    // (HdrSessionPin::begin), so an HDR start never pays a BGRA recreate.
 
     ComPtr<IDXGIOutput1> output1;
     hr = output.As(&output1);
@@ -252,7 +292,7 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
 
     Logger::instance().info(L"capture",
         L"Desktop Duplication initialized at " + std::to_wstring(width_) + L"x" + std::to_wstring(height_) +
-        (hdrActive_ ? L" (HDR active; frames will be tone-mapped to SDR)" : L""));
+        (hdrPollState_ ? L" (HDR reported; first surface decides the pool)" : L""));
     return true;
 }
 
@@ -267,7 +307,10 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
     if (lastHdrPollAt_.time_since_epoch().count() == 0 ||
         hdrPollNow - lastHdrPollAt_ >= std::chrono::seconds(1)) {
         lastHdrPollAt_ = hdrPollNow;
-        applyHdrState(queryAdvancedColor());
+        // Raw poll only: publishing waits for the surface format to agree over
+        // consecutive frames below, so a poll/format race holds instead of
+        // flipping mid-GOP.
+        hdrPollState_ = queryAdvancedColor();
     }
 
     // DXGI requires ReleaseFrame before the next AcquireNextFrame.
@@ -309,38 +352,83 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
 
     D3D11_TEXTURE2D_DESC acquiredDesc{};
     acquiredTexture->GetDesc(&acquiredDesc);
+    const DXGI_FORMAT arrivedFormat = acquiredDesc.Format;
+    const bool sizeChanged =
+        acquiredDesc.Width != width_ || acquiredDesc.Height != height_;
     if (pool_.empty()) {
-        // First frame sizes the pool to the real surface format, so an HDR
-        // session never pays a BGRA recreate and drops nothing to get there.
+        // First surface decides pool and pin (HdrSessionPin::begin). The OS
+        // report never pre-pins: an HDR poll with all-BGRA surfaces is a
+        // whole SDR session, and an scRGB pool would force every one of its
+        // frames through the HDR tone-map. A later HDR surface still
+        // upgrades once through noteSurfaceFormat below.
         width_ = acquiredDesc.Width;
         height_ = acquiredDesc.Height;
-        format_ = acquiredDesc.Format;
-        applyHdrState(queryAdvancedColor());
+        format_ = hdrPin_.begin(arrivedFormat);
         if (!createTexturePool(width_, height_, format_, poolSize_)) {
             markLost(L"Texture pool create failed", E_FAIL);
             return false;
         }
-    } else if (acquiredDesc.Width != width_ || acquiredDesc.Height != height_ || acquiredDesc.Format != format_) {
-        Logger::instance().info(L"capture",
-            L"Capture surface changed to " + std::to_wstring(acquiredDesc.Width) + L"x" +
-            std::to_wstring(acquiredDesc.Height) + L"; recreating texture pool");
+    } else if (sizeChanged || arrivedFormat != format_) {
         width_ = acquiredDesc.Width;
         height_ = acquiredDesc.Height;
-        format_ = acquiredDesc.Format;
-        // A display-mode switch is also when HDR can toggle; refresh the flag
-        // so frames carry the correct color-space hint. applyHdrState already
-        // bumped resolutionChanges_ on a real flip, so skip the second bump.
-        const bool hdrFlipped = applyHdrState(queryAdvancedColor());
-        if (!createTexturePool(width_, height_, format_, poolSize_)) {
-            markLost(L"Texture pool recreate failed", E_FAIL);
-            return false;
-        }
-        // In-place resize/format switch opens a new GOP via the app's
-        // existing resolutionChangeCount hook.
-        if (!hdrFlipped) {
+        hdrPollState_ = queryAdvancedColor();
+        if (!hdrPin_.pinnedHdr() && isHdrCaptureFormat(arrivedFormat)) {
+            // SDR->HDR upgrade: the one direction the ratchet allows. Adopt
+            // the HDR pool once; every later SDR surface bridges instead.
+            hdrPin_.noteSurfaceFormat(arrivedFormat);
+            format_ = arrivedFormat;
+            applyHdrUpgrade();
+            Logger::instance().info(L"capture",
+                L"Capture surface changed to " + std::to_wstring(acquiredDesc.Width) + L"x" +
+                std::to_wstring(acquiredDesc.Height) + L"; recreating texture pool for pinned HDR");
+            if (!createTexturePool(width_, height_, format_, poolSize_)) {
+                markLost(L"Texture pool recreate failed", E_FAIL);
+                return false;
+            }
+        } else if (hdrPin_.pinnedHdr() && isHdrCaptureFormat(arrivedFormat) &&
+            isHdrCaptureFormat(format_)) {
+            // Genuine HDR<->HDR switch (PQ<->scRGB), rare: adopt it. An
+            // SDR<->HDR flap never reaches here; it bridges with no recreate.
+            format_ = arrivedFormat;
+            Logger::instance().info(L"capture",
+                L"Capture surface changed to " + std::to_wstring(acquiredDesc.Width) + L"x" +
+                std::to_wstring(acquiredDesc.Height) + L"; recreating texture pool");
+            if (!createTexturePool(width_, height_, format_, poolSize_)) {
+                markLost(L"Texture pool recreate failed", E_FAIL);
+                return false;
+            }
+            ++resolutionChanges_;
+        } else if (hdrPin_.pinnedHdr() && !isHdrCaptureFormat(arrivedFormat)) {
+            // SDR surface in a pinned HDR session: bridge it below. No pool
+            // recreate, no GOP break; a resize still rebuilds at the pool format.
+            if (sizeChanged) {
+                Logger::instance().info(L"capture",
+                    L"Capture surface changed to " + std::to_wstring(acquiredDesc.Width) + L"x" +
+                    std::to_wstring(acquiredDesc.Height) + L"; recreating texture pool");
+                if (!createTexturePool(width_, height_, format_, poolSize_)) {
+                    markLost(L"Texture pool recreate failed", E_FAIL);
+                    return false;
+                }
+                ++resolutionChanges_;
+            }
+        } else {
+            // SDR session, SDR arrival (defensive format adopt; DD is BGRA).
+            format_ = arrivedFormat;
+            Logger::instance().info(L"capture",
+                L"Capture surface changed to " + std::to_wstring(acquiredDesc.Width) + L"x" +
+                std::to_wstring(acquiredDesc.Height) + L"; recreating texture pool");
+            if (!createTexturePool(width_, height_, format_, poolSize_)) {
+                markLost(L"Texture pool recreate failed", E_FAIL);
+                return false;
+            }
+            // In-place resize/format switch opens a new GOP via the app's
+            // existing resolutionChangeCount hook.
             ++resolutionChanges_;
         }
     }
+    // Any remaining mismatch is an SDR surface in a pinned HDR session and
+    // flows through the bridge; the pool format never flaps mid-session.
+    const bool bridged = arrivedFormat != format_;
 
     const bool cursorUpdated = captureCursor_ && frameInfo.LastMouseUpdateTime.QuadPart != 0;
     const bool cursorShapeUpdated = captureCursor_ && frameInfo.PointerShapeBufferSize > 0;
@@ -369,9 +457,22 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         nextCursorOnlyFrameAt_ = now + cursorOnlyFrameInterval_;
         ++cursorOnlyFrames_;
     }
+    // Bridge resources build outside the context lock (device work only),
+    // mirroring ensureCompositor below.
+    if (desktopChanged && bridged && !ensureBridgeResources(width_, height_, arrivedFormat)) {
+        releaseHeldFrame();
+        return false;
+    }
     if (desktopChanged) {
         std::scoped_lock lock(device_->immediateContextMutex());
-        device_->context()->CopyResource(desktopCopy_.Get(), acquiredTexture.Get());
+        if (bridged) {
+            // SDR surface in a pinned HDR session: stage it, then normalize
+            // into the HDR desktop copy. Same mapping as native frames.
+            device_->context()->CopyResource(bridgeStaging_.Get(), acquiredTexture.Get());
+            normalizeIntoDesktopCopy();
+        } else {
+            device_->context()->CopyResource(desktopCopy_.Get(), acquiredTexture.Get());
+        }
         haveContent_ = true;
     }
 
@@ -418,11 +519,13 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
     frame.width = width_;
     frame.height = height_;
     frame.format = format_;
-    // Only 10-bit/FP16 surfaces carry native PQ content; 8-bit BGRA under HDR
-    // is already SDR-mapped by the desktop composition.
-    frame.hdr = hdrActive_ &&
-        (format_ == DXGI_FORMAT_R10G10B10A2_UNORM ||
-         format_ == DXGI_FORMAT_R16G16B16A16_FLOAT);
+    // Pinned session, single mapping: every frame carries the pool format and
+    // the pin, so the scaler programs its tone-map state once and never
+    // alternates interpretations mid-GOP.
+    frame.hdr = hdrPin_.pinnedHdr() && isHdrCaptureFormat(format_);
+    if (bridged) {
+        ++bridgedFrames_;
+    }
     return true;
 }
 
@@ -432,13 +535,21 @@ void DesktopDuplicationCapture::shutdown() {
     haveContent_ = false;
     frameHeld_ = false;
     deviceLost_ = true;
-    hdrActive_ = false;
+    hdrPin_.reset();
+    hdrPollState_ = false;
+    bridgedFrames_ = 0;
     colorProbe_.Reset();
     lastHdrPollAt_ = {};
     monitor_ = nullptr;
     pool_.clear();
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
+    desktopCopyRtv_.Reset();
+    bridgeStaging_.Reset();
+    bridgeStagingSrv_.Reset();
+    bridgeStagingFormat_ = DXGI_FORMAT_UNKNOWN;
+    bridgeVs_.Reset();
+    bridgePs_.Reset();
     cursorTexture_.Reset();
     cursorSrv_.Reset();
     cursorVs_.Reset();
@@ -492,7 +603,10 @@ bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t heigh
     copyDesc.Format = format;
     copyDesc.SampleDesc.Count = 1;
     copyDesc.Usage = D3D11_USAGE_DEFAULT;
-    copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    // SHADER_RESOURCE feeds the cursor compositor; RENDER_TARGET receives the
+    // SDR bridge normalization in a pinned HDR session. Both views coexist;
+    // the bridge unbinds inputs before rendering (D3D11 forbids input+output).
+    copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
     HRESULT hr = device_->device()->CreateTexture2D(&copyDesc, nullptr, &desktopCopy_);
     if (FAILED(hr)) {
         Logger::instance().error(L"capture", L"CreateTexture2D for desktop copy failed: " + hresultToString(hr));
@@ -508,11 +622,21 @@ bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t heigh
         desktopCopySrv_.Reset();
         return false;
     }
+    hr = device_->device()->CreateRenderTargetView(desktopCopy_.Get(), nullptr, &desktopCopyRtv_);
+    if (FAILED(hr)) {
+        Logger::instance().error(L"capture", L"CreateRenderTargetView for desktop copy failed: " + hresultToString(hr));
+        pool_.clear();
+        desktopCopy_.Reset();
+        desktopCopySrv_.Reset();
+        desktopCopyRtv_.Reset();
+        return false;
+    }
 
     pool_.setFootprintBytes(dxgiTextureBytes(width, height, format) * pool_.size());
     Logger::instance().debug(L"capture",
         L"Desktop Duplication texture pool initialized " +
         std::to_wstring(width) + L"x" + std::to_wstring(height) +
+        L" " + poolFormatName(format) +
         L" pool=" + std::to_wstring(pool_.size()) +
         L" (" + std::to_wstring(pool_.footprintBytes() / 1024) + L" KiB)");
 
@@ -604,6 +728,105 @@ bool DesktopDuplicationCapture::ensureCompositor() {
 
     compositorReady_ = true;
     return true;
+}
+
+bool DesktopDuplicationCapture::ensureBridgeResources(uint32_t width, uint32_t height, DXGI_FORMAT sdrFormat) {
+    if (!bridgeVs_ || !bridgePs_) {
+        ComPtr<ID3DBlob> vsBlob;
+        ComPtr<ID3DBlob> psBlob;
+        ComPtr<ID3DBlob> errorBlob;
+        HRESULT hr = D3DCompile(kBridgeShaderHlsl, sizeof(kBridgeShaderHlsl) - 1, "bridge.hlsl", nullptr,
+            nullptr, "VSMain", "vs_4_0", 0, 0, &vsBlob, &errorBlob);
+        if (FAILED(hr)) {
+            Logger::instance().error(L"capture", L"Bridge vertex shader compile failed: " + hresultToString(hr));
+            return false;
+        }
+        hr = D3DCompile(kBridgeShaderHlsl, sizeof(kBridgeShaderHlsl) - 1, "bridge.hlsl", nullptr,
+            nullptr, "PSMain", "ps_4_0", 0, 0, &psBlob, &errorBlob);
+        if (FAILED(hr)) {
+            Logger::instance().error(L"capture", L"Bridge pixel shader compile failed: " + hresultToString(hr));
+            return false;
+        }
+        hr = device_->device()->CreateVertexShader(
+            vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &bridgeVs_);
+        if (FAILED(hr)) {
+            Logger::instance().error(L"capture", L"Bridge CreateVertexShader failed: " + hresultToString(hr));
+            return false;
+        }
+        hr = device_->device()->CreatePixelShader(
+            psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &bridgePs_);
+        if (FAILED(hr)) {
+            Logger::instance().error(L"capture", L"Bridge CreatePixelShader failed: " + hresultToString(hr));
+            bridgeVs_.Reset();
+            return false;
+        }
+    }
+    bool stagingFits = bridgeStaging_ && bridgeStagingFormat_ == sdrFormat;
+    if (stagingFits) {
+        D3D11_TEXTURE2D_DESC staged{};
+        bridgeStaging_->GetDesc(&staged);
+        stagingFits = staged.Width == width && staged.Height == height;
+    }
+    if (!stagingFits) {
+        bridgeStaging_.Reset();
+        bridgeStagingSrv_.Reset();
+        // One texture, not a pool: a format wobble recreates this instead of
+        // the 500 MB capture pool.
+        D3D11_TEXTURE2D_DESC staged{};
+        staged.Width = width;
+        staged.Height = height;
+        staged.MipLevels = 1;
+        staged.ArraySize = 1;
+        staged.Format = sdrFormat;
+        staged.SampleDesc.Count = 1;
+        staged.Usage = D3D11_USAGE_DEFAULT;
+        staged.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        HRESULT hr = device_->device()->CreateTexture2D(&staged, nullptr, &bridgeStaging_);
+        if (FAILED(hr)) {
+            Logger::instance().warning(L"capture", L"Bridge staging texture creation failed: " + hresultToString(hr));
+            return false;
+        }
+        hr = device_->device()->CreateShaderResourceView(bridgeStaging_.Get(), nullptr, &bridgeStagingSrv_);
+        if (FAILED(hr)) {
+            Logger::instance().warning(L"capture", L"Bridge staging SRV creation failed: " + hresultToString(hr));
+            bridgeStaging_.Reset();
+            return false;
+        }
+        bridgeStagingFormat_ = sdrFormat;
+    }
+    return true;
+}
+
+void DesktopDuplicationCapture::normalizeIntoDesktopCopy() {
+    // Caller holds the immediate-context mutex. Unbind shader inputs first:
+    // desktopCopy_ is about to become a render target while its SRV may be
+    // bound from the previous cursor composite.
+    auto* ctx = device_->context();
+    ID3D11ShaderResourceView* nullSrvs[] = {nullptr, nullptr};
+    ctx->PSSetShaderResources(0, 2, nullSrvs);
+
+    D3D11_VIEWPORT viewport{};
+    viewport.Width = static_cast<float>(width_);
+    viewport.Height = static_cast<float>(height_);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &viewport);
+
+    ID3D11RenderTargetView* rtv = desktopCopyRtv_.Get();
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(bridgeVs_.Get(), nullptr, 0);
+    ctx->PSSetShader(bridgePs_.Get(), nullptr, 0);
+    ID3D11ShaderResourceView* srvs[] = {bridgeStagingSrv_.Get()};
+    ctx->PSSetShaderResources(0, 1, srvs);
+
+    ctx->Draw(3, 0);
+
+    ID3D11RenderTargetView* nullRtv = nullptr;
+    ctx->OMSetRenderTargets(1, &nullRtv, nullptr);
+    ctx->PSSetShaderResources(0, 1, nullSrvs);
 }
 
 void DesktopDuplicationCapture::updateCursorState(const DXGI_OUTDUPL_FRAME_INFO& frameInfo) {
@@ -753,10 +976,10 @@ void DesktopDuplicationCapture::compositeCursor(const std::shared_ptr<TextureSlo
         float rect[4];
         float desktopSize[2];
         uint32_t shapeType;
-        uint32_t hdrBypass; // 1 on R10/R16F targets: shader stays linear, skips 8-bit quantize
+        uint32_t hdrBypass; // 1 on pinned-HDR targets: the pool format (and the scaler mapping) never flaps mid-session, so cursor and tone-map always agree
     } constants{{leftNdc, topNdc, widthNdc, heightNdc}, {static_cast<float>(width_), static_cast<float>(height_)},
         cursorShapeType_,
-        (format_ == DXGI_FORMAT_R10G10B10A2_UNORM || format_ == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 1u : 0u};
+        (hdrPin_.pinnedHdr() && isHdrCaptureFormat(format_)) ? 1u : 0u};
     ctx->UpdateSubresource(cursorConstantBuffer_.Get(), 0, nullptr, &constants, 0, 0);
 
     D3D11_VIEWPORT viewport{};

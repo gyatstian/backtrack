@@ -13,11 +13,9 @@ namespace {
 
 constexpr size_t kMaxInputViewCacheEntries = 64;
 
-// Transient mode-switch/virtual-adapter blips must not pin SDR forever:
-// the HDR latch auto-clears after this cooldown (or on input format/dims
-// change) so tone-mapping is retried. Stays latched inside the window to
-// avoid per-frame log spam.
-constexpr auto kHdrRejectionCooldown = std::chrono::seconds(5);
+// HDR rejection backoff lives in capture/HdrStability.h (shared, tested): a
+// fixed retry window re-alternates tone-mapped and SDR frames on drivers
+// that only sometimes accept the HDR input space.
 
 // Only a refusal of the HDR color space latches the sticky SDR fallback.
 // Anything else under an HDR mapping (device loss, timeout, ...) is
@@ -52,8 +50,13 @@ bool D3D11FrameScaler::scale(
     if (hdrInputRejected_ && input.hdr) {
         const bool formatChanged = input.format != hdrRejectedFormat_ ||
             input.width != hdrRejectedWidth_ || input.height != hdrRejectedHeight_;
-        if (formatChanged ||
-            std::chrono::steady_clock::now() - hdrRejectedAt_ >= kHdrRejectionCooldown) {
+        if (formatChanged) {
+            // Fresh format, fresh chance: retry tone-mapping immediately.
+            hdrInputRejected_ = false;
+            hdrRejectStrikes_ = 0;
+            hdrRetryAfterCooldown = true;
+        } else if (std::chrono::steady_clock::now() - hdrRejectedAt_ >=
+            hdrRejectionCooldown(hdrRejectStrikes_)) {
             hdrInputRejected_ = false;
             hdrRetryAfterCooldown = true;
         }
@@ -266,13 +269,15 @@ D3D11FrameScaler::VpBltOutcome D3D11FrameScaler::tryVpBlt(
         // the cached VpState) with no pool rebuild.
         if (appliedHdrInputSpace_ && !hdrInputRejected_ && isHdrRejectionHr(bltHr)) {
             hdrInputRejected_ = true;
+            ++hdrRejectStrikes_;
             hdrRejectedAt_ = std::chrono::steady_clock::now();
             hdrRejectedFormat_ = input.format;
             hdrRejectedWidth_ = input.width;
             hdrRejectedHeight_ = input.height;
             Logger::instance().warning(L"capture",
                 L"D3D11 video processor rejected HDR input conversion (" +
-                hresultToString(bltHr) + L"); falling back to SDR interpretation");
+                hresultToString(bltHr) + L"); falling back to SDR interpretation, tone-map retry in " +
+                std::to_wstring(hdrRejectionCooldown(hdrRejectStrikes_).count()) + L"s");
             return VpBltOutcome::RetrySdr;
         }
         Logger::instance().warning(L"capture",
@@ -282,6 +287,7 @@ D3D11FrameScaler::VpBltOutcome D3D11FrameScaler::tryVpBlt(
 
     if (hdrRetryAfterCooldown && appliedHdrInputSpace_) {
         hdrRetryAfterCooldown = false;
+        hdrRejectStrikes_ = 0;
         Logger::instance().info(L"capture",
             L"D3D11 video processor HDR tone-mapping recovered after transient rejection");
     }
@@ -331,7 +337,7 @@ void D3D11FrameScaler::applyVideoProcessorState(const VpState& state) {
     // Interpreting them as gamma-22 SDR washes out color and clips
     // highlights; declaring the real input color space makes the
     // video processor tone-map down to the SDR output. A rejected
-    // conversion falls back to the SDR mapping for a cooldown so a
+    // conversion falls back to the SDR mapping with backoff so a
     // limited processor degrades to old behavior, never to frame
     // drops (finding 16).
     DXGI_COLOR_SPACE_TYPE inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -423,6 +429,7 @@ void D3D11FrameScaler::reset() {
     useCopiedInput_ = false;
     nv12Unavailable_ = false;
     hdrInputRejected_ = false;
+    hdrRejectStrikes_ = 0;
     hdrRejectedAt_ = {};
     hdrRejectedFormat_ = DXGI_FORMAT_UNKNOWN;
     hdrRejectedWidth_ = 0;

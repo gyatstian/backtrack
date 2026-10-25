@@ -167,6 +167,13 @@ add_backtrack_test(DecodeOrderTimestampsTests
 add_backtrack_test(SpscQueueTests
     SOURCES backtrack/tests/SpscQueueTests.cpp)
 
+# HdrStabilityTests covers capture/HdrStability.h alone (session pin ratchet,
+# sRGB bridge transfer, backoff schedule, HDR format predicate): the header
+# stays free of project includes beyond SDK types so the suite compiles as a
+# single file.
+add_backtrack_test(HdrStabilityTests
+    SOURCES backtrack/tests/HdrStabilityTests.cpp)
+
 # AudioConvertTests exercises audio/AudioConvert.cpp, which logs via core/Logger.cpp.
 add_backtrack_test(AudioConvertTests
     SOURCES

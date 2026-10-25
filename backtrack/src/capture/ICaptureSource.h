@@ -18,6 +18,10 @@ public:
     virtual uint32_t width() const = 0;
     virtual uint32_t height() const = 0;
     virtual uint64_t cursorOnlyFrames() const { return 0; }
+    // Session-pinned HDR interpretation (Desktop Duplication only) and the
+    // SDR surfaces bridged into it. Diagnostics mirrors, no settings backing.
+    virtual bool hdrPinned() const { return false; }
+    virtual uint64_t hdrBridgedFrames() const { return 0; }
     // Counts in-place source resolution changes handled without a rebind
     // (e.g. the WGC FramePool.Recreate path on a display-mode change). The
     // capture loop requests an encoder keyframe whenever this advances so the

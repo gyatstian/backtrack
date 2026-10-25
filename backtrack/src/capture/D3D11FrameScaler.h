@@ -2,6 +2,7 @@
 
 #include "capture/D3DDevice.h"
 #include "capture/GpuTexturePool.h"
+#include "capture/HdrStability.h"
 #include "core/Types.h"
 
 #include <d3d11_1.h>
@@ -127,11 +128,13 @@ private:
     // capture surface.
     bool useCopiedInput_ = false;
     bool nv12Unavailable_ = false;
-    // Sticky with cooldown: set when the video processor rejected an HDR
+    // Sticky with backoff: set when the video processor rejected an HDR
     // (PQ/scRGB) input color space, so later frames fall back to the plain
-    // SDR interpretation instead of failing every frame. Auto-clears on the
-    // next HDR frame after the cooldown or when input format/dims change.
+    // SDR interpretation instead of failing every frame. Tone-mapping is
+    // retried after hdrRejectionCooldown(hdrRejectStrikes_) or on input
+    // format/dims change; each consecutive rejection backs off further.
     bool hdrInputRejected_ = false;
+    int hdrRejectStrikes_ = 0;
     std::chrono::steady_clock::time_point hdrRejectedAt_{};
     DXGI_FORMAT hdrRejectedFormat_ = DXGI_FORMAT_UNKNOWN;
     uint32_t hdrRejectedWidth_ = 0;

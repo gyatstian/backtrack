@@ -38,16 +38,42 @@
 namespace backtrack {
 
 // hdrRejected covers two cases; split them here so a WGC washout never reads
-// as a driver refusal. stats() fields stay as-is.
+// as a driver refusal. stats() fields stay as-is. Backend + format + flip
+// count ride the same line so the HDR friend self-serves without a new row.
+// Format names mirror app's hdrFormatName; both stay local so the platform
+// contract stays limited to the backend display name.
+static std::wstring hdrFormatName(DXGI_FORMAT format) {
+    switch (format) {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return L"R10G10B10A2";
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return L"scRGB";
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return L"BGRA";
+    default:
+        return L"unknown";
+    }
+}
+
 static std::wstring hdrStatusLine(const RecordingStats& stats) {
+    const std::wstring detail =
+        std::wstring(L", ") + captureBackendDisplayName(stats.activeCaptureBackend) +
+        L", " + hdrFormatName(stats.hdrFormat) +
+        L", flips " + std::to_wstring(stats.hdrFlipCount);
     if (stats.hdrActive && stats.hdrRejected) {
-        return L"HDR: rejected (tone-mapping refused)";
+        return L"HDR: rejected (tone-mapping refused" + detail + L")";
     }
     if (stats.hdrActive) {
-        return L"HDR: active (tone-mapping)";
+        // Pinned single-mapping sessions self-report stability: flips stay 0
+        // and bridged counts the SDR surfaces normalized into the HDR mapping.
+        if (stats.hdrPinned) {
+            return L"HDR: active (tone-mapping, pinned" + detail +
+                L", bridged " + std::to_wstring(stats.hdrBridgedFrames) + L")";
+        }
+        return L"HDR: active (tone-mapping" + detail + L")";
     }
     if (stats.hdrRejected) {
-        return L"HDR: SDR on HDR monitor (WGC/DWM)";
+        return L"HDR: SDR on HDR monitor (WGC/DWM" + detail + L")";
     }
     return L"HDR: SDR";
 }

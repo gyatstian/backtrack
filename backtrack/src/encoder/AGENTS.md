@@ -89,6 +89,12 @@ share.
   lock-free. Do not implement it in terms of `stats()`. `stats()` and
   `capabilities()` serve a snapshot when the state mutex is held across a
   driver call instead of waiting, so diagnostics never block the encode.
+- AMF output VUI is pinned BT.709 (transfer, primaries, matrix, studio range
+  in `applyColorProperties`); input conversion stays driver AUTO. Explicit
+  input matrix/range pins deep-fried SDR on Adrenalin while the defaults
+  encode it exactly, so the driver owns conversion and we only describe the
+  stream. Color `setProp` failures stay warning-only: a driver that drops them still
+  encodes, and the log names the property.
 - Packets come out in decode order, with `pts100ns` in presentation order and
   `dts100ns` valid only with `hasDts`. Both backends set `hasDts` on every
   packet and take DTS from `DecodeOrderTimestamps`, which equals PTS when

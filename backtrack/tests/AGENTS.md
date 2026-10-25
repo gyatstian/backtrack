@@ -87,6 +87,14 @@ capture device, or a window.
     the journal), and the try_lock-only crash path proven against a lock held
     on another thread. Needs no COM or WASAPI: sessions enter as
     `SessionMuteCandidate` values with recording lambdas.
+  - `HdrStabilityTests` - `capture/HdrStability.h` alone, so the header must
+    stay free of project includes for the suite to compile as a single file.
+    Covers the session-pin ratchet (SDR start, HDR start from surface,
+    surfaces-decide over the OS poll, one-time upgrade, never downgrades),
+    the sRGB bridge transfer (exact black and paper-white endpoints, exact
+    0.5 midpoint, toe joint, white-scale and passthrough guards,
+    monotonicity, 1-LSB 8-bit round trip), the rejection backoff schedule,
+    and the HDR format predicate.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` defines
   `Mp4Muxer::muxToMp4` and `removeEmptyOutputReservation` itself so
@@ -117,7 +125,7 @@ capture device, or a window.
   inside the production budget of 4 attempts over ~2.1 s, and goes red if
   `ERROR_ACCESS_DENIED` is dropped from that retry set.
 - No suite covers the encoder backends, `mux/Mp4Muxer` (only its stub runs),
-  capture, the UI, or the UI-side settings flow. Changes there are verified by
+  capture beyond `capture/HdrStability.h`, the UI, or the UI-side settings flow. Changes there are verified by
   building and by hand.
 - Tests are CMake and CTest only. `backtrack.vcxproj` has no test targets, so a
   change that only builds under MSBuild is not verified here.

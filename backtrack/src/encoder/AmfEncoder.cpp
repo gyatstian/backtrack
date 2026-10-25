@@ -374,11 +374,13 @@ struct AmfEncoder::Impl {
         }
     }
 
-    // Pins BT.709 matrix/primaries/transfer with limited (studio) output range
-    // so clips decode with identical colors regardless of driver defaults.
-    // Input properties describe the incoming NV12 (converted by the capture
-    // scaler's video processor, or BGRA on the fallback path - both BT.709);
-    // output properties land in the stream VUI where the runtime supports it.
+    // Output VUI is pinned BT.709 matrix/primaries/transfer with limited
+    // (studio) range so clips decode with identical colors regardless of
+    // player defaults. Input conversion properties are deliberately left at
+    // driver AUTO: explicitly pinning InMatrixCoeff/InputFullRange uniformly
+    // deep-fried SDR output on AMD Adrenalin (RX 9070 XT observed) while the
+    // defaults encode it exactly, so the driver owns the conversion and we
+    // only describe the stream.
     void applyColorProperties(bool beforeInit) {
         if (beforeInit) {
             if (isHevc()) {
@@ -399,6 +401,8 @@ struct AmfEncoder::Impl {
                     amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)));
             setProp(encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_COLOR_PRIMARIES,
                     amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)));
+            setProp(encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_MATRIX_COEFF,
+                    amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_MATRIX_COEFF_BT_709)));
             setProp(encoder, AMF_VIDEO_ENCODER_HEVC_OUTPUT_FULL_RANGE_COLOR,
                     amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_NOMINAL_RANGE_STUDIO)));
         } else {
@@ -406,6 +410,8 @@ struct AmfEncoder::Impl {
                     amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_TRANSFER_CHARACTERISTIC_BT709)));
             setProp(encoder, AMF_VIDEO_ENCODER_OUTPUT_COLOR_PRIMARIES,
                     amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_PRIMARIES_BT709)));
+            setProp(encoder, AMF_VIDEO_ENCODER_OUTPUT_MATRIX_COEFF,
+                    amf::AMFVariant(static_cast<amf_int64>(AMF_COLOR_MATRIX_COEFF_BT_709)));
             setProp(encoder, AMF_VIDEO_ENCODER_OUTPUT_FULL_RANGE_COLOR, amf::AMFVariant(false));
         }
     }

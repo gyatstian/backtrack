@@ -1,6 +1,5 @@
 #pragma once
 
-#include "core/Logger.h"
 #include "core/Types.h"
 #include "mux/WavWriter.h"
 
@@ -10,36 +9,29 @@
 
 namespace backtrack {
 
-// Hard limit on PTS gap-fill, shared by the recording path
-// (Mp4Muxer::writeTimelineAudioPacket) and the replay path
-// (ReplayBuffer::writeTimelineAudio). A replay window runs up to an hour, so
-// one unavailable loopback device would otherwise be written out as tens of
-// minutes of silence, and the mux free-space preflight then demands hundreds
-// of megabytes for a clip whose real audio is a few. Past the cap the pacing
-// pointer resyncs to the incoming packet, compressing the audio timeline
-// instead of inflating the temporary WAV.
-inline constexpr int64_t kMaxSilenceGapFill100ns = 10 * kHundredNanosecondsPerSecond;
-
 // Open-ended window bound for paceAudioPacket: the recording path has no video
 // end yet, so gaps are measured against the incoming packet alone.
 inline constexpr int64_t kNoAudioWindowEnd = (std::numeric_limits<int64_t>::max)();
 
 // Advances nextPts100ns across one packet on the shared audio timeline:
-// drops format-mismatched callers' responsibility (checked by the caller),
-// fills a PTS gap with at most kMaxSilenceGapFill100ns of silence, trims an
-// overlap with already-written audio, and writes at most up to endPts100ns.
-// The replay path passes its video end; the recording path passes
+// format mismatch is the caller's responsibility (checked by the caller),
+// fills the full PTS gap with silence so the saved audio keeps the real gap
+// duration (a gap is never compressed against the unchanged video track),
+// trims an overlap with already-written audio, and writes at most up to
+// endPts100ns. The replay path passes its video end; the recording path passes
 // kNoAudioWindowEnd. Returns false only on a write failure (typically disk
 // full); the caller maps that onto its own failure (fail the save vs flag the
 // recording). Zeroed writer timing means the writer was never opened, which
-// the caller owns, so it skips rather than fails here.
+// the caller owns, so it skips rather than fails here. logSubsystem and
+// fileName stay in the signature because both callers pass them; they are not
+// used here anymore.
 inline bool paceAudioPacket(
     WavWriter& writer,
     int64_t& nextPts100ns,
     const AudioPacket& packet,
     int64_t endPts100ns,
-    const wchar_t* logSubsystem,
-    const wchar_t* fileName) {
+    const wchar_t* /*logSubsystem*/,
+    const wchar_t* /*fileName*/) {
     if (packet.frameCount == 0 || packet.bytes.empty()) {
         return true;
     }
@@ -60,27 +52,23 @@ inline bool paceAudioPacket(
     }
 
     if (packet.pts100ns > nextPts100ns) {
+        // The whole gap becomes silence so post-outage audio lands at its true
+        // absolute time. The old 10 s cap resynced the pacing pointer past the
+        // residual gap and played resumed audio (gap - 10 s) early against the
+        // unchanged video track.
         const int64_t gap100ns = std::min(packet.pts100ns, endPts100ns) - nextPts100ns;
-        const int64_t fill100ns = std::min<int64_t>(gap100ns, kMaxSilenceGapFill100ns);
+        // A gap this large cannot be stored anyway (thousands of TB of
+        // silence); saturating keeps the multiply below well-defined and lets
+        // the write fail on disk-full instead of overflowing.
+        const int64_t maxSafeGap100ns =
+            (std::numeric_limits<int64_t>::max)() / static_cast<int64_t>(samplesPerSec);
+        const int64_t fill100ns = gap100ns > maxSafeGap100ns ? maxSafeGap100ns : gap100ns;
         const auto gapFrames = static_cast<uint64_t>(
             (fill100ns * static_cast<int64_t>(samplesPerSec)) / kHundredNanosecondsPerSecond);
-        const bool silenceWritten = writer.writeSilenceFrames(gapFrames);
-        nextPts100ns += static_cast<int64_t>((gapFrames * kHundredNanosecondsPerSecond) / samplesPerSec);
-        if (!silenceWritten) {
+        if (!writer.writeSilenceFrames(gapFrames)) {
             return false;
         }
-        if (fill100ns < gap100ns) {
-            // Cap hit: bridge with the capped silence, then resynchronize the
-            // pacing pointer to the incoming packet. Without the resync every
-            // later packet would still lag the residual gap and trigger
-            // another capped fill, re-inflating the stream. Post-outage audio
-            // then plays (gap - limit) earlier against video than captured,
-            // which beats an unbounded silent WAV.
-            nextPts100ns = std::min(packet.pts100ns, endPts100ns);
-            Logger::instance().warning(logSubsystem,
-                std::wstring(L"Audio gap exceeded the silence-fill limit; audio timeline compressed: ") +
-                fileName);
-        }
+        nextPts100ns += static_cast<int64_t>((gapFrames * kHundredNanosecondsPerSecond) / samplesPerSec);
         if (nextPts100ns >= endPts100ns) {
             return true;
         }

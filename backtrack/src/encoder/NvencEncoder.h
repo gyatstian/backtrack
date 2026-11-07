@@ -13,7 +13,7 @@ public:
 
     bool initialize(D3DDevice& device, const VideoSettings& settings) override;
     void requestKeyFrame() override;
-    void resetInputResources() override;
+    bool resetInputResources() override;
     bool encodeFrame(const GpuFrame& frame, EncodedPacket& packet) override;
     void encodeFrame(const GpuFrame& frame, std::vector<EncodedPacket>& packets) override;
     void drain(std::vector<EncodedPacket>& packets) override;
@@ -22,9 +22,12 @@ public:
     EncoderStats stats() const override;
     bool encoderAvailable() const noexcept override;
     DXGI_FORMAT preferredInputFormat() const override;
+    uint32_t inputRetentionBudget() const override;
 
 private:
+    friend struct NvencEncoderTestAccess;
     struct Impl;
+    void abandonImpl();
     std::unique_ptr<Impl> impl_;
 };
 

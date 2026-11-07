@@ -24,6 +24,9 @@ League of Legends kill reminder.
   `ChampionKill` names the active player (`riotId`, `summonerName`, or
   `riotIdGameName`, compared tag-insensitively). The window turns that into
   `kLeagueKillDetectedMessage`. Kill reminder only: it never triggers a save.
+- The first feed snapshot after connection and one whose maximum id decreases or
+  maximum time drops by more than 0.001 seconds establish a baseline without
+  replaying kills. Empty snapshots retain the previous baseline.
 - Live Client Data responses are size-capped (`kMaxHttpResponseBytes`, 4 MiB,
   in `WinHttpJson.h`). Port
   2999 is loopback but not ours, so an oversized body is refused, never
@@ -31,10 +34,13 @@ League of Legends kill reminder.
   proxy cannot redirect the poll off the machine. That cap is on the raw
   `std::string` body; `trimText` only ever sees the extracted player names
   inside it, so its erase-from-front cost is bounded by a name, not by the body.
-- `WinHttpJson.h` is the one WinHTTP GET (`httpGetBody`: status-checked,
-  capped, per-stage logging) and the one `\u`-safe JSON string reader for both
-  the League poll and the update check in `ui`. `ignoreCert` exists for the
-  self-signed local game endpoint only, never for internet hosts.
+- `WinHttpJson.h` owns the status-checked, size-capped GET and `\u`-safe JSON
+  string reader for League and the update check in `ui`. League uses an async
+  session: stop or a five-second total request deadline closes the request, and
+  its callback retains the read buffer and parent handles until handle closing.
+  the update check still supplies a synchronous session and has only per-stage
+  timeouts; switching it to the cancellable overload requires a UI change.
+  `ignoreCert` is for the self-signed local endpoint only.
 - Liveness and failures are published through `stats()` (`gameAvailable`,
   `lastError`) for the Diagnostics page; the worker sets them on
   detect/loss/fault transitions, not per poll.
@@ -59,17 +65,16 @@ League of Legends kill reminder.
 - The activity text names the foreground application, using the same source as
   replay naming (`foregroundApplicationName`). Keep those two consistent; a
   mismatch is visible to users as "it names the wrong game".
-- Leaving the worker sends that same null-activity frame and closes the pipe, so
-  a clean exit cannot leave a ghost presence in the user's Discord. Do that
-  before dropping the handle. Closing is enough: do not add `FlushFileBuffers`.
-  On a named pipe it waits for Discord to read everything still buffered, so a
-  client that stopped reading would wedge the worker and `stop()`'s join with
-  it, breaking the one-loop-iteration cost below.
+- pipe reads and writes are overlapped, stop-aware and deadline-limited. a
+  completion wait owns each operation's duplicate handle, `OVERLAPPED` and
+  buffer until the kernel signals completion, including after cancellation.
+  exit attempts a null-activity frame with a 100 ms I/O deadline, then closes
+  the pipe; an unresponsive peer may retain stale presence. do not add
+  `FlushFileBuffers`.
 - Both workers run on their own named thread, watch `stopRequested_`, and wrap
   their body so no exception escapes the thread procedure. Neither integration
   may fail app startup: a missing game client or Discord only logs and retries.
-  `stop()` joins the worker, so it costs up to one loop iteration on the calling
-  thread.
+  `stop()` joins the worker; cancellation completion can outlive that join.
 
 ## Work Guidance
 
@@ -81,11 +86,13 @@ League of Legends kill reminder.
 
 ## Verification
 
-No automated test; both depend on external applications. Manual check: with
-League running, confirm the kill callback fires; with Discord running, confirm
-the presence appears, updates when the foreground application changes (the
-foreground is only re-read every `kActivityUpdateInterval`), and disappears on
-exit.
+`backtrack/tests/LeagueOfLegendsIntegrationTests.cpp`,
+`backtrack/tests/DiscordRichPresenceTests.cpp`, and
+`backtrack/tests/WinHttpJsonTests.cpp` are not registered with CTest. Manual
+check: with League running, confirm the kill callback fires; with Discord
+running, confirm the presence appears, updates when the foreground application
+changes (the foreground is only re-read every `kActivityUpdateInterval`), and
+disappears on exit.
 
 ## Child DOX Index
 

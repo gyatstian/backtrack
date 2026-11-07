@@ -9,9 +9,10 @@ GPU scaler that converts frames to whatever the active encoder wants.
 ## Ownership
 
 - Owns: `ICaptureSource`, `WgcCaptureSource`, `DesktopDuplicationCapture`,
-  `D3DDevice`, `D3D11FrameScaler`, `HdrStability.h`, `GpuTexturePool.h`, `GpuPoolBuilder.h`.
-  `ICaptureSource` also carries the HDR diagnostics defaults (`hdrPinned`,
-  `hdrBridgedFrames`); only Desktop Duplication overrides them.
+  `D3DDevice`, `D3D11FrameScaler`, `HdrStability.h`, `GpuTexturePool.h`,
+  `GpuPoolBuilder.h`, `WgcCopyPool.h`.
+  `ICaptureSource` carries the HDR diagnostics defaults (`hdrPinned`,
+  `hdrBridgedFrames`); no source currently overrides them.
 - Does not own: encoder input format decisions (the encoder declares its
   preference through `IEncoder::preferredInputFormat`) or the frame queue, which
   belongs to `app`.
@@ -22,53 +23,56 @@ GPU scaler that converts frames to whatever the active encoder wants.
   need a default implementation; a new backend must be selected in
   `RecorderController::createCaptureSource` and report itself through
   `backend()`.
-- Frame format follows the source, not this folder. `WgcCaptureSource` is always
-  BGRA: its `Direct3D11CaptureFramePool` is created with
-  `B8G8R8A8UIntNormalized`. `DesktopDuplicationCapture` adopts whatever format
-  the duplication texture reports and republishes it in `GpuFrame::format`; on
-  an advanced-color output that is `R10G10B10A2_UNORM` or
-  `R16G16B16A16_FLOAT`.
+- `WgcCaptureSource` uses BGRA. desktop duplication requests
+  `R16G16B16A16_FLOAT` and `B8G8R8A8_UNORM` through `DuplicateOutput1`;
+  `E_NOINTERFACE`, `E_NOTIMPL`, `E_INVALIDARG`, and `DXGI_ERROR_UNSUPPORTED`
+  fall back to legacy BGRA. transient errors retry the same API. other returned
+  formats are rejected as source loss. R10 is not negotiated: its format alone
+  does not establish PQ.
 - `GpuFrame::lease` (`std::shared_ptr<void>`) keeps the source-side surface
   alive to the end of the frame: a WGC zero-copy lease pins the
   `Direct3D11CaptureFrame`, every other path pins the pool `TextureSlot`.
-  Dropping it early releases a surface the encoder is still reading.
+  Dropping it early releases a surface the encoder is still reading. `app`
+  releases capture-held frames only after the encoder reset acknowledges every
+  mapping; a failed reset keeps them alive. WGC shutdown waits 2 s for
+  outstanding leases and then proceeds anyway, so a wedged encoder can still
+  make session close block; that is a last-resort hang risk, not a safe
+  retirement barrier.
 - Desktop Duplication is per-output and must never guess output 0.
   `initialize` resolves `target.monitor` (or `settings.monitorIndex`) to an
   `IDXGIOutput` on the device's own adapter and fails when the monitor is not
   there. `app` pre-filters the same case against `D3DDevice::adapterIndex()`
   before choosing the backend, because the wrong adapter silently records the
   wrong monitor.
+- Desktop Duplication returns the image unrotated and reports the display
+  rotation through `DXGI_OUTDUPL_DESC::Rotation`; `ModeDesc` carries the
+  rotated (physical) mode dimensions. `DesktopDuplicationCapture` queries it
+  at `initialize`, stores `rotation_`, and normalizes `width_`/`height_` to
+  the unrotated texture dimensions (swap for 90/270). The cursor position
+  DXGI reports is in physical (rotated) coordinates, so `compositeCursor`
+  maps it to the texture space through the header-inline
+  `unrotatedDimensions`/`transformCursorPosition` helpers (the cursor shape
+  itself stays upright; the saved output is in the unrotated orientation).
+  `rotation_` resets to `UNSPECIFIED` on loss and shutdown.
 - A source never rebinds or recovers itself. Both implementations latch their
   loss flag - `WgcCaptureSource` on `item.Closed`, a WinRT `hresult_error`, or a
   failed pool recreate, `DesktopDuplicationCapture::markLost` on ACCESS_LOST,
   INVALID_CALL, DEVICE_REMOVED, DEVICE_RESET, `E_INVALIDARG`, or any other
   failed `AcquireNextFrame` - and `acquireNextFrame` then returns false
   immediately. `app` watches `isDeviceLost()` and owns every recovery.
-- `GpuFrame::hdr` is set only by `DesktopDuplicationCapture`, and only in a
-  pinned HDR session (`HdrSessionPin` in `HdrStability.h`) on the pinned pool
-  format (`R10G10B10A2_UNORM` PQ or `R16G16B16A16_FLOAT` scRGB). The pin
-  ratchets: the first surface pins HDR, an HDR surface upgrades an SDR session
-  once, and nothing downgrades mid-session. The init-time OS poll never
-  pre-pins: it stayed HDR for whole sessions whose every surface arrived BGRA,
-  and pooling scRGB on the poll alone forces those SDR-range frames through
-  the HDR tone-map. An SDR surface arriving in a pinned session is staged and normalized to scRGB-linear
-  by the `kBridgeShaderHlsl` fullscreen pass (`srgbChannelToLinear`, the exact
-  CPU-mirrored transfer tested in `HdrStabilityTests`), so bridged and native
-  frames take the identical tone-map path and one GOP never mixes
-  interpretations. The bridge renders into the desktop copy (which carries a
-  render-target view for exactly this) before the slot copy and cursor
-  composite, so cursor and downstream reads see current pixels either way.
-  Every other frame, including every WGC frame, leaves `hdr` false; WGC assigns
-  `hdr = false` explicitly on both emit paths so a stale DD `true` can never
-  leak across a backend switch.
-- `resolutionChangeCount()` advances when a source handles a change without a
-  rebind: the WGC `FramePool.Recreate` path on a display-mode change, and
-  `DesktopDuplicationCapture` on the one-time SDR->HDR upgrade
-  (`applyHdrUpgrade`), a genuine HDR<->HDR (PQ<->scRGB) pool adopt, or a pool
-  recreate for a size change. An SDR surface in a pinned session bridges with
-  no recreate and no bump, so an oscillation storm costs one shader pass per
-  frame, not a 500 MB pool rebuild plus a GOP break per flap. The capture loop
-  then requests an encoder keyframe so the jump never lands mid-GOP.
+- desktop duplication sets `GpuFrame::hdr` for FP16 scRGB surfaces only;
+  BGRA and WGC frames remain SDR. the flag selects the scaler's linear-input
+  mapping, not proof that an FP16 surface contains HDR highlights. the output
+  color poll does not label pixels. a BGRA/scRGB transition adopts the arriving
+  format instead of bridging: the old bridge assumed an unverified SDR white
+  level and could not reconstruct clipped highlights.
+- `resolutionChangeCount()` advances on an in-place size or format change.
+  desktop duplication recreates its pool on each BGRA/scRGB transition, so
+  repeated transitions can cause visible brightness changes and pool churn.
+  the capture loop requests a keyframe on each reported change. WGC reports
+  the change before attempting `FramePool.Recreate`, allowing the controller to
+  drain old frame leases and encoder registrations first. `WgcCopyPool` rebuilds
+  lazily when the fallback texture size differs from the new capture size.
 - Cursor capture is per source, not shared. WGC delegates to the session
   (`IsCursorCaptureEnabled`), and `setCursorCaptureEnabled` re-applies it to the
   live session without a rebind. Desktop Duplication composites the pointer
@@ -76,12 +80,13 @@ GPU scaler that converts frames to whatever the active encoder wants.
   AND/XOR and alpha-XOR paths monochrome and masked-color shapes need - which is
   why its pool slots carry `D3D11_BIND_RENDER_TARGET`; its
   `setCursorCaptureEnabled` only flips a flag the next acquired frame reads.
-  The cursor shader's `hdrBypass` keys off the session pin (`hdrPin_.pinnedHdr()`
-  plus pool format), which never moves mid-session, so cursor and tone-map
-  always agree; it stays 0 on 8-bit targets (legacy quantize +
-  0.5-selector paths for monochrome shapes) and 1 on stable-HDR `R10G10B10A2_UNORM` /
-  `R16G16B16A16_FLOAT` targets, where blending stays linear so PQ/scRGB
-  highlights neither clip nor band.
+  `hdrBypass` avoids 8-bit quantization on scRGB targets. HDR cursor color,
+  white level, and XOR approximations still need hardware validation.
+  DXGI reports the pointer shape only when it changes, so the CPU-side
+  shape/position/visibility is carried across a rebuild on the same output
+  (`DesktopDuplicationCursorCarry`) instead of blanking the cursor until the
+  next pointer update; a different monitor or a loss (`markLost`) clears the
+  carry so a stale cursor is never composited.
 - `D3DDevice` owns the adapter selection and reports the vendor the encoder
   factory keys off. Its `immediateContextMutex()` must be held by every caller
   issuing immediate-context work; teardown and recreation are serialized
@@ -119,16 +124,11 @@ GPU scaler that converts frames to whatever the active encoder wants.
   `hdrInputRejected()` / `hdrMappingActive()` expose the latch and the applied
   mapping; both are read by `app` only under `pipelineGpuMutex_`, which also
   guards every mutation.
-- Desktop Duplication polls HDR state at most once per second through its cached
-  `IDXGIOutput6` (`colorProbe_`, no factory walk; falls back to
-  `monitorHasAdvancedColor` when the probe is gone) into a raw poll state that
-  is diagnostics-only. Surfaces decide: the first one pins the session
-  through `HdrSessionPin::begin`, a later HDR surface upgrades it once
-  through `noteSurfaceFormat`. `hdrActive()` exposes the pin and
-  `hdrChangeCount()` its upgrades; `hdrBridgedFrames()` counts bridged
-  surfaces. The pool stays empty until the first acquired surface reveals its
-  real format, so an HDR session never pays a BGRA recreate to get there; an
-  SDR-first session pools BGRA and upgrades once if HDR arrives.
+- desktop duplication polls output color state through cached `IDXGIOutput6`
+  at most once per second, with `monitorHasAdvancedColor` as fallback. it is
+  not used to infer the surface format. the pool stays empty until the first
+  acquired surface; later format changes use the same pool recreation path as
+  size changes.
 - The scaler prunes cached input views whose texture is otherwise unreferenced.
   Views pin their texture, so a missed prune holds GPU memory.
 - Textures come from fixed `GpuTexturePool` pools sized by
@@ -144,6 +144,14 @@ GPU scaler that converts frames to whatever the active encoder wants.
   itself is `wgcFramePoolSizeForQueueLimit`: `frameQueueLimit + 2`, 3..8);
   hitting it drops that frame onto the copy path instead of holding the
   `Direct3D11CaptureFrame`.
+- The scaler's output pool is the encoder-feeding pool and is sized separately:
+  `encoderFeedingPoolSizeFor(queueLimit, encoderRetention)` (`queueLimit +
+  retention + 1`, clamped 5..64) from the encoder's `inputRetentionBudget`,
+  so a deep NVENC lookahead session that retains accepted inputs before
+  producing output cannot exhaust it and drop frames. Only this feeding pool
+  grows; the queue-derived capture and source pools are intermediate and stay
+  capped at 16. `app` re-negotiates it after encoder initialize and on every
+  handoff.
 - Every pool teardown invalidates any GPU registration the consumer still holds
   for those textures, so `releaseResources()` bumps `poolGeneration()` and the
   caller must drop its registrations when that value changes across a call. The
@@ -166,26 +174,24 @@ GPU scaler that converts frames to whatever the active encoder wants.
 
 ## Verification
 
-`HdrStabilityTests` (CTest) covers the pure logic in `HdrStability.h`: the
-session-pin ratchet, the sRGB bridge transfer, the rejection backoff, and the
-format predicate. Everything GPU-bound (pool pinning, bridge pass, cursor
-bypass) is verified by building Release and confirming the Diagnostics page
-reports the expected selected and active capture backend, the HDR line
-(active / rejected / SDR), capture size, dropped
-frames, and cursor-only desktop frames on a machine with a hardware encoder.
-Manual HDR check (needs an HDR monitor with the BGRA<->scRGB oscillation, no
-suite can drive a duplication surface): record the desktop, then confirm the
-HDR line reads `active (tone-mapping, pinned, ..., flips 0)` with a growing
-`bridged` count while oscillating, no per-second `HDR state changed` or
-`Capture surface changed` lines in the log, and no brightness flicker in the
-saved clip. A uniformly deep-fried pinned clip (crushed mids, boosted
-saturation for the whole duration) means SDR-range frames reached the HDR
-tone-map: expect `pool=BGRA` SDR sessions in the log instead, and scRGB/R10
-pools only after a genuine HDR surface (one `Capture surface changed` line
-plus one GOP restart). Discriminator for a mixed-tenure session: record a
-static gray ramp with OS HDR on (pin build) and with OS HDR off (SDR path),
-then compare mid-gray Y; equal native/bridged tenures clear the bridge
-transfer and indict the driver's G10 tone-map on SDR-range input.
+`HdrStabilityTests` (CTest) exercises production duplication negotiation with
+fake API calls, format acceptance, retries, and HDR rejection backoff.
+`DesktopDuplicationRotationTests` (CTest) exercises the header-inline rotation
+coordinate helpers (dimension normalization and cursor transform for 90/180/270)
+and the cursor carry across a same-output rebuild, without a D3D device. `WgcCopyPoolTests` (CTest) exercises fallback resize with WARP.
+`D3D11FrameScalerTests` (CTest) uses WARP and a fake video device to check the
+copied-input fallback and NV12 failure handling.
+
+on HDR hardware, compare recorded gray and highlight ramps with the displayed
+image and an SDR reference, including multiple SDR white levels, fullscreen
+content, cursor shapes, and BGRA/scRGB transitions. verify SDR capture and
+recovery after display changes as well. the fake does not validate driver color
+conversion, tone mapping, cursor appearance, or actual HDR luminance.
+
+on rotated hardware, verify the saved output is in the unrotated orientation
+with correct dimensions and that the cursor tracks content in all four
+orientations; the fake does not validate the OS-provided rotation value, the
+actual texture orientation, or cursor appearance.
 
 ## Child DOX Index
 

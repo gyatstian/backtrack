@@ -395,9 +395,8 @@ void MainWindow::switchPage(Page page) {
         stashVisibleSettings();
     }
     if (previousPage == Page::Library) {
-        // Do not keep processing Shell thumbnails after leaving the library. Results already
-        // in thumbnailCache_ remain available when the page is rebuilt.
-        clearClipThumbnails();
+        cancelLibraryScan();
+        releaseClipThumbnailCache();
     }
 
     // Diagnostics has no asynchronous UI work. Library thumbnail callbacks can arrive after
@@ -544,7 +543,6 @@ void MainWindow::clearPageControls() {
     settingsCategoryButtons_.clear();
     renameEdit_ = nullptr;
     renameEditButton_ = nullptr;
-    selectedClipIndex_ = static_cast<size_t>(-1);
     fpsEdit_ = nullptr;
     resolutionModeCombo_ = nullptr;
     widthEdit_ = nullptr;
@@ -792,15 +790,6 @@ HWND MainWindow::addSectionLabel(const wchar_t* text, int x, int y, int width) {
 }
 
 void MainWindow::buildSettingsPage() {
-    // Re-sync from the recorder only when its state is trustworthy: right
-    // after Save the ApplySettings action is still queued/running on the
-    // worker thread, so controller_.settings() can lag behind what the user
-    // just saved. Pulling then would render stale values (e.g. an unchecked
-    // "buffer on disk") and poison the dirty-detection baseline.
-    if (!settingsDirty_ && !controllerActionPending_.load()) {
-        settings_ = controller_.settings();
-        savedSettings_ = settings_;
-    }
     buildSettingsCategoryTabs(78);
     buildSettingsCategoryBody();
     addDirtySaveButton();
@@ -1623,12 +1612,6 @@ void MainWindow::buildSettingsGameIntegrationsPage() {
 }
 
 void MainWindow::buildCapturePage() {
-    // Same pending-action guard as buildSettingsPage above.
-    if (!settingsDirty_ && !controllerActionPending_.load()) {
-        settings_ = controller_.settings();
-        savedSettings_ = settings_;
-    }
-
     constexpr int kX = 44;
     constexpr int kLabelWidth = 160;
     constexpr int kControlX = 224;

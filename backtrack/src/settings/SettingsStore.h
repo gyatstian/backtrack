@@ -10,8 +10,11 @@ class SettingsStore {
 public:
     explicit SettingsStore(std::filesystem::path path);
 
-    AppSettings load() const;
-    void save(const AppSettings& settings) const;
+    enum class LoadStatus { Missing, Failed, Loaded };
+
+    AppSettings load(LoadStatus* status = nullptr) const;
+    bool save(const AppSettings& settings) const;
+    bool normalizeLoaded(const AppSettings& settings, LoadStatus status) const;
 
     const std::filesystem::path& path() const { return path_; }
 

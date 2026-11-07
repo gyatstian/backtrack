@@ -18,9 +18,34 @@ namespace backtrack {
 inline constexpr uint32_t kMinTexturePoolSize = 5;
 inline constexpr uint32_t kMaxTexturePoolSize = 16;
 
+// Ceiling for the encoder-feeding pool (the scaler's output pool). Capture
+// and source pools stay capped at kMaxTexturePoolSize: they only feed the
+// scaler and never see the encoder's reorder retention. The scaler output is
+// the last pool the encoder reads from, so it must hold every accepted input
+// the encoder retains before producing output (NVENC lookahead can pin 31)
+// plus the queue and the capture loop's held/scale slot. 64 covers the
+// deepest NVENC budget: 31 lookahead + 2 B-frame + 4 bitstream buffers + 8
+// queue limit + 1 held-frame slack.
+inline constexpr uint32_t kMaxEncoderFeedingPoolSize = 64;
+
+// Sizes the encoder-feeding pool from the negotiated input-retention budget:
+// queued frames each pin one slot, the encoder retains `encoderRetention`
+// accepted inputs (IEncoder::inputRetentionBudget) before producing output,
+// and one slot is held as the in-flight scale / lastFrame slack. The queue
+// derived capture pools are NOT grown by this; only the final feeding pool.
+inline uint32_t encoderFeedingPoolSizeFor(
+    uint32_t frameQueueLimit,
+    uint32_t encoderRetention) {
+    return std::clamp<uint32_t>(
+        frameQueueLimit + encoderRetention + 1,
+        kMinTexturePoolSize,
+        kMaxEncoderFeedingPoolSize);
+}
+
 // One knob for every capture and scaler texture pool, so a queue-limit
 // mapping change is a single edit here. (RecorderController keeps its own
-// copy for the scaler feed; it is the only other site.)
+// copy as the pre-encoder default; the scaler's encoder feed now uses
+// encoderFeedingPoolSizeFor above.)
 inline uint32_t texturePoolSizeForQueueLimit(uint32_t frameQueueLimit) {
     return std::clamp<uint32_t>(
         frameQueueLimit + 4, kMinTexturePoolSize, kMaxTexturePoolSize);

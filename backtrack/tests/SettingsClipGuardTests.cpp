@@ -352,9 +352,9 @@ void testUtf8RoundTripsThroughSaveAndLoad() {
 // Holding settings.ini with no FILE_SHARE_* denies both write and delete, so the
 // swap fails with ERROR_SHARING_VIOLATION after the temp file was already
 // written. What must survive is the previous file, byte for byte: a save that
-// could not complete may not damage what was already there. save() returns void
-// and reports through the logger, which this suite does not link, so the
-// observable is disk state alone.
+// could not complete may not damage what was already there. save() reports that
+// failure through its return value and through the logger, which this suite does
+// not link, so the observable is the status plus the disk state.
 void testFailedSavePreservesTheOldFileAndLeavesNoTemp() {
     const auto path = settingsPath(L"sharing_violation");
     const backtrack::SettingsStore store(path);
@@ -365,7 +365,7 @@ void testFailedSavePreservesTheOldFileAndLeavesNoTemp() {
     original.clipDirectory = testRoot() / L"clips";
     original.video.fps = 123;
     original.replay.seconds = 777;
-    store.save(original);
+    expect(store.save(original), "the baseline settings save reported failure");
     const std::vector<char> before = readFileBytes(path);
     expect(!before.empty(), "the baseline settings file was not written");
 
@@ -377,7 +377,7 @@ void testFailedSavePreservesTheOldFileAndLeavesNoTemp() {
     AppSettings replacement = original;
     replacement.video.fps = 45;
     replacement.replay.seconds = 30;
-    store.save(replacement);
+    expect(!store.save(replacement), "a save that could not swap still reported success");
 
     CloseHandle(held);
 
@@ -388,7 +388,7 @@ void testFailedSavePreservesTheOldFileAndLeavesNoTemp() {
 
     // The lock is gone, so the same save must now land: the failure above must
     // be the lock's doing and not a broken store or an early return.
-    store.save(replacement);
+    expect(store.save(replacement), "the unlocked save reported failure");
     const AppSettings reloaded = store.load();
     expect(reloaded.video.fps == 45 && reloaded.replay.seconds == 30,
         "save did not take effect once the file was no longer locked");
@@ -808,8 +808,10 @@ void testClipPathGateRejectsEverythingOutsideTheClipDirectory() {
 }
 
 // Clips saved with per-game folders on must still show up in the library: the
-// listing scans one level of subfolders, while dot-directories like
-// .backtrack_tmp (staged .publish.mp4 files) are never finished clips.
+// listing scans the root, its game folders, and the legacy clips/ child. Legacy
+// dot folders stay discoverable because they can hold game clips, but a staged
+// .publish[.n].mp4 directly in .backtrack_tmp can be incomplete and is not a
+// clip.
 void testListClipsIncludesGameSubfolders() {
     std::error_code ignored;
     std::filesystem::remove_all(testRoot(), ignored);
@@ -818,7 +820,7 @@ void testListClipsIncludesGameSubfolders() {
     writeFile(root / L"root.mp4");
     writeFile(root / L"League of Legends" / L"game.mp4");
     writeFile(root / L"clips" / L"legacy.mp4");
-    writeFile(root / L".backtrack_tmp" / L"staged.mp4");
+    writeFile(root / L".backtrack_tmp" / L"clip.publish.2.mp4");
 
     backtrack::ClipManager manager(root);
     const auto clips = manager.listClips();

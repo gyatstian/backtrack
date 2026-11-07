@@ -27,11 +27,13 @@ public:
     void stop();
 
 private:
+    friend struct DiscordRichPresenceTestAccess;
+
     void workerLoop();
     bool connect();
     void disconnect();
     bool handshake();
-    bool sendFrame(int opcode, const std::string& payload);
+    bool sendFrame(int opcode, const std::string& payload, bool exitClear = false);
     bool drainInbox();
     bool updateActivity(const std::string& gameName, long long startUnixSeconds);
 

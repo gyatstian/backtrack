@@ -69,13 +69,42 @@ uint64_t audioSourceChunkFrames(const AudioSource& source) {
     return std::max<uint64_t>(1, std::min<uint64_t>(kMaxAudioSourceChunkFrames, kAudioSourceChunkBytes / blockAlign));
 }
 
+// parseWav trusts the declared RIFF extent while it is plausible, so a source
+// WAV that crossed the 4 GiB RIFF boundary (WavWriter's large-file form: data
+// size clamped to the uint32 maximum, data runs to EOF) reads back capped at
+// that boundary. When the header declares that clamp, extend the extent to the
+// real file so long recordings mix in full. A smaller declared size means real
+// trailing chunks, which are not audio.
+void extendClampedWavExtent(const std::filesystem::path& path, WavInfo& info) {
+    std::error_code error;
+    const auto fileBytes = std::filesystem::file_size(path, error);
+    if (error || info.dataOffset < 8 ||
+        info.dataOffset + info.dataBytes >= static_cast<uint64_t>(fileBytes)) {
+        return;
+    }
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream.is_open()) {
+        return;
+    }
+    // The data chunk's size field sits 4 bytes before its payload.
+    stream.seekg(static_cast<std::streamoff>(info.dataOffset - 4), std::ios::beg);
+    uint32_t declaredDataSize = 0;
+    stream.read(reinterpret_cast<char*>(&declaredDataSize), sizeof(declaredDataSize));
+    if (stream && declaredDataSize == (std::numeric_limits<uint32_t>::max)()) {
+        info.dataBytes = static_cast<uint64_t>(fileBytes) - info.dataOffset;
+    }
+}
+
 bool openAudioSource(const std::filesystem::path& path, uint32_t targetSamplesPerSec, AudioSource& source) {
     if (!parseWav(path, source.info)) {
         return false;
     }
+    extendClampedWavExtent(path, source.info);
     source.frames = source.info.dataBytes / source.info.blockAlign;
     if (source.frames == 0) {
-        return false;
+        // Valid WAV with no payload: nothing was recorded on this track. The
+        // caller skips it; an empty track is not a read failure.
+        return true;
     }
     source.outputFrames =
         (source.frames * static_cast<uint64_t>(targetSamplesPerSec) + source.info.samplesPerSec - 1) /
@@ -189,13 +218,24 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
     std::vector<std::filesystem::path> audioPaths;
     // error_code overloads: this runs inside every save; a throwing
     // std::filesystem::exists on an unreadable file would terminate the app.
-    std::error_code systemError;
-    if (!inputs.systemAudioPath.empty() && std::filesystem::exists(inputs.systemAudioPath, systemError) && !systemError) {
-        audioPaths.push_back(inputs.systemAudioPath);
-    }
-    std::error_code microphoneError;
-    if (!inputs.microphoneAudioPath.empty() && std::filesystem::exists(inputs.microphoneAudioPath, microphoneError) && !microphoneError) {
-        audioPaths.push_back(inputs.microphoneAudioPath);
+    // A track is absent only when its path is empty or the file genuinely does
+    // not exist; existence that cannot be determined is a read failure.
+    for (const auto& path : {inputs.systemAudioPath, inputs.microphoneAudioPath}) {
+        if (path.empty()) {
+            continue;
+        }
+        std::error_code error;
+        const bool exists = std::filesystem::exists(path, error);
+        if (exists) {
+            audioPaths.push_back(path);
+            continue;
+        }
+        if (error) {
+            Logger::instance().error(L"audio",
+                L"Could not determine whether the recorded audio stream exists; failing the MP4 save: " + path.wstring());
+            mixedPath.clear();
+            return false;
+        }
     }
     if (audioPaths.empty()) {
         mixedPath.clear();
@@ -205,11 +245,21 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
     std::vector<AudioSource> sources;
     for (const auto& path : audioPaths) {
         AudioSource source;
-        if (openAudioSource(path, kMuxAudioSampleRate, source)) {
-            sources.push_back(std::move(source));
-        } else {
-            Logger::instance().warning(L"audio", L"Skipping unsupported audio stream for native MP4 mux: " + path.wstring());
+        if (!openAudioSource(path, kMuxAudioSampleRate, source)) {
+            // The track existed when the save started but cannot be read back
+            // (locked, permission denied, corrupt header). That is a failed
+            // read of an expected stream, not "no audio": failing the save
+            // keeps recovery from publishing a silent clip and deleting the
+            // original WAVs.
+            Logger::instance().error(L"audio",
+                L"Recorded audio stream could not be read back; failing the MP4 save so the recording is preserved: " + path.wstring());
+            mixedPath.clear();
+            return false;
         }
+        if (source.frames == 0) {
+            continue;  // valid WAV, no samples — nothing to mix on this track
+        }
+        sources.push_back(std::move(source));
     }
     if (sources.empty()) {
         mixedPath.clear();

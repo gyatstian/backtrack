@@ -284,42 +284,33 @@ void LeagueOfLegendsIntegration::workerLoop() {
         int64_t lastEventId = -1;
         double lastEventTime = 0.0;
 
-        // Pooled across polls: creating a WinHTTP session + TLS connection per
-        // request (twice per second) kept the heap hot for no benefit. Both are
-        // recreated lazily when missing, and the connection is additionally
-        // dropped after any failed request so stale transport state from a
-        // restarted game client never lingers.
-        InternetHandle session;
-        InternetHandle connection;
+        // a cancelled request retains its old session and connection until
+        // WinHTTP finishes closing it; later polls use a fresh pair on failure.
+        std::shared_ptr<AsyncHttpHandles> handles;
 
         while (!stopRequested_.load(std::memory_order_acquire)) {
-            if (!session) {
-                // Loopback must never leave the machine; a system proxy or VPN would
-                // otherwise turn every poll into a remote connection failure.
-                session.reset(WinHttpOpen(
+            if (!handles) {
+                handles = std::make_shared<AsyncHttpHandles>();
+                // loopback must never be redirected through a system proxy.
+                handles->session.reset(WinHttpOpen(
                     L"Backtrack/1.0",
                     WINHTTP_ACCESS_TYPE_NO_PROXY,
                     WINHTTP_NO_PROXY_NAME,
                     WINHTTP_NO_PROXY_BYPASS,
-                    0));
-                if (session) {
-                    WinHttpSetTimeouts(session.value, 1000, 1000, 1000, 1000);
+                    WINHTTP_FLAG_ASYNC));
+                if (handles->session) {
+                    WinHttpSetTimeouts(handles->session.value, 1000, 1000, 1000, 1000);
+                    handles->connection.reset(WinHttpConnect(handles->session.value, kHost, kPort, 0));
                 }
             }
-            if (session && !connection) {
-                connection.reset(WinHttpConnect(session.value, kHost, kPort, 0));
-            }
-            // Local endpoint with a self-signed cert; polled twice per second, so
-            // the session and connection stay pooled and only the connection is
-            // dropped after a failure, giving a restarted client fresh state.
-            auto activePlayer = httpGetBody(session.value, connection.value, L"/liveclientdata/activeplayer", nullptr, true, L"league");
-            // activeplayer is the liveness probe, so when it fails the client is
-            // gone: skip the request that would be a guaranteed connection failure.
-            auto eventData = activePlayer
-                ? httpGetBody(session.value, connection.value, L"/liveclientdata/eventdata", nullptr, true, L"league")
+            CancellableHttpSession session{handles, &stopRequested_};
+            auto activePlayer = httpGetBody(session, handles->connection.value, L"/liveclientdata/activeplayer", nullptr, true, L"league");
+            // activeplayer is the liveness probe; don't request events after it fails.
+            auto eventData = activePlayer && !stopRequested_.load(std::memory_order_acquire)
+                ? httpGetBody(session, handles->connection.value, L"/liveclientdata/eventdata", nullptr, true, L"league")
                 : std::nullopt;
             if (!activePlayer || !eventData) {
-                connection.reset();
+                handles.reset();
                 if (gameAvailable) {
                     Logger::instance().info(L"league", L"League of Legends live client data is no longer available");
                 }
@@ -334,8 +325,9 @@ void LeagueOfLegendsIntegration::workerLoop() {
 
             const auto names = activePlayerNames(*activePlayer);
             const auto events = parseEvents(*eventData);
-            int64_t maxEventId = lastEventId;
-            double maxEventTime = lastEventTime;
+            // An empty snapshot has no maxima and must not erase the baseline.
+            int64_t maxEventId = events.empty() ? lastEventId : events.front().eventId;
+            double maxEventTime = events.empty() ? lastEventTime : events.front().eventTime;
             for (const auto& event : events) {
                 maxEventId = std::max(maxEventId, event.eventId);
                 maxEventTime = std::max(maxEventTime, event.eventTime);

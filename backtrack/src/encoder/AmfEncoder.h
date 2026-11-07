@@ -16,7 +16,7 @@ public:
 
     bool initialize(D3DDevice& device, const VideoSettings& settings) override;
     void requestKeyFrame() override;
-    void resetInputResources() override;
+    bool resetInputResources() override;
     bool encodeFrame(const GpuFrame& frame, EncodedPacket& packet) override;
     void encodeFrame(const GpuFrame& frame, std::vector<EncodedPacket>& packets) override;
     void drain(std::vector<EncodedPacket>& packets) override;
@@ -27,6 +27,7 @@ public:
     DXGI_FORMAT preferredInputFormat() const override;
 
 private:
+    friend struct AmfEncoderTestAccess;
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

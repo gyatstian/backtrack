@@ -16,7 +16,9 @@ public:
     // Returns true when the full payload was handed to the stream without
     // error. False means a write failure (typically disk full); the stream
     // stays open so close() can still finalize what was written, but callers
-    // must stop feeding packets - every further write fails too.
+    // must stop feeding packets - every further write fails too. Writes past
+    // the 4 GiB RIFF boundary keep going (clamped header, data runs to EOF)
+    // instead of dropping audio.
     bool write(const uint8_t* data, size_t size);
     bool writeSilenceFrames(uint64_t frames);
     void close();
@@ -28,6 +30,9 @@ public:
     uint32_t samplesPerSec() const { return samplesPerSec_; }
     // Format blob the header was written with; empty before open().
     const WaveFormatBlob& format() const { return format_; }
+    // Test-only: shrink the RIFF boundary so the large-file path is reachable
+    // without writing 4 GiB. The app never calls it.
+    void setMaxDataBytesForTesting(uint64_t maxDataBytes) { maxDataBytes_ = maxDataBytes; }
 
 private:
     void writeHeader(const WaveFormatBlob& format);
@@ -41,7 +46,7 @@ private:
     uint64_t maxDataBytes_ = 0;
     uint16_t blockAlign_ = 0;
     uint32_t samplesPerSec_ = 0;
-    bool sizeLimitLogged_ = false;
+    bool riffBoundaryLogged_ = false;
 };
 
 } // namespace backtrack

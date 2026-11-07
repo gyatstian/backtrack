@@ -1,4 +1,5 @@
 #include "ui/MainWindow.h"
+#include "ui/DiagnosticsLog.h"
 #include "ui/UiHelpers.h"
 #include "ui/UiIds.h"
 
@@ -26,7 +27,6 @@
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -108,33 +108,8 @@ void MainWindow::saveLog() {
         return;
     }
 
-    std::error_code copyError;
-    // Copy to a sibling temp and rename over the target. copy_file opens the
-    // destination with CREATE_ALWAYS, so a copy that dies partway (disk full,
-    // antivirus lock) would leave a previously good log truncated. The rename
-    // is what actually replaces the destination, and it is the user's own file
-    // from the dialog above, so destroying it on failure loses the attachment
-    // they were about to send with a bug report.
-    const std::filesystem::path destination(fileName);
-    const std::filesystem::path staging = destination.wstring() + L".tmp";
-    std::filesystem::copy_file(
-        source,
-        staging,
-        std::filesystem::copy_options::overwrite_existing,
-        copyError);
-    if (!copyError) {
-        std::filesystem::rename(staging, destination, copyError);
-    }
-    if (copyError) {
-        // Leave the previous file intact; the status line is the only feedback
-        // the user gets that the copy did not land.
-        std::error_code cleanupError;
-        std::filesystem::remove(staging, cleanupError);
-        setStatus(L"Could not save log: " + utf8ToWide(copyError.message()));
-        return;
-    }
     // Bug-report attachment: carry the HDR witness with the log (same line
-    // updateStats renders). Append-only, so a failure here keeps the copy.
+    // updateStats renders).
     const RecordingStats tailStats = controller_.stats();
     std::wstringstream tail;
     tail << L"\nActive backend: ";
@@ -144,9 +119,9 @@ void MainWindow::saveLog() {
         tail << L"inactive";
     }
     tail << L"\n" << hdrStatusLine(tailStats) << L"\n";
-    std::ofstream out(destination, std::ios::binary | std::ios::app);
-    if (out) {
-        out << wideToUtf8(tail.str());
+    if (const auto error = saveDiagnosticsLog(fileName, wideToUtf8(tail.str())); error) {
+        setStatus(L"Could not save log: " + utf8ToWide(error.message()));
+        return;
     }
     setStatus(std::wstring(L"Log saved to ") + fileName);
 }

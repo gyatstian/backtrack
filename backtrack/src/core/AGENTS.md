@@ -52,16 +52,24 @@ the lock-free queue used between threads, and the app version constant.
   200-line `recentLines` deque for the Diagnostics page. Rate limiting is keyed
   on the message text alone: level, subsystem, and thread id are recorded for
   the summary line but are not part of the key, so the same text from two
-  callers shares one budget of 3 lines per rolling 10 s window, and what was
-  suppressed surfaces as a single `(rate limited N occurrences ...)` line when
-  the window rolls over. `Error` is never throttled. The file stream is
-  buffered, not flushed per line; flush before any fatal exit.
+  callers shares one budget of 3 lines per rolling 10 s window. suppressed
+  occurrences produce one `(rate limited N occurrences ...)` line when that
+  window rolls over or an expired key is pruned; the summary uses the last
+  occurrence's level, subsystem, and thread. `Error` is never throttled. the
+  file stream is buffered, not flushed per line; `flush` reports whether the
+  file stream was open and flushed successfully. flush before export or a fatal
+  exit.
 - `SpscQueue<T>` is header-only and lock-free with exactly one producer and one
   consumer. `tryPush` returns false when full and leaves the caller's item
   untouched, so the overflow policy belongs to the caller, which must count it;
   `tryPop` returns false when empty. `size()` is advisory and clamped, never
-  exact. `resetCapacity` is legal only when both ends are stopped; `clear`
-  moves the consumer's index, so it needs the consumer stopped too.
+  exact. The ring storage is fixed for the queue's lifetime: `resetCapacity`
+  only lowers an atomic logical limit (clamped to the storage) and never
+  reassigns the backing vector, so `size()`/`capacity()` are safe to call from
+  any thread, including while a reset runs (the UI diagnostics timer reads
+  `frameQueue_.size()` during a pipeline restart). `resetCapacity`/`clear` are
+  still legal only when both ends are stopped; `clear` moves the consumer's
+  index, so it needs the consumer stopped too.
 - `AppVersion.h`'s `kCurrentAppVersion` is the app's only version string;
   `MainWindow::startUpdateCheck` compares it against the latest GitHub release.
   The check is opt-out: `AppSettings::checkForUpdates` (default on) gates it in
@@ -79,11 +87,9 @@ the lock-free queue used between threads, and the app version constant.
 
 ## Verification
 
-No suite covers `SpscQueue.h` or `AppVersion.h`: the queue's only user is
-`RecorderController`, which no test links. `Logger.cpp` is linked into
-`AudioConvertTests`, `ReplayBufferTests`, and `SettingsClipGuardTests`, so
-building those three is the practical check for this folder; `Types.h` and
-`AppVersion.h` are compile-checked by whichever of them include them.
+`SpscQueueTests` covers the queue; no suite covers `AppVersion.h` directly.
+`LoggerDiagnosticsTests` (CTest) covers logger rate limiting, pruning, stream
+failure, and diagnostics export. existing suites also link `Logger.cpp`.
 
 ## Child DOX Index
 

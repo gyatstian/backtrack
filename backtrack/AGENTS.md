@@ -16,7 +16,15 @@ lives beside the sources. `backtrack.slnx` is the Visual Studio entry point,
 
 - Two build definitions must stay equivalent:
   - `CMakeLists.txt` at the repository root: target `Backtrack`, CTest
-    registration, option `BACKTRACK_NOISE_SUPPRESSION` (default OFF).
+    registration, option `BACKTRACK_NOISE_SUPPRESSION` (default OFF). The app
+    sources compile once into the `BacktrackApp` object library; `Backtrack`
+    links it and so do the UI suites, so an app-only source change must not be
+    moved out of that library. Every define that changes a header's layout
+    (`BACKTRACK_HAS_*`, `UNICODE`, `WIN32_LEAN_AND_MEAN`) is `PUBLIC` on that
+    library: the consumers compile their own translation units against the same
+    headers, and a define they cannot see is a struct-layout mismatch that
+    crashes at run time. `BACKTRACK_HAS_NOISE_SUPPRESSION` moves a member of
+    `ui/MainWindow.h`, which is exactly that case.
   - `backtrack/backtrack.vcxproj` + `.filters`: project property
     `BacktrackNoiseSuppression` (default false).
 - New `.cpp` / `.h` under `src` is picked up automatically by both
@@ -28,6 +36,11 @@ lives beside the sources. `backtrack.slnx` is the Visual Studio entry point,
   files fall outside that wildcard and are listed explicitly with a
   `Condition=`, so adding or removing one is a vcxproj edit on top of the
   CMake `file(GLOB ... third_party/rnnoise/src/*.c)`.
+- Two sources may share a file name (`src\audio\WavReader.cpp` and
+  `src\mux\WavReader.cpp` do). The vcxproj keeps the source folder in
+  `ObjectFileName` for that reason; the default `$(IntDir)%(Filename).obj` makes
+  one translation unit silently replace the other, and the link then reports the
+  missing symbols. CMake already emits a per-file object name for duplicates.
 - Compile-time switches, all owned by the build files; never set one from
   source:
   - `BACKTRACK_HAS_NVENC` / `BACKTRACK_HAS_AMF`: header detection, always
@@ -79,8 +92,9 @@ the installed toolchain; `cmake` lives inside that install and is not on
 component (`<sapi.h>` pulls in `atlbase.h`); without it only the app fails, the
 test targets still build.
 
-With noise suppression on, add `-DBACKTRACK_NOISE_SUPPRESSION=ON`; that adds
-`AudioDenoiseTests` to the six unconditional suites.
+34 suites build unconditionally. `NvencLifecycleTests` and `AmfEncoderTests`
+are added when the NVENC and AMF headers are found (both are vendored), and
+`AudioDenoiseTests` only with `-DBACKTRACK_NOISE_SUPPRESSION=ON`.
 
 ## Child DOX Index
 

@@ -9,8 +9,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace backtrack {
 
@@ -39,6 +41,8 @@ constexpr auto kActivityUpdateInterval = std::chrono::seconds(2);
 // not be trusted to size an allocation. Frames larger than this were never
 // meaningful, so treat them as a lost connection instead of allocating.
 constexpr uint32_t kMaxInboundFrameBytes = 64 * 1024;
+constexpr auto kPipeIoTimeout = std::chrono::seconds(2);
+constexpr auto kExitClearTimeout = std::chrono::milliseconds(100);
 
 std::string jsonEscape(const std::string& value) {
     std::string out;
@@ -88,19 +92,81 @@ std::string nonceString() {
     return stream.str();
 }
 
-// Byte-mode read: loops until exactly `size` bytes arrive. A single ReadFile
-// on a pipe may return fewer bytes than requested, so one call is not enough
-// to fill a header or a payload.
-bool readExact(HANDLE pipe, void* data, DWORD size) {
-    auto* cursor = static_cast<uint8_t*>(data);
-    DWORD done = 0;
-    while (done < size) {
-        DWORD got = 0;
-        if (!ReadFile(pipe, cursor + done, size - done, &got, nullptr) || got == 0) {
+struct PipeOperation {
+    HANDLE pipe = nullptr;
+    OVERLAPPED overlapped{};
+    std::shared_ptr<std::vector<uint8_t>> buffer;
+
+    ~PipeOperation() {
+        if (pipe) CloseHandle(pipe);
+        if (overlapped.hEvent) CloseHandle(overlapped.hEvent);
+    }
+};
+
+void CALLBACK releasePipeOperation(PTP_CALLBACK_INSTANCE, void* context, PTP_WAIT wait, TP_WAIT_RESULT) {
+    std::unique_ptr<std::shared_ptr<PipeOperation>> owner(
+        static_cast<std::shared_ptr<PipeOperation>*>(context));
+    CloseThreadpoolWait(wait);
+}
+
+bool pipeTransfer(HANDLE pipe, const std::shared_ptr<std::vector<uint8_t>>& buffer, DWORD offset,
+    DWORD size, bool write, const std::atomic<bool>* stop,
+    std::chrono::steady_clock::time_point deadline, DWORD& transferred) {
+    auto operation = std::make_shared<PipeOperation>();
+    operation->buffer = buffer;
+    if (!DuplicateHandle(GetCurrentProcess(), pipe, GetCurrentProcess(), &operation->pipe,
+            0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        return false;
+    }
+    operation->overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!operation->overlapped.hEvent) return false;
+
+    auto owner = std::make_unique<std::shared_ptr<PipeOperation>>(operation);
+    PTP_WAIT completion = CreateThreadpoolWait(releasePipeOperation, owner.get(), nullptr);
+    if (!completion) return false;
+    const BOOL started = write
+        ? WriteFile(operation->pipe, buffer->data() + offset, size, nullptr, &operation->overlapped)
+        : ReadFile(operation->pipe, buffer->data() + offset, size, nullptr, &operation->overlapped);
+    if (!started && GetLastError() != ERROR_IO_PENDING) {
+        CloseThreadpoolWait(completion);
+        return false;
+    }
+    // cancellation may complete after this worker exits; the wait owns the
+    // duplicate handle, OVERLAPPED and buffer until the kernel signals completion.
+    SetThreadpoolWait(completion, operation->overlapped.hEvent, nullptr);
+    owner.release();
+
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if ((stop && stop->load(std::memory_order_acquire)) || now >= deadline) {
+            CancelIoEx(operation->pipe, &operation->overlapped);
             return false;
         }
-        done += got;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        const DWORD waitMs = remaining >= std::chrono::milliseconds(50)
+            ? 50 : static_cast<DWORD>(remaining.count() + 1);
+        const DWORD result = WaitForSingleObject(operation->overlapped.hEvent, waitMs);
+        if (result == WAIT_TIMEOUT) continue;
+        if (result != WAIT_OBJECT_0) {
+            CancelIoEx(operation->pipe, &operation->overlapped);
+            return false;
+        }
+        if (!GetOverlappedResult(operation->pipe, &operation->overlapped, &transferred, FALSE)) return false;
+        return transferred != 0;
     }
+}
+
+bool pipeTransferExact(HANDLE pipe, void* data, DWORD size, bool write,
+    const std::atomic<bool>* stop, std::chrono::steady_clock::time_point deadline) {
+    auto buffer = std::make_shared<std::vector<uint8_t>>(size);
+    if (write && size) std::memcpy(buffer->data(), data, size);
+    DWORD done = 0;
+    while (done < size) {
+        DWORD transferred = 0;
+        if (!pipeTransfer(pipe, buffer, done, size - done, write, stop, deadline, transferred)) return false;
+        done += transferred;
+    }
+    if (!write && size) std::memcpy(data, buffer->data(), size);
     return true;
 }
 
@@ -245,17 +311,13 @@ void DiscordRichPresence::workerLoop() {
             + std::to_wstring(fault) + L")");
     }
 
-    // Leaving the worker sends the same null-activity frame as leaving
-    // fullscreen and then drops the handle, so a clean exit cannot leave a ghost
-    // presence in the user's Discord. It also runs after a fault, and the frame
-    // build is guarded: it is the last thing this thread does, so an exception
-    // escaping here terminates just as hard as one from the loop.
+    // an unresponsive peer must not hold shutdown while clearing presence.
     if (pipe_) {
         try {
             std::ostringstream payload;
             payload << "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" << GetCurrentProcessId()
                     << ",\"activity\":null},\"nonce\":\"" << nonceString() << "\"}";
-            sendFrame(kOpcodeFrame, payload.str());
+            sendFrame(kOpcodeFrame, payload.str(), true);
         } catch (const std::exception& error) {
             Logger::instance().warning(L"discord",
                 L"Discord activity clear failed before exit: " + utf8ToWide(error.what()));
@@ -268,6 +330,7 @@ void DiscordRichPresence::workerLoop() {
 
 bool DiscordRichPresence::connect() {
     for (int index = 0; index <= kMaxDiscordPipeIndex; ++index) {
+        if (stopRequested_.load(std::memory_order_acquire)) return false;
         wchar_t path[64]{};
         std::swprintf(path, _countof(path), L"\\\\?\\pipe\\discord-ipc-%d", index);
         HANDLE pipe = CreateFileW(
@@ -276,18 +339,18 @@ bool DiscordRichPresence::connect() {
             0,
             nullptr,
             OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
             nullptr);
         const DWORD createError = GetLastError();
         if (pipe == INVALID_HANDLE_VALUE && createError == ERROR_PIPE_BUSY) {
-            if (WaitNamedPipeW(path, 2000)) {
+            if (WaitNamedPipeW(path, 100) && !stopRequested_.load(std::memory_order_acquire)) {
                 pipe = CreateFileW(
                     path,
                     GENERIC_READ | GENERIC_WRITE,
                     0,
                     nullptr,
                     OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
                     nullptr);
             }
         }
@@ -336,8 +399,8 @@ bool DiscordRichPresence::handshake() {
     return ok;
 }
 
-bool DiscordRichPresence::sendFrame(int opcode, const std::string& payload) {
-    if (!pipe_) {
+bool DiscordRichPresence::sendFrame(int opcode, const std::string& payload, bool exitClear) {
+    if (!pipe_ || payload.size() > MAXDWORD - 8) {
         return false;
     }
     const auto op = static_cast<uint32_t>(opcode);
@@ -348,18 +411,9 @@ bool DiscordRichPresence::sendFrame(int opcode, const std::string& payload) {
     std::memcpy(frame.data() + 4, &len, sizeof(len));
     std::memcpy(frame.data() + 8, payload.data(), payload.size());
 
-    const HANDLE handle = reinterpret_cast<HANDLE>(pipe_);
-    const DWORD total = static_cast<DWORD>(frame.size());
-    DWORD done = 0;
-    while (done < total) {
-        DWORD got = 0;
-        if (!WriteFile(handle, frame.data() + done, total - done, &got, nullptr) ||
-            got == 0) {
-            return false;
-        }
-        done += got;
-    }
-    return done == total;
+    const auto deadline = std::chrono::steady_clock::now() + (exitClear ? kExitClearTimeout : kPipeIoTimeout);
+    return pipeTransferExact(reinterpret_cast<HANDLE>(pipe_), frame.data(), static_cast<DWORD>(frame.size()),
+        true, exitClear ? nullptr : &stopRequested_, deadline);
 }
 
 bool DiscordRichPresence::drainInbox() {
@@ -380,7 +434,8 @@ bool DiscordRichPresence::drainInbox() {
             // Partial header still in flight; wait for the rest next pass.
             return true;
         }
-        if (!readExact(reinterpret_cast<HANDLE>(pipe_), header, sizeof(header))) {
+        const auto deadline = std::chrono::steady_clock::now() + kPipeIoTimeout;
+        if (!pipeTransferExact(reinterpret_cast<HANDLE>(pipe_), header, sizeof(header), false, &stopRequested_, deadline)) {
             return false;
         }
         uint32_t opcode = 0;
@@ -396,7 +451,8 @@ bool DiscordRichPresence::drainInbox() {
 
         std::string payload(length, '\0');
         if (!payload.empty()) {
-            if (!readExact(reinterpret_cast<HANDLE>(pipe_), payload.data(), static_cast<DWORD>(payload.size()))) {
+            if (!pipeTransferExact(reinterpret_cast<HANDLE>(pipe_), payload.data(), static_cast<DWORD>(payload.size()),
+                    false, &stopRequested_, deadline)) {
                 return false;
             }
         }

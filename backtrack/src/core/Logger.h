@@ -26,7 +26,7 @@ public:
     void write(LogLevel level, const wchar_t* subsystem, const std::wstring& message);
     std::vector<std::wstring> recentLines(size_t maxLines) const;
     std::filesystem::path currentPath() const;
-    void flush();
+    bool flush();
 
     void trace(const std::wstring& message) { write(LogLevel::Trace, message); }
     void debug(const std::wstring& message) { write(LogLevel::Debug, message); }
@@ -40,9 +40,12 @@ public:
     void error(const wchar_t* subsystem, const std::wstring& message) { write(LogLevel::Error, subsystem, message); }
 
 private:
+    friend struct LoggerTestAccess;
     Logger() = default;
 
     void writeLine(const std::wstring& text);
+    void writeLocked(LogLevel level, const wchar_t* subsystem, const std::wstring& message,
+        std::chrono::steady_clock::time_point now);
 
     mutable std::mutex mutex_;
     std::filesystem::path logPath_;
@@ -53,8 +56,8 @@ private:
     // Windowed per-message rate limiting. Each distinct message text is allowed
     // a fixed number of lines per rolling time window; further occurrences are
     // counted and collapsed into a single "(rate limited N occurrences)" line
-    // when the window rolls over. This catches interleaved spam (A,B,A,B...)
-    // that consecutive-duplicate suppression alone would miss.
+    // when the window rolls over or an expired key is pruned. This catches
+    // interleaved spam that consecutive-duplicate suppression would miss.
     struct RateState {
         std::chrono::steady_clock::time_point windowStart{};
         size_t emitted = 0;      // lines written this window
@@ -63,6 +66,8 @@ private:
         DWORD threadId = 0;
         std::wstring subsystem;
     };
+    // caller holds mutex_; summaries must not re-enter the rate limiter.
+    void writeRateSummary(const std::wstring& message, const RateState& state);
     std::unordered_map<std::wstring, RateState> rateStates_;
 };
 

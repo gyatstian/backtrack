@@ -340,13 +340,36 @@ bool MainWindow::ensureFoldersExist() {
     return true;
 }
 
-void MainWindow::commitSettings() {
-    settings_ = sanitizeSettings(settings_);
-    updateStartupRegistration();
-    settingsStore_.save(settings_);
-    // Persisted: the pristine baseline the Save button diffs against, so
-    // further edits reverted to these values hide it.
-    savedSettings_ = settings_;
+bool MainWindow::commitSettings(const AppSettings& candidate) {
+    if (!startupSettingsReadable_) {
+        setStatus(L"Settings could not be read at startup; restart after the file becomes readable");
+        return false;
+    }
+    const AppSettings normalized = sanitizeSettings(candidate);
+    if (!settingsStore_.save(normalized)) {
+        setStatus(L"Settings could not be saved; try again");
+        return false;
+    }
+    const bool startupChanged =
+        savedSettings_.startWithWindowsMinimized != normalized.startWithWindowsMinimized;
+    savedSettings_ = normalized;
+    if (startupChanged) {
+        updateWindowsStartupRegistration(savedSettings_.startWithWindowsMinimized);
+    }
+    Logger::instance().setMinLevel(savedSettings_.logLevel);
+    controller_.setUiPreferences(savedSettings_.logLevel, savedSettings_.libraryGalleryView);
+    return true;
+}
+
+void MainWindow::setDiagnosticLogLevel(LogLevel level) {
+    settings_.logLevel = level;
+    AppSettings candidate = savedSettings_;
+    candidate.logLevel = level;
+    if (commitSettings(candidate)) {
+        Logger::instance().info(L"ui", std::wstring(L"Log level changed to ") + logLevelName(level));
+        setStatus(std::wstring(L"Log level: ") + logLevelName(level));
+    }
+    markSettingsDirty();
 }
 
 void MainWindow::stashVisibleSettings() {
@@ -363,11 +386,14 @@ void MainWindow::applyVisibleSettings() {
         playActionIndicator(MB_ICONHAND, settings_.notificationSoundVolumePercent);
         return;
     }
-    readVisibleSettingsInto(settings_);
+    stashVisibleSettings();
     if (!ensureFoldersExist()) {
         return;
     }
-    commitSettings();
+    if (!commitSettings(settings_)) {
+        markSettingsDirty();
+        return;
+    }
     clipManager_.setDirectory(settings_.clipDirectory);
     const bool hotkeysOk = hotkeys_.registerHotkeys(window_, settings_.hotkeys);
     const std::wstring hotkeyError = hotkeys_.lastErrorMessage();
@@ -467,8 +493,29 @@ bool MainWindow::promptSaveSettingsIfDirty(bool allowCancel) {
         return !settingsDirty_;
     }
     if (result == IDNO) {
-        settings_ = controller_.settings();
-        savedSettings_ = settings_;
+        settings_ = savedSettings_;
+        const auto savedView = settings_.libraryGalleryView ? LibraryViewMode::Gallery : LibraryViewMode::List;
+        if (libraryViewMode_ != savedView) {
+            libraryViewMode_ = savedView;
+            if (clipList_) {
+                setListItemHeightIfChanged(clipList_, clipListItemHeight_,
+                    savedView == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);
+                populateClipListRows();
+                onClipSelectionChanged();
+                loadClipThumbnails();
+                layoutCurrentPage();
+                requestThumbnailUpdate();
+                InvalidateRect(clipList_, nullptr, FALSE);
+            }
+        }
+        const HWND diagnosticsHost = pageCaches_[static_cast<size_t>(Page::Diagnostics)].host;
+        const HWND logLevel = diagnosticsHost ? GetDlgItem(diagnosticsHost, kLogLevelComboId) : nullptr;
+        for (size_t index = 0; logLevel && index < std::size(kLogLevelComboEntries); ++index) {
+            if (kLogLevelComboEntries[index].value == static_cast<int>(settings_.logLevel)) {
+                SendMessageW(logLevel, CB_SETCURSEL, static_cast<WPARAM>(index), 0);
+                break;
+            }
+        }
         recordHotkeyModifiers_ = settings_.hotkeys.startStopModifiers;
         recordHotkeyVirtualKey_ = settings_.hotkeys.startStopVirtualKey;
         replayHotkeyModifiers_ = settings_.hotkeys.saveReplayModifiers;
@@ -1061,10 +1108,6 @@ bool MainWindow::isLibraryTitleLabel(HWND control) const {
     }
     return false;
 }
-void MainWindow::updateStartupRegistration() {
-    updateWindowsStartupRegistration(settings_.startWithWindowsMinimized);
-}
-
 void MainWindow::browseClipFolder() {
     std::wstring path;
     if (!pickFolder(window_, L"Choose where Backtrack saves clips", path)) {

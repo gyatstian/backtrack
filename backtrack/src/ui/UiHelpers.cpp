@@ -915,26 +915,37 @@ void applyWavVolume(std::vector<uint8_t>& wav, uint32_t volumePercent) {
     }
 }
 
-void playActionIndicator(UINT type, uint32_t volumePercent, const std::filesystem::path& customSuccessSoundPath) {
+void playActionIndicator(
+    UINT type, uint32_t volumePercent, const std::filesystem::path& customSuccessSoundPath,
+    std::vector<uint8_t> (*loadWav)(const std::filesystem::path&),
+    BOOL (WINAPI* playSound)(LPCWSTR, HMODULE, DWORD)) {
     volumePercent = std::min<uint32_t>(volumePercent, 100);
     if (volumePercent == 0) {
         return;
     }
 
-    // Serialize playback so SND_ASYNC memory buffers stay valid until replaced.
+    std::vector<uint8_t> customWav;
+    if (type == MB_OK && !customSuccessSoundPath.empty()) {
+        customWav = (loadWav ? loadWav : loadWavFile)(customSuccessSoundPath);
+        applyWavVolume(customWav, volumePercent);
+    }
+
+    // SND_ASYNC retains the buffer; skip feedback rather than wait for its owner.
     static std::mutex playMutex;
     static std::vector<uint8_t> scaled;
-    std::lock_guard<std::mutex> lock(playMutex);
-    PlaySoundW(nullptr, nullptr, 0);
+    std::unique_lock lock(playMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return;
+    }
+    if (!playSound) {
+        playSound = PlaySoundW;
+    }
+    playSound(nullptr, nullptr, 0);
 
-    if (type == MB_OK && !customSuccessSoundPath.empty()) {
-        auto customWav = loadWavFile(customSuccessSoundPath);
-        if (!customWav.empty()) {
-            applyWavVolume(customWav, volumePercent);
-            scaled = std::move(customWav);
-            if (PlaySoundW(reinterpret_cast<LPCWSTR>(scaled.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {
-                return;
-            }
+    if (!customWav.empty()) {
+        scaled = std::move(customWav);
+        if (playSound(reinterpret_cast<LPCWSTR>(scaled.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {
+            return;
         }
     }
 
@@ -946,7 +957,7 @@ void playActionIndicator(UINT type, uint32_t volumePercent, const std::filesyste
         playback = &scaled;
     }
 
-    if (!PlaySoundW(reinterpret_cast<LPCWSTR>(playback->data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {
+    if (!playSound(reinterpret_cast<LPCWSTR>(playback->data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {
         if (volumePercent >= 100) {
             MessageBeep(type);
         }

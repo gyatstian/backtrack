@@ -31,12 +31,13 @@ application has focus, including while a game does.
   unregisters first so a settings change can re-register. It is skipped only
   when no hotkey is bound at all. The destructor clears `activeService_` when it
   still points at the dying instance: `WM_DESTROY` unregisters first today, but
-  the hook proc runs on the system's input thread and would otherwise be left
-  dereferencing freed memory.
-- Modifier state is tracked manually (`ctrlDown_`, `altDown_`, `shiftDown_`,
-  seeded at registration) because a low-level hook cannot rely on
-  `GetKeyState`. A one-shot (non-repeating) check plus a tick timestamp keeps a
-  held key from firing repeatedly.
+  the hook proc must not be left dereferencing freed memory.
+- modifier state is seeded with `GetAsyncKeyState` and tracked independently
+  for each left/right key; the hook cannot query the updated async state from
+  its callback. matching ORs the two sides. generic `VK_CONTROL` and `VK_MENU`
+  use `LLKHF_EXTENDED`; generic `VK_SHIFT` uses the scan code, falling back to
+  left when the scan code cannot identify a side. injected keys are handled like
+  other keys. a one-shot check prevents a held hotkey from firing repeatedly.
 - The hook proc always chains through `CallNextHookEx` and never consumes a key,
   so it cannot suppress anything. A hotkey fired this way reaches the
   foreground application as well as Backtrack.
@@ -54,15 +55,18 @@ application has focus, including while a game does.
 ## Work Guidance
 
 - Keep the hook proc fast and allocation-free on the hot path; it runs on the
-  input thread of the system.
+  installing thread and delays input delivery.
 - A new hotkey needs an id constant here, a `HotkeySettings` field, a
   `sanitizeSettings` rule, and a handler in `MainWindowController.cpp`.
 
 ## Verification
 
-No automated test. Check that each hotkey fires while a different application is
-focused, that a game holding the combination still reaches Backtrack through the
-hook fallback, and that holding the key fires once.
+`HotkeyServiceTests` (CTest) exercises modifier tracking and matching without a
+window. manually check hotkeys
+with a modifier held during registration, overlapping sides, and injected keys.
+check that each hotkey fires while a different application is focused, that a
+game holding the combination still reaches Backtrack through the hook fallback,
+and that holding the key fires once.
 
 ## Child DOX Index
 

@@ -36,7 +36,13 @@ public:
     }
 
     ~ScopedDirectoryCleanup() {
-        cleanup();
+        if (discardOnExit_) {
+            cleanup();
+        }
+    }
+
+    void preserveOnFailure() {
+        discardOnExit_ = false;
     }
 
     void cleanup() {
@@ -59,12 +65,56 @@ public:
 
 private:
     std::filesystem::path path_;
+    bool discardOnExit_ = true;
 };
 
 // One GOP of tolerance: a cut may start up to a GOP before the window so the
 // clip still begins at a keyframe.
 int64_t gopTolerance100ns(uint32_t gopSeconds) {
     return secondsTo100ns((std::max<uint32_t>)(1, gopSeconds));
+}
+
+template <typename Meta>
+int64_t videoPresentationEnd(const Meta& meta) {
+    return meta.pts100ns + (std::max<int64_t>)(clampSingleVideoDuration100ns(meta.duration100ns), 0);
+}
+
+template <typename Packet, typename GetMeta>
+int64_t latestPresentationEnd(const std::vector<Packet>& packets, GetMeta getMeta) {
+    int64_t latest = videoPresentationEnd(getMeta(packets.front()));
+    for (const auto& packet : packets) {
+        latest = (std::max)(latest, videoPresentationEnd(getMeta(packet)));
+    }
+    return latest;
+}
+
+// Packets are in decode order, so the last packet need not end last.
+template <typename Packet, typename GetMeta>
+int64_t cutReplayWindow(std::vector<Packet>& packets, uint32_t seconds, uint32_t gopSeconds, GetMeta getMeta) {
+    const int64_t budget = secondsTo100ns(seconds) + gopTolerance100ns(gopSeconds);
+    const int64_t oldestAllowedEnd = latestPresentationEnd(packets, getMeta) - budget;
+    const auto windowBegin = std::find_if(packets.begin(), packets.end(), [&](const Packet& packet) {
+        return videoPresentationEnd(getMeta(packet)) > oldestAllowedEnd;
+    });
+    if (windowBegin != packets.end()) {
+        const auto keyFrame = std::find_if(windowBegin, packets.end(), [&](const Packet& packet) {
+            return getMeta(packet).keyFrame;
+        });
+        if (keyFrame != packets.end()) {
+            packets.erase(packets.begin(), keyFrame);
+        } else {
+            // A long hold can end on a packet other than the decode-order tail.
+            const int64_t endLimit = getMeta(packets.front()).pts100ns + budget;
+            for (auto& packet : packets) {
+                auto& meta = getMeta(packet);
+                // Shortening cannot bring a frame starting past the limit inside it.
+                if (meta.pts100ns < endLimit && videoPresentationEnd(meta) > endLimit) {
+                    meta.duration100ns = (std::min)(meta.duration100ns, endLimit - meta.pts100ns);
+                }
+            }
+        }
+    }
+    return latestPresentationEnd(packets, getMeta);
 }
 
 // Writes the buffered packets onto one shared-timeline WAV. Returns false
@@ -235,16 +285,8 @@ void ReplayBuffer::removeOrphanedRing(const std::filesystem::path& storageDirect
     if (!std::filesystem::exists(directory, error) || error) {
         return;
     }
-    std::filesystem::remove_all(directory, error);
-    if (error) {
-        Logger::instance().warning(L"replay",
-            L"Could not remove leftover replay ring folder " + directory.wstring() +
-            L" (" + utf8ToWide(error.message()) + L")");
-        return;
-    }
-    Logger::instance().info(L"replay",
-        L"Removed leftover replay ring folder " + directory.wstring() +
-        L" from a previous session");
+    // Legacy ring files have no ownership marker and can be a game's content.
+    Logger::instance().info(L"replay", L"Preserving existing replay ring folder: " + directory.wstring());
 }
 
 ReplayBuffer::~ReplayBuffer() {
@@ -300,10 +342,10 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
     if (!wantDisk) {
         if (usingDisk) {
             Logger::instance().info(L"replay", L"Replay video buffering switched back to memory");
+            clearBufferedVideoLocked();
+            closeRingLocked();
+            videoBackend_ = VideoBackend::Ram;
         }
-        clearBufferedVideoLocked();
-        closeRingLocked();
-        videoBackend_ = VideoBackend::Ram;
         // Also clears a reason left over from a failed open: disk backing is
         // off now, so there is nothing degraded to report.
         setVideoFallbackReasonLocked({});
@@ -343,7 +385,7 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
     } else if (audioCapacityBytes != audioRing_.capacity()) {
         // Same non-destructive rule as the video ring: re-laying out a ring
         // that still holds packets would invalidate every live extent.
-        if (diskSystemAudio_.empty() && diskMicrophoneAudio_.empty() && !savePinsRefs_) {
+        if (diskAudio_.empty() && !savePinsRefs_) {
             openAudioRingWithFallbackLocked(audioCapacityBytes);
         } else {
             Logger::instance().info(L"replay",
@@ -598,8 +640,7 @@ bool ReplayBuffer::saveTo(
     std::vector<SnapshottedVideo> video;
     std::vector<std::shared_ptr<const AudioPacket>> systemAudio;
     std::vector<std::shared_ptr<const AudioPacket>> microphoneAudio;
-    std::vector<DiskAudioPacket> diskSystemAudio;
-    std::vector<DiskAudioPacket> diskMicrophoneAudio;
+    std::vector<DiskAudioPacket> diskAudio;
     int64_t lastSaveEndPts100ns = 0;
     uint32_t replayWindowSeconds = 0;
     uint32_t saveGopSeconds = 2;
@@ -641,8 +682,7 @@ bool ReplayBuffer::saveTo(
         systemAudio.assign(systemAudio_.begin(), systemAudio_.end());
         microphoneAudio.assign(microphoneAudio_.begin(), microphoneAudio_.end());
         if (diskAudioMode) {
-            diskSystemAudio.assign(diskSystemAudio_.begin(), diskSystemAudio_.end());
-            diskMicrophoneAudio.assign(diskMicrophoneAudio_.begin(), diskMicrophoneAudio_.end());
+            diskAudio.assign(diskAudio_.begin(), diskAudio_.end());
         }
         lastSaveEndPts100ns = lastSaveEndPts100ns_;
         replayWindowSeconds = settings_.seconds;
@@ -699,29 +739,30 @@ bool ReplayBuffer::saveTo(
     video.back().meta.duration100ns =
         clampSingleVideoDuration100ns(video.back().meta.duration100ns);
 
-    int64_t newestVideoEndPts =
-        video.back().meta.pts100ns + std::max<int64_t>(video.back().meta.duration100ns, 0);
+    const auto metaOf = [](auto& snapshot) -> auto& { return snapshot.meta; };
+    const int64_t bufferedVideoEndPts = latestPresentationEnd(video, metaOf);
     constexpr int64_t kConsecutiveSaveGrace100ns = 3 * kHundredNanosecondsPerSecond;
     const bool saveSinceLastClip =
         lastSaveEndPts100ns > 0 &&
-        lastSaveEndPts100ns <= newestVideoEndPts &&
+        lastSaveEndPts100ns <= bufferedVideoEndPts &&
         lastSaveEndPts100ns > video.front().meta.pts100ns;
 
     auto firstKeyFrame = video.end();
     if (saveSinceLastClip) {
         const int64_t desiredStartPts = lastSaveEndPts100ns - kConsecutiveSaveGrace100ns;
         for (auto it = video.begin(); it != video.end(); ++it) {
-            if (it->meta.keyFrame && it->meta.pts100ns <= desiredStartPts) {
+            if (it->meta.keyFrame && it->meta.pts100ns <= desiredStartPts &&
+                (firstKeyFrame == video.end() || it->meta.pts100ns > firstKeyFrame->meta.pts100ns)) {
                 firstKeyFrame = it;
-            }
-            if (it->meta.pts100ns > desiredStartPts) {
-                break;
             }
         }
         if (firstKeyFrame == video.end()) {
-            firstKeyFrame = std::find_if(video.begin(), video.end(), [desiredStartPts](const SnapshottedVideo& snapshot) {
-                return snapshot.meta.keyFrame && snapshot.meta.pts100ns >= desiredStartPts;
-            });
+            for (auto it = video.begin(); it != video.end(); ++it) {
+                if (it->meta.keyFrame && it->meta.pts100ns >= desiredStartPts &&
+                    (firstKeyFrame == video.end() || it->meta.pts100ns < firstKeyFrame->meta.pts100ns)) {
+                    firstKeyFrame = it;
+                }
+            }
         }
     } else {
         firstKeyFrame = std::find_if(video.begin(), video.end(), [](const SnapshottedVideo& snapshot) {
@@ -740,40 +781,9 @@ bool ReplayBuffer::saveTo(
     }
 
     video.erase(video.begin(), firstKeyFrame);
-    // Window cut, applied after (intersecting) the consecutive-save overlap
-    // cut above: age eviction keys on PTS, which freezes while coalescing, so
-    // a long hold would otherwise publish window + stretched tail. Packets are
-    // dropped by end time, then realigned forward to a keyframe; the cut only
-    // ever narrows.
-    const int64_t oldestAllowedEndPts = newestVideoEndPts - secondsTo100ns(replayWindowSeconds) -
-        gopTolerance100ns(saveGopSeconds);
-    auto windowBegin = video.end();
-    for (auto it = video.begin(); it != video.end(); ++it) {
-        if (it->meta.pts100ns + (std::max<int64_t>)(it->meta.duration100ns, 0) > oldestAllowedEndPts) {
-            windowBegin = it;
-            break;
-        }
-    }
-    if (windowBegin != video.end()) {
-        const auto windowKeyFrame = std::find_if(
-            windowBegin, video.end(), [](const SnapshottedVideo& snapshot) { return snapshot.meta.keyFrame; });
-        if (windowKeyFrame != video.end()) {
-            video.erase(video.begin(), windowKeyFrame);
-        } else {
-            // Tail region holds no keyframe (a stretched P-frame tail): the
-            // buffer already starts at a keyframe, so shrink the tail to fit
-            // the window budget instead of publishing past it.
-            const int64_t tailBudget = secondsTo100ns(replayWindowSeconds) +
-                gopTolerance100ns(saveGopSeconds) -
-                (video.back().meta.pts100ns - video.front().meta.pts100ns);
-            int64_t& tailDuration = video.back().meta.duration100ns;
-            tailDuration = (std::min)(tailDuration, (std::max<int64_t>)(tailBudget, 0));
-        }
-        newestVideoEndPts =
-            video.back().meta.pts100ns + std::max<int64_t>(video.back().meta.duration100ns, 0);
-    }
+    // Recompute after each cut: the removed prefix may have held the maximum.
+    const int64_t replayEndPts = cutReplayWindow(video, replayWindowSeconds, saveGopSeconds, metaOf);
     const int64_t replayStartPts = video.front().meta.pts100ns;
-    const int64_t replayEndPts = newestVideoEndPts;
     if (!outputPath.parent_path().empty()) {
         std::error_code error;
         std::filesystem::create_directories(outputPath.parent_path(), error);
@@ -783,20 +793,14 @@ bool ReplayBuffer::saveTo(
         }
     }
 
-    const auto tempDirectory = outputPath.parent_path() / L".backtrack_tmp" / outputPath.stem();
     std::error_code tempError;
-    std::filesystem::create_directories(tempDirectory, tempError);
-    if (tempError) {
-        return fail(L"could not create replay temporary folder " + tempDirectory.wstring() +
+    const auto tempDirectory = RecoveryStore::createUniqueDirectory(
+        outputPath.parent_path() / L".backtrack_tmp" / outputPath.stem(), tempError);
+    if (tempDirectory.empty()) {
+        return fail(L"could not create replay temporary folder for " + outputPath.wstring() +
                     L" (" + utf8ToWide(tempError.message()) + L")");
     }
     ScopedDirectoryCleanup cleanup(tempDirectory);
-
-    // A stale manifest belongs to a previous failed save whose elementary
-    // streams this attempt is about to truncate; drop it before opening the
-    // streams so a crash mid-attempt can never describe bytes that no longer
-    // exist. This attempt publishes a fresh manifest before muxing.
-    RecoveryStore::clearStaleManifest(tempDirectory);
 
     const auto videoPath = tempDirectory / (videoSettings.codec == VideoCodec::H264 ? L"replay.h264" : L"replay.hevc");
 
@@ -874,10 +878,7 @@ bool ReplayBuffer::saveTo(
         for (const auto& packet : microphoneAudio) {
             estimatedBytes += packet->bytes.size();
         }
-        for (const auto& entry : diskSystemAudio) {
-            estimatedBytes += static_cast<uint64_t>(entry.first.byteCount) + entry.second.byteCount;
-        }
-        for (const auto& entry : diskMicrophoneAudio) {
+        for (const auto& entry : diskAudio) {
             estimatedBytes += static_cast<uint64_t>(entry.first.byteCount) + entry.second.byteCount;
         }
         std::wstring spaceDetail;
@@ -890,6 +891,8 @@ bool ReplayBuffer::saveTo(
     if (!videoStream.is_open()) {
         return fail(L"could not open temporary replay video stream " + videoPath.wstring());
     }
+    // an exception after writing begins must not discard the only saved bytes.
+    cleanup.preserveOnFailure();
 
     // Sized from the bytes actually written: sample 0's table entry must cover
     // exactly what is on disk, or every later sample offset shifts.
@@ -937,44 +940,57 @@ bool ReplayBuffer::saveTo(
         videoOffset += sampleBytes;
     }
     videoStream.close();
+    MuxedInputs inputs;
+    inputs.videoPath = videoPath;
+    inputs.videoSamples = std::move(videoSamples);
+    inputs.codec = videoSettings.codec;
+    inputs.fps = videoSettings.fps;
+    inputs.width = videoSettings.width;
+    inputs.height = videoSettings.height;
+    inputs.bitrateKbps = videoSettings.bitrateKbps;
+    inputs.resolutionMode = videoSettings.resolutionMode;
+    WavWriter systemWriter;
+    WavWriter microphoneWriter;
+    auto preserveFailure = [&](const std::wstring& reason) {
+        systemWriter.close();
+        microphoneWriter.close();
+        inputs.systemAudioPath = systemWriter.dataBytes() > 0 ? systemWriter.path() : std::filesystem::path();
+        inputs.microphoneAudioPath = microphoneWriter.dataBytes() > 0 ? microphoneWriter.path() : std::filesystem::path();
+        const auto detail = RecoveryStore::preserveFailedRecording(inputs, outputPath, tempDirectory, reason);
+        cleanup.release();
+        return fail(detail);
+    };
+
     // Reassemble disk-backed audio the same way: the pin guarantees the
     // referenced extents cannot be overwritten while they are consumed.
     bool audioRingReadFailed = false;
-    // Unconditional: the disk queues are empty in RAM mode, so this no-ops
-    // there and the save path never branches on the audio backend.
-    {
-        auto reassembleAudio = [&](const std::vector<DiskAudioPacket>& disk,
-                                   std::vector<std::shared_ptr<const AudioPacket>>& out) {
-            for (const DiskAudioPacket& entry : disk) {
-                const uint32_t totalBytes = entry.first.byteCount + entry.second.byteCount;
-                ringScratch.resize(totalBytes);
-                if (entry.first.byteCount != 0 &&
-                    !audioRing_.read(entry.first.offset, ringScratch.data(), entry.first.byteCount)) {
-                    audioRingReadFailed = true;
-                    return;
-                }
-                if (entry.second.byteCount != 0 &&
-                    !audioRing_.read(
-                        entry.second.offset,
-                        ringScratch.data() + entry.first.byteCount,
-                        entry.second.byteCount)) {
-                    audioRingReadFailed = true;
-                    return;
-                }
-                auto packet = std::make_shared<AudioPacket>();
-                packet->track = entry.track;
-                packet->processId = entry.processId;
-                packet->bytes.assign(ringScratch.begin(), ringScratch.end());
-                packet->frameCount = entry.frameCount;
-                packet->pts100ns = entry.pts100ns;
-                packet->format = entry.format;
-                out.push_back(std::move(packet));
-            }
-        };
-        reassembleAudio(diskSystemAudio, systemAudio);
-        if (!audioRingReadFailed) {
-            reassembleAudio(diskMicrophoneAudio, microphoneAudio);
+    // The snapshot is empty in RAM mode; split disk packets by track only
+    // after reading them in insertion order.
+    for (const DiskAudioPacket& entry : diskAudio) {
+        const uint32_t totalBytes = entry.first.byteCount + entry.second.byteCount;
+        ringScratch.resize(totalBytes);
+        if (entry.first.byteCount != 0 &&
+            !audioRing_.read(entry.first.offset, ringScratch.data(), entry.first.byteCount)) {
+            audioRingReadFailed = true;
+            break;
         }
+        if (entry.second.byteCount != 0 &&
+            !audioRing_.read(
+                entry.second.offset,
+                ringScratch.data() + entry.first.byteCount,
+                entry.second.byteCount)) {
+            audioRingReadFailed = true;
+            break;
+        }
+        auto packet = std::make_shared<AudioPacket>();
+        packet->track = entry.track;
+        packet->processId = entry.processId;
+        packet->bytes.assign(ringScratch.begin(), ringScratch.end());
+        packet->frameCount = entry.frameCount;
+        packet->pts100ns = entry.pts100ns;
+        packet->format = entry.format;
+        auto& out = entry.track == AudioTrack::System ? systemAudio : microphoneAudio;
+        out.push_back(std::move(packet));
     }
     pinRelease.reset(); // All ring bytes consumed; pushes may reclaim space.
 
@@ -996,7 +1012,7 @@ bool ReplayBuffer::saveTo(
                 L"may have gone away); replay video is being buffered in memory for the rest of "
                 L"this session. See the log for details.");
         }
-        return fail(L"could not read buffered replay video from the disk ring " + ringPath.wstring());
+        return preserveFailure(L"could not read buffered replay video from the disk ring " + ringPath.wstring());
     }
     if (audioRingReadFailed) {
         // Same policy as the video path: the bytes behind these extents are
@@ -1010,16 +1026,14 @@ bool ReplayBuffer::saveTo(
                 L"may have gone away); replay sound is being buffered in memory for the rest of "
                 L"this session. See the log for details.");
         }
-        return fail(L"could not read buffered replay sound from the disk ring " + audioRingPath.wstring());
+        return preserveFailure(L"could not read buffered replay sound from the disk ring " + audioRingPath.wstring());
     }
     if (!videoStream) {
         // Most common cause of a mid-stream write failure is a full disk.
-        return fail(L"could not write the temporary replay video stream " + videoPath.wstring() +
+        return preserveFailure(L"could not write the temporary replay video stream " + videoPath.wstring() +
                     L" (disk full?)");
     }
 
-    WavWriter systemWriter;
-    WavWriter microphoneWriter;
     std::filesystem::path systemPath;
     std::filesystem::path microphonePath;
 
@@ -1028,7 +1042,7 @@ bool ReplayBuffer::saveTo(
         if (!writeTimelineAudio(systemWriter, systemAudio, systemPath, replayStartPts, replayEndPts)) {
             // A failed WAV write (typically disk full) must fail the save;
             // muxing would publish a silently truncated audio track.
-            return fail(L"could not write the temporary replay audio stream " + systemPath.wstring() +
+            return preserveFailure(L"could not write the temporary replay audio stream " + systemPath.wstring() +
                         L" (disk full?)");
         }
         if (systemWriter.dataBytes() == 0) {
@@ -1040,7 +1054,7 @@ bool ReplayBuffer::saveTo(
     if (!microphoneAudio.empty()) {
         microphonePath = tempDirectory / L"replay_microphone.wav";
         if (!writeTimelineAudio(microphoneWriter, microphoneAudio, microphonePath, replayStartPts, replayEndPts)) {
-            return fail(L"could not write the temporary replay audio stream " + microphonePath.wstring() +
+            return preserveFailure(L"could not write the temporary replay audio stream " + microphonePath.wstring() +
                         L" (disk full?)");
         }
         if (microphoneWriter.dataBytes() == 0) {
@@ -1049,17 +1063,8 @@ bool ReplayBuffer::saveTo(
         }
     }
 
-    MuxedInputs inputs;
-    inputs.videoPath = videoPath;
     inputs.systemAudioPath = systemPath;
     inputs.microphoneAudioPath = microphonePath;
-    inputs.videoSamples = std::move(videoSamples);
-    inputs.codec = videoSettings.codec;
-    inputs.fps = videoSettings.fps;
-    inputs.width = videoSettings.width;
-    inputs.height = videoSettings.height;
-    inputs.bitrateKbps = videoSettings.bitrateKbps;
-    inputs.resolutionMode = videoSettings.resolutionMode;
 
     // Shared publish tail with the recording finalize path: manifest+readme
     // first, then mux with retry. The temp layout matches what
@@ -1069,22 +1074,14 @@ bool ReplayBuffer::saveTo(
             cleanup.cleanup();
             {
                 std::scoped_lock lock(mutex_);
-                lastSaveEndPts100ns_ = newestVideoEndPts;
+                lastSaveEndPts100ns_ = replayEndPts;
                 Logger::instance().info(L"replay",
                     L"Replay saved: " + outputPath.wstring() +
                     L" in " + std::to_wstring((steadyNow100ns() - saveStart100ns) / 10000) + L"ms");
             }
             return true;
-        case RecoveryStore::MuxPublishResult::kPreservedForRecovery:
-            // The manifest describes the streams on disk: keep the directory
-            // so the clip stays recoverable. errorDetail already carries the
-            // preserved-recording reason.
+        case RecoveryStore::MuxPublishResult::kPreserved:
             cleanup.release();
-            return false;
-        case RecoveryStore::MuxPublishResult::kFailed:
-            // No manifest, so nothing is recoverable; drop the directory
-            // rather than promise a recovery that cannot happen.
-            cleanup.cleanup();
             return false;
     }
     return false;
@@ -1117,9 +1114,8 @@ size_t ReplayBuffer::videoKeyFrameCount() const {
 
 int64_t ReplayBuffer::videoSpan100ns() const {
     std::scoped_lock lock(mutex_);
-    // Backend-agnostic span: collect the metadata once, then run the same
-    // window cut saveTo applies so the reported span never exceeds what a save
-    // would publish. Keyed on the last GOP saveTo observed.
+    // Run the save window cut before any consecutive-save overlap, using the
+    // last GOP saveTo observed.
     std::vector<VideoPacketMeta> metas;
     if (videoBackend_ == VideoBackend::Disk) {
         metas.reserve(diskVideo_.size());
@@ -1147,28 +1143,10 @@ int64_t ReplayBuffer::videoSpan100ns() const {
     if (firstKeyFrame == metas.end()) {
         return 0;
     }
-    const int64_t newestVideoEndPts = metas.back().pts100ns +
-        (std::max<int64_t>)(clampSingleVideoDuration100ns(metas.back().duration100ns), 0);
-    const uint32_t gopSeconds = (std::max<uint32_t>)(1, lastGopSeconds_);
-    const int64_t oldestAllowedEndPts =
-        newestVideoEndPts - secondsTo100ns(settings_.seconds) - gopTolerance100ns(gopSeconds);
-    auto windowBegin = metas.end();
-    for (auto it = metas.begin(); it != metas.end(); ++it) {
-        if (it->pts100ns + (std::max<int64_t>)(it->duration100ns, 0) > oldestAllowedEndPts) {
-            windowBegin = it;
-            break;
-        }
-    }
-    if (windowBegin != metas.end()) {
-        const auto windowKeyFrame = std::find_if(
-            windowBegin, metas.end(), [](const VideoPacketMeta& meta) { return meta.keyFrame; });
-        if (windowKeyFrame != metas.end()) {
-            return (std::max<int64_t>)(0, newestVideoEndPts - windowKeyFrame->pts100ns);
-        }
-    }
-    return (std::min)(
-        (std::max<int64_t>)(0, newestVideoEndPts - firstKeyFrame->pts100ns),
-        secondsTo100ns(settings_.seconds) + gopTolerance100ns(gopSeconds));
+    metas.erase(metas.begin(), firstKeyFrame);
+    const auto metaOf = [](auto& meta) -> auto& { return meta; };
+    const int64_t replayEndPts = cutReplayWindow(metas, settings_.seconds, lastGopSeconds_, metaOf);
+    return (std::max<int64_t>)(0, replayEndPts - metas.front().pts100ns);
 }
 
 int64_t ReplayBuffer::newestVideoPts100ns() const {
@@ -1332,10 +1310,6 @@ void ReplayBuffer::trimLocked() {
 
     trimAudioQueue(systemAudio_, oldestAudioAllowed, ramAudioEndPts, dropRamAudio);
     trimAudioQueue(microphoneAudio_, oldestAudioAllowed, ramAudioEndPts, dropRamAudio);
-    if (!savePinsRefs_) {
-        trimAudioQueue(diskSystemAudio_, oldestAudioAllowed, diskAudioEndPts, releaseDiskAudio);
-        trimAudioQueue(diskMicrophoneAudio_, oldestAudioAllowed, diskAudioEndPts, releaseDiskAudio);
-    }
 
     const int64_t videoStartPts = videoBackend_ == VideoBackend::Disk
         ? diskVideo_.front().meta.pts100ns
@@ -1343,12 +1317,11 @@ void ReplayBuffer::trimLocked() {
     trimAudioQueue(systemAudio_, videoStartPts, ramAudioEndPts, dropRamAudio);
     trimAudioQueue(microphoneAudio_, videoStartPts, ramAudioEndPts, dropRamAudio);
     if (!savePinsRefs_) {
-        trimAudioQueue(diskSystemAudio_, videoStartPts, diskAudioEndPts, releaseDiskAudio);
-        trimAudioQueue(diskMicrophoneAudio_, videoStartPts, diskAudioEndPts, releaseDiskAudio);
+        // An expired packet behind a newer one cannot be reclaimed yet.
+        trimAudioQueue(diskAudio_, (std::max)(oldestAudioAllowed, videoStartPts), diskAudioEndPts, releaseDiskAudio);
     }
-    // RAM audio byte cap: plain oldest-first across both tracks by front PTS,
-    // same policy as the audio ring. Safe mid-save for the same shared_ptr
-    // reason as RAM video.
+    // RAM audio byte cap: plain oldest-first across both tracks by front PTS.
+    // Safe mid-save for the same shared_ptr reason as RAM video.
     while (ramAudioCapacityBytes_ > 0 && ramAudioBytes_ > ramAudioCapacityBytes_ &&
            (!systemAudio_.empty() || !microphoneAudio_.empty())) {
         const int64_t systemPts =
@@ -1466,8 +1439,7 @@ void ReplayBuffer::failOverToRamLocked(std::wstring reason) {
 }
 
 void ReplayBuffer::clearBufferedAudioLocked() {
-    diskSystemAudio_.clear();
-    diskMicrophoneAudio_.clear();
+    diskAudio_.clear();
     audioRing_.clearLive();
     // The write cursor deliberately survives, for the same reason the video
     // cursor does in clearBufferedVideoLocked.
@@ -1484,15 +1456,14 @@ void ReplayBuffer::failOverAudioToRamLocked(std::wstring reason) {
 }
 
 bool ReplayBuffer::ensureAudioRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size) {
-    // Audio eviction policy: plain oldest-first across both tracks, since
-    // audio packets stand alone with no keyframe realignment.
+    // Audio eviction follows physical insertion order across both tracks.
     return audioRing_.ensureSpace(
         lock,
         size,
         savePinsRefs_,
         ringSpace_,
         [this](uint64_t bytesNeeded) { freeAudioRingSpaceLocked(bytesNeeded); },
-        [this] { return diskSystemAudio_.empty() && diskMicrophoneAudio_.empty(); },
+        [this] { return diskAudio_.empty(); },
         L"audio ring");
 }
 
@@ -1511,26 +1482,16 @@ bool ReplayBuffer::appendAudioRingLocked(const AudioPacket& packet) {
     if (!audioRing_.writeWrapped(packet.bytes.data(), size, entry.first, entry.second, L"audio ring")) {
         return false;
     }
-    auto& queue = packet.track == AudioTrack::System ? diskSystemAudio_ : diskMicrophoneAudio_;
-    queue.push_back(std::move(entry));
+    diskAudio_.push_back(std::move(entry));
     trimLocked();
     return true;
 }
 
 void ReplayBuffer::freeAudioRingSpaceLocked(uint64_t bytesNeeded) {
-    // Audio has no keyframe realignment: every packet stands alone, so plain
-    // oldest-first eviction across both tracks (by front PTS) keeps the window
-    // coherent without stranding anything.
-    auto frontPts = [](const std::deque<DiskAudioPacket>& queue) {
-        return queue.empty() ? (std::numeric_limits<int64_t>::max)() : queue.front().pts100ns;
-    };
-    while ((!diskSystemAudio_.empty() || !diskMicrophoneAudio_.empty()) && audioRing_.freeBytes() < bytesNeeded) {
-        auto& queue = frontPts(diskSystemAudio_) <= frontPts(diskMicrophoneAudio_)
-            ? diskSystemAudio_
-            : diskMicrophoneAudio_;
-        const DiskAudioPacket& front = queue.front();
+    while (!diskAudio_.empty() && audioRing_.freeBytes() < bytesNeeded) {
+        const DiskAudioPacket& front = diskAudio_.front();
         audioRing_.releaseBytes(front.first.byteCount + front.second.byteCount);
-        queue.pop_front();
+        diskAudio_.pop_front();
     }
 }
 

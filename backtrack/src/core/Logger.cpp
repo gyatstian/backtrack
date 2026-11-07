@@ -13,6 +13,7 @@ namespace backtrack {
 namespace {
 
 constexpr size_t kRecentLineCapacity = 200;
+constexpr auto kRateWindow = std::chrono::seconds(10);
 
 const wchar_t* levelName(LogLevel level) {
     switch (level) {
@@ -121,21 +122,40 @@ void Logger::write(LogLevel level, const std::wstring& message) {
 
 void Logger::write(LogLevel level, const wchar_t* subsystem, const std::wstring& message) {
     std::scoped_lock lock(mutex_);
+    writeLocked(level, subsystem, message, std::chrono::steady_clock::now());
+}
 
+void Logger::writeRateSummary(const std::wstring& message, const RateState& state) {
+    if (state.suppressed == 0) {
+        return;
+    }
+    std::wstringstream summary;
+    summary << L"[" << timestamp() << L"] [" << levelName(state.level) << L"] [tid="
+            << state.threadId << L"]";
+    if (!state.subsystem.empty()) {
+        summary << L" [" << state.subsystem << L"]";
+    }
+    summary << L" " << message << L" (rate limited " << state.suppressed
+            << L" occurrence" << (state.suppressed == 1 ? L"" : L"s")
+            << L" in previous " << std::chrono::duration_cast<std::chrono::seconds>(kRateWindow).count()
+            << L"s)\n";
+    writeLine(summary.str());
+}
+
+void Logger::writeLocked(LogLevel level, const wchar_t* subsystem, const std::wstring& message,
+    std::chrono::steady_clock::time_point now) {
     if (level < minLevel_) {
         return;
     }
 
     // Windowed per-message rate limiting. Errors are never throttled so real
     // failures always surface. Any other level is capped at kMaxPerWindow lines
-    // per kWindow; excess occurrences are counted and reported as a single
+    // per kRateWindow; excess occurrences are counted and reported as a single
     // summary line when the window rolls over. This bounds interleaved spam
     // (e.g. monitor-switch churn, retry loops) that previously produced tens of
     // thousands of lines, without hiding sporadic events.
-    constexpr auto kWindow = std::chrono::seconds(10);
     constexpr size_t kMaxPerWindow = 3;
 
-    const auto now = std::chrono::steady_clock::now();
     // Gate on level only. A minLevel_ condition here made the default Debug
     // configuration skip throttling entirely, so hot loops were never collapsed.
     const bool throttleable = level != LogLevel::Error;
@@ -149,7 +169,8 @@ void Logger::write(LogLevel level, const wchar_t* subsystem, const std::wstring&
         constexpr size_t kMaxRateEntries = 512;
         if (rateStates_.size() > kMaxRateEntries) {
             for (auto it = rateStates_.begin(); it != rateStates_.end();) {
-                if (it->second.suppressed == 0 && now - it->second.windowStart >= kWindow) {
+                if (now - it->second.windowStart >= kRateWindow) {
+                    writeRateSummary(it->first, it->second);
                     it = rateStates_.erase(it);
                 } else {
                     ++it;
@@ -157,30 +178,19 @@ void Logger::write(LogLevel level, const wchar_t* subsystem, const std::wstring&
             }
         }
 
-        auto& state = rateStates_[message];
-        state.level = level;
-        state.threadId = GetCurrentThreadId();
-        state.subsystem = subsystem ? subsystem : L"";
-        if (state.windowStart == std::chrono::steady_clock::time_point{} ||
-            now - state.windowStart >= kWindow) {
-            // Window rolled over: report anything suppressed in the prior window.
-            if (state.suppressed > 0) {
-                std::wstringstream summary;
-                summary << L"[" << timestamp() << L"] [" << levelName(state.level) << L"] [tid="
-                        << state.threadId << L"]";
-                if (!state.subsystem.empty()) {
-                    summary << L" [" << state.subsystem << L"]";
-                }
-                summary << L" " << message << L" (rate limited " << state.suppressed
-                        << L" occurrence" << (state.suppressed == 1 ? L"" : L"s")
-                        << L" in previous " << std::chrono::duration_cast<std::chrono::seconds>(kWindow).count()
-                        << L"s)\n";
-                writeLine(summary.str());
+        auto [it, inserted] = rateStates_.try_emplace(message);
+        auto& state = it->second;
+        if (inserted || now - state.windowStart >= kRateWindow) {
+            if (!inserted) {
+                writeRateSummary(message, state);
             }
             state.windowStart = now;
             state.emitted = 0;
             state.suppressed = 0;
         }
+        state.level = level;
+        state.threadId = GetCurrentThreadId();
+        state.subsystem = subsystem ? subsystem : L"";
 
         if (state.emitted >= kMaxPerWindow) {
             ++state.suppressed;
@@ -199,11 +209,13 @@ void Logger::write(LogLevel level, const wchar_t* subsystem, const std::wstring&
     writeLine(line.str());
 }
 
-void Logger::flush() {
+bool Logger::flush() {
     std::scoped_lock lock(mutex_);
-    if (stream_.is_open()) {
-        stream_.flush();
+    if (!stream_.is_open()) {
+        return false;
     }
+    stream_.flush();
+    return static_cast<bool>(stream_);
 }
 
 std::filesystem::path Logger::currentPath() const {

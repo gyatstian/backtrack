@@ -35,6 +35,8 @@ public:
     bool hdrMappingActive() const;
 
 private:
+    friend struct D3D11FrameScalerTestAccess;
+
     struct TextureSlot {
         ComPtr<ID3D11Texture2D> texture;
         ComPtr<ID3D11RenderTargetView> renderTargetView;

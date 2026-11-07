@@ -62,23 +62,27 @@ int MainWindow::galleryTileColumnAt(const RECT& row, int x) {
 }
 
 void MainWindow::setLibraryViewMode(LibraryViewMode mode) {
-    if (libraryViewMode_ == mode && clipList_) {
+    const bool gallery = mode == LibraryViewMode::Gallery;
+    if (libraryViewMode_ == mode && clipList_ && savedSettings_.libraryGalleryView == gallery) {
         return;
     }
     libraryViewMode_ = mode;
-    selectedClipIndex_ = static_cast<size_t>(-1);
     clipListWheelRemainder_ = 0;
-    // Persist the view flag against the in-memory settings, never against
-    // controller_.settings(): during a pending ApplySettings the controller
-    // still holds pre-save values, and saving them here used to revert the
-    // settings file the user had just written.
-    settings_.libraryGalleryView = mode == LibraryViewMode::Gallery;
-    commitSettings();
-    Logger::instance().info(L"ui", std::wstring(L"Library view changed to ") + (mode == LibraryViewMode::Gallery ? L"gallery" : L"list"));
+    settings_.libraryGalleryView = gallery;
+    AppSettings candidate = savedSettings_;
+    candidate.libraryGalleryView = gallery;
+    if (commitSettings(candidate)) {
+        Logger::instance().info(L"ui", std::wstring(L"Library view changed to ") + (gallery ? L"gallery" : L"list"));
+    }
+    markSettingsDirty();
     if (clipList_) {
-        setListItemHeightIfChanged(clipList_, clipListItemHeight_, mode == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);
-        refreshClips();
+        setListItemHeightIfChanged(clipList_, clipListItemHeight_,
+            mode == LibraryViewMode::Gallery ? kGalleryClipMinimumItemHeight : kListClipItemHeight);
+        populateClipListRows();
+        onClipSelectionChanged();
+        loadClipThumbnails();
         layoutCurrentPage();
+        requestThumbnailUpdate();
         InvalidateRect(clipList_, nullptr, FALSE);
     }
 }
@@ -88,8 +92,12 @@ void MainWindow::clearClipThumbnails() {
     {
         std::scoped_lock lock(thumbnailQueueMutex_);
         thumbnailQueue_.clear();
+        if (thumbnailResult_ && thumbnailResult_->bitmap) DeleteObject(thumbnailResult_->bitmap);
+        thumbnailResult_.reset();
     }
+    thumbnailQueueCv_.notify_all();
     clipThumbnails_.clear();
+    thumbnailFirst_ = thumbnailLast_ = 0;
 }
 
 void MainWindow::releaseClipThumbnailCache() {
@@ -105,170 +113,123 @@ void MainWindow::releaseClipThumbnailCache() {
     thumbnailCache_.clear();
 }
 
-void MainWindow::pruneClipThumbnailCache() {
-    std::unordered_set<std::wstring> liveKeys;
-    liveKeys.reserve(clips_.size());
-    for (const auto& clip : clips_) {
-        liveKeys.insert(thumbnailCacheKey(clip.path));
-    }
-
-    for (auto it = thumbnailCache_.begin(); it != thumbnailCache_.end();) {
-        if (liveKeys.contains(it->first)) {
-            ++it;
-            continue;
-        }
-        if (it->second.bitmap) {
-            DeleteObject(it->second.bitmap);
-        }
-        if (it->second.tileBitmap) {
-            DeleteObject(it->second.tileBitmap);
-        }
-        it = thumbnailCache_.erase(it);
-    }
-}
-
 void MainWindow::loadClipThumbnails() {
     clearClipThumbnails();
-    // Prune before the Gallery check so deleted/renamed clips release their
-    // cached bitmaps regardless of the active library view mode.
-    pruneClipThumbnailCache();
-    if (libraryViewMode_ != LibraryViewMode::Gallery) {
+    if (page_ != Page::Library || libraryViewMode_ != LibraryViewMode::Gallery) {
+        releaseClipThumbnailCache();
+        return;
+    }
+    if (clips_.empty()) {
+        releaseClipThumbnailCache();
         return;
     }
     clipThumbnails_.resize(clips_.size());
-
-    std::deque<ThumbnailRequest> requests;
-    const uint64_t generation = thumbnailGeneration_.load(std::memory_order_acquire);
-    for (size_t index = 0; index < clips_.size(); ++index) {
-        const auto& clip = clips_[index];
-        const std::wstring key = thumbnailCacheKey(clip.path);
-        auto cache = thumbnailCache_.find(key);
-        if (cache != thumbnailCache_.end()) {
-            auto& entry = cache->second;
-            if (entry.bytes == clip.bytes && entry.modifiedTime == clip.modifiedTime) {
-                clipThumbnails_[index].bitmap = entry.bitmap;
-                clipThumbnails_[index].tileBitmap = entry.tileBitmap;
-                clipThumbnails_[index].tileWidth = entry.tileWidth;
-                clipThumbnails_[index].tileHeight = entry.tileHeight;
-                clipThumbnails_[index].unavailable = entry.unavailable;
-                continue;
-            }
-            if (entry.bitmap) {
-                DeleteObject(entry.bitmap);
-            }
-            if (entry.tileBitmap) {
-                DeleteObject(entry.tileBitmap);
-            }
-            thumbnailCache_.erase(cache);
-        }
-
-        clipThumbnails_[index].loading = true;
-        ThumbnailRequest request;
-        request.generation = generation;
-        request.clipIndex = index;
-        request.path = clip.path;
-        request.modifiedTime = clip.modifiedTime;
-        request.bytes = clip.bytes;
-        requests.push_back(std::move(request));
-    }
-
-    if (requests.empty()) {
-        return;
-    }
-
-    // Decode what is on screen first: with a large uncached library the
-    // visible tiles would otherwise wait behind every off-screen entry.
-    if (clipList_) {
-        const LRESULT top = SendMessageW(clipList_, LB_GETTOPINDEX, 0, 0);
-        RECT client{};
-        GetClientRect(clipList_, &client);
-        const int itemHeight = std::max(1, clipListItemHeight_ > 0 ? clipListItemHeight_ : kGalleryClipMinimumItemHeight);
-        const int visibleRows = std::max(1, static_cast<int>(client.bottom - client.top) / itemHeight);
-        if (top != LB_ERR && top >= 0) {
-            const size_t firstVisible = static_cast<size_t>(top) * kGalleryClipColumns;
-            const size_t lastVisible = firstVisible + static_cast<size_t>(visibleRows) * kGalleryClipColumns;
-            std::stable_partition(requests.begin(), requests.end(), [&](const ThumbnailRequest& request) {
-                return request.clipIndex >= firstVisible && request.clipIndex < lastVisible;
-            });
-        }
-    }
-
-    startThumbnailWorker();
-    {
-        std::scoped_lock lock(thumbnailQueueMutex_);
-        if (thumbnailWorkerStopping_) {
-            return;
-        }
-        for (auto& request : requests) {
-            thumbnailQueue_.push_back(std::move(request));
-        }
-    }
-    thumbnailQueueCv_.notify_one();
+    for (auto& slot : clipThumbnails_) slot.loading = true;
+    thumbnailWorkingSetDirty_ = true;
+    updateThumbnailWorkingSet();
 }
 
 void MainWindow::refreshThumbnailsAfterLibraryEdit() {
-    // Same per-index validation as handleClipThumbnailReady already drops
-    // stale results, so reusing the current generation is safe: duplicates
-    // self-discard instead of starving the worker like a bump would.
-    pruneClipThumbnailCache();
-    if (libraryViewMode_ != LibraryViewMode::Gallery || clips_.empty()) {
-        clipThumbnails_.clear();
+    if (page_ != Page::Library || libraryViewMode_ != LibraryViewMode::Gallery || clips_.empty()) {
+        releaseClipThumbnailCache();
         return;
     }
-    clipThumbnails_.resize(clips_.size());
-    const uint64_t generation = thumbnailGeneration_.load(std::memory_order_acquire);
-    std::deque<ThumbnailRequest> requests;
-    for (size_t index = 0; index < clips_.size(); ++index) {
-        const auto& clip = clips_[index];
-        const std::wstring key = thumbnailCacheKey(clip.path);
-        const auto cache = thumbnailCache_.find(key);
-        if (cache != thumbnailCache_.end() &&
-            cache->second.bytes == clip.bytes &&
-            cache->second.modifiedTime == clip.modifiedTime) {
-            auto& slot = clipThumbnails_[index];
-            slot.bitmap = cache->second.bitmap;
-            slot.tileBitmap = cache->second.tileBitmap;
-            slot.tileWidth = cache->second.tileWidth;
-            slot.tileHeight = cache->second.tileHeight;
-            slot.loading = false;
-            slot.unavailable = cache->second.unavailable;
-            continue;
+    clipThumbnails_.assign(clips_.size(), {});
+    for (auto& slot : clipThumbnails_) slot.loading = true;
+    thumbnailWorkingSetDirty_ = true;
+    requestThumbnailUpdate();
+}
+
+void MainWindow::requestThumbnailUpdate() {
+    if (!thumbnailUpdatePosted_ && window_ && page_ == Page::Library &&
+        libraryViewMode_ == LibraryViewMode::Gallery) {
+        thumbnailUpdatePosted_ = PostMessageW(window_, kLibraryThumbnailUpdateMessage, 0, 0) != FALSE;
+    }
+}
+
+void MainWindow::updateThumbnailWorkingSet() {
+    if (!clipList_ || page_ != Page::Library || libraryViewMode_ != LibraryViewMode::Gallery || clips_.empty() ||
+        clipThumbnails_.empty()) return;
+    const LRESULT top = SendMessageW(clipList_, LB_GETTOPINDEX, 0, 0);
+    if (top == LB_ERR || top < 0) return;
+    RECT client{};
+    GetClientRect(clipList_, &client);
+    const int height = std::max(1, clipListItemHeight_);
+    const size_t rows = static_cast<size_t>((std::max(1L, client.bottom - client.top) + height - 1) / height);
+    const size_t visible = static_cast<size_t>(top) * kGalleryClipColumns;
+    const size_t first = std::min({clips_.size(), clipThumbnails_.size(),
+        visible >= kGalleryClipColumns ? visible - kGalleryClipColumns : 0});
+    const size_t last = std::min({clips_.size(), clipThumbnails_.size(), visible + (rows + 1) * kGalleryClipColumns,
+                                  first + kMaxLibraryThumbnails});
+    if (!thumbnailWorkingSetDirty_ && first == thumbnailFirst_ && last == thumbnailLast_) return;
+
+    const bool rangeChanged = first != thumbnailFirst_ || last != thumbnailLast_;
+    thumbnailWorkingSetDirty_ = false;
+    // Same-range edits keep in-flight decodes for unchanged clips; a range
+    // change invalidates every result outside the new window.
+    const uint64_t generation = rangeChanged
+        ? thumbnailGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1
+        : thumbnailGeneration_.load(std::memory_order_acquire);
+    if (rangeChanged) {
+        for (size_t index = thumbnailFirst_; index < thumbnailLast_ && index < clipThumbnails_.size(); ++index) {
+            clipThumbnails_[index] = {};
         }
-        clipThumbnails_[index] = ClipThumbnail{};
-        clipThumbnails_[index].loading = true;
-        ThumbnailRequest request;
-        request.generation = generation;
-        request.clipIndex = index;
-        request.path = clip.path;
-        request.modifiedTime = clip.modifiedTime;
-        request.bytes = clip.bytes;
-        requests.push_back(std::move(request));
     }
-    if (requests.empty()) {
-        return;
+    thumbnailFirst_ = first;
+    thumbnailLast_ = last;
+    std::unordered_set<std::wstring> keep;
+    for (size_t index = first; index < last; ++index) keep.insert(thumbnailCacheKey(clips_[index].path));
+    for (auto it = thumbnailCache_.begin(); it != thumbnailCache_.end();) {
+        if (keep.contains(it->first)) { ++it; continue; }
+        if (it->second.bitmap) DeleteObject(it->second.bitmap);
+        if (it->second.tileBitmap) DeleteObject(it->second.tileBitmap);
+        it = thumbnailCache_.erase(it);
     }
-    startThumbnailWorker();
+
+    std::deque<ThumbnailRequest> requests;
+    for (size_t index = first; index < last; ++index) {
+        const auto& clip = clips_[index];
+        const auto key = thumbnailCacheKey(clip.path);
+        auto cache = thumbnailCache_.find(key);
+        if (cache != thumbnailCache_.end() &&
+            (cache->second.bytes != clip.bytes || cache->second.modifiedTime != clip.modifiedTime)) {
+            if (cache->second.bitmap) DeleteObject(cache->second.bitmap);
+            if (cache->second.tileBitmap) DeleteObject(cache->second.tileBitmap);
+            thumbnailCache_.erase(cache);
+            cache = thumbnailCache_.end();
+        }
+        if (cache != thumbnailCache_.end()) {
+            clipThumbnails_[index] = {cache->second.bitmap, false, cache->second.unavailable};
+        } else {
+            clipThumbnails_[index].loading = true;
+            requests.push_back({generation, index, clip.path, clip.modifiedTime, clip.bytes});
+        }
+    }
+    if (!requests.empty()) {
+        try {
+            startThumbnailWorker();
+        } catch (...) {
+            Logger::instance().error(L"ui", L"Could not start thumbnail worker");
+        }
+    }
     {
         std::scoped_lock lock(thumbnailQueueMutex_);
-        if (thumbnailWorkerStopping_) {
-            return;
-        }
-        for (auto& request : requests) {
-            thumbnailQueue_.push_back(std::move(request));
-        }
+        thumbnailQueue_ = std::move(requests);
+        if (thumbnailResult_ && thumbnailResult_->bitmap) DeleteObject(thumbnailResult_->bitmap);
+        thumbnailResult_.reset();
     }
-    thumbnailQueueCv_.notify_one();
+    thumbnailQueueCv_.notify_all();
+    InvalidateRect(clipList_, nullptr, FALSE);
 }
 
 void MainWindow::startThumbnailWorker() {
-    if (thumbnailWorker_.joinable()) {
+    if (thumbnailWorkerSuppressed_ || thumbnailWorker_.joinable()) {
         return;
     }
 
     {
         std::scoped_lock lock(thumbnailQueueMutex_);
         thumbnailWorkerStopping_ = false;
-        thumbnailQueue_.clear();
     }
     thumbnailWorker_ = std::thread(&MainWindow::thumbnailWorkerLoop, this);
 }
@@ -285,70 +246,51 @@ void MainWindow::stopThumbnailWorker() {
         thumbnailWorker_.join();
     }
 
-    MSG message{};
-    while (window_ && PeekMessageW(&message, window_, kClipThumbnailReadyMessage, kClipThumbnailReadyMessage, PM_REMOVE)) {
-        auto* result = reinterpret_cast<ThumbnailResult*>(message.lParam);
-        if (result) {
-            if (result->bitmap) {
-                DeleteObject(result->bitmap);
-            }
-            delete result;
-        }
-    }
+    std::scoped_lock lock(thumbnailQueueMutex_);
+    if (thumbnailResult_ && thumbnailResult_->bitmap) DeleteObject(thumbnailResult_->bitmap);
+    thumbnailResult_.reset();
 }
 
 void MainWindow::thumbnailWorkerLoop() {
     setThreadDescriptionSafe(L"Backtrack thumbnails");
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    for (;;) {
-        ThumbnailRequest request;
-        {
-            std::unique_lock lock(thumbnailQueueMutex_);
-            thumbnailQueueCv_.wait(lock, [&] {
-                return thumbnailWorkerStopping_ || !thumbnailQueue_.empty();
-            });
-            if (thumbnailWorkerStopping_ && thumbnailQueue_.empty()) {
-                break;
+    try {
+        for (;;) {
+            ThumbnailRequest request;
+            {
+                std::unique_lock lock(thumbnailQueueMutex_);
+                thumbnailQueueCv_.wait(lock, [&] {
+                    return thumbnailWorkerStopping_ || (!thumbnailQueue_.empty() && !thumbnailResult_);
+                });
+                if (thumbnailWorkerStopping_) break;
+                request = std::move(thumbnailQueue_.front());
+                thumbnailQueue_.pop_front();
             }
-            request = std::move(thumbnailQueue_.front());
-            thumbnailQueue_.pop_front();
-        }
-
-        if (request.generation != thumbnailGeneration_.load(std::memory_order_acquire)) {
-            continue;
-        }
-
-        HBITMAP bitmap = loadShellThumbnail(request.path, kGalleryThumbnailWidth, kGalleryThumbnailHeight);
-        bool stopping = false;
-        {
-            std::scoped_lock lock(thumbnailQueueMutex_);
-            stopping = thumbnailWorkerStopping_;
-        }
-        if (stopping || request.generation != thumbnailGeneration_.load(std::memory_order_acquire)) {
-            if (bitmap) {
-                DeleteObject(bitmap);
+            if (request.generation != thumbnailGeneration_.load(std::memory_order_acquire)) continue;
+            HBITMAP bitmap = nullptr;
+            try {
+                bitmap = loadShellThumbnail(request.path, kGalleryThumbnailWidth, kGalleryThumbnailHeight);
+            } catch (...) {
+                Logger::instance().error(L"ui", L"Could not load clip thumbnail");
             }
-            continue;
-        }
-
-        auto result = std::make_unique<ThumbnailResult>();
-        result->generation = request.generation;
-        result->clipIndex = request.clipIndex;
-        result->path = std::move(request.path);
-        result->modifiedTime = request.modifiedTime;
-        result->bytes = request.bytes;
-        result->bitmap = bitmap;
-
-        auto* rawResult = result.release();
-        if (!window_ ||
-            !IsWindow(window_) ||
-            !PostMessageW(window_, kClipThumbnailReadyMessage, 0, reinterpret_cast<LPARAM>(rawResult))) {
-            if (rawResult->bitmap) {
-                DeleteObject(rawResult->bitmap);
+            {
+                std::scoped_lock lock(thumbnailQueueMutex_);
+                if (!thumbnailWorkerStopping_ &&
+                    request.generation == thumbnailGeneration_.load(std::memory_order_acquire)) {
+                    thumbnailResult_.emplace(ThumbnailResult{request.generation, request.clipIndex,
+                        std::move(request.path), request.modifiedTime, request.bytes, bitmap});
+                    bitmap = nullptr;
+                    if (!window_ || !PostMessageW(window_, kClipThumbnailReadyMessage, 0, 0)) {
+                        bitmap = thumbnailResult_->bitmap;
+                        thumbnailResult_.reset();
+                    }
+                }
             }
-            delete rawResult;
+            if (bitmap) DeleteObject(bitmap);
         }
+    } catch (...) {
+        Logger::instance().error(L"ui", L"Thumbnail worker failed");
     }
 
     if (SUCCEEDED(com)) {
@@ -356,7 +298,16 @@ void MainWindow::thumbnailWorkerLoop() {
     }
 }
 
-void MainWindow::handleClipThumbnailReady(ThumbnailResult& result) {
+void MainWindow::handleClipThumbnailReady() {
+    std::optional<ThumbnailResult> ready;
+    {
+        std::scoped_lock lock(thumbnailQueueMutex_);
+        ready = std::move(thumbnailResult_);
+        thumbnailResult_.reset();
+    }
+    thumbnailQueueCv_.notify_all();
+    if (!ready) return;
+    auto& result = *ready;
     auto deleteResultBitmap = [&] {
         if (result.bitmap) {
             DeleteObject(result.bitmap);
@@ -365,7 +316,8 @@ void MainWindow::handleClipThumbnailReady(ThumbnailResult& result) {
     };
 
     if (result.generation != thumbnailGeneration_.load(std::memory_order_acquire) ||
-        libraryViewMode_ != LibraryViewMode::Gallery ||
+        page_ != Page::Library || libraryViewMode_ != LibraryViewMode::Gallery ||
+        result.clipIndex < thumbnailFirst_ || result.clipIndex >= thumbnailLast_ ||
         result.clipIndex >= clips_.size() ||
         result.clipIndex >= clipThumbnails_.size()) {
         deleteResultBitmap();
@@ -381,6 +333,14 @@ void MainWindow::handleClipThumbnailReady(ThumbnailResult& result) {
         return;
     }
 
+    BITMAP info{};
+    constexpr uint64_t maxBytes = static_cast<uint64_t>(kGalleryThumbnailWidth) * kGalleryThumbnailHeight * 4;
+    if (result.bitmap && (GetObjectW(result.bitmap, sizeof(info), &info) != sizeof(info) ||
+        info.bmWidth <= 0 || info.bmWidth > kGalleryThumbnailWidth ||
+        info.bmHeight <= 0 || info.bmHeight > kGalleryThumbnailHeight || info.bmWidthBytes <= 0 ||
+        static_cast<uint64_t>(info.bmWidthBytes) * static_cast<uint64_t>(info.bmHeight) > maxBytes)) {
+        deleteResultBitmap();
+    }
     auto& entry = thumbnailCache_[key];
     if (entry.bitmap && entry.bitmap != result.bitmap) {
         DeleteObject(entry.bitmap);
@@ -401,9 +361,6 @@ void MainWindow::handleClipThumbnailReady(ThumbnailResult& result) {
 
     auto& slot = clipThumbnails_[result.clipIndex];
     slot.bitmap = entry.bitmap;
-    slot.tileBitmap = entry.tileBitmap;
-    slot.tileWidth = entry.tileWidth;
-    slot.tileHeight = entry.tileHeight;
     slot.loading = false;
     slot.unavailable = entry.unavailable;
 
@@ -563,27 +520,148 @@ void MainWindow::invalidateClipRow(size_t clipIndex) {
 }
 
 void MainWindow::refreshClips() {
-    if (!clipList_) {
-        return;
+    if (!clipList_) return;
+    const auto directory = controller_.settings().clipDirectory;
+    clipManager_.setDirectory(directory);
+    if (clipsDirectory_ != directory) {
+        clipsDirectory_ = directory;
+        clips_.clear();
+        selectedClipIndex_ = static_cast<size_t>(-1);
+        releaseClipThumbnailCache();
     }
-
-    clipManager_.setDirectory(controller_.settings().clipDirectory);
-    clips_ = clipManager_.listClips();
-    selectedClipIndex_ = static_cast<size_t>(-1);
-    loadClipThumbnails();
     populateClipListRows();
-    if (clips_.empty()) {
-        setText(renameEdit_, L"");
-        setStatus(L"No clips found");
+    onClipSelectionChanged();
+    loadClipThumbnails();
+    const uint64_t generation = libraryScanGeneration_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    try {
+        if (!libraryScanWorker_.joinable()) {
+            libraryScanStopping_ = false;
+            libraryScanWorker_ = std::thread(&MainWindow::libraryScanWorkerLoop, this);
+        }
+        {
+            std::scoped_lock lock(libraryScanMutex_);
+            libraryScanRequest_ = LibraryScanRequest{generation, directory};
+            libraryScanResult_.reset();
+        }
+        libraryScanPending_ = true;
+        libraryScanCv_.notify_one();
+        setStatus(L"Refreshing clips...");
+    } catch (...) {
+        libraryScanPending_ = false;
+        Logger::instance().error(L"ui", L"Could not start library scan");
+        setStatus(L"Could not refresh clips");
+    }
+}
+
+void MainWindow::cancelLibraryScan() {
+    libraryScanGeneration_.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::scoped_lock lock(libraryScanMutex_);
+        libraryScanRequest_.reset();
+        libraryScanResult_.reset();
+        libraryScanMessagePosted_ = false;
+    }
+    libraryScanPending_ = false;
+    libraryScanCv_.notify_all();
+}
+
+void MainWindow::stopLibraryScanWorker() {
+    cancelLibraryScan();
+    {
+        std::scoped_lock lock(libraryScanMutex_);
+        libraryScanStopping_ = true;
+    }
+    libraryScanCv_.notify_all();
+    if (libraryScanWorker_.joinable()) libraryScanWorker_.join();
+}
+
+void MainWindow::libraryScanWorkerLoop() {
+    setThreadDescriptionSafe(L"Backtrack library scan");
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    try {
+        ClipManager manager;
+        for (;;) {
+            LibraryScanRequest request;
+            {
+                std::unique_lock lock(libraryScanMutex_);
+                libraryScanCv_.wait(lock, [&] { return libraryScanStopping_ || libraryScanRequest_.has_value(); });
+                if (libraryScanStopping_) break;
+                request = std::move(*libraryScanRequest_);
+                libraryScanRequest_.reset();
+            }
+            const auto cancelled = [this, generation = request.generation] {
+                return libraryScanGeneration_.load(std::memory_order_acquire) != generation;
+            };
+            LibraryScanResult result;
+            result.request = request;
+            try {
+                if (libraryScanOverride_) {
+                    result.clips = libraryScanOverride_(request.directory, cancelled);
+                } else {
+                    manager.setDirectory(request.directory);
+                    result.clips = manager.listClips(cancelled);
+                }
+            } catch (...) {
+                result.failed = true;
+                Logger::instance().error(L"ui", L"Library scan failed");
+            }
+            if (cancelled()) continue;
+            {
+                std::scoped_lock lock(libraryScanMutex_);
+                if (libraryScanStopping_ || cancelled()) continue;
+                libraryScanResult_ = std::move(result);
+                if (!libraryScanMessagePosted_) {
+                    const HWND window = window_;
+                    libraryScanMessagePosted_ = window && IsWindow(window) &&
+                        PostMessageW(window, kLibraryScanReadyMessage, 0, 0);
+                    if (!libraryScanMessagePosted_) libraryScanResult_.reset();
+                }
+            }
+        }
+    } catch (...) {
+        Logger::instance().error(L"ui", L"Library scan worker failed");
+    }
+    if (SUCCEEDED(com)) CoUninitialize();
+}
+
+void MainWindow::handleLibraryScanReady() {
+    std::optional<LibraryScanResult> result;
+    {
+        std::scoped_lock lock(libraryScanMutex_);
+        libraryScanMessagePosted_ = false;
+        result = std::move(libraryScanResult_);
+        libraryScanResult_.reset();
+    }
+    if (!result || result->request.generation != libraryScanGeneration_.load(std::memory_order_acquire)) return;
+    if (page_ != Page::Library || !clipList_) {
+        libraryScanPending_ = false;
         return;
     }
-
-    Logger::instance().info(L"ui", L"Library refreshed: " + std::to_wstring(clips_.size()) + L" clips in " + controller_.settings().clipDirectory.wstring());
-    std::wstring status = std::to_wstring(clips_.size()) + (clips_.size() == 1 ? L" clip found" : L" clips found");
-    const bool loadingPreviews = std::any_of(clipThumbnails_.begin(), clipThumbnails_.end(), [](const ClipThumbnail& thumbnail) {
-        return thumbnail.loading;
-    });
-    if (loadingPreviews) {
+    if (result->request.directory != clipsDirectory_ ||
+        result->request.directory != controller_.settings().clipDirectory) {
+        libraryScanPending_ = false;
+        refreshClips();
+        return;
+    }
+    libraryScanPending_ = false;
+    if (result->failed) {
+        setStatus(L"Could not refresh clips");
+        return;
+    }
+    const auto selected =
+        selectedClipIndex_ < clips_.size() ? clips_[selectedClipIndex_].path : std::filesystem::path{};
+    clips_ = std::move(result->clips);
+    selectedClipIndex_ = selected.empty() ? static_cast<size_t>(-1) : clipIndexForPath(selected);
+    populateClipListRows();
+    onClipSelectionChanged();
+    loadClipThumbnails();
+    Logger::instance().info(L"ui", L"Library refreshed: " + std::to_wstring(clips_.size()) + L" clips in " +
+        clipsDirectory_.wstring());
+    std::wstring status = clips_.empty() ? L"No clips found" :
+        std::to_wstring(clips_.size()) + (clips_.size() == 1 ? L" clip found" : L" clips found");
+    if (std::any_of(clipThumbnails_.begin(), clipThumbnails_.end(), [](const ClipThumbnail& thumbnail) {
+            return thumbnail.loading;
+        })) {
         status += L"; loading previews";
     }
     setStatus(status);
@@ -626,8 +704,9 @@ void MainWindow::populateClipListRows() {
     }
 
     if (selectedClipIndex_ < clips_.size()) {
-        SendMessageW(clipList_, LB_SETCURSEL,
-            static_cast<WPARAM>(libraryViewMode_ == LibraryViewMode::Gallery ? selectedClipIndex_ / kGalleryClipColumns : selectedClipIndex_), 0);
+        const size_t row = libraryViewMode_ == LibraryViewMode::Gallery
+            ? selectedClipIndex_ / kGalleryClipColumns : selectedClipIndex_;
+        SendMessageW(clipList_, LB_SETCURSEL, static_cast<WPARAM>(row), 0);
     }
     InvalidateRect(clipList_, nullptr, FALSE);
     updateLibraryActionButtons();
@@ -750,11 +829,12 @@ void MainWindow::deleteSelectedClip() {
             }
         }
         selectedClipIndex_ = static_cast<size_t>(-1);
-        // Releases the deleted clip's cached bitmaps without discarding
-        // in-flight decodes for the clips that remain.
+        // Marks the working set dirty; the next update prunes the deleted
+        // clip's cache and re-queues the visible previews.
         refreshThumbnailsAfterLibraryEdit();
         populateClipListRows();
         setText(renameEdit_, L"");
+        if (libraryScanPending_) refreshClips();
         setStatus(L"Clip deleted");
     } else {
         Logger::instance().warning(L"ui", std::wstring(L"Clip delete failed from library: ") + path.wstring());
@@ -797,11 +877,12 @@ void MainWindow::renameSelectedClip() {
                 return left.path.filename().wstring() > right.path.filename().wstring();
             });
             selectedClipIndex_ = clipIndexForPath(renamed);
-            // Drops the thumbnail cached under the old path without
-            // discarding in-flight decodes for the clips that remain.
+            // Marks the working set dirty so the old path's cache is pruned
+            // and the visible previews are re-queued.
             refreshThumbnailsAfterLibraryEdit();
             populateClipListRows();
         }
+        if (libraryScanPending_) refreshClips();
         setStatus(L"Clip renamed");
     } else {
         Logger::instance().warning(L"ui", std::wstring(L"Clip rename failed from library: ") + path.wstring() + L" -> " + newName);
@@ -831,6 +912,7 @@ void MainWindow::toggleSelectedFavorite() {
             // of rebuilding the whole list (no flicker, no scroll jump).
             invalidateClipRow(index);
         }
+        if (libraryScanPending_) refreshClips();
         setStatus(currentlyFavorite ? L"Favorite removed" : L"Clip favorited");
     } else {
         Logger::instance().warning(L"ui", std::wstring(L"Favorite update failed for clip: ") + path.wstring());

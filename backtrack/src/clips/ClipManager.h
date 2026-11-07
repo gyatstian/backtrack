@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,13 +22,15 @@ public:
     explicit ClipManager(std::filesystem::path directory = {});
 
     void setDirectory(std::filesystem::path directory);
-    std::vector<ClipInfo> listClips() const;
+    std::vector<ClipInfo> listClips(const std::function<bool()>& cancelled = {}) const;
     bool removeClip(const std::filesystem::path& path) const;
     bool renameClip(const std::filesystem::path& path, const std::wstring& newStem) const;
     bool setFavorite(const std::filesystem::path& path, bool favorite) const;
     bool addTag(const std::filesystem::path& path, const std::wstring& tag) const;
 
 private:
+    friend struct ClipManagerTestAccess;
+
     struct DurationCacheEntry {
         uintmax_t bytes = 0;
         std::filesystem::file_time_type modifiedTime{};
@@ -35,12 +38,14 @@ private:
     };
 
     bool isManagedClipPath(const std::filesystem::path& path) const;
+    bool renameClipImpl(const std::filesystem::path& path, const std::wstring& newStem,
+                        void (*beforeMove)(const std::filesystem::path&)) const;
     std::filesystem::path favoriteMarker(const std::filesystem::path& path) const;
     std::filesystem::path tagFile(const std::filesystem::path& path) const;
     std::vector<std::wstring> readTags(const std::filesystem::path& path) const;
     // Shell property reads are slow (per-file COM handler open), so durations
-    // are cached per file identity (size + modified time). listClips() runs on
-    // the UI thread only, so no locking is needed.
+    // are cached per file identity (size + modified time). Calls on one
+    // instance must be serialized.
     uint64_t cachedMediaDuration(
         const std::filesystem::path& path,
         uintmax_t bytes,

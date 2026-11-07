@@ -1,13 +1,15 @@
 #include "settings/SettingsStore.h"
 
+#include "clips/AtomicWrite.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
 #include <algorithm>
+#include <array>
 #include <cwctype>
-#include <fstream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <sstream>
 #include <unordered_set>
 
@@ -97,6 +99,10 @@ void dedupeNamedExecutableApps(std::vector<App>& apps) {
         if (app.name.empty()) {
             app.name = app.executablePath.stem().wstring();
         }
+        std::replace_if(app.name.begin(), app.name.end(), [](wchar_t ch) {
+            return ch == L'\r' || ch == L'\n';
+        }, L' ');
+        app.name = trimText(std::move(app.name));
         const std::wstring key = normalizedPathKey(app.executablePath);
         if (key.empty() || seen.contains(key)) {
             continue;
@@ -181,32 +187,67 @@ SettingsStore::SettingsStore(std::filesystem::path path)
     : path_(std::move(path)) {
 }
 
-AppSettings SettingsStore::load() const {
+bool SettingsStore::normalizeLoaded(const AppSettings& settings, LoadStatus status) const {
+    return status != LoadStatus::Loaded || save(settings);
+}
+
+AppSettings SettingsStore::load(LoadStatus* status) const {
     AppSettings settings;
     settings.clipDirectory = defaultClipDirectory();
+    if (status) {
+        *status = LoadStatus::Failed;
+    }
 
-    std::ifstream input(path_, std::ios::binary);
-    if (!input.is_open()) {
+    // MSVC filebuf can treat read errors as EOF; exclude writers while reading.
+    HANDLE handle = CreateFileW(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (status && (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
+            *status = LoadStatus::Missing;
+        }
         return sanitizeSettings(settings);
     }
+    const std::unique_ptr<void, decltype(&CloseHandle)> input(handle, CloseHandle);
 
     std::map<std::wstring, std::wstring> values;
     std::string rawLine;
-    std::wstring line;
-    while (std::getline(input, rawLine)) {
+    const auto parseLine = [&] {
         if (!rawLine.empty() && rawLine.back() == '\r') {
             rawLine.pop_back();
         }
-        line = utf8ToWide(rawLine);
-        line = trimText(line);
+        const std::wstring line = trimText(utf8ToWide(rawLine));
         if (line.empty() || line.front() == L'#') {
-            continue;
+            return;
         }
         const auto pos = line.find(L'=');
-        if (pos == std::wstring::npos) {
-            continue;
+        if (pos != std::wstring::npos) {
+            values[trimText(line.substr(0, pos))] = trimText(line.substr(pos + 1));
         }
-        values[trimText(line.substr(0, pos))] = trimText(line.substr(pos + 1));
+    };
+    std::array<char, 4096> buffer;
+    for (;;) {
+        DWORD count = 0;
+        if (!ReadFile(input.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr)) {
+            return sanitizeSettings(settings);
+        }
+        if (count == 0) {
+            break;
+        }
+        for (DWORD index = 0; index < count; ++index) {
+            if (buffer[index] == '\n') {
+                parseLine();
+                rawLine.clear();
+            } else {
+                rawLine.push_back(buffer[index]);
+            }
+        }
+    }
+    if (!rawLine.empty()) {
+        parseLine();
+    }
+    if (status) {
+        *status = LoadStatus::Loaded;
     }
 
     settings.video.width = readUInt(values, L"video.width", settings.video.width);
@@ -333,14 +374,14 @@ AppSettings SettingsStore::load() const {
     return sanitizeSettings(settings);
 }
 
-void SettingsStore::save(const AppSettings& settings) const {
+bool SettingsStore::save(const AppSettings& settings) const {
     const AppSettings normalized = sanitizeSettings(settings);
     if (!path_.parent_path().empty()) {
         std::error_code error;
         std::filesystem::create_directories(path_.parent_path(), error);
         if (error) {
             Logger::instance().error(L"settings", L"Could not create settings directory: " + path_.parent_path().wstring());
-            return;
+            return false;
         }
     }
 
@@ -430,46 +471,18 @@ void SettingsStore::save(const AppSettings& settings) const {
     output << L"hotkeys.startStop.vk=" << normalized.hotkeys.startStopVirtualKey << L"\n";
     output << L"hotkeys.saveReplay.modifiers=" << normalized.hotkeys.saveReplayModifiers << L"\n";
     output << L"hotkeys.saveReplay.vk=" << normalized.hotkeys.saveReplayVirtualKey << L"\n";
-
-    // Stage the rewrite in a sibling temp file and swap it over the live one,
-    // the way the recovery manifest and the session-mute journal are published.
-    // Truncating settings.ini in place means a full disk or a lock from a sync
-    // client zeroes it before the first byte is written, and the next load then
-    // silently falls back to defaults for every key the partial file lost. A
-    // process killed between the write and the rename only leaves the temp
-    // file, which the next save truncates and reuses.
-    const std::filesystem::path tempPath = path_.wstring() + L".tmp";
-    {
-        std::ofstream file(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!file.is_open()) {
-            Logger::instance().error(L"settings", L"Could not open settings temp file for writing: " + tempPath.wstring());
-            return;
-        }
-        file << wideToUtf8(output.str());
-        // A buffered write can pass and still fail on the way to the disk.
-        file.flush();
-        if (!file) {
-            Logger::instance().error(L"settings", L"Could not write settings temp file: " + tempPath.wstring());
-            file.close();
-            std::error_code removeError;
-            std::filesystem::remove(tempPath, removeError);
-            return;
-        }
+    if (!output) {
+        Logger::instance().error(L"settings", L"Could not serialize settings");
+        return false;
     }
 
-    // MSVC implements std::filesystem::rename as
-    // MoveFileEx(MOVEFILE_REPLACE_EXISTING), so the live file is replaced
-    // rather than making this fail because settings.ini already exists. This is
-    // the only point at which the live file is touched, and it cannot damage
-    // what is already there.
-    std::error_code replaceError;
-    std::filesystem::rename(tempPath, path_, replaceError);
-    if (replaceError) {
-        Logger::instance().error(L"settings", L"Could not replace settings file, previous settings kept: " +
-            path_.wstring() + L" (Win32 error " + std::to_wstring(replaceError.value()) + L")");
-        std::error_code removeError;
-        std::filesystem::remove(tempPath, removeError);
+    const auto error = atomicWriteSibling(path_, wideToUtf8(output.str()));
+    if (error) {
+        Logger::instance().error(L"settings", L"Could not publish settings file, previous settings kept: " +
+            path_.wstring() + L" (Win32 error " + std::to_wstring(error.value()) + L")");
+        return false;
     }
+    return true;
 }
 
 VideoSettings validateEncoderConfig(VideoSettings video) {
@@ -519,6 +532,11 @@ AppSettings sanitizeSettings(AppSettings settings) {
          settings.hotkeys.saveReplayVirtualKey == settings.hotkeys.startStopVirtualKey)) {
         settings.hotkeys.saveReplayModifiers = defaultHotkeys.saveReplayModifiers;
         settings.hotkeys.saveReplayVirtualKey = defaultHotkeys.saveReplayVirtualKey;
+        if (settings.hotkeys.saveReplayModifiers == settings.hotkeys.startStopModifiers &&
+            settings.hotkeys.saveReplayVirtualKey == settings.hotkeys.startStopVirtualKey) {
+            settings.hotkeys.saveReplayModifiers = 0;
+            settings.hotkeys.saveReplayVirtualKey = 0;
+        }
     }
     if (!settings.multiMonitorSupport || !settings.followFocusedMonitor) {
         settings.followMouseMonitor = false;

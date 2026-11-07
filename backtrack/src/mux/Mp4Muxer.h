@@ -25,10 +25,8 @@ public:
     std::wstring lastError() const;
     const std::filesystem::path& outputPath() const { return outputPath_; }
 
-    // stagingVariant: zero-based index selecting the staged output name
-    // (<stem>.publish.mp4, then <stem>.publish.<variant>.mp4). Retry wrappers
-    // rotate it when an external handle (antivirus/indexer) pins the previous
-    // staging file. win32Error: optional receiver for the raw Win32 code of
+    // stagingVariant selects the preferred per-attempt staging directory.
+    // win32Error: optional receiver for the raw Win32 code of
     // the failing file operation (ERROR_SHARING_VIOLATION etc.);
     // ERROR_SUCCESS when the failure was not from a Win32 call.
     static bool muxToMp4(
@@ -42,6 +40,8 @@ public:
         std::wstring& detail);
 
 private:
+    friend struct Mp4MuxerTestAccess;
+
     struct AudioTimelineState {
         WavWriter writer;
         int64_t nextPts100ns = 0;
@@ -87,12 +87,9 @@ private:
     std::wstring lastError_;
 };
 
-// Removes path only when it is an empty, hidden zero-byte output-name
-// reservation (created when a clip name is claimed before muxing; see
-// RecorderController::nextClipPath and RecoveryStore's recovered-output
-// claim). The hidden attribute is what distinguishes our reservation from a
-// user's own empty .mp4 placeholder at the same path. Real content is never
-// removed. Returns true when a reservation was found and removed.
+// Removes a hidden, empty file at a path previously claimed for output.
+// The attributes do not establish identity if another process replaces it.
+// Returns true when such a file was removed.
 bool removeEmptyOutputReservation(const std::filesystem::path& path);
 
 } // namespace backtrack

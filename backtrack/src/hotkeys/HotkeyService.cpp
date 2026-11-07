@@ -184,9 +184,12 @@ void HotkeyService::unregisterHotkeys(HWND window) {
     UnregisterHotKey(window, kSaveReplayId);
     window_ = nullptr;
     settings_ = HotkeySettings{};
-    ctrlDown_ = false;
-    altDown_ = false;
-    shiftDown_ = false;
+    leftCtrlDown_ = false;
+    rightCtrlDown_ = false;
+    leftAltDown_ = false;
+    rightAltDown_ = false;
+    leftShiftDown_ = false;
+    rightShiftDown_ = false;
     startStopPressed_ = false;
     saveReplayPressed_ = false;
     startStopHookTick_ = 0;
@@ -221,7 +224,7 @@ void HotkeyService::handleKeyboardEvent(WPARAM message, const KBDLLHOOKSTRUCT& e
     }
 
     const uint32_t virtualKey = event.vkCode;
-    updateModifierState(virtualKey, keyDown);
+    updateModifierState(event, keyDown);
     if (keyUp) {
         if (virtualKey == settings_.startStopVirtualKey) {
             startStopPressed_ = false;
@@ -250,30 +253,44 @@ void HotkeyService::handleKeyboardEvent(WPARAM message, const KBDLLHOOKSTRUCT& e
 }
 
 void HotkeyService::seedModifierState() {
-    ctrlDown_ = isKeyDownNow(VK_CONTROL) || isKeyDownNow(VK_LCONTROL) || isKeyDownNow(VK_RCONTROL);
-    altDown_ = isKeyDownNow(VK_MENU) || isKeyDownNow(VK_LMENU) || isKeyDownNow(VK_RMENU);
-    shiftDown_ = isKeyDownNow(VK_SHIFT) || isKeyDownNow(VK_LSHIFT) || isKeyDownNow(VK_RSHIFT);
+    leftCtrlDown_ = isKeyDownNow(VK_LCONTROL);
+    rightCtrlDown_ = isKeyDownNow(VK_RCONTROL);
+    leftAltDown_ = isKeyDownNow(VK_LMENU);
+    rightAltDown_ = isKeyDownNow(VK_RMENU);
+    leftShiftDown_ = isKeyDownNow(VK_LSHIFT);
+    rightShiftDown_ = isKeyDownNow(VK_RSHIFT);
 }
 
-void HotkeyService::updateModifierState(uint32_t virtualKey, bool down) {
-    if (isControlVirtualKey(virtualKey)) {
-        ctrlDown_ = down;
-    } else if (isAltVirtualKey(virtualKey)) {
-        altDown_ = down;
-    } else if (isShiftVirtualKey(virtualKey)) {
-        shiftDown_ = down;
+void HotkeyService::updateModifierState(const KBDLLHOOKSTRUCT& event, bool down) {
+    uint32_t virtualKey = event.vkCode;
+    if (virtualKey == VK_CONTROL) {
+        virtualKey = (event.flags & LLKHF_EXTENDED) ? VK_RCONTROL : VK_LCONTROL;
+    } else if (virtualKey == VK_MENU) {
+        virtualKey = (event.flags & LLKHF_EXTENDED) ? VK_RMENU : VK_LMENU;
+    } else if (virtualKey == VK_SHIFT) {
+        // a generic shift without a usable scan code cannot identify a side.
+        virtualKey = MapVirtualKeyW(event.scanCode, MAPVK_VSC_TO_VK_EX) == VK_RSHIFT ? VK_RSHIFT : VK_LSHIFT;
+    }
+
+    switch (virtualKey) {
+    case VK_LCONTROL: leftCtrlDown_ = down; break;
+    case VK_RCONTROL: rightCtrlDown_ = down; break;
+    case VK_LMENU: leftAltDown_ = down; break;
+    case VK_RMENU: rightAltDown_ = down; break;
+    case VK_LSHIFT: leftShiftDown_ = down; break;
+    case VK_RSHIFT: rightShiftDown_ = down; break;
     }
 }
 
 uint32_t HotkeyService::currentHookModifiers() const {
     uint32_t modifiers = 0;
-    if (ctrlDown_) {
+    if (leftCtrlDown_ || rightCtrlDown_) {
         modifiers |= MOD_CONTROL;
     }
-    if (altDown_) {
+    if (leftAltDown_ || rightAltDown_) {
         modifiers |= MOD_ALT;
     }
-    if (shiftDown_) {
+    if (leftShiftDown_ || rightShiftDown_) {
         modifiers |= MOD_SHIFT;
     }
     return modifiers;

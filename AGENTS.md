@@ -21,6 +21,9 @@ RNNoise.
 - This file does not own: any module's internal contracts. Every
   `backtrack/src/*` folder and `backtrack/tests` owns its own rules through its
   child AGENTS.md.
+- `AUDIT_HANDOFF.md` is the audit snapshot and implementation handoff. It records
+  findings, evidence limits, and coordination dependencies; it does not replace
+  the source domains' current contracts.
 - Nothing may weaken the DOX framework section below.
 
 ### Local Contracts

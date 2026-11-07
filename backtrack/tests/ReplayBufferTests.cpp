@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -29,17 +30,47 @@ namespace backtrack {
 
 static MuxedInputs g_lastMuxedInputs;
 static std::optional<WavInfo> g_lastSystemWav;
+static std::optional<WavInfo> g_lastMicrophoneWav;
+static bool g_captureAudioBytes = false;
+static std::vector<uint8_t> g_lastSystemAudioBytes;
+static std::vector<uint8_t> g_lastMicrophoneAudioBytes;
 // Snapshot of the elementary stream at mux time: saveTo deletes its staging
 // directory right after the stub returns, so integrity checks must copy.
 static std::vector<char> g_lastVideoStreamBytes;
 // When set, the stub reports a muxing failure so saveTo's failure branch is
 // reachable; the real muxer returning false is otherwise never exercised.
 static bool g_muxShouldFail = false;
+// Recovery muxes an owned work copy of the streams, so the input path is not
+// the session identity any more; the recovered output name is.
+static std::filesystem::path g_muxFailOutputName;
+static std::vector<std::filesystem::path> g_muxedVideoPaths;
+static std::vector<std::filesystem::path> g_muxedOutputPaths;
+static std::vector<size_t> g_muxedSampleCounts;
 static std::wstring g_muxFailureDetail;
+
+static void captureWav(const std::filesystem::path& path, std::optional<WavInfo>& wav,
+                       std::vector<uint8_t>& bytes) {
+    wav.reset();
+    bytes.clear();
+    WavInfo info;
+    if (path.empty() || !parseWav(path, info)) {
+        return;
+    }
+    wav = info;
+    if (g_captureAudioBytes) {
+        std::ifstream stream(path, std::ios::binary);
+        stream.seekg(static_cast<std::streamoff>(info.dataOffset));
+        bytes.resize(static_cast<size_t>(info.dataBytes));
+        stream.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!stream) {
+            bytes.clear();
+        }
+    }
+}
 
 bool Mp4Muxer::muxToMp4(
     const MuxedInputs& inputs,
-    const std::filesystem::path& /*outputPath*/,
+    const std::filesystem::path& outputPath,
     std::wstring* errorDetail,
     unsigned /*stagingVariant*/,
     DWORD* win32Error) {
@@ -47,9 +78,16 @@ bool Mp4Muxer::muxToMp4(
         *win32Error = ERROR_SUCCESS;
     }
     g_lastMuxedInputs = inputs;
+    g_muxedVideoPaths.push_back(inputs.videoPath);
+    g_muxedOutputPaths.push_back(outputPath);
+    g_muxedSampleCounts.push_back(inputs.videoSamples.size());
     g_lastSystemWav.reset();
+    g_lastMicrophoneWav.reset();
+    g_lastSystemAudioBytes.clear();
+    g_lastMicrophoneAudioBytes.clear();
     g_lastVideoStreamBytes.clear();
-    if (g_muxShouldFail) {
+    if (g_muxShouldFail ||
+        (!g_muxFailOutputName.empty() && outputPath.filename() == g_muxFailOutputName)) {
         if (errorDetail) {
             *errorDetail = g_muxFailureDetail;
         }
@@ -62,12 +100,8 @@ bool Mp4Muxer::muxToMp4(
                 std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
         }
     }
-    if (!inputs.systemAudioPath.empty()) {
-        WavInfo info;
-        if (parseWav(inputs.systemAudioPath, info)) {
-            g_lastSystemWav = info;
-        }
-    }
+    captureWav(inputs.systemAudioPath, g_lastSystemWav, g_lastSystemAudioBytes);
+    captureWav(inputs.microphoneAudioPath, g_lastMicrophoneWav, g_lastMicrophoneAudioBytes);
     return true;
 }
 
@@ -100,6 +134,9 @@ struct ReplayBufferTestAccess {
     }
     static uint64_t ramAudioBytes(const ReplayBuffer& buffer) {
         return buffer.ramAudioBytes_;
+    }
+    static uint64_t diskAudioBytes(const ReplayBuffer& buffer) {
+        return buffer.audioRing_.liveBytes();
     }
 };
 
@@ -509,6 +546,169 @@ void testRecoveryManifestRoundTripIsAtomic() {
     expect(backtrack::g_lastMuxedInputs.videoSamples.back().offset ==
                (kPackets - 1) * kPacketSize,
         "round trip changed the last sample offset");
+    fixture.dispose();
+}
+
+void testSessionDirectoriesAreExclusivelyCreated() {
+    RecoveryFixture fixture = RecoveryFixture::create(L"exclusive_sessions");
+    const auto marker = fixture.sessionDir / L"existing.txt";
+    writeTextFile(marker, "original");
+    constexpr size_t count = 8;
+    std::vector<std::filesystem::path> paths(count);
+    std::vector<std::error_code> errors(count);
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < count; ++i) {
+        threads.emplace_back([&, i] {
+            paths[i] = backtrack::RecoveryStore::createUniqueDirectory(fixture.sessionDir, errors[i]);
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    for (size_t i = 0; i < count; ++i) {
+        expect(!errors[i] && !paths[i].empty(), "could not create a unique session");
+        expect(paths[i] != fixture.sessionDir, "reused an existing session");
+        expect(std::find(paths.begin(), paths.begin() + i, paths[i]) == paths.begin() + i,
+            "concurrent saves claimed the same session");
+    }
+    std::ifstream stream(marker);
+    std::string value;
+    stream >> value;
+    stream.close();
+    expect(value == "original", "session creation changed existing data");
+    fixture.dispose();
+}
+
+void testFailedManifestRewriteKeepsIncrementalPrefix() {
+    RecoveryFixture fixture = RecoveryFixture::create(L"writefailure");
+    const auto videoPath = fixture.sessionDir / L"video.h264";
+    writeElementaryStream(videoPath, kPackets);
+    const auto incremental = makeMuxedInputs(videoPath, kPackets + 2);
+    expect(backtrack::RecoveryStore::writeManifest(incremental, fixture.sessionDir),
+        "could not write incremental manifest fixture");
+    const auto manifestPath = fixture.sessionDir / backtrack::RecoveryStore::kRecoveryManifestName;
+    std::ifstream beforeFile(manifestPath, std::ios::binary);
+    const std::string before((std::istreambuf_iterator<char>(beforeFile)), std::istreambuf_iterator<char>());
+    beforeFile.close();
+
+    std::error_code error;
+    std::filesystem::create_directory(fixture.sessionDir / L"recovery.tsv.tmp", error);
+    expect(!error, "could not block the manifest rewrite");
+    backtrack::g_muxShouldFail = true;
+    std::wstring detail;
+    const auto result = backtrack::RecoveryStore::publishMuxedInputs(
+        incremental, fixture.clipsDir / L"session1.mp4", fixture.sessionDir, &detail);
+    backtrack::g_muxShouldFail = false;
+    expect(result == backtrack::RecoveryStore::MuxPublishResult::kPreserved,
+        "failed rewrite discarded the incremental recovery manifest");
+    expect(detail.find(L"Recover Failed") != std::wstring::npos,
+        "usable prefix was not reported as recoverable");
+    std::ifstream afterFile(manifestPath, std::ios::binary);
+    const std::string after((std::istreambuf_iterator<char>(afterFile)), std::istreambuf_iterator<char>());
+    afterFile.close();
+    expect(after == before, "failed rewrite changed the incremental manifest");
+    expectRecoveredSamples(fixture, kPackets, "failed rewrite and missing tail");
+    fixture.dispose();
+}
+
+void testFailedMuxWithoutManifestKeepsStreams() {
+    RecoveryFixture fixture = RecoveryFixture::create(L"manual_recovery");
+    const auto videoPath = fixture.sessionDir / L"video.h264";
+    const auto original = writeElementaryStream(videoPath, kPackets);
+    std::error_code error;
+    std::filesystem::create_directory(fixture.sessionDir / L"recovery.tsv.tmp", error);
+    expect(!error, "could not block the recovery manifest");
+    backtrack::g_muxShouldFail = true;
+    std::wstring detail;
+    const auto result = backtrack::RecoveryStore::publishMuxedInputs(
+        makeMuxedInputs(videoPath, kPackets), fixture.clipsDir / L"session1.mp4", fixture.sessionDir, &detail);
+    backtrack::g_muxShouldFail = false;
+    expect(result == backtrack::RecoveryStore::MuxPublishResult::kPreserved,
+        "failed mux did not preserve streams without a manifest");
+    expect(detail.find(L"manual recovery") != std::wstring::npos,
+        "missing manifest was not reported as a manual recovery case");
+    std::ifstream stream(videoPath, std::ios::binary);
+    const std::vector<uint8_t> after((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+    stream.close();
+    expect(after == original, "failed mux changed streams without a manifest");
+    fixture.dispose();
+}
+
+void testStartupRecoversAllValidSessionsAndKeepsFailures() {
+    RecoveryFixture fixture = RecoveryFixture::create(L"startup_multi");
+    const auto root = fixture.sessionDir.parent_path();
+    const auto failedDir = fixture.sessionDir;
+    const auto firstDir = root / L"session2";
+    const auto secondDir = root / L"session3";
+    const auto unknownDir = root / L"unknown";
+    std::error_code error;
+    for (const auto& dir : {firstDir, secondDir, unknownDir}) {
+        std::filesystem::create_directory(dir, error);
+        expect(!error, "could not create startup recovery fixture");
+    }
+    std::vector<uint8_t> failedBytes;
+    for (const auto& dir : {failedDir, firstDir, secondDir}) {
+        const auto video = dir / L"video.h264";
+        const auto bytes = writeElementaryStream(video, kPackets);
+        if (dir == failedDir) {
+            failedBytes = bytes;
+        }
+        const auto samples = dir == secondDir ? kPackets + 2 : kPackets;
+        expect(backtrack::RecoveryStore::writeManifest(makeMuxedInputs(video, samples), dir),
+            "could not write startup recovery manifest");
+    }
+    writeElementaryStream(unknownDir / L"video.h264", kPackets);
+    const auto old = std::filesystem::file_time_type::clock::now() - std::chrono::hours(48);
+    for (const auto& dir : {failedDir, firstDir, secondDir, unknownDir}) {
+        std::filesystem::last_write_time(dir, old, error);
+        expect(!error, "could not age startup recovery directory");
+    }
+    for (const auto& dir : {failedDir, firstDir, secondDir}) {
+        std::filesystem::last_write_time(dir / backtrack::RecoveryStore::kRecoveryManifestName, old, error);
+        expect(!error, "could not age startup recovery manifest");
+    }
+    std::filesystem::last_write_time(
+        failedDir / backtrack::RecoveryStore::kRecoveryManifestName, old + std::chrono::hours(2), error);
+    expect(!error, "could not make the failed manifest newest");
+    backtrack::g_muxedVideoPaths.clear();
+    backtrack::g_muxedOutputPaths.clear();
+    backtrack::g_muxedSampleCounts.clear();
+    backtrack::g_muxFailOutputName = L"session1.mp4";
+    backtrack::g_muxFailureDetail = L"simulated startup failure";
+    backtrack::RecoveryStore::sweepOrphanedRecoveryData(fixture.clipsDir);
+    backtrack::g_muxFailOutputName.clear();
+    backtrack::g_muxFailureDetail.clear();
+
+    expect(std::filesystem::exists(failedDir / L"video.h264"), "startup deleted the failed session");
+    expect(std::filesystem::exists(failedDir / backtrack::RecoveryStore::kRecoveryManifestName),
+        "startup deleted the failed session manifest");
+    std::ifstream failedStream(failedDir / L"video.h264", std::ios::binary);
+    const std::vector<uint8_t> afterFailure(
+        (std::istreambuf_iterator<char>(failedStream)), std::istreambuf_iterator<char>());
+    failedStream.close();
+    expect(afterFailure == failedBytes, "startup changed the failed session's video");
+    expect(std::filesystem::exists(unknownDir / L"video.h264"), "startup deleted unrecognized data");
+    // Recovery muxes from an exclusively created work copy, so the original
+    // sessions and their streams are retained; the sweep only adds the clips.
+    expect(std::filesystem::exists(firstDir) && std::filesystem::exists(secondDir),
+        "startup recovery deleted a valid session's streams");
+    expect(std::count(backtrack::g_muxedOutputPaths.begin(), backtrack::g_muxedOutputPaths.end(),
+                      fixture.clipsDir / L"session1.mp4") == 4,
+        "startup did not make one bounded recovery attempt for the failed session");
+    for (const auto& dir : {firstDir, secondDir}) {
+        const auto output = fixture.clipsDir / (dir.filename().wstring() + L".mp4");
+        const auto it = std::find(backtrack::g_muxedOutputPaths.begin(), backtrack::g_muxedOutputPaths.end(),
+                                  output);
+        expect(it != backtrack::g_muxedOutputPaths.end(), "startup skipped a valid session");
+        expect(std::count(backtrack::g_muxedOutputPaths.begin(), backtrack::g_muxedOutputPaths.end(),
+                          output) == 1,
+            "startup recovered a valid session more than once");
+        expect(std::filesystem::exists(output), "startup did not publish a recovered session");
+        const auto index = static_cast<size_t>(it - backtrack::g_muxedOutputPaths.begin());
+        expect(backtrack::g_muxedSampleCounts[index] == kPackets,
+            "startup failed to trim a missing stream tail");
+    }
+    expectRecoveredSamples(fixture, kPackets, "retry after failed startup recovery");
     fixture.dispose();
 }
 
@@ -1047,6 +1247,64 @@ void testMuxFailurePreservesStreamsAndReportsReason() {
     std::filesystem::remove_all(testOutputDir(), error);
 }
 
+void testSameNameRetryDoesNotTouchPreservedReplay() {
+    std::error_code error;
+    std::filesystem::remove_all(testOutputDir(), error);
+    ReplayBuffer buffer;
+    buffer.configure(settings(30));
+    for (int64_t pts = 0; pts < 6; ++pts) {
+        buffer.pushVideo(makeVideoPayload(
+            pts * kSecond100ns, kSecond100ns, pts == 0, static_cast<uint8_t>(0xA0 + pts), 1024));
+    }
+    const auto directory = testOutputDir() / L"same_minute";
+    std::filesystem::create_directories(directory, error);
+    expect(!error, "could not create retry fixture");
+    const auto output = directory / L"clip.mp4";
+    const HANDLE reservation = CreateFileW(
+        output.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    expect(reservation != INVALID_HANDLE_VALUE, "could not reserve first output name");
+    CloseHandle(reservation);
+
+    backtrack::g_muxShouldFail = true;
+    std::wstring detail;
+    const bool saved = buffer.saveTo(output, defaultVideoSettings(), &detail);
+    backtrack::g_muxShouldFail = false;
+    expect(!saved, "first replay unexpectedly saved");
+    expect(!std::filesystem::exists(output), "failed replay did not release its output reservation");
+    const auto firstDir = directory / L".backtrack_tmp" / output.stem();
+    const auto firstVideo = firstDir / L"replay.h264";
+    const auto firstManifest = firstDir / backtrack::RecoveryStore::kRecoveryManifestName;
+    std::ifstream videoBefore(firstVideo, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(videoBefore)), std::istreambuf_iterator<char>());
+    std::ifstream manifestBefore(firstManifest, std::ios::binary);
+    const std::string manifest((std::istreambuf_iterator<char>(manifestBefore)), std::istreambuf_iterator<char>());
+    videoBefore.close();
+    manifestBefore.close();
+    expect(!bytes.empty() && !manifest.empty(), "first replay was not preserved");
+
+    const HANDLE retryReservation = CreateFileW(
+        output.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_HIDDEN, nullptr);
+    expect(retryReservation != INVALID_HANDLE_VALUE, "could not reserve retry output name");
+    CloseHandle(retryReservation);
+    expect(buffer.saveTo(output, defaultVideoSettings()), "same-name retry failed");
+    expect(backtrack::g_lastMuxedInputs.videoPath.parent_path() != firstDir,
+        "retry reused the preserved session directory");
+    std::ifstream videoAfter(firstVideo, std::ios::binary);
+    const std::string afterBytes((std::istreambuf_iterator<char>(videoAfter)), std::istreambuf_iterator<char>());
+    std::ifstream manifestAfter(firstManifest, std::ios::binary);
+    const std::string afterManifest((std::istreambuf_iterator<char>(manifestAfter)), std::istreambuf_iterator<char>());
+    videoAfter.close();
+    manifestAfter.close();
+    expect(afterBytes == bytes && afterManifest == manifest, "retry altered the preserved replay");
+    std::wstring recoveryDetail;
+    expect(!backtrack::RecoveryStore::recoverLatestFailedRecording(directory, recoveryDetail).empty(),
+        "preserved replay could not be recovered after retry");
+    expect(std::string(backtrack::g_lastVideoStreamBytes.begin(), backtrack::g_lastVideoStreamBytes.end()) == bytes,
+        "recovery did not receive the original replay bytes");
+    buffer.clear();
+    std::filesystem::remove_all(testOutputDir(), error);
+}
+
 // Audio is buffered through the RAM queues when diskBackedAudio is off, so
 // only pushing it through the disk backend proves the save path stitches both
 // timelines.
@@ -1082,15 +1340,12 @@ void testDiskBackendSavesAudio() {
     std::filesystem::remove_all(storageRoot, error);
 }
 
-// Only a backend or ring-directory switch may drop buffered video; those are
-// the cases where the recorded extents stop being meaningful.
-// A loopback device that drops out for 20 s used to be written out as 20 s of
-// silence. A replay window runs up to an hour, so one unavailable device became
-// tens of minutes of padding and the mux free-space preflight then demanded
-// hundreds of megabytes for a clip whose real audio is a few. The gap fill is
-// capped at 10 s and the pacing pointer resyncs past it, so the exact byte
-// count - not "at least" - is what pins the cap.
-void testReplayAudioGapFillIsCapped() {
+// A loopback device that drops out for 20 s is written out as the full 20 s of
+// silence so the saved audio keeps the real gap duration and post-outage audio
+// stays aligned with the unchanged video track. Compressing the gap would play
+// it early. The exact byte count - not "at least" - is what pins the preserved
+// duration.
+void testReplayAudioGapPreservesDuration() {
     std::error_code error;
     std::filesystem::remove_all(testOutputDir(), error);
 
@@ -1102,20 +1357,21 @@ void testReplayAudioGapFillIsCapped() {
         buffer.pushVideo(makeVideoPayload(
             pts * kSecond100ns, kSecond100ns, pts % 5 == 0, static_cast<uint8_t>(0xE0 + (pts % 8)), 1024));
     }
-    // One system-audio packet at 20 s: a 20 s hole, twice the 10 s cap.
+    // One system-audio packet at 20 s: a 20 s hole.
     buffer.pushAudio(makeAudio(20 * kSecond100ns, 1));
 
     const auto output = testOutputDir() / L"gapcap.mp4";
     expect(buffer.saveTo(output, defaultVideoSettings()),
-        "saving a replay with a capped audio gap failed");
+        "saving a replay with an audio gap failed");
     expect(backtrack::g_lastSystemWav.has_value(),
-        "a capped gap produced no system audio WAV");
+        "an audio gap produced no system audio WAV");
 
-    // 10 s of silence (the cap) plus the one-second packet, and nothing else.
-    // Uncapped this was 20 s of silence plus the packet.
-    const uint64_t expectedBytes = 10ull * 48000 * 4 + 48000ull * 4;
+    // The full 20 s gap as silence plus the one-second packet, and nothing
+    // else: the saved audio preserves the real gap duration instead of
+    // compressing it to 10 s of silence plus the packet.
+    const uint64_t expectedBytes = 21ull * 48000 * 4;
     expect(backtrack::g_lastSystemWav->dataBytes == expectedBytes,
-        "the audio gap fill was not capped at 10 s (got " +
+        "the audio gap duration was not preserved (got " +
             std::to_string(backtrack::g_lastSystemWav->dataBytes) +
             " bytes, expected " + std::to_string(expectedBytes) + ")");
 
@@ -1171,9 +1427,7 @@ void testManifestPublishSurvivesSharingViolation() {
     fixture.dispose();
 }
 
-// A directory of preserved elementary streams with no manifest describes bytes
-// with no timing, so muxing them would need to invent a sample table. Keeping
-// such a directory would only promise a recovery that cannot happen.
+// a directory without timing data remains available for manual recovery.
 void testDirectoryWithoutManifestIsNotRecovered() {
     RecoveryFixture fixture = RecoveryFixture::create(L"nomanifest");
     writeElementaryStream(fixture.sessionDir / L"replay.h264", kPackets);
@@ -1282,6 +1536,157 @@ void testDiskAudioRoundTripAcrossWrap() {
     std::filesystem::remove_all(storageRoot, error);
 }
 
+AudioPacket makeMarkedAudio(AudioTrack track, int64_t seconds, uint8_t marker) {
+    AudioPacket packet = makeAudio(seconds * kSecond100ns, 1);
+    packet.track = track;
+    packet.processId = marker;
+    for (size_t i = 0; i < packet.bytes.size(); ++i) {
+        packet.bytes[i] = static_cast<uint8_t>(i * 31 + i / 251 + marker * 17);
+    }
+    return packet;
+}
+
+std::vector<uint8_t> audioSeconds(std::initializer_list<const AudioPacket*> seconds) {
+    std::vector<uint8_t> result;
+    for (const AudioPacket* packet : seconds) {
+        if (packet) {
+            result.insert(result.end(), packet->bytes.begin(), packet->bytes.end());
+        } else {
+            result.insert(result.end(), 48000 * 4, 0);
+        }
+    }
+    return result;
+}
+
+void expectAudioTracks(std::initializer_list<const AudioPacket*> system,
+                       std::initializer_list<const AudioPacket*> microphone) {
+    expect(backtrack::g_lastSystemWav.has_value() == (system.size() != 0),
+        "system audio track presence changed");
+    expect(backtrack::g_lastMicrophoneWav.has_value() == (microphone.size() != 0),
+        "microphone audio track presence changed");
+    expect(backtrack::g_lastSystemAudioBytes == audioSeconds(system),
+        "saved system audio bytes differ");
+    expect(backtrack::g_lastMicrophoneAudioBytes == audioSeconds(microphone),
+        "saved microphone audio bytes differ");
+}
+
+void testDiskAudioInsertionOrderAcrossTrackDrains() {
+    backtrack::g_captureAudioBytes = true;
+    for (const bool diskVideo : {false, true}) {
+        const auto storageRoot = testOutputDir() / (diskVideo ? L"audio_fifo_disk_video" : L"audio_fifo_ram_video");
+        std::error_code error;
+        std::filesystem::remove_all(storageRoot, error);
+        {
+            ReplaySettings replaySettings = settings(30);
+            replaySettings.diskBackedAudio = true;
+            replaySettings.diskBackedVideo = diskVideo;
+            ReplayBuffer buffer;
+            buffer.configure(replaySettings, storageRoot, 8ull * 1024 * 1024, 1024ull * 1024);
+            for (int64_t pts = 0; pts < 12; ++pts) {
+                buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, pts == 0));
+            }
+            std::vector<AudioPacket> packets;
+            for (int64_t pts = 4; pts <= 6; ++pts) {
+                packets.push_back(makeMarkedAudio(AudioTrack::System, pts, static_cast<uint8_t>(packets.size() + 1)));
+            }
+            for (int64_t pts = 1; pts <= 3; ++pts) {
+                packets.push_back(makeMarkedAudio(AudioTrack::Microphone, pts, static_cast<uint8_t>(packets.size() + 1)));
+            }
+            for (int64_t pts = 7; pts <= 9; ++pts) {
+                packets.push_back(makeMarkedAudio(AudioTrack::System, pts, static_cast<uint8_t>(packets.size() + 1)));
+            }
+            for (int64_t pts = 4; pts <= 6; ++pts) {
+                packets.push_back(makeMarkedAudio(AudioTrack::Microphone, pts, static_cast<uint8_t>(packets.size() + 1)));
+            }
+            const auto output = storageRoot / L"drains.mp4";
+            for (size_t i = 0; i < 3; ++i) {
+                buffer.pushAudio(packets[i]);
+            }
+            expect(buffer.saveTo(output, defaultVideoSettings()), "save between track drains failed");
+            expectAudioTracks({nullptr, nullptr, nullptr, nullptr, &packets[0], &packets[1], &packets[2]}, {});
+
+            for (size_t i = 3; i < 6; ++i) {
+                buffer.pushAudio(packets[i]);
+            }
+            expect(buffer.saveTo(output, defaultVideoSettings()), "save after reversed timestamps failed");
+            expectAudioTracks({nullptr, nullptr, nullptr, nullptr, nullptr, &packets[1], &packets[2]},
+                              {nullptr, &packets[3], &packets[4], &packets[5]});
+
+            for (size_t i = 6; i < 9; ++i) {
+                buffer.pushAudio(packets[i]);
+            }
+            expect(buffer.saveTo(output, defaultVideoSettings()), "second save between track drains failed");
+            expectAudioTracks({nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                               &packets[6], &packets[7], &packets[8]},
+                              {nullptr, nullptr, &packets[4], &packets[5]});
+
+            for (size_t i = 9; i < 12; ++i) {
+                buffer.pushAudio(packets[i]);
+            }
+            expect(buffer.saveTo(output, defaultVideoSettings()), "save after second wrap failed");
+            expectAudioTracks({nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                               &packets[7], &packets[8]},
+                              {nullptr, nullptr, nullptr, nullptr, &packets[9], &packets[10], &packets[11]});
+        }
+        std::filesystem::remove_all(storageRoot, error);
+    }
+    backtrack::g_captureAudioBytes = false;
+}
+
+void testDiskAudioAgeTrimKeepsPhysicalPrefix() {
+    backtrack::g_captureAudioBytes = true;
+    constexpr uint64_t kPacketBytes = 48000 * 4;
+    for (const bool diskVideo : {false, true}) {
+        const auto storageRoot = testOutputDir() / (diskVideo ? L"audio_age_disk_video" : L"audio_age_ram_video");
+        std::error_code error;
+        std::filesystem::remove_all(storageRoot, error);
+        {
+            ReplaySettings replaySettings = settings(3);
+            replaySettings.diskBackedAudio = true;
+            replaySettings.diskBackedVideo = diskVideo;
+            ReplayBuffer buffer;
+            buffer.configure(replaySettings, storageRoot, 8ull * 1024 * 1024, 1024ull * 1024);
+            buffer.pushVideo(makeVideo(0, kSecond100ns, true));
+            const auto a = makeMarkedAudio(AudioTrack::System, 2, 1);
+            const auto b = makeMarkedAudio(AudioTrack::Microphone, 0, 2);
+            const auto c = makeMarkedAudio(AudioTrack::System, 3, 3);
+            const auto d = makeMarkedAudio(AudioTrack::Microphone, 1, 4);
+            const auto e = makeMarkedAudio(AudioTrack::System, 4, 5);
+            const auto f = makeMarkedAudio(AudioTrack::Microphone, 2, 6);
+            for (const auto* packet : {&a, &b, &c, &d, &e}) {
+                buffer.pushAudio(*packet);
+            }
+            for (int64_t pts = 1; pts <= 4; ++pts) {
+                buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, pts != 2));
+            }
+            expect(backtrack::ReplayBufferTestAccess::diskAudioBytes(buffer) == 5 * kPacketBytes,
+                "age trimming reclaimed bytes behind an unexpired packet");
+            const auto output = storageRoot / L"age.mp4";
+            expect(buffer.saveTo(output, defaultVideoSettings()), "save after age trimming failed");
+            expectAudioTracks({nullptr, &a, &c, &e}, {&d});
+
+            buffer.pushAudio(f);
+            expect(backtrack::ReplayBufferTestAccess::diskAudioBytes(buffer) == 4 * kPacketBytes,
+                "capacity eviction or subsequent age trimming removed the wrong prefix");
+            expect(buffer.saveTo(output, defaultVideoSettings()), "save after age trim and wrap failed");
+            expectAudioTracks({nullptr, nullptr, &c, &e}, {&d, &f});
+
+            for (int64_t pts = 5; pts <= 7; ++pts) {
+                buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, true));
+            }
+            expect(backtrack::ReplayBufferTestAccess::diskAudioBytes(buffer) == 2 * kPacketBytes,
+                "age trimming did not stop at the first unexpired packet");
+            expect(buffer.saveTo(output, defaultVideoSettings()), "save after prefix expired failed");
+            expectAudioTracks({&e}, {});
+            buffer.pushVideo(makeVideo(8 * kSecond100ns, kSecond100ns, true));
+            expect(backtrack::ReplayBufferTestAccess::diskAudioBytes(buffer) == 0,
+                "age trimming did not reclaim the remaining expired prefix");
+        }
+        std::filesystem::remove_all(storageRoot, error);
+    }
+    backtrack::g_captureAudioBytes = false;
+}
+
 // A capacity-only change must not drop buffered audio, mirroring the video
 // ring: the recorded extents stay valid at their offsets.
 void testDiskAudioSurvivesCapacityChange() {
@@ -1308,11 +1713,8 @@ void testDiskAudioSurvivesCapacityChange() {
     expect(std::filesystem::file_size(ringPath, error) == 1024ull * 1024,
         "an audio capacity change re-laid out a ring that still held packets");
 
-    // Reconfiguring with video in RAM drops the video window (the existing
-    // rule for that backend); the audio ring must have kept its packets.
-    for (int64_t pts = 0; pts < 3; ++pts) {
-        buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, pts == 0));
-    }
+    expect(buffer.videoPacketCount() == 3,
+        "an audio capacity change dropped RAM video");
     const auto output = testOutputDir() / L"disk_audio_capacity.mp4";
     expect(buffer.saveTo(output, defaultVideoSettings()),
         "saving after an audio capacity change failed");
@@ -1402,12 +1804,14 @@ void testBackendAndDirectorySwitchesResetBuffer() {
         "the ring file in the old folder survived the switch");
     expect(buffer.storageFallbackReason().empty(), "a directory switch reported a fallback");
 
-    // Disk -> RAM drops it too, and leaves no ring behind.
+    // Disk -> RAM drops it too. The ring file is deleted by its own handle on
+    // close; the folder stays, because it carries no ownership marker and can
+    // hold a legacy ring or a game's files.
     buffer.pushVideo(makeVideoPayload(0, kSecond100ns, true, 0xC1, 1024));
     buffer.configure(settings(30), secondRoot, 8ull * 1024 * 1024);
     expect(buffer.videoPacketCount() == 0, "switching to RAM kept disk-resident video");
-    expect(!std::filesystem::exists(secondRoot / L".backtrack_ring", error),
-        "switching to RAM left the ring folder behind");
+    expect(!std::filesystem::exists(secondRoot / L".backtrack_ring" / L"replay_video.bin", error),
+        "switching to RAM left the ring file behind");
 
     std::filesystem::remove_all(firstRoot, error);
     std::filesystem::remove_all(secondRoot, error);
@@ -1472,9 +1876,11 @@ void testRingReadFailureFailsSaveAndFailsOver() {
     std::filesystem::remove_all(storageRoot, error);
 }
 
-// A killed session strands a pre-sized ring file that the recovery sweep does
-// not cover, because it only walks the clip library's .backtrack_tmp.
-void testOrphanedRingFolderIsSwept() {
+// A killed session can strand a pre-sized ring file. Neither the file nor its
+// folder carries an ownership marker, so startup maintenance preserves both: a
+// legacy ring, or a game's own files, can live under the same name. Only a ring
+// file this process created is reclaimed, by its own delete-on-close handle.
+void testOrphanedRingFolderIsPreserved() {
     const auto storageRoot = testOutputDir() / L"orphan_ring";
     std::error_code error;
     std::filesystem::remove_all(storageRoot, error);
@@ -1484,12 +1890,18 @@ void testOrphanedRingFolderIsSwept() {
     {
         std::ofstream file(orphan, std::ios::binary | std::ios::trunc);
         expect(file.is_open(), "could not create the orphaned ring file");
+        file << "legacy ring bytes";
     }
     ReplayBuffer::removeOrphanedRing(storageRoot);
-    expect(!std::filesystem::exists(storageRoot / L".backtrack_ring", error),
-        "a leftover ring folder survived the startup sweep");
+    expect(std::filesystem::exists(orphan, error),
+        "startup maintenance deleted a ring file it has no ownership evidence for");
+    {
+        std::ifstream file(orphan, std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        expect(bytes == "legacy ring bytes", "startup maintenance changed a ring file it does not own");
+    }
 
-    // Idempotent: a ring folder that is already gone must not report an error.
+    // Idempotent, and the empty directory is a no-op too.
     ReplayBuffer::removeOrphanedRing(storageRoot);
     ReplayBuffer::removeOrphanedRing({});
     std::filesystem::remove_all(storageRoot, error);
@@ -1680,6 +2092,248 @@ void testNewestVideoPtsDiskAndBackendSwitch() {
     std::filesystem::remove_all(storageRoot, error);
 }
 
+void testRamVideoSurvivesReconfiguration() {
+    struct Scenario {
+        const wchar_t* name;
+        uint32_t seconds;
+        uint64_t videoCap;
+        bool toggleAudio;
+        int64_t firstPts;
+    };
+    constexpr uint64_t kPacketBytes = 1024;
+    constexpr uint64_t kInitialCap = 32 * kPacketBytes;
+    const Scenario scenarios[] = {
+        {L"unchanged", 20, kInitialCap, false, 0},
+        {L"longer", 40, kInitialCap, false, 0},
+        {L"shorter", 4, kInitialCap, false, 4},
+        {L"byte_cap", 20, 3 * kPacketBytes, false, 6},
+        {L"audio_only", 20, kInitialCap, true, 0},
+    };
+    for (const auto& scenario : scenarios) {
+        const auto root = testOutputDir() / L"ram_reconfigure" / scenario.name;
+        std::error_code error;
+        std::filesystem::remove_all(root, error);
+        {
+            ReplayBuffer buffer;
+            ReplaySettings replaySettings = settings(20);
+            buffer.configure(replaySettings, root, kInitialCap, 1024ull * 1024);
+            for (int64_t pts = 0; pts < 8; ++pts) {
+                buffer.pushVideo(makeVideoPayload(
+                    pts * kSecond100ns, kSecond100ns, (pts % 2) == 0,
+                    static_cast<uint8_t>(0x30 + pts), kPacketBytes));
+            }
+            replaySettings.seconds = scenario.seconds;
+            buffer.configure(replaySettings, root, scenario.videoCap, 1024ull * 1024);
+            if (scenario.toggleAudio) {
+                replaySettings.diskBackedAudio = true;
+                buffer.configure(replaySettings, root, scenario.videoCap, 1024ull * 1024);
+                expect(std::filesystem::exists(root / L".backtrack_ring" / L"replay_audio.bin"),
+                    "audio-only switch did not open the audio ring");
+                replaySettings.diskBackedAudio = false;
+                buffer.configure(replaySettings, root, scenario.videoCap, 1024ull * 1024);
+            }
+            const size_t expectedCount = static_cast<size_t>(8 - scenario.firstPts);
+            expect(buffer.videoPacketCount() == expectedCount,
+                "RAM reconfiguration lost video or failed to trim it");
+            expect(buffer.videoKeyFrameCount() == expectedCount / 2,
+                "RAM reconfiguration changed the retained keyframe count");
+            expect(buffer.saveTo(root / L"clip.mp4", defaultVideoSettings()),
+                "save after RAM reconfiguration failed");
+            const auto& samples = backtrack::g_lastMuxedInputs.videoSamples;
+            expect(samples.size() == expectedCount, "RAM reconfiguration saved the wrong packets");
+            std::vector<char> expectedBytes;
+            for (size_t i = 0; i < expectedCount; ++i) {
+                const int64_t pts = scenario.firstPts + static_cast<int64_t>(i);
+                expect(samples[i].pts100ns == pts * kSecond100ns &&
+                       samples[i].offset == i * kPacketBytes && samples[i].size == kPacketBytes,
+                    "RAM reconfiguration changed a saved sample");
+                expectedBytes.insert(expectedBytes.end(), kPacketBytes, static_cast<char>(0x30 + pts));
+            }
+            expect(backtrack::g_lastVideoStreamBytes == expectedBytes,
+                "RAM reconfiguration changed saved video bytes");
+        }
+        std::filesystem::remove_all(root, error);
+    }
+}
+
+void testReorderedPresentationEndAndConsecutiveSaves() {
+    backtrack::g_captureAudioBytes = true;
+    for (const bool diskVideo : {false, true}) {
+        for (const bool diskAudio : {false, true}) {
+            const auto root = testOutputDir() /
+                (diskVideo ? (diskAudio ? L"reordered_dd" : L"reordered_dr")
+                           : (diskAudio ? L"reordered_rd" : L"reordered_rr"));
+            std::error_code error;
+            std::filesystem::remove_all(root, error);
+            {
+                ReplaySettings replaySettings = settings(30);
+                replaySettings.diskBackedVideo = diskVideo;
+                replaySettings.diskBackedAudio = diskAudio;
+                ReplayBuffer buffer;
+                buffer.configure(replaySettings, root, 8ull * 1024 * 1024, 4ull * 1024 * 1024);
+                const int64_t presentationOrder[] = {0, 2, 1, 3, 5, 4, 6, 8, 7, 9, 10, 12, 11};
+                for (size_t i = 0; i < std::size(presentationOrder); ++i) {
+                    const int64_t pts = presentationOrder[i];
+                    EncodedPacket packet = makeVideoPayload(
+                        pts * kSecond100ns, kSecond100ns, pts == 0 || pts == 3 || pts == 6 || pts == 10,
+                        static_cast<uint8_t>(0x20 + i), 16);
+                    packet.hasDts = true;
+                    packet.dts100ns = (static_cast<int64_t>(i) - 2) * kSecond100ns;
+                    expect(packet.dts100ns <= packet.pts100ns, "invalid reordered DTS fixture");
+                    buffer.pushVideo(std::move(packet));
+                }
+                std::vector<AudioPacket> audio;
+                for (int64_t pts = 0; pts < 15; ++pts) {
+                    audio.push_back(makeMarkedAudio(AudioTrack::System, pts, static_cast<uint8_t>(pts + 1)));
+                    if (pts < 13) {
+                        buffer.pushAudio(audio.back());
+                    }
+                }
+                auto expectedAudio = [&](size_t begin, size_t end) {
+                    std::vector<uint8_t> bytes;
+                    for (size_t i = begin; i < end; ++i) {
+                        bytes.insert(bytes.end(), audio[i].bytes.begin(), audio[i].bytes.end());
+                    }
+                    return bytes;
+                };
+                expect(buffer.videoSpan100ns() == 13 * kSecond100ns,
+                    "reordered video span used the decode-order tail");
+                const auto output = root / L"clip.mp4";
+                expect(buffer.saveTo(output, defaultVideoSettings()), "reordered save failed");
+                const auto& firstSamples = backtrack::g_lastMuxedInputs.videoSamples;
+                expect(firstSamples.size() == std::size(presentationOrder), "reordered save lost video");
+                for (size_t i = 0; i < firstSamples.size(); ++i) {
+                    expect(firstSamples[i].pts100ns == presentationOrder[i] * kSecond100ns &&
+                           firstSamples[i].hasDts &&
+                           firstSamples[i].dts100ns == (static_cast<int64_t>(i) - 2) * kSecond100ns,
+                        "reordered save changed PTS or DTS");
+                }
+                expect(backtrack::g_lastSystemAudioBytes == expectedAudio(0, 13),
+                    "reordered save dropped audio before the latest presentation end");
+
+                expect(buffer.saveTo(output, defaultVideoSettings()), "consecutive reordered save failed");
+                expect(backtrack::g_lastMuxedInputs.videoSamples.front().pts100ns == 10 * kSecond100ns,
+                    "consecutive save did not use the previous presentation end");
+                expect(backtrack::g_lastSystemAudioBytes == expectedAudio(10, 13),
+                    "consecutive reordered save cut audio at the decode-order tail");
+
+                expect(buffer.extendLastVideoDuration(11 * kSecond100ns, 4 * kSecond100ns),
+                    "reordered tail extension failed");
+                buffer.pushAudio(audio[13]);
+                buffer.pushAudio(audio[14]);
+                expect(buffer.videoSpan100ns() == 15 * kSecond100ns,
+                    "reordered tail extension did not update the presentation end");
+                expect(buffer.saveTo(output, defaultVideoSettings()), "extended reordered save failed");
+                expect(backtrack::g_lastSystemAudioBytes == expectedAudio(10, 15),
+                    "extended reordered save lost continuous audio");
+            }
+            std::filesystem::remove_all(root, error);
+        }
+    }
+    backtrack::g_captureAudioBytes = false;
+}
+
+void testPresentationEndAfterWindowCuts() {
+    backtrack::g_captureAudioBytes = true;
+    for (const bool disk : {false, true}) {
+        for (const bool laterKeyframe : {false, true}) {
+            const auto root = testOutputDir() /
+                (disk ? (laterKeyframe ? L"cut_disk_key" : L"cut_disk_hold")
+                      : (laterKeyframe ? L"cut_ram_key" : L"cut_ram_hold"));
+            std::error_code error;
+            std::filesystem::remove_all(root, error);
+            {
+                ReplaySettings replaySettings = settings(laterKeyframe ? 6 : 3);
+                replaySettings.diskBackedVideo = disk;
+                replaySettings.diskBackedAudio = disk;
+                ReplayBuffer buffer;
+                buffer.configure(replaySettings, root, 8ull * 1024 * 1024, 4ull * 1024 * 1024);
+                const int64_t ptsWithKey[] = {0, 1, 2, 4, 3, 6};
+                const int64_t ptsWithoutKey[] = {0, 1, 3, 2};
+                const size_t count = laterKeyframe ? std::size(ptsWithKey) : std::size(ptsWithoutKey);
+                for (size_t i = 0; i < count; ++i) {
+                    const int64_t pts = laterKeyframe ? ptsWithKey[i] : ptsWithoutKey[i];
+                    const bool key = pts == 0 || (laterKeyframe && (pts == 2 || pts == 6));
+                    EncodedPacket packet = makeVideo(pts * kSecond100ns,
+                        (pts == 1 ? 11 : 1) * kSecond100ns, key);
+                    packet.hasDts = true;
+                    packet.dts100ns = (static_cast<int64_t>(i) - 2) * kSecond100ns;
+                    expect(packet.dts100ns <= packet.pts100ns, "invalid cut DTS fixture");
+                    buffer.pushVideo(std::move(packet));
+                }
+                std::vector<AudioPacket> audio;
+                for (int64_t pts = 0; pts < 12; ++pts) {
+                    audio.push_back(makeMarkedAudio(AudioTrack::System, pts, static_cast<uint8_t>(pts + 1)));
+                    buffer.pushAudio(audio.back());
+                }
+                std::vector<uint8_t> expectedAudio;
+                const size_t begin = laterKeyframe ? 2 : 0;
+                const size_t end = laterKeyframe ? 7 : 5;
+                for (size_t i = begin; i < end; ++i) {
+                    expectedAudio.insert(expectedAudio.end(), audio[i].bytes.begin(), audio[i].bytes.end());
+                }
+                expect(buffer.videoSpan100ns() == 5 * kSecond100ns,
+                    "span did not recompute the presentation end after the window cut");
+                const auto output = root / L"clip.mp4";
+                expect(buffer.saveTo(output, defaultVideoSettings()), "window-cut save failed");
+                const auto& samples = backtrack::g_lastMuxedInputs.videoSamples;
+                expect(samples.front().pts100ns == static_cast<int64_t>(begin) * kSecond100ns,
+                    "window cut chose the wrong keyframe");
+                if (!laterKeyframe) {
+                    expect(samples[1].duration100ns == 4 * kSecond100ns,
+                        "window cut did not bound the non-tail hold");
+                }
+                expect(backtrack::g_lastSystemAudioBytes == expectedAudio,
+                    "window cut used an end from removed or shortened video");
+                if (laterKeyframe) {
+                    expect(buffer.saveTo(output, defaultVideoSettings()), "save after window cut failed");
+                    expect(backtrack::g_lastMuxedInputs.videoSamples.front().pts100ns == 2 * kSecond100ns,
+                        "consecutive save used the removed packet's presentation end");
+                    expect(backtrack::g_lastSystemAudioBytes == expectedAudio,
+                        "consecutive save after window cut changed audio");
+                }
+            }
+            std::filesystem::remove_all(root, error);
+        }
+    }
+    backtrack::g_captureAudioBytes = false;
+}
+
+void testUncuttableFramesKeepTheirPresentationEnd() {
+    for (const bool disk : {false, true}) {
+        const auto root = testOutputDir() / (disk ? L"uncuttable_disk" : L"uncuttable_ram");
+        std::error_code error;
+        std::filesystem::remove_all(root, error);
+        {
+            ReplaySettings replaySettings = settings(30);
+            replaySettings.diskBackedVideo = disk;
+            ReplayBuffer buffer;
+            buffer.configure(replaySettings, root, 8ull * 1024 * 1024);
+            const int64_t pts[] = {0, 6, 1};
+            for (size_t i = 0; i < std::size(pts); ++i) {
+                EncodedPacket packet = makeVideo(pts[i] * kSecond100ns, kSecond100ns, i == 0);
+                packet.hasDts = true;
+                packet.dts100ns = (static_cast<int64_t>(i) - 1) * kSecond100ns;
+                buffer.pushVideo(std::move(packet));
+            }
+            replaySettings.seconds = 3;
+            buffer.configure(replaySettings, root, 8ull * 1024 * 1024);
+            for (int64_t i = 0; i < 7; ++i) {
+                buffer.pushAudio(makeAudio(i * kSecond100ns, 1));
+            }
+            expect(buffer.videoSpan100ns() == 7 * kSecond100ns,
+                "uncuttable reordered video reported a shortened span");
+            expect(buffer.saveTo(root / L"clip.mp4", defaultVideoSettings()), "uncuttable save failed");
+            expect(backtrack::g_lastMuxedInputs.videoSamples[1].duration100ns == kSecond100ns,
+                "window cut zeroed a frame beyond the limit");
+            expect(backtrack::g_lastSystemWav.has_value() &&
+                   backtrack::g_lastSystemWav->dataBytes == 7ull * 48000 * 4,
+                "uncuttable video lost audio before its presentation end");
+        }
+        std::filesystem::remove_all(root, error);
+    }
+}
+
 // A day-long stall (exclusive-fullscreen hold) must not stretch the replay
 // past its window: extendLastVideoDuration clamps a rogue tail to 60 s and
 // saveTo cuts the tail to the window plus one GOP of keyframe tolerance.
@@ -1798,6 +2452,10 @@ int main() {
         testSaveWithoutKeyframeFails();
         testParseWavRecoversUnpatchedCrashHeader();
         testRecoveryManifestRoundTripIsAtomic();
+        testSessionDirectoriesAreExclusivelyCreated();
+        testFailedManifestRewriteKeepsIncrementalPrefix();
+        testFailedMuxWithoutManifestKeepsStreams();
+        testStartupRecoversAllValidSessionsAndKeepsFailures();
         testRecoveryTrimsSamplesBeyondStreamEnd();
         testRecoveryKeepsPrefixOnTornFinalLine();
         testRecoveryRejectsPlausibleNonContiguousTail();
@@ -1807,6 +2465,10 @@ int main() {
         testDiskBackedMatchesRamBackend();
         testNewestVideoPtsRam();
         testNewestVideoPtsDiskAndBackendSwitch();
+        testRamVideoSurvivesReconfiguration();
+        testReorderedPresentationEndAndConsecutiveSaves();
+        testPresentationEndAfterWindowCuts();
+        testUncuttableFramesKeepTheirPresentationEnd();
         testDiskRingSurvivesCapacityChange();
         testRingOpenFailureReportsFallback();
         testRingRejectsPacketLargerThanCapacity();
@@ -1817,15 +2479,18 @@ int main() {
         testDiskBackendSavesAudio();
         testDiskAudioRoundTrip();
         testDiskAudioRoundTripAcrossWrap();
+        testDiskAudioInsertionOrderAcrossTrackDrains();
+        testDiskAudioAgeTrimKeepsPhysicalPrefix();
         testDiskAudioSurvivesCapacityChange();
         testAudioRingReadFailureFailsOverAudioOnly();
-        testReplayAudioGapFillIsCapped();
+        testReplayAudioGapPreservesDuration();
         testManifestPublishSurvivesSharingViolation();
         testDirectoryWithoutManifestIsNotRecovered();
         testBackendAndDirectorySwitchesResetBuffer();
         testRingReadFailureFailsSaveAndFailsOver();
         testMuxFailurePreservesStreamsAndReportsReason();
-        testOrphanedRingFolderIsSwept();
+        testSameNameRetryDoesNotTouchPreservedReplay();
+        testOrphanedRingFolderIsPreserved();
         testDayHoldStaysWithinWindow();
         testRamModeEnforcesByteCap();
         std::cout << "ReplayBuffer tests passed\n";

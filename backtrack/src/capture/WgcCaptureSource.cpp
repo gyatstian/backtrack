@@ -1,8 +1,7 @@
 #include "capture/WgcCaptureSource.h"
 
 #include "capture/D3DDevice.h"
-#include "capture/GpuPoolBuilder.h"
-#include "capture/GpuTexturePool.h"
+#include "capture/WgcCopyPool.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -24,15 +23,10 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <vector>
 
 namespace backtrack {
 
 struct WgcCaptureSource::Impl {
-    struct TextureSlot {
-        ComPtr<ID3D11Texture2D> texture;
-    };
-
     struct DirectFrameLease {
         winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame{nullptr};
     };
@@ -50,7 +44,7 @@ struct WgcCaptureSource::Impl {
     // if the global timer period was not raised (timeBeginPeriod denied). nullptr
     // falls back to the coarse WaitForSingleObject path.
     HANDLE cadenceTimer = nullptr;
-    GpuTexturePool<TextureSlot> pool;
+    WgcCopyPool pool;
     uint64_t zeroCopyLeaseDrops = 0;
     uint64_t frameIndex = 0;
     uint32_t width = 0;
@@ -143,7 +137,7 @@ struct WgcCaptureSource::Impl {
             const auto size = item.Size();
             width = static_cast<uint32_t>(size.Width);
             height = static_cast<uint32_t>(size.Height);
-            if (!zeroCopy && !createTexturePool(width, height)) {
+            if (!zeroCopy && !pool.create(device->device(), width, height, texturePoolSize)) {
                 return false;
             }
             Logger::instance().debug(L"capture",
@@ -219,7 +213,7 @@ struct WgcCaptureSource::Impl {
         // progress once every frame of the old pool has been released.
         if (recreatePending) {
             completePendingPoolRecreate();
-            if (recreatePending) {
+            if (recreatePending || deviceLost.load()) {
                 return false;
             }
         }
@@ -272,10 +266,6 @@ struct WgcCaptureSource::Impl {
             if (static_cast<uint32_t>(size.Width) != width || static_cast<uint32_t>(size.Height) != height) {
                 width = static_cast<uint32_t>(size.Width);
                 height = static_cast<uint32_t>(size.Height);
-                if (!zeroCopy && !createTexturePool(width, height)) {
-                    deviceLost.store(true);
-                    return false;
-                }
                 // Recreate requires every frame from the old pool to be released.
                 // Zero-copy frames still leased by the encoder would otherwise
                 // stall the new pool; defer instead of recreating under them.
@@ -287,7 +277,7 @@ struct WgcCaptureSource::Impl {
                 Logger::instance().info(L"capture",
                     L"WGC content resized in place; recreating frame pool at " +
                     std::to_wstring(width) + L"x" + std::to_wstring(height));
-                completePendingPoolRecreate();
+                // Let the controller drain its leases and registrations before retrying.
                 return false;
             }
 
@@ -466,6 +456,11 @@ struct WgcCaptureSource::Impl {
         }
 
         recreateDeferrals = 0;
+        if (!zeroCopy && !pool.create(device->device(), width, height, texturePoolSize)) {
+            deviceLost.store(true);
+            recreatePending = false;
+            return;
+        }
         try {
             framePool.Recreate(
                 winrtDevice,
@@ -506,64 +501,10 @@ struct WgcCaptureSource::Impl {
         }
     }
 
-    // Shared copy path for the no-zero-copy mode and the zero-copy lease-cap
-    // fallback: copies the captured surface into a pooled texture so the
-    // Direct3D11CaptureFrame is released on return.
     bool emitCopyFrame(GpuFrame& output, ID3D11Texture2D* captured, int64_t presentTime100ns) {
-        // Lazy for the lease-cap fallback, which never built the pool at init.
-        if (pool.empty() && !createTexturePool(width, height)) {
-            return false;
-        }
-        auto slot = pool.acquireOrLog(L"WGC capture texture pool exhausted");
-        if (!slot) {
-            return false;
-        }
-        {
-            std::scoped_lock lock(device->immediateContextMutex());
-            device->context()->CopyResource(slot->texture.Get(), captured);
-        }
-        output.texture = slot->texture;
-        output.lease = slot;
-        output.frameIndex = frameIndex++;
-        output.pts100ns = presentTime100ns;
-        output.width = width;
-        output.height = height;
-        output.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        // DWM pre-tonemaps WGC to SDR; scaler must not tone-map again.
-        output.hdr = false;
-        return true;
-    }
-
-    bool createTexturePool(uint32_t newWidth, uint32_t newHeight) {
-        pool.clear();
-
-        // RENDER_TARGET is required by some NVIDIA drivers before NVENC accepts
-        // the texture as a registered input (NV_ENC_ERR_RESOURCE_REGISTER_FAILED
-        // otherwise); SHADER_RESOURCE keeps the downstream scaler happy. This
-        // mirrors the other capture pools.
-        GpuPoolBuildOptions options;
-        options.wantRtv = true;
-        options.wantSrv = true;
-        std::vector<ComPtr<ID3D11Texture2D>> textures;
-        if (!GpuPoolBuilder::build(
-                device->device(), newWidth, newHeight,
-                DXGI_FORMAT_B8G8R8A8_UNORM, options, texturePoolSize,
-                textures, L"WGC pool")) {
-            return false;
-        }
-        for (auto& texture : textures) {
-            auto slot = std::make_shared<TextureSlot>();
-            slot->texture = std::move(texture);
-            pool.push_back(std::move(slot));
-        }
-        pool.setFootprintBytes(
-            dxgiTextureBytes(newWidth, newHeight, DXGI_FORMAT_B8G8R8A8_UNORM) * pool.size());
-        Logger::instance().debug(L"capture",
-            L"WGC texture pool initialized " +
-            std::to_wstring(newWidth) + L"x" + std::to_wstring(newHeight) +
-            L" pool=" + std::to_wstring(pool.size()) +
-            L" (" + std::to_wstring(pool.footprintBytes() / 1024) + L" KiB)");
-        return true;
+        std::scoped_lock lock(device->immediateContextMutex());
+        return pool.emit(device->device(), device->context(), captured, width, height,
+                         texturePoolSize, frameIndex, presentTime100ns, output);
     }
 };
 

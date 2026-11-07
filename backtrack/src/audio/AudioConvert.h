@@ -40,7 +40,7 @@ AudioFormatInfo parseAudioFormat(const WaveFormatBlob& blob);
 
 bool audioFormatUsable(const AudioFormatInfo& format);
 
-// Decodes one interleaved sample as a normalized float in [-1, 1].
+// Decodes one supported interleaved sample as a normalized float in [-1, 1].
 float decodeInterleavedSample(const uint8_t* sample, const AudioFormatInfo& info);
 
 WaveFormatBlob canonicalAudioFormat();

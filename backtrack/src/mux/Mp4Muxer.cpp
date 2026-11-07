@@ -6,6 +6,7 @@
 #include "core/Logger.h"
 #include "mux/AudioTimeline.h"
 #include "mux/RecoveryStore.h"
+#include "mux/WavReader.h"
 
 #include <mfapi.h>
 #include <mferror.h>
@@ -41,17 +42,15 @@ DWORD win32CodeOfHresult(HRESULT hr) {
     return HRESULT_FACILITY(hr) == FACILITY_WIN32 ? HRESULT_CODE(hr) : ERROR_SUCCESS;
 }
 
-// Removes the staged file unless the publish already disarmed the guard.
 struct StagedOutputGuard {
     std::filesystem::path path;
-    bool armed = true;
 
     ~StagedOutputGuard() {
-        if (!armed || path.empty()) {
+        if (path.empty()) {
             return;
         }
         std::error_code error;
-        std::filesystem::remove(path, error);
+        std::filesystem::remove_all(path, error);
     }
 };
 
@@ -64,13 +63,8 @@ uint64_t fileSizeOrZero(const std::filesystem::path& path) {
     return error ? 0 : size;
 }
 
-// True when path is one of our own clip-name reservations: the transient
-// placeholder created when a clip name was claimed (fail-if-exists) and not
-// yet published over. Reservations are always created empty AND hidden
-// (FILE_ATTRIBUTE_HIDDEN, see reserveClipOutputName and
-// uniqueRecoveredOutputPath), so requiring both keeps a user's own zero-byte
-// .mp4 placeholder at the target from being silently removed on a failed
-// save.
+// Reservations are hidden and empty, but these attributes cannot prove
+// ownership if another process replaces a reservation while a save is active.
 bool isEmptyOutputReservation(const std::filesystem::path& path) {
     if (path.empty()) {
         return false;
@@ -414,11 +408,12 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     microphoneAudio_.nextPts100ns = 0;
     firstVideoPts100ns_.reset();
     closeManifestStreamLocked();
-    tempDirectory_ = outputPath.parent_path() / L".backtrack_tmp" / outputPath.stem();
     std::error_code directoryError;
-    std::filesystem::create_directories(tempDirectory_, directoryError);
-    if (directoryError) {
-        Logger::instance().error(L"mux", L"Could not create recording temporary directory: " + tempDirectory_.wstring());
+    tempDirectory_ = RecoveryStore::createUniqueDirectory(
+        outputPath.parent_path() / L".backtrack_tmp" / outputPath.stem(), directoryError);
+    if (tempDirectory_.empty()) {
+        Logger::instance().error(L"mux", L"Could not create recording temporary directory for " + outputPath.wstring() +
+            L" (" + utf8ToWide(directoryError.message()) + L")");
         return false;
     }
 
@@ -428,6 +423,7 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
         Logger::instance().error(L"mux", L"Could not open temporary video stream: " + videoPath_.wstring());
         std::error_code cleanupError;
         std::filesystem::remove_all(tempDirectory_, cleanupError);
+        tempDirectory_.clear();
         return false;
     }
 
@@ -586,6 +582,7 @@ std::filesystem::path Mp4Muxer::finalize() {
         }
 
         videoStream_.close();
+        writeFailed_ = writeFailed_ || !videoStream_;
         flushPendingAudioLocked();
         systemAudio_.writer.close();
         microphoneAudio_.writer.close();
@@ -609,18 +606,17 @@ std::filesystem::path Mp4Muxer::finalize() {
         inputs.bitrateKbps = settings_.bitrateKbps;
         inputs.resolutionMode = settings_.resolutionMode;
         outputPath = outputPath_;
-        tempDirectory = tempDirectory_;
+        tempDirectory = std::move(tempDirectory_);
+        tempDirectory_.clear();
         videoBytes = videoBytes_;
         writeFailed = writeFailed_;
     }
 
     if (writeFailed) {
-        std::error_code cleanupError;
-        std::filesystem::remove_all(tempDirectory, cleanupError);
-        // No MP4 is staged over the clip-name reservation, so drop it here
-        // too (same rule as the mux-failure path below).
         removeEmptyOutputReservation(outputPath);
-        const std::wstring detail = L"Recording stream had write errors (disk full?); MP4 was not created";
+        const std::wstring detail = RecoveryStore::preserveFailedRecording(
+            inputs, outputPath, tempDirectory,
+            L"Recording stream had write errors (disk full?); MP4 was not created");
         {
             std::scoped_lock lock(mutex_);
             lastError_ = detail;
@@ -642,11 +638,7 @@ std::filesystem::path Mp4Muxer::finalize() {
         return {};
     }
 
-    // Shared publish tail with the replay save path: manifest+readme first,
-    // then mux with retry. The temp directory is kept only when the manifest
-    // describes the streams on disk (recoverable); a manifest that will not
-    // publish means a real write failure, so the directory is dropped rather
-    // than promise a recovery that cannot happen.
+    // a failed publish retains the session even when timing data cannot be verified.
     std::wstring muxErrorDetail;
     const auto publishResult =
         RecoveryStore::publishMuxedInputs(inputs, outputPath, tempDirectory, &muxErrorDetail);
@@ -658,10 +650,6 @@ std::filesystem::path Mp4Muxer::finalize() {
         }
         Logger::instance().info(L"mux", L"MP4 finalized: " + outputPath.wstring());
         return outputPath;
-    }
-    if (publishResult == RecoveryStore::MuxPublishResult::kFailed) {
-        std::error_code cleanupError;
-        std::filesystem::remove_all(tempDirectory, cleanupError);
     }
     {
         std::scoped_lock lock(mutex_);
@@ -675,7 +663,11 @@ void Mp4Muxer::abort() {
     std::filesystem::path outputPath;
     {
         std::scoped_lock lock(mutex_);
-        tempDirectory = tempDirectory_;
+        if (!active_) {
+            return;
+        }
+        tempDirectory = std::move(tempDirectory_);
+        tempDirectory_.clear();
         outputPath = outputPath_;
         active_ = false;
         writeFailed_ = false;
@@ -695,9 +687,6 @@ void Mp4Muxer::abort() {
         std::error_code cleanupError;
         std::filesystem::remove_all(tempDirectory, cleanupError);
     }
-    // Nothing is ever published over the clip-name reservation on abort, so
-    // an empty hidden file at the target can only be our own placeholder;
-    // a foreign file survives untouched (see removeEmptyOutputReservation).
     removeEmptyOutputReservation(outputPath);
 }
 
@@ -878,33 +867,34 @@ bool Mp4Muxer::muxToMp4(
         return fail(L"Mixing recording audio tracks failed before MP4 writing");
     }
     Logger::instance().debug(L"mux", L"Native MP4 mux audio mix complete");
+    // parseMuxWav, not parseWav: the mixed track can itself cross the 4 GiB
+    // RIFF boundary on a long recording, and the clamped header would otherwise
+    // end the MP4 audio track at the boundary while the file holds the rest.
+    // A mixed track that cannot be read back is a failed read of an expected
+    // stream, not "no audio"; failing keeps recovery from publishing a
+    // truncated track.
     WavInfo mixedAudio;
-    bool hasAudio = !mixedAudioPath.empty() && parseWav(mixedAudioPath, mixedAudio);
+    bool hasAudio = false;
+    if (!mixedAudioPath.empty()) {
+        if (!parseMuxWav(mixedAudioPath, mixedAudio)) {
+            return fail(L"Mixed audio track could not be read back before MP4 writing: " +
+                        mixedAudioPath.wstring());
+        }
+        hasAudio = true;
+    }
 
-    // Atomic publish: the MP4 is written to a staging file next to the output
-    // (same volume, hidden from the clip library scan), then moved into place
-    // only after Finalize and a forced flush. A crash mid-save can therefore
-    // never leave a partial MP4 at the final clip path. Retry attempts rotate
-    // to an alternate staging name so an external handle (antivirus/indexer)
-    // pinning the previous staging file does not block the next try.
-    const std::filesystem::path stagingDirectory = outputPath.parent_path().empty()
-        ? std::filesystem::path(L".backtrack_tmp")
-        : outputPath.parent_path() / L".backtrack_tmp";
+    // each attempt owns its staging directory, including after a crash or retry.
     std::error_code stagingDirectoryError;
-    std::filesystem::create_directories(stagingDirectory, stagingDirectoryError);
-    if (stagingDirectoryError) {
-        return fail(L"Could not create MP4 staging folder " + stagingDirectory.wstring() +
+    const auto stagingDirectory = RecoveryStore::createUniqueDirectory(
+        inputs.videoPath.parent_path() / (L".publish_" + std::to_wstring(stagingVariant)),
+        stagingDirectoryError);
+    if (stagingDirectory.empty()) {
+        return fail(L"Could not create MP4 staging folder beside " + inputs.videoPath.wstring() +
                     L" (" + utf8ToWide(stagingDirectoryError.message()) + L")");
     }
-    std::wstring stagingName = outputPath.stem().wstring() + L".publish.mp4";
-    if (stagingVariant > 0) {
-        stagingName = outputPath.stem().wstring() +
-                      L".publish." + std::to_wstring(stagingVariant) + L".mp4";
-    }
-    const std::filesystem::path stagingPath = stagingDirectory / stagingName;
-    StagedOutputGuard stagedGuard{stagingPath, true};
+    const std::filesystem::path stagingPath = stagingDirectory / L"output.mp4";
+    StagedOutputGuard stagedGuard{stagingDirectory};
     std::error_code staleStagingError;
-    std::filesystem::remove(stagingPath, staleStagingError);
 
     ComPtr<IMFAttributes> attributes;
     HRESULT hr = MFCreateAttributes(&attributes, 3);
@@ -987,11 +977,8 @@ bool Mp4Muxer::muxToMp4(
         return fail(L"Could not flush finished MP4 to disk (Win32 error " + std::to_wstring(flushError) + L")");
     }
 
-    // Fail-if-exists publish. The final name was claimed as an empty file when
-    // the clip path was picked, so the only thing allowed to sit at the target
-    // is our own reservation; a foreign file created in the meantime must never
-    // be overwritten. After releasing the reservation, the plain move below
-    // still fails instead of replacing should anything reappear at the name.
+    // The plain move fails rather than replacing a file that appears after
+    // the reservation is released.
     std::error_code targetError;
     const bool targetExists = std::filesystem::exists(outputPath, targetError);
     if (!targetError && targetExists) {
@@ -1011,8 +998,6 @@ bool Mp4Muxer::muxToMp4(
         return fail(L"Finished MP4 could not be moved into place at " + outputPath.wstring() +
                     L" (Win32 error " + std::to_wstring(moveError) + L")");
     }
-    stagedGuard.armed = false;
-
     Logger::instance().info(L"mux",
         L"Native MP4 mux complete: " + outputPath.wstring() + L" in " + std::to_wstring(elapsedMs) + L"ms");
     return true;

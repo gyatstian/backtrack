@@ -1,0 +1,597 @@
+#include "encoder/NvencEncoder.cpp"
+#include "app/CaptureFrameHandoff.h"
+#include "capture/GpuTexturePool.h"
+
+#if !BACKTRACK_HAS_NVENC
+#error NvencLifecycleTests requires the NVENC SDK header
+#endif
+
+#include <array>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace backtrack {
+
+struct NvencEncoderTestAccess {
+    static void attach(NvencEncoder& encoder, void* session,
+                       const NV_ENCODE_API_FUNCTION_LIST& api,
+                       std::array<unsigned char, 4>& buffers) {
+        auto& impl = *encoder.impl_;
+        impl.session = session;
+        impl.api = api;
+        impl.settings.width = 2;
+        impl.settings.height = 2;
+        impl.settings.fps = 60;
+        impl.caps.available = true;
+        impl.publishAvailability(true);
+        for (auto& buffer : buffers) {
+            impl.bitstreamBuffers.push_back(&buffer);
+            impl.availableBitstreams.push_back(&buffer);
+        }
+    }
+
+    static bool harvest(NvencEncoder& encoder) {
+        return encoder.impl_->harvestPendingOutputs(false);
+    }
+
+    static bool popReady(NvencEncoder& encoder, EncodedPacket& packet) {
+        return encoder.impl_->popReadyPacket(packet);
+    }
+
+    static bool inputMappingFaulted(const NvencEncoder& encoder) {
+        return encoder.impl_->inputMappingFaulted;
+    }
+
+    // B-frame reorder delay, so an early output is not plausibly complete yet.
+    static void setBFrames(NvencEncoder& encoder, bool enabled) {
+        encoder.impl_->caps.effective.bFrames = enabled;
+    }
+
+    // Simulates an output that has been waiting past the lock deadline.
+    static void agePendingOutputs(NvencEncoder& encoder, std::chrono::seconds age) {
+        for (auto& pending : encoder.impl_->pendingOutputs) {
+            pending.submittedAt -= age;
+        }
+    }
+};
+
+} // namespace backtrack
+
+namespace {
+
+using namespace backtrack;
+
+enum class Event { Write, Map, Submit, Complete, Unmap, Release, Unregister, Destroy };
+
+void expect(bool condition, const std::string& message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+struct FakeNvenc {
+    FakeNvenc() { events.reserve(128); }
+
+    std::array<unsigned char, 4> buffers{};
+    std::array<uint8_t, 6> bytes{0, 0, 0, 1, 0x65, 0x88};
+    std::unordered_map<NV_ENC_OUTPUT_PTR, uint64_t> timestamps;
+    std::unordered_map<NV_ENC_INPUT_PTR, uint64_t> inputTokens;
+    std::unordered_set<NV_ENC_INPUT_PTR> mappedResources;
+    std::unordered_set<uint64_t> completedTokens;
+    std::vector<uint64_t> lockOrder;
+    size_t lockIndex = 0;
+    std::vector<Event> events;
+    NVENCSTATUS submitStatus = NV_ENC_SUCCESS;
+    int completionCredits = 0;
+    int outstanding = 0;
+    int accepted = 0;
+    int unmapAttempts = 0;
+    int mapAttempts = 0;
+    bool mapped = false;
+    bool submittedSinceMap = false;
+    bool submittedWithoutFreshMap = false;
+    bool failLock = false;
+    bool failMap = false;
+    // This driver answers a not-yet-complete non-blocking lock with
+    // NV_ENC_ERR_OUT_OF_MEMORY instead of NV_ENC_ERR_LOCK_BUSY.
+    bool outOfMemoryWhenIncomplete = false;
+    int lockAttempts = 0;
+    bool failUnmap = false;
+    bool completeOnEos = false;
+    bool invalidUnmap = false;
+    bool invalidDestroy = false;
+    bool releasedWhileMapped = false;
+
+    static FakeNvenc& from(void* session) { return *static_cast<FakeNvenc*>(session); }
+
+    static NVENCSTATUS NVENCAPI registerResource(void*, NV_ENC_REGISTER_RESOURCE* resource) {
+        resource->registeredResource = resource->resourceToRegister;
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI map(void* session, NV_ENC_MAP_INPUT_RESOURCE* resource) {
+        auto& fake = from(session);
+        ++fake.mapAttempts;
+        if (fake.failMap) return NV_ENC_ERR_MAP_FAILED;
+        fake.mappedResources.insert(resource->registeredResource);
+        fake.mapped = true;
+        fake.submittedSinceMap = false;
+        fake.events.push_back(Event::Map);
+        resource->mappedResource = resource->registeredResource;
+        resource->mappedBufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI submit(void* session, NV_ENC_PIC_PARAMS* pic) {
+        auto& fake = from(session);
+        if (pic->encodePicFlags & NV_ENC_PIC_FLAG_EOS) {
+            if (fake.completeOnEos) fake.completionCredits += fake.outstanding;
+            return NV_ENC_SUCCESS;
+        }
+        fake.events.push_back(Event::Submit);
+        fake.submittedWithoutFreshMap |= !fake.mapped || fake.submittedSinceMap;
+        fake.submittedSinceMap = true;
+        if (fake.submitStatus == NV_ENC_SUCCESS || fake.submitStatus == NV_ENC_ERR_NEED_MORE_INPUT) {
+            ++fake.accepted;
+            ++fake.outstanding;
+            fake.timestamps[pic->outputBitstream] = pic->inputTimeStamp;
+            fake.inputTokens[pic->inputBuffer] = pic->inputTimeStamp;
+        }
+        return fake.submitStatus;
+    }
+    static NVENCSTATUS NVENCAPI lock(void* session, NV_ENC_LOCK_BITSTREAM* output) {
+        auto& fake = from(session);
+        ++fake.lockAttempts;
+        if (fake.failLock) return NV_ENC_ERR_GENERIC;
+        if (fake.completionCredits == 0) {
+            return fake.outOfMemoryWhenIncomplete ? NV_ENC_ERR_OUT_OF_MEMORY
+                                                  : NV_ENC_ERR_LOCK_BUSY;
+        }
+        --fake.completionCredits;
+        --fake.outstanding;
+        fake.events.push_back(Event::Complete);
+        output->bitstreamBufferPtr = fake.bytes.data();
+        output->bitstreamSizeInBytes = static_cast<uint32_t>(fake.bytes.size());
+        const uint64_t token = fake.lockIndex < fake.lockOrder.size()
+            ? fake.lockOrder[fake.lockIndex++]
+            : fake.timestamps.at(output->outputBitstream);
+        fake.completedTokens.insert(token);
+        output->outputTimeStamp = token;
+        output->outputDuration = 166667;
+        output->pictureType = NV_ENC_PIC_TYPE_IDR;
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI unlock(void*, NV_ENC_OUTPUT_PTR) { return NV_ENC_SUCCESS; }
+    static NVENCSTATUS NVENCAPI unmap(void* session, NV_ENC_INPUT_PTR input) {
+        auto& fake = from(session);
+        ++fake.unmapAttempts;
+        const auto token = fake.inputTokens.find(input);
+        if (token != fake.inputTokens.end()) {
+            if (fake.completedTokens.erase(token->second) == 0) {
+                fake.invalidUnmap = true;
+                return NV_ENC_ERR_GENERIC;
+            }
+            fake.inputTokens.erase(token);
+        }
+        if (fake.failUnmap) return NV_ENC_ERR_GENERIC;
+        fake.mappedResources.erase(input);
+        fake.mapped = !fake.mappedResources.empty();
+        fake.events.push_back(Event::Unmap);
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI unregisterResource(void* session, NV_ENC_REGISTERED_PTR) {
+        auto& fake = from(session);
+        if (fake.mapped) return NV_ENC_ERR_GENERIC;
+        fake.events.push_back(Event::Unregister);
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI destroyBuffer(void* session, NV_ENC_OUTPUT_PTR) {
+        auto& fake = from(session);
+        if (fake.outstanding != 0) fake.invalidDestroy = true;
+        return fake.outstanding == 0 ? NV_ENC_SUCCESS : NV_ENC_ERR_GENERIC;
+    }
+    static NVENCSTATUS NVENCAPI destroyEncoder(void* session) {
+        auto& fake = from(session);
+        if (fake.outstanding != 0 || fake.mapped) fake.invalidDestroy = true;
+        fake.events.push_back(Event::Destroy);
+        return fake.invalidDestroy ? NV_ENC_ERR_GENERIC : NV_ENC_SUCCESS;
+    }
+
+    NV_ENCODE_API_FUNCTION_LIST api() {
+        NV_ENCODE_API_FUNCTION_LIST result{};
+        result.nvEncRegisterResource = registerResource;
+        result.nvEncMapInputResource = map;
+        result.nvEncEncodePicture = submit;
+        result.nvEncLockBitstream = lock;
+        result.nvEncUnlockBitstream = unlock;
+        result.nvEncUnmapInputResource = unmap;
+        result.nvEncUnregisterResource = unregisterResource;
+        result.nvEncDestroyBitstreamBuffer = destroyBuffer;
+        result.nvEncDestroyEncoder = destroyEncoder;
+        return result;
+    }
+};
+
+class InstrumentedPool {
+    struct Slot { ComPtr<ID3D11Texture2D> texture; };
+    struct Lease {
+        std::shared_ptr<Slot> slot;
+        FakeNvenc* fake = nullptr;
+        ~Lease() {
+            fake->releasedWhileMapped |= fake->mapped;
+            fake->events.push_back(Event::Release);
+        }
+    };
+
+public:
+    explicit InstrumentedPool(FakeNvenc& fake, uint32_t slots = 1) : fake_(fake) {
+        expect(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+            &device_, nullptr, &context_)), "create WARP device failed");
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = 2;
+        desc.Height = 2;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        for (uint32_t index = 0; index < slots; ++index) {
+            auto slot = std::make_shared<Slot>();
+            expect(SUCCEEDED(device_->CreateTexture2D(&desc, nullptr, &slot->texture)),
+                   "create texture failed");
+            pool_.push_back(std::move(slot));
+        }
+    }
+
+    bool available() { return static_cast<bool>(pool_.acquire()); }
+
+    GpuFrame write() {
+        auto slot = pool_.acquire();
+        expect(static_cast<bool>(slot), "pool slot reused while leased");
+        expect(!fake_.mapped, "graphics accessed a mapped input");
+        const uint32_t pixels[4] = {1, 2, 3, 4};
+        context_->UpdateSubresource(slot->texture.Get(), 0, nullptr, pixels, 2 * sizeof(uint32_t), 0);
+        fake_.events.push_back(Event::Write);
+        GpuFrame frame;
+        frame.texture = slot->texture;
+        auto lease = std::make_shared<Lease>();
+        lease->slot = std::move(slot);
+        lease->fake = &fake_;
+        frame.lease = std::move(lease);
+        frame.width = 2;
+        frame.height = 2;
+        frame.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        frame.duration100ns = 166667;
+        return frame;
+    }
+
+private:
+    FakeNvenc& fake_;
+    ComPtr<ID3D11Device> device_;
+    ComPtr<ID3D11DeviceContext> context_;
+    GpuTexturePool<Slot> pool_;
+};
+
+size_t eventAfter(const FakeNvenc& fake, Event event, size_t start = 0) {
+    for (size_t index = start; index < fake.events.size(); ++index) {
+        if (fake.events[index] == event) return index;
+    }
+    throw std::runtime_error("required lifecycle event was missing or out of order");
+}
+
+void attach(NvencEncoder& encoder, FakeNvenc& fake) {
+    NvencEncoderTestAccess::attach(encoder, &fake, fake.api(), fake.buffers);
+}
+
+void testCompletionBeforeReuse() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    frame = {};
+    expect(!pool.available(), "pending input lease was released");
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "completed output was not harvested");
+    expect(!fake.mapped && !fake.releasedWhileMapped, "input was released while still mapped");
+    expect(pool.available(), "completed input did not return to the pool");
+    auto reused = pool.write();
+    expect(reused.lease != nullptr, "reused frame has no lease");
+    size_t position = 0;
+    for (Event event : {Event::Write, Event::Map, Event::Submit, Event::Complete,
+                        Event::Unmap, Event::Release, Event::Write}) {
+        position = eventAfter(fake, event, position) + 1;
+    }
+}
+
+void testRemapAfterCompletion() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "first output was not harvested");
+    expect(!fake.mapped, "first input remained mapped after completion");
+    frame.pts100ns = 166667;
+    encoder.encodeFrame(frame, packets);
+    expect(fake.accepted == 2 && fake.mapAttempts == 2,
+           "a completed input was resubmitted without a fresh mapping");
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "second output was not harvested");
+    frame = {};
+    expect(pool.available() && !fake.mapped && !fake.releasedWhileMapped && !fake.invalidUnmap,
+           "resubmitted input was not safely released");
+}
+
+void testReorderedInputRetirement() {
+    FakeNvenc fake;
+    InstrumentedPool poolA(fake);
+    InstrumentedPool poolB(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    auto first = poolA.write();
+    auto second = poolB.write();
+    fake.lockOrder = {2, 1};
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(first, packets);
+    encoder.encodeFrame(second, packets);
+    first = {};
+    second = {};
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "reordered output was not harvested");
+    expect(!fake.invalidUnmap, "an input was unmapped before its own output completed");
+    expect(poolB.available() && !poolA.available(),
+           "reordered output retired the wrong input");
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "second reordered output was not harvested");
+    expect(poolA.available() && poolB.available() && !fake.mapped,
+           "reordered inputs were not retired in output-timestamp order");
+}
+
+void testMapFailureReleasesInput() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    fake.failMap = true;
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    expect(fake.accepted == 0 && fake.mapAttempts == 2, "map failure was not retried once");
+    frame = {};
+    expect(!fake.mapped && !fake.releasedWhileMapped && pool.available(),
+           "map failure released or retained the producer input");
+}
+
+void testRepeatedInput() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    fake.completeOnEos = true;
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    frame.pts100ns = 166667;
+    encoder.encodeFrame(frame, packets);
+    expect(fake.accepted == 1, "a texture already mapped by an in-flight submission was submitted again");
+    expect(!fake.submittedWithoutFreshMap, "repeated input was submitted without a fresh mapping");
+    frame = {};
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "first repeated output was not harvested");
+    expect(pool.available() && !fake.mapped && !fake.releasedWhileMapped &&
+           !fake.invalidUnmap && !fake.invalidDestroy,
+           "repeated input was not safely released");
+}
+
+void testRejectedSubmission() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    fake.submitStatus = NV_ENC_ERR_ENCODER_BUSY;
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    frame = {};
+    expect(fake.accepted == 0 && !fake.mapped && !fake.releasedWhileMapped && pool.available(),
+           "rejected input was returned to its producer before unmap");
+}
+
+void testResetAndCaptureHandoff() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    fake.submitStatus = NV_ENC_ERR_NEED_MORE_INPUT;
+    auto last = pool.write();
+    GpuFrame acquired;
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(last, packets);
+    fake.completionCredits = 1;
+    expect(releaseCaptureFrames(last, acquired, [&] {
+        expect(encoder.resetInputResources(), "input reset failed");
+        expect(last.lease && !fake.mapped, "capture lease was not held through reset unmap");
+        return encoder.encoderAvailable();
+    }), "input reset failed");
+    expect(pool.available() && !fake.releasedWhileMapped, "reset released a mapped input");
+    size_t position = 0;
+    for (Event event : {Event::Write, Event::Map, Event::Submit, Event::Complete,
+                        Event::Unmap, Event::Unregister, Event::Release}) {
+        position = eventAfter(fake, event, position) + 1;
+    }
+}
+
+void testFailedResetKeepsCaptureFrame() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    fake.submitStatus = NV_ENC_ERR_NEED_MORE_INPUT;
+    auto last = pool.write();
+    GpuFrame acquired;
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(last, packets);
+    fake.completionCredits = 1;
+    fake.failUnmap = true;
+    const bool released = releaseCaptureFrames(last, acquired, [&] {
+        encoder.resetInputResources();
+        return encoder.encoderAvailable();
+    });
+    expect(!released && last.lease && !pool.available() && !fake.invalidDestroy,
+           "failed reset released capture ownership");
+}
+
+void testFailedLockRetainsInput() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    frame = {};
+    fake.failLock = true;
+    NvencEncoderTestAccess::harvest(encoder);
+    expect(!pool.available() && !fake.invalidUnmap && !fake.invalidDestroy,
+           "lock failure released or destroyed an input with work outstanding");
+}
+
+void testShutdownRetainsUnfinishedInput() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    frame = {};
+    fake.failLock = true;
+    encoder.shutdown();
+    expect(!pool.available() && !fake.invalidUnmap && !fake.invalidDestroy,
+           "shutdown released or destroyed an unfinished input");
+}
+
+void testFailedUnmapRetainsInput() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    frame = {};
+    fake.failUnmap = true;
+    fake.completionCredits = 1;
+    NvencEncoderTestAccess::harvest(encoder);
+    expect(fake.unmapAttempts > 0 && !pool.available() && !fake.releasedWhileMapped,
+           "unmap failure was not handled or released a mapped input");
+}
+
+// Regression: this driver answers a not-yet-complete non-blocking lock with
+// NV_ENC_ERR_OUT_OF_MEMORY. That is a "not ready" status, not a fault: the
+// encoder must stay available and publish the output once it completes.
+void testIncompleteLockStatusIsNotAFault() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake, 4);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    // B-frames: nothing is complete until the reorder pipeline is full.
+    NvencEncoderTestAccess::setBFrames(encoder, true);
+    fake.outOfMemoryWhenIncomplete = true;
+    std::vector<GpuFrame> frames;
+    for (int index = 0; index < 4; ++index) {
+        frames.push_back(pool.write());
+        frames.back().pts100ns = 166667 * (index + 1);
+    }
+    std::vector<EncodedPacket> packets;
+    for (auto& frame : frames) {
+        encoder.encodeFrame(frame, packets);
+        expect(encoder.encoderAvailable(), "an incomplete non-blocking lock faulted the encoder");
+        expect(!NvencEncoderTestAccess::inputMappingFaulted(encoder),
+               "a not-ready lock latched the input-mapping fault");
+    }
+    expect(fake.lockAttempts > 0, "the early lock status was never exercised");
+    expect(fake.accepted == 4, "submissions stopped after a not-ready lock");
+
+    // The same picture completes later: the encoder must still publish it.
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "the completed output was not harvested");
+    EncodedPacket packet;
+    expect(NvencEncoderTestAccess::popReady(encoder, packet), "no packet was published");
+    expect(!packet.bytes.empty(), "the published packet is empty");
+    expect(encoder.encoderAvailable(), "the encoder stayed unavailable after publishing");
+
+    // The remaining reordered outputs complete in order; every input must be
+    // retired before its lease is released.
+    fake.completionCredits = 3;
+    expect(NvencEncoderTestAccess::harvest(encoder), "the remaining outputs were not harvested");
+    frames.clear();
+    expect(!fake.mapped && !fake.invalidUnmap && !fake.releasedWhileMapped,
+           "an input was released while still mapped");
+}
+
+// A driver that never completes the picture must still escalate after the lock
+// deadline, or a real out-of-memory/stuck session would wedge the pipeline.
+void testStuckLockStillEscalates() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    fake.outOfMemoryWhenIncomplete = true;
+    auto frame = pool.write();
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    expect(encoder.encoderAvailable(), "an early lock status faulted the encoder");
+
+    NvencEncoderTestAccess::agePendingOutputs(encoder, std::chrono::seconds(6));
+    expect(!NvencEncoderTestAccess::harvest(encoder),
+           "a permanently stuck lock must escalate to a fault");
+    expect(!encoder.encoderAvailable(),
+           "a stuck lock must publish unavailable for the recreate path");
+    expect(encoder.capabilities().detail.find(L"OUT_OF_MEMORY") != std::wstring::npos,
+           "the fault detail must name the lock status for Diagnostics");
+    // A lock deadline is not an input-binding fault: the session can still
+    // retire its inputs, which is what lets the recreate path release them.
+    expect(!NvencEncoderTestAccess::inputMappingFaulted(encoder),
+           "a stuck lock latched the input-mapping fault");
+    fake.outOfMemoryWhenIncomplete = false;
+    fake.completionCredits = 1;
+    expect(encoder.resetInputResources(), "a faulted session could not retire its inputs");
+    frame = {};
+    expect(pool.available() && !fake.mapped, "the input was not released after the fault");
+    encoder.shutdown();
+}
+
+} // namespace
+
+int main() {
+    try {
+        testCompletionBeforeReuse();
+        testRemapAfterCompletion();
+        testReorderedInputRetirement();
+        testMapFailureReleasesInput();
+        testRepeatedInput();
+        testRejectedSubmission();
+        testResetAndCaptureHandoff();
+        testFailedResetKeepsCaptureFrame();
+        testFailedLockRetainsInput();
+        testShutdownRetainsUnfinishedInput();
+        testFailedUnmapRetainsInput();
+        testIncompleteLockStatusIsNotAFault();
+        testStuckLockStillEscalates();
+    } catch (const std::exception& error) {
+        std::cerr << "NvencLifecycleTests: " << error.what() << '\n';
+        return 1;
+    }
+    return 0;
+}

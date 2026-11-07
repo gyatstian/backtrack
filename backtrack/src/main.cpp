@@ -9,10 +9,10 @@
 
 namespace {
 
-// Sound-separation mutes are global system state (foreign apps' render
-// sessions). Every fatal exit path gets a best-effort restore so a crash can
-// never leave Discord/Spotify muted until the next clean Backtrack run.
+// sound-separation mutes are global system state; attempt restoration before
+// constructing or logging a message, either of which can fail during a crash.
 LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers) {
+    backtrack::WasapiCapture::emergencyRestoreSessionMutes();
     std::wstringstream message;
     message << L"Unhandled SEH exception";
     if (exceptionPointers && exceptionPointers->ExceptionRecord) {
@@ -21,12 +21,12 @@ LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS* exceptionPointers) {
                 << L", address=" << record->ExceptionAddress;
     }
     backtrack::Logger::instance().error(L"fatal", message.str());
-    backtrack::WasapiCapture::emergencyRestoreSessionMutes();
     backtrack::Logger::instance().flush();
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
 void terminateHandler() {
+    backtrack::WasapiCapture::emergencyRestoreSessionMutes();
     std::wstring message = L"std::terminate called";
     if (const auto exception = std::current_exception()) {
         try {
@@ -39,7 +39,6 @@ void terminateHandler() {
         }
     }
     backtrack::Logger::instance().error(L"fatal", message);
-    backtrack::WasapiCapture::emergencyRestoreSessionMutes();
     backtrack::Logger::instance().flush();
     std::abort();
 }

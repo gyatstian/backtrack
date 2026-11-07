@@ -718,7 +718,7 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::copiedInputViewFor(
         // Video-processor input textures must have no bind flags on strict
         // drivers (AMD). SHADER_RESOURCE here causes CreateVideoProcessorInputView
         // to fail with E_INVALIDARG. This texture is only used as VP blt input.
-        copyDesc.BindFlags = GpuPoolBuilder::bindFlagsFor({});
+        copyDesc.BindFlags = 0;
 
         HRESULT hr = device.device()->CreateTexture2D(
             &copyDesc, nullptr, &copiedInputTexture_);

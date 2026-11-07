@@ -79,12 +79,18 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
         return 0;
     }
 
-    auto settings = settingsStore_.load();
-    settingsStore_.save(settings);
+    SettingsStore::LoadStatus settingsStatus;
+    auto settings = settingsStore_.load(&settingsStatus);
+    const bool normalizationFailed = !settingsStore_.normalizeLoaded(settings, settingsStatus);
 
     Logger::instance().initialize(localAppDataPath() / L"logs" / L"backtrack.log");
     Logger::instance().setMinLevel(settings.logLevel);
     Logger::instance().info(L"Backtrack starting");
+    if (settingsStatus == SettingsStore::LoadStatus::Failed) {
+        Logger::instance().error(L"settings", L"Could not read settings; startup normalization was skipped");
+    } else if (normalizationFailed) {
+        Logger::instance().error(L"settings", L"Could not normalize settings at startup");
+    }
     if (!instanceMutex) {
         Logger::instance().warning(L"Single-instance mutex could not be created; continuing without duplicate launch protection");
     }
@@ -93,7 +99,9 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
                                      L", replay=" + (settings.replay.enabled ? L"enabled" : L"disabled") +
                                      L", resolution=" + std::to_wstring(settings.video.width) + L"x" +
                                      std::to_wstring(settings.video.height) + L"@" + std::to_wstring(settings.video.fps));
-    updateWindowsStartupRegistration(settings.startWithWindowsMinimized);
+    if (settingsStatus != SettingsStore::LoadStatus::Failed) {
+        updateWindowsStartupRegistration(settings.startWithWindowsMinimized);
+    }
 
     // Restore sound-separation session mutes a previous crashed session left
     // applied system-wide. Runs after logger init and under the single-instance
@@ -129,7 +137,7 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
             L", H264=" + (capabilities.h264 ? L"yes" : L"no") +
             L", HEVC=" + (capabilities.hevc ? L"yes" : L"no"));
 
-    MainWindow window(controller_, settingsStore_);
+    MainWindow window(controller_, settingsStore_, settings, settingsStatus);
     const bool startMinimized = settings.startWithWindowsMinimized &&
                                 hasCommandLineArgument(commandLine, kBacktrackStartupArgument);
     if (!window.create(instance, showCommand, startMinimized)) {

@@ -117,6 +117,9 @@ void applyMicrophoneAgc(AudioPacket& packet, const AudioFormatInfo& format, Micr
 // buffered frame more or fewer samples than it consumed: the helper resizes
 // the packet payload to match what was actually produced, and held-back
 // samples arrive in a later packet, keeping cumulative stream length exact.
+// The denoiser also rewrites packet.pts100ns to the position of the oldest
+// buffered sample, so fragmented packets stay exactly contiguous on the WAV
+// pacer's timeline instead of gaining a silence/trim at every boundary.
 // Returns the produced mono-sample count.
 size_t applyMicrophoneNoiseSuppression(
     AudioPacket& packet,
@@ -145,8 +148,11 @@ size_t applyMicrophoneNoiseSuppression(
     // +480 lets the denoiser flush any frame buffered by an earlier odd-sized
     // packet instead of accumulating backlog.
     scratchMonoOut.resize(frameCount + 480);
-    const size_t produced =
-        denoiser.process(scratchMonoIn.data(), frameCount, scratchMonoOut.data(), scratchMonoOut.size());
+    // inputPts100ns and outPts100ns may alias; the denoiser reads the packet
+    // PTS for its continuity check before stamping the oldest pending position.
+    const size_t produced = denoiser.process(
+        scratchMonoIn.data(), frameCount, scratchMonoOut.data(), scratchMonoOut.size(),
+        packet.pts100ns, packet.pts100ns);
 
     packet.bytes.resize(produced * 2 * sizeof(float));
     float* out = reinterpret_cast<float*>(packet.bytes.data());

@@ -24,11 +24,13 @@ public:
     const std::wstring& lastErrorMessage() const { return lastErrorMessage_; }
 
 private:
+    friend struct HotkeyServiceTestAccess;
+
     static LRESULT CALLBACK keyboardHookProc(int code, WPARAM wParam, LPARAM lParam);
 
     void handleKeyboardEvent(WPARAM message, const KBDLLHOOKSTRUCT& event);
     void seedModifierState();
-    void updateModifierState(uint32_t virtualKey, bool down);
+    void updateModifierState(const KBDLLHOOKSTRUCT& event, bool down);
     uint32_t currentHookModifiers() const;
     bool matchesHotkey(uint32_t modifiers, uint32_t virtualKey, uint32_t hotkeyModifiers, uint32_t hotkeyVirtualKey) const;
     bool postHookHotkey(int id);
@@ -38,9 +40,12 @@ private:
     HWND window_ = nullptr;
     HHOOK keyboardHook_ = nullptr;
     HotkeySettings settings_{};
-    bool ctrlDown_ = false;
-    bool altDown_ = false;
-    bool shiftDown_ = false;
+    bool leftCtrlDown_ = false;
+    bool rightCtrlDown_ = false;
+    bool leftAltDown_ = false;
+    bool rightAltDown_ = false;
+    bool leftShiftDown_ = false;
+    bool rightShiftDown_ = false;
     bool startStopPressed_ = false;
     bool saveReplayPressed_ = false;
     ULONGLONG startStopHookTick_ = 0;

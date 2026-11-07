@@ -180,6 +180,9 @@ struct NvencEncoder::Impl {
     HMODULE module = nullptr;
     NV_ENCODE_API_FUNCTION_LIST api{};
     void* session = nullptr;
+    ComPtr<ID3D11Device> sessionDevice;
+    bool sessionFlushed = false;
+    uint64_t nextInputToken = 1;
     VideoSettings settings;
     EncoderCapabilities caps;
     EncoderStats encoderStats;
@@ -203,40 +206,36 @@ struct NvencEncoder::Impl {
     }
 
     struct RegisteredResource {
-        // Scaler owns these textures for their lifetime. Keeping another ComPtr here
-        // would pin every pool slot and permanently exhaust capture after one pass.
-        ID3D11Texture2D* texture = nullptr;
+        // The COM reference protects registration across pool destruction. The
+        // mapping and lease live on the pending submission, not here, so a
+        // producer never sees a registration-level cached mapping.
+        ComPtr<ID3D11Texture2D> texture;
         NV_ENC_REGISTERED_PTR registered = nullptr;
-        // Address binding created by nvEncMapInputResource. Valid for the whole
-        // session (the driver only requires the unmap to precede unregister /
-        // texture destruction), so it is created lazily on first use and kept:
-        // mapping/unmapping per submitted frame costs two pure driver calls
-        // that carry no information the driver does not already have. The
-        // lease pinning on PendingOutput keeps a pool slot from recycling
-        // while the encoder still reads it, exactly as before.
-        NV_ENC_INPUT_PTR mapped = nullptr;
-        NV_ENC_BUFFER_FORMAT mappedFormat = NV_ENC_BUFFER_FORMAT_UNDEFINED;
-        uint64_t generation = 0;
     };
-
-    // Bumped on full invalidation (pool recreation / resetInputResources).
-    uint64_t registrationGeneration = 1;
 
     struct PendingOutput {
         NV_ENC_OUTPUT_PTR bitstream = nullptr;
-        int64_t fallbackPts100ns = 0;
-        int64_t fallbackDuration100ns = 0;
+        NV_ENC_INPUT_PTR mapped = nullptr;
+        ID3D11Texture2D* inputTexture = nullptr;
+        std::shared_ptr<void> lease;
+        uint64_t token = 0;
+        int64_t pts100ns = 0;
+        int64_t duration100ns = 0;
         std::chrono::steady_clock::time_point submittedAt;
-        // Encoder submission counter when this frame was accepted. The output
-        // can only complete once enough later frames were submitted to fill
-        // the reorder pipeline; until then LOCK_BUSY is healthy, not wedged.
         uint64_t submittedFramesAtSubmission = 0;
-        // Keeps the input surface alive until its bitstream is harvested.
-        // Zero-copy capture sources (WGC) hand out textures whose pool slot
-        // recycles as soon as the frame lease is released; without pinning
-        // the lease here, a still-queued picture could reference a recycled
-        // surface and corrupt the encode. Released automatically when the
-        // pending entry is consumed (harvest/drain/shutdown).
+        uint64_t outputToken = 0;
+        const uint8_t* lockedData = nullptr;
+        uint32_t lockedSize = 0;
+        int64_t lockedDuration = 0;
+        NV_ENC_PIC_TYPE lockedPictureType = NV_ENC_PIC_TYPE_UNKNOWN;
+        bool completed = false;
+        bool locked = false;
+        bool finalized = false;
+    };
+
+    struct RetainedMapping {
+        NV_ENC_INPUT_PTR mapped = nullptr;
+        ID3D11Texture2D* inputTexture = nullptr;
         std::shared_ptr<void> lease;
     };
 
@@ -250,6 +249,7 @@ struct NvencEncoder::Impl {
     std::vector<NV_ENC_OUTPUT_PTR> bitstreamBuffers;
     std::deque<NV_ENC_OUTPUT_PTR> availableBitstreams;
     std::deque<PendingOutput> pendingOutputs;
+    std::deque<RetainedMapping> retainedMappings;
     std::deque<EncodedPacket> readyPackets;
     DecodeOrderTimestamps decodeTimestamps;
     std::atomic<bool> forceKeyFrame{true};
@@ -260,6 +260,11 @@ struct NvencEncoder::Impl {
     uint32_t consecutiveNeedMoreInput = 0;
     uint32_t consecutiveOutputBufferStarvation = 0;
     uint32_t consecutiveLockFailures = 0;
+    // Terminal fault: stop submitting into a session that cannot produce
+    // output. `inputMappingFaulted` is the narrower subset where the driver's
+    // input bindings are in an unknown state (a failed unmap/unregister/EOS),
+    // so the caller must also keep every mapping and lease alive.
+    bool sessionFaulted = false;
     bool inputMappingFaulted = false;
 
     // Non-blocking bitstream-lock support. Healthy drivers honour
@@ -346,6 +351,8 @@ struct NvencEncoder::Impl {
             caps.detail = L"nvEncOpenEncodeSessionEx failed: " + nvStatusName(status);
             return false;
         }
+        // Keep the device alive with a session that may have to be abandoned.
+        sessionDevice = device;
         return true;
     }
 
@@ -380,6 +387,7 @@ struct NvencEncoder::Impl {
         consecutiveMapFailures = 0;
         consecutiveRegisterFailures = 0;
         consecutiveEncodeFailures = 0;
+        sessionFaulted = false;
         inputMappingFaulted = false;
         cachedParameterSets.clear();
         if (!loadApi() || !openSession(device)) {
@@ -511,6 +519,8 @@ struct NvencEncoder::Impl {
             caps.detail = L"nvEncInitializeEncoder failed: " + nvStatusName(status);
             return false;
         }
+        sessionFlushed = false;
+        nextInputToken = 1;
 
         const uint32_t bitstreamBufferCount = desiredBitstreamBufferCount();
         for (uint32_t index = 0; index < bitstreamBufferCount; ++index) {
@@ -527,7 +537,7 @@ struct NvencEncoder::Impl {
         }
 
         Logger::instance().info(L"encoder",
-            L"NVENC initialized in zero-copy D3D11 mode at " +
+            L"NVENC initialized in D3D11 mode at " +
             std::to_wstring(settings.width) + L"x" + std::to_wstring(settings.height) +
             L" with " + std::to_wstring(bitstreamBufferCount) + L" output buffers");
         return true;
@@ -542,32 +552,25 @@ struct NvencEncoder::Impl {
     RegisteredResource* registeredResourceFor(ID3D11Texture2D* texture, NV_ENC_BUFFER_FORMAT bufferFormat) {
         const auto existing = registeredResources.find(texture);
         if (existing != registeredResources.end()) {
-            // Pool resets unregister resources before destroying textures; generation
-            // rejects entries left over from a reset.
-            if (existing->second.generation == registrationGeneration &&
-                existing->second.texture == texture &&
-                existing->second.registered) {
-                return &existing->second;
-            }
-            if (existing->second.registered && session) {
-                unmapRegistered(existing->second);
-                api.nvEncUnregisterResource(session, existing->second.registered);
-            }
-            registeredResources.erase(existing);
+            return &existing->second;
         }
 
+        // Allocate the entry before giving its texture to the driver.
+        const auto [it, inserted] = registeredResources.try_emplace(texture);
+        (void)inserted;
+        it->second.texture = texture;
         NV_ENC_REGISTER_RESOURCE resource{};
         resource.version = NV_ENC_REGISTER_RESOURCE_VER;
         resource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
         resource.resourceToRegister = texture;
         resource.width = settings.width;
         resource.height = settings.height;
-        resource.pitch = 0;
         resource.bufferFormat = bufferFormat;
         resource.bufferUsage = NV_ENC_INPUT_IMAGE;
 
-        NVENCSTATUS status = api.nvEncRegisterResource(session, &resource);
+        const NVENCSTATUS status = api.nvEncRegisterResource(session, &resource);
         if (status != NV_ENC_SUCCESS) {
+            registeredResources.erase(it);
             ++consecutiveRegisterFailures;
             if (consecutiveRegisterFailures == 1) {
                 Logger::instance().error(L"encoder", L"nvEncRegisterResource failed: " + nvStatusName(status));
@@ -578,91 +581,77 @@ struct NvencEncoder::Impl {
             }
             return nullptr;
         }
-
+        it->second.registered = resource.registeredResource;
         consecutiveRegisterFailures = 0;
-        RegisteredResource cached;
-        cached.texture = texture;
-        cached.registered = resource.registeredResource;
-        cached.generation = registrationGeneration;
-        const auto [it, inserted] = registeredResources.emplace(texture, std::move(cached));
-        (void)inserted;
-        // Every input texture comes from a fixed capture or scaler pool, so this
-        // count only grows while those pools live. Logged because the bound
-        // those pools impose is otherwise invisible from the encode side.
         Logger::instance().debug(L"encoder",
-            L"NVENC registered input resources: " +
-            std::to_wstring(registeredResources.size()));
-        // unordered_map nodes are stable: the returned entry stays valid until
-        // it is erased (all erasure paths run under Impl::mutex, same as this
-        // call), so callers may hold the pointer across driver calls.
+            L"NVENC registered input resources: " + std::to_wstring(registeredResources.size()));
         return &it->second;
     }
 
-    // Releases the address binding of a registration. Must be called before
-    // nvEncUnregisterResource / texture destruction per the NVENC contract.
-    void unmapRegistered(RegisteredResource& entry) {
-        if (entry.mapped && session) {
-            api.nvEncUnmapInputResource(session, entry.mapped);
+    bool unregisterResource(ID3D11Texture2D* texture) {
+        const auto it = registeredResources.find(texture);
+        if (it == registeredResources.end()) {
+            return true;
         }
-        entry.mapped = nullptr;
-        entry.mappedFormat = NV_ENC_BUFFER_FORMAT_UNDEFINED;
+        if (!it->second.registered) {
+            registeredResources.erase(it);
+            return true;
+        }
+        const NVENCSTATUS status = api.nvEncUnregisterResource(session, it->second.registered);
+        if (status != NV_ENC_SUCCESS) {
+            return failInputMapping(L"nvEncUnregisterResource failed: " + nvStatusName(status));
+        }
+        registeredResources.erase(it);
+        return true;
     }
 
-    void unregisterResource(ID3D11Texture2D* texture, NV_ENC_REGISTERED_PTR registered) {
-        if (registered && session) {
-            const auto it = registeredResources.find(texture);
-            if (it != registeredResources.end() && it->second.registered == registered) {
-                unmapRegistered(it->second);
-            }
-            api.nvEncUnregisterResource(session, registered);
-        }
-        registeredResources.erase(texture);
-    }
-
-    void unregisterAllResources() {
-        if (session) {
-            for (auto& item : registeredResources) {
-                if (item.second.mapped) {
-                    api.nvEncUnmapInputResource(session, item.second.mapped);
-                    item.second.mapped = nullptr;
-                }
-                api.nvEncUnregisterResource(session, item.second.registered);
-            }
-        }
-        registeredResources.clear();
-        // Invalidate any concurrent lookups that might still hold raw NV_ENC_REGISTERED_PTR
-        // from a previous pool epoch (pool recreation path).
-        ++registrationGeneration;
-        if (registrationGeneration == 0) {
-            registrationGeneration = 1;
-        }
-        consecutiveRegisterFailures = 0;
-        consecutiveMapFailures = 0;
-    }
-
-    // Unmapping and unregistering a resource a queued picture still points at
-    // is an NVENC contract violation, so a pool rebuild has to let those
-    // pictures finish first. An EOS picture flushes the reorder pipeline
-    // without needing new input; the encoder guide documents EOS as repeatable
-    // within one session, and the next encodeFrame simply continues on it.
-    // Harvested packets stay in readyPackets: the next encodeFrame pops them,
-    // and the pipeline-stop drain flushes whatever is left.
-    void flushAndUnregisterResources() {
-        if (!session || pendingOutputs.empty()) {
-            unregisterAllResources();
-            return;
-        }
+    bool sendEos() {
         NV_ENC_PIC_PARAMS pic{};
         pic.version = NV_ENC_PIC_PARAMS_VER;
         pic.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
         const NVENCSTATUS status = api.nvEncEncodePicture(session, &pic);
         if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
-            Logger::instance().warning(L"encoder",
-                L"NVENC flush before input reset failed: " + nvStatusName(status));
+            return failInputMapping(L"nvEncEncodePicture(EOS) failed: " + nvStatusName(status));
         }
+        sessionFlushed = true;
         readyOutputCount = pendingOutputs.size();
-        harvestPendingOutputs(true);
-        unregisterAllResources();
+        return true;
+    }
+
+    bool flushAndUnregisterResources() {
+        if (!session) {
+            return registeredResources.empty() && pendingOutputs.empty() &&
+                   retainedMappings.empty();
+        }
+        while (!retainedMappings.empty()) {
+            const auto& retained = retainedMappings.front();
+            const NVENCSTATUS status = api.nvEncUnmapInputResource(session, retained.mapped);
+            if (status != NV_ENC_SUCCESS) {
+                return failInputMapping(L"nvEncUnmapInputResource failed: " + nvStatusName(status));
+            }
+            retainedMappings.pop_front();
+        }
+        if (!pendingOutputs.empty()) {
+            if (!sessionFlushed && !sendEos()) {
+                // Only outputs already credited by successful submissions may be locked.
+                harvestPendingOutputs(false);
+                return false;
+            }
+            if (!harvestPendingOutputs(true)) {
+                return false;
+            }
+        }
+        if (!pendingOutputs.empty() || !retainedMappings.empty()) {
+            return false;
+        }
+        while (!registeredResources.empty()) {
+            if (!unregisterResource(registeredResources.begin()->first)) {
+                return false;
+            }
+        }
+        consecutiveRegisterFailures = 0;
+        consecutiveMapFailures = 0;
+        return true;
     }
 
     void noteMapFailure(NVENCSTATUS status) {
@@ -675,7 +664,6 @@ struct NvencEncoder::Impl {
             caps.detail = L"NVENC input mapping failed repeatedly; capture pipeline disabled encoder until restart";
             publishAvailability(false);
             Logger::instance().error(L"encoder", caps.detail);
-            shutdownEncoder();
         } else if ((consecutiveMapFailures % 300) == 0) {
             Logger::instance().warning(L"encoder",
                 L"Still suppressing repeated nvEncMapInputResource failures; count=" +
@@ -708,14 +696,24 @@ struct NvencEncoder::Impl {
         }
     }
 
+    // Terminal encoder fault: the session cannot produce output, so stop
+    // submitting and publish unavailable for the capture loop's recreate path.
+    // Driver state is still known well enough to retire resources.
     bool failEncoder(const std::wstring& detail) {
-        inputMappingFaulted = true;
+        sessionFaulted = true;
         caps.available = false;
         caps.detail = detail;
         publishAvailability(false);
         Logger::instance().error(L"encoder", detail);
-        shutdownEncoder();
         return false;
+    }
+
+    // A failed unmap/unregister/EOS leaves the driver's input bindings in an
+    // unknown state: additionally latch inputMappingFaulted so no further input
+    // is submitted and the caller keeps every mapping and lease alive.
+    bool failInputMapping(const std::wstring& detail) {
+        inputMappingFaulted = true;
+        return failEncoder(detail);
     }
 
     bool popReadyPacket(EncodedPacket& packet) {
@@ -741,6 +739,15 @@ struct NvencEncoder::Impl {
         }
     }
 
+    // A non-blocking lock that cannot return the picture yet means "not ready",
+    // not a fault. This driver answers that case with NV_ENC_ERR_OUT_OF_MEMORY
+    // instead of NV_ENC_ERR_LOCK_BUSY, so a status-only check turns every early
+    // poll into a terminal fault. Only the per-output deadline escalates it.
+    static bool lockNotReady(NVENCSTATUS status, bool nonBlocking) {
+        return status == NV_ENC_ERR_LOCK_BUSY ||
+               (nonBlocking && status == NV_ENC_ERR_OUT_OF_MEMORY);
+    }
+
     bool harvestPendingOutputs(bool waitForCompletion) {
         // Drain mode uses an idle bound refreshed on every successfully locked
         // output instead of one absolute budget: a large queue of completed
@@ -750,124 +757,143 @@ struct NvencEncoder::Impl {
             ? SteadyClock::now() + kBitstreamLockTimeout
             : SteadyClock::time_point::max();
 
-        while (!pendingOutputs.empty() && (waitForCompletion || readyOutputCount > 0)) {
-            PendingOutput pending = std::move(pendingOutputs.front());
-            const bool oldestShouldBeComplete = outputShouldBeComplete(pending);
-            pendingOutputs.pop_front();
-
-            NV_ENC_LOCK_BITSTREAM lock{};
-            lock.version = NV_ENC_LOCK_BITSTREAM_VER;
-            lock.outputBitstream = pending.bitstream;
-
-            // Bounded acquisition. Prefer the non-blocking lock and poll so a
-            // wedged driver escalates to an encoder fault instead of blocking
-            // forever while pipelineGpuMutex_ is held.
-            NVENCSTATUS status = NV_ENC_SUCCESS;
-            for (;;) {
-                const bool polling = bitstreamPolling != BitstreamPolling::Unsupported;
-                // Legacy drivers only offer a blocking lock with no timeout.
-                // Never block on a frame whose reorder pipeline is not full
-                // yet (a healthy driver would answer instantly, a wedged one
-                // would hang the encode worker), and never block on an output
-                // that should long have completed: the LOCK_BUSY path below
-                // faults it instead of gambling on the lock returning.
-                if (!polling && !waitForCompletion &&
-                    (!oldestShouldBeComplete ||
-                     SteadyClock::now() - pending.submittedAt >= kBitstreamLockTimeout)) {
-                    status = NV_ENC_ERR_LOCK_BUSY;
-                    break;
-                }
-                lock.doNotWait = polling ? 1 : 0;
-                status = api.nvEncLockBitstream(session, &lock);
-
-                if (status == NV_ENC_SUCCESS) {
-                    bitstreamPolling = polling ? BitstreamPolling::Supported
-                                               : BitstreamPolling::Unsupported;
-                    break;
-                }
-                if (status == NV_ENC_ERR_LOCK_BUSY) {
-                    if (!waitForCompletion) {
-                        break; // not complete yet: defer below
+        while (!pendingOutputs.empty() &&
+               (waitForCompletion || readyOutputCount > 0 || pendingOutputs.front().completed)) {
+            PendingOutput& pending = pendingOutputs.front();
+            if (!pending.completed) {
+                const bool oldestShouldBeComplete = outputShouldBeComplete(pending);
+                NV_ENC_LOCK_BITSTREAM lock{};
+                lock.version = NV_ENC_LOCK_BITSTREAM_VER;
+                lock.outputBitstream = pending.bitstream;
+                NVENCSTATUS status = NV_ENC_SUCCESS;
+                bool lastLockNonBlocking = false;
+                for (;;) {
+                    const bool polling = bitstreamPolling != BitstreamPolling::Unsupported;
+                    // Legacy blocking locks have no timeout, including during drain.
+                    if (!polling && !waitForCompletion &&
+                        (!oldestShouldBeComplete ||
+                         SteadyClock::now() - pending.submittedAt >= kBitstreamLockTimeout)) {
+                        status = NV_ENC_ERR_LOCK_BUSY;
+                        break;
                     }
-                    if (SteadyClock::now() < idleDeadline) {
+                    lock.doNotWait = polling ? 1 : 0;
+                    lastLockNonBlocking = polling;
+                    status = api.nvEncLockBitstream(session, &lock);
+                    if (status == NV_ENC_SUCCESS) {
+                        bitstreamPolling = polling ? BitstreamPolling::Supported
+                                                   : BitstreamPolling::Unsupported;
+                        break;
+                    }
+                    if (lockNotReady(status, polling)) {
+                        if (!waitForCompletion || SteadyClock::now() >= idleDeadline) {
+                            break;
+                        }
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                         continue;
                     }
-                    break; // drain deadline expired: fault below
+                    if (polling && bitstreamPolling == BitstreamPolling::Unknown &&
+                        (status == NV_ENC_ERR_UNSUPPORTED_PARAM || status == NV_ENC_ERR_INVALID_PARAM ||
+                         status == NV_ENC_ERR_UNIMPLEMENTED)) {
+                        bitstreamPolling = BitstreamPolling::Unsupported;
+                        continue;
+                    }
+                    break;
                 }
-                if (polling && bitstreamPolling == BitstreamPolling::Unknown) {
-                    // Older drivers reject doNotWait=1 with an error other
-                    // than LOCK_BUSY. Probe the blocking lock once; success
-                    // pins this session to legacy blocking semantics.
-                    bitstreamPolling = BitstreamPolling::Unsupported;
-                    continue;
+                if (lockNotReady(status, lastLockNonBlocking) && !waitForCompletion) {
+                    // Retry later, but only until the deadline from submission:
+                    // a genuinely stuck driver still escalates to a recreate.
+                    if (SteadyClock::now() - pending.submittedAt >= kBitstreamLockTimeout) {
+                        return failEncoder(L"NVENC output did not complete before the lock deadline (" +
+                            nvStatusName(status) + L")");
+                    }
+                    break;
                 }
-                break; // terminal failure: handled below
-            }
-
-            if (status == NV_ENC_ERR_LOCK_BUSY && !waitForCompletion) {
-                // A busy output that should long be complete means the driver
-                // stopped making progress.
-                if (oldestShouldBeComplete &&
-                    SteadyClock::now() - pending.submittedAt >= kBitstreamLockTimeout) {
-                    pendingOutputs.push_front(std::move(pending));
-                    return failEncoder(
-                        L"NVENC output was not lockable within " +
-                        std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(
-                                            kBitstreamLockTimeout)
-                                            .count()) +
-                        L"s although its reorder pipeline was full; encoder faulted so the capture pipeline can recreate it");
+                if (lockNotReady(status, lastLockNonBlocking)) {
+                    return failEncoder(L"NVENC drain did not produce a lockable output before the deadline (" +
+                        nvStatusName(status) + L")");
                 }
-                pendingOutputs.push_front(std::move(pending));
-                break;
-            }
-            if (status == NV_ENC_ERR_LOCK_BUSY) {
-                return failEncoder(
-                    L"NVENC drain did not produce a lockable output within " +
-                    std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(
-                                        kBitstreamLockTimeout)
-                                        .count()) +
-                    L"s; encoder faulted so the capture pipeline can recreate it");
-            }
-            if (status != NV_ENC_SUCCESS) {
-                ++consecutiveLockFailures;
-                ++encoderStats.droppedFrames;
-                return failEncoder(
-                    L"NVENC output lock failed: " + nvStatusName(status) +
-                    L"; encoder was reset to stop recycling a bad output buffer");
-            }
-            if (!waitForCompletion && readyOutputCount > 0) {
-                --readyOutputCount;
-            }
-            consecutiveLockFailures = 0;
-            // Progress made: extend the drain idle bound.
-            if (waitForCompletion) {
+                if (status != NV_ENC_SUCCESS) {
+                    ++consecutiveLockFailures;
+                    ++encoderStats.droppedFrames;
+                    return failEncoder(L"NVENC output lock failed: " + nvStatusName(status));
+                }
+                pending.completed = true;
+                pending.locked = true;
+                pending.outputToken = static_cast<uint64_t>(lock.outputTimeStamp);
+                pending.lockedData = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
+                pending.lockedSize = lock.bitstreamSizeInBytes;
+                pending.lockedDuration = static_cast<int64_t>(lock.outputDuration);
+                pending.lockedPictureType = lock.pictureType;
+                if (readyOutputCount > 0) {
+                    --readyOutputCount;
+                }
+                consecutiveLockFailures = 0;
                 idleDeadline = SteadyClock::now() + kBitstreamLockTimeout;
             }
-
-            EncodedPacket packet;
-            const auto* begin = static_cast<const uint8_t*>(lock.bitstreamBufferPtr);
-            // Only the picture-type read stays backend-specific; timestamps,
-            // keyframe rule, headers, and stats live in finalizePacket.
-            // outputTimeStamp echoes the submitted inputTimeStamp, so driver
-            // timestamps are always present; validity is explicit (zero is a
-            // legal timestamp, never a sentinel).
-            const bool metadataIdr = lock.pictureType == NV_ENC_PIC_TYPE_IDR;
-            const bool finalized = finalizePacket(
-                settings.codec, begin, lock.bitstreamSizeInBytes,
-                static_cast<int64_t>(lock.outputTimeStamp), true,
-                static_cast<int64_t>(lock.outputDuration),
-                pending.fallbackPts100ns, pending.fallbackDuration100ns,
-                metadataIdr, decodeTimestamps, cachedParameterSets,
-                encoderStats, pending.submittedAt, packet);
-
-            api.nvEncUnlockBitstream(session, pending.bitstream);
-            releaseBitstreamBuffer(pending.bitstream);
-
-            if (!finalized) {
-                continue;
+            // B-frame output reorders: the output that just locked carries the
+            // timestamp of the input it encodes, which is not necessarily the
+            // front slot's own input. Retire that input, and keep its mapping
+            // until then.
+            PendingOutput* matched = nullptr;
+            if (pending.outputToken == 0) {
+                return failEncoder(L"NVENC output did not carry an input timestamp");
             }
-            readyPackets.push_back(std::move(packet));
+            const uint64_t matchedToken = pending.outputToken;
+            for (auto& candidate : pendingOutputs) {
+                if (candidate.token == matchedToken) {
+                    matched = &candidate;
+                    break;
+                }
+            }
+            if (!matched) {
+                return failEncoder(L"NVENC output did not identify a submitted input");
+            }
+            if (pending.locked) {
+                if (matched && !matched->finalized) {
+                    EncodedPacket packet;
+                    const bool finalized = finalizePacket(
+                        settings.codec, pending.lockedData, pending.lockedSize,
+                        matched->pts100ns, true, pending.lockedDuration, matched->pts100ns,
+                        matched->duration100ns, pending.lockedPictureType == NV_ENC_PIC_TYPE_IDR,
+                        decodeTimestamps, cachedParameterSets, encoderStats,
+                        matched->submittedAt, packet);
+                    matched->finalized = true;
+                    if (finalized) {
+                        readyPackets.push_back(std::move(packet));
+                    }
+                }
+                const NVENCSTATUS status = api.nvEncUnlockBitstream(session, pending.bitstream);
+                if (status != NV_ENC_SUCCESS) {
+                    return failEncoder(L"nvEncUnlockBitstream failed: " + nvStatusName(status));
+                }
+                pending.locked = false;
+            }
+            if (matched && matched->mapped) {
+                const NVENCSTATUS status = api.nvEncUnmapInputResource(session, matched->mapped);
+                if (status != NV_ENC_SUCCESS) {
+                    return failEncoder(L"nvEncUnmapInputResource failed: " + nvStatusName(status));
+                }
+                matched->mapped = nullptr;
+                matched->lease.reset();
+            }
+            releaseBitstreamBuffer(pending.bitstream);
+            if (matched == &pending) {
+                pendingOutputs.pop_front();
+            } else {
+                // The lock returned a later submission's output, so the front
+                // submission is still pending and has to keep its mapping and
+                // lease. Give it the finished submission's bitstream slot and
+                // clear the completion state that output left behind, then drop
+                // the finished entry rather than the front one.
+                PendingOutput& front = pendingOutputs.front();
+                front.bitstream = matched->bitstream;
+                front.completed = false;
+                front.locked = false;
+                front.outputToken = 0;
+                std::erase_if(pendingOutputs, [matchedToken](const PendingOutput& entry) {
+                    return entry.token == matchedToken;
+                });
+            }
         }
         if (waitForCompletion) {
             readyOutputCount = 0;
@@ -876,7 +902,7 @@ struct NvencEncoder::Impl {
     }
 
     bool encode(const GpuFrame& frame, EncodedPacket& packet) {
-        if (inputMappingFaulted || !session || bitstreamBuffers.empty() || !frame.texture) {
+        if (sessionFaulted || inputMappingFaulted || !session || bitstreamBuffers.empty() || !frame.texture) {
             return popReadyPacket(packet);
         }
         if (frame.width != settings.width || frame.height != settings.height) {
@@ -900,8 +926,28 @@ struct NvencEncoder::Impl {
         }
 
         const auto start = std::chrono::steady_clock::now();
+        ID3D11Texture2D* texture = frame.texture.Get();
 
-        RegisteredResource* entry = registeredResourceFor(frame.texture.Get(), expectedBufferFormat);
+        // A texture stays mapped until the output carrying its timestamp is
+        // harvested. Submitting the same zero-copy lastFrame again while it is
+        // still mapped would touch a texture the encoder owns; drop the repeat.
+        // After unmap the producer may reuse it, so only mapped entries block.
+        for (const auto& pending : pendingOutputs) {
+            if (pending.mapped != nullptr && pending.inputTexture == texture) {
+                forceKeyFrame = true;
+                ++encoderStats.droppedFrames;
+                return popReadyPacket(packet);
+            }
+        }
+        for (const auto& retained : retainedMappings) {
+            if (retained.inputTexture == texture) {
+                forceKeyFrame = true;
+                ++encoderStats.droppedFrames;
+                return popReadyPacket(packet);
+            }
+        }
+
+        RegisteredResource* entry = registeredResourceFor(texture, expectedBufferFormat);
         if (!entry) {
             // Frame lost before reaching the encoder: restart the next GOP so
             // the stream never continues from a broken reference chain.
@@ -911,36 +957,6 @@ struct NvencEncoder::Impl {
             // harvests must not strand behind this drop.
             return popReadyPacket(packet);
         }
-
-        // Lazy one-time map: the address binding stays valid for the whole
-        // session, so steady-state submissions skip both driver calls. A
-        // failed first map heals through a fresh register+map pair exactly as
-        // before; only repeated failures escalate (noteMapFailure).
-        if (!entry->mapped) {
-            NV_ENC_MAP_INPUT_RESOURCE map{};
-            map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-            map.registeredResource = entry->registered;
-            NVENCSTATUS status = api.nvEncMapInputResource(session, &map);
-            if (status != NV_ENC_SUCCESS) {
-                unregisterResource(frame.texture.Get(), entry->registered);
-                entry = registeredResourceFor(frame.texture.Get(), expectedBufferFormat);
-                if (entry) {
-                    map = {};
-                    map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-                    map.registeredResource = entry->registered;
-                    status = api.nvEncMapInputResource(session, &map);
-                }
-                if (!entry || status != NV_ENC_SUCCESS) {
-                    forceKeyFrame = true;
-                    noteMapFailure(status);
-                    ++encoderStats.droppedFrames;
-                    return popReadyPacket(packet);
-                }
-            }
-            entry->mapped = map.mappedResource;
-            entry->mappedFormat = map.mappedBufferFmt;
-        }
-        consecutiveMapFailures = 0;
 
         NV_ENC_OUTPUT_PTR bitstream = acquireBitstreamBuffer();
         if (!bitstream && !pendingOutputs.empty()) {
@@ -964,41 +980,68 @@ struct NvencEncoder::Impl {
             return popReadyPacket(packet);
         }
 
+        NV_ENC_MAP_INPUT_RESOURCE map{};
+        map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+        map.registeredResource = entry->registered;
+        NVENCSTATUS status = api.nvEncMapInputResource(session, &map);
+        if (status != NV_ENC_SUCCESS) {
+            // A stale registration heals through one fresh register+map pair.
+            if (!unregisterResource(texture)) {
+                releaseBitstreamBuffer(bitstream);
+                return false;
+            }
+            entry = registeredResourceFor(texture, expectedBufferFormat);
+            if (entry) {
+                map = {};
+                map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+                map.registeredResource = entry->registered;
+                status = api.nvEncMapInputResource(session, &map);
+            }
+            if (!entry || status != NV_ENC_SUCCESS) {
+                forceKeyFrame = true;
+                noteMapFailure(status);
+                ++encoderStats.droppedFrames;
+                releaseBitstreamBuffer(bitstream);
+                return popReadyPacket(packet);
+            }
+        }
+        consecutiveMapFailures = 0;
+
         NV_ENC_PIC_PARAMS pic{};
         pic.version = NV_ENC_PIC_PARAMS_VER;
-        pic.inputBuffer = entry->mapped;
-        pic.bufferFmt = entry->mappedFormat == NV_ENC_BUFFER_FORMAT_UNDEFINED
+        pic.inputBuffer = map.mappedResource;
+        pic.bufferFmt = map.mappedBufferFmt == NV_ENC_BUFFER_FORMAT_UNDEFINED
             ? expectedBufferFormat
-            : entry->mappedFormat;
+            : map.mappedBufferFmt;
         pic.inputWidth = settings.width;
         pic.inputHeight = settings.height;
         pic.outputBitstream = bitstream;
         pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-        pic.inputTimeStamp = frame.pts100ns;
         pic.inputDuration = frame.duration100ns > 0
             ? static_cast<uint64_t>(frame.duration100ns)
             : static_cast<uint64_t>(
                 kHundredNanosecondsPerSecond / std::max<uint32_t>(settings.fps, 1));
         pic.frameIdx = static_cast<uint32_t>(encoderStats.submittedFrames);
+        const uint64_t token = nextInputToken++;
+        pic.inputTimeStamp = token;
         const bool requestedKeyFrame = forceKeyFrame.exchange(false);
         if (requestedKeyFrame) {
             pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
         }
 
         ++encoderStats.submittedFrames;
-        const NVENCSTATUS status = api.nvEncEncodePicture(session, &pic);
+        status = api.nvEncEncodePicture(session, &pic);
 
         PendingOutput pending;
         pending.bitstream = bitstream;
-        pending.fallbackPts100ns = frame.pts100ns;
-        pending.fallbackDuration100ns = static_cast<int64_t>(pic.inputDuration);
+        pending.mapped = map.mappedResource;
+        pending.inputTexture = texture;
+        pending.lease = frame.lease;
+        pending.token = token;
+        pending.pts100ns = frame.pts100ns;
+        pending.duration100ns = static_cast<int64_t>(pic.inputDuration);
         pending.submittedAt = start;
         pending.submittedFramesAtSubmission = encoderStats.submittedFrames;
-        // Pin the input surface until the output is harvested: a zero-copy
-        // capture texture must not recycle back to its source pool while the
-        // encoder still references it (queued picture in the reorder/lookahead
-        // pipeline). Mirrors the AMF backend's in-flight lease pinning.
-        pending.lease = frame.lease;
 
         if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
             Logger::instance().error(L"encoder", L"nvEncEncodePicture failed: " + nvStatusName(status));
@@ -1008,6 +1051,11 @@ struct NvencEncoder::Impl {
             forceKeyFrame = true;
             releaseBitstreamBuffer(bitstream);
             ++encoderStats.droppedFrames;
+            if (api.nvEncUnmapInputResource(session, pending.mapped) != NV_ENC_SUCCESS) {
+                retainedMappings.push_back(
+                    {pending.mapped, pending.inputTexture, std::move(pending.lease)});
+                return failInputMapping(L"nvEncUnmapInputResource failed after a rejected submission");
+            }
             if (consecutiveEncodeFailures >= kMaxConsecutiveEncodeFailures) {
                 return failEncoder(
                     L"nvEncEncodePicture failed " +
@@ -1018,6 +1066,7 @@ struct NvencEncoder::Impl {
             return popReadyPacket(packet);
         }
         consecutiveEncodeFailures = 0;
+        sessionFlushed = false;
 
         // Accepted input: NVENC produces exactly one output packet for it, in
         // decode order. Record the submission slot for decode-timestamp
@@ -1040,7 +1089,12 @@ struct NvencEncoder::Impl {
         consecutiveNeedMoreInput = 0;
         pendingOutputs.push_back(std::move(pending));
         ++readyOutputCount;
-        if (!harvestPendingOutputs(false)) {
+        // A submission cannot be complete while the reorder pipeline is still
+        // filling, so polling then only costs a driver call (and this driver
+        // answers that poll with OUT_OF_MEMORY). readyOutputCount keeps the
+        // credit for the next harvest.
+        if (outputShouldBeComplete(pendingOutputs.front()) &&
+            !harvestPendingOutputs(false)) {
             return false;
         }
         return popReadyPacket(packet);
@@ -1056,35 +1110,35 @@ struct NvencEncoder::Impl {
             return;
         }
 
-        NV_ENC_PIC_PARAMS pic{};
-        pic.version = NV_ENC_PIC_PARAMS_VER;
-        pic.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
-        const NVENCSTATUS status = api.nvEncEncodePicture(session, &pic);
-        if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
-            Logger::instance().error(L"encoder", L"nvEncEncodePicture(EOS) failed: " + nvStatusName(status));
-        }
         // Harvest regardless of the EOS result: NEED_MORE_INPUT (and even some
         // error codes on quirky drivers) can precede valid frames still queued
         // in the encoder. Skipping the harvest here loses the tail of the
         // recording. The drain harvest is idle-bounded, so this stays safe.
-        readyOutputCount = pendingOutputs.size();
-        harvestPendingOutputs(true);
+        const bool flushed = sessionFlushed || sendEos();
+        if (!flushed) {
+            readyOutputCount = pendingOutputs.size();
+            harvestPendingOutputs(false);
+        } else {
+            harvestPendingOutputs(true);
+        }
         while (!readyPackets.empty()) {
             packets.push_back(std::move(readyPackets.front()));
             readyPackets.pop_front();
         }
     }
 
-    void destroyBitstreamBuffers() {
-        pendingOutputs.clear();
+    bool destroyBitstreamBuffers() {
+        if (!pendingOutputs.empty() || !retainedMappings.empty()) {
+            return false;
+        }
         readyPackets.clear();
         availableBitstreams.clear();
         readyOutputCount = 0;
         decodeTimestamps.reset(0);
         if (session) {
             for (NV_ENC_OUTPUT_PTR buffer : bitstreamBuffers) {
-                if (buffer) {
-                    api.nvEncDestroyBitstreamBuffer(session, buffer);
+                if (buffer && api.nvEncDestroyBitstreamBuffer(session, buffer) != NV_ENC_SUCCESS) {
+                    return failEncoder(L"nvEncDestroyBitstreamBuffer failed");
                 }
             }
         }
@@ -1093,20 +1147,32 @@ struct NvencEncoder::Impl {
         consecutiveEncodeFailures = 0;
         consecutiveOutputBufferStarvation = 0;
         consecutiveLockFailures = 0;
+        return true;
     }
 
-    void shutdownEncoder() {
+    bool shutdownEncoder() {
         if (session) {
-            unregisterAllResources();
-            destroyBitstreamBuffers();
-
-            api.nvEncDestroyEncoder(session);
+            if (!flushAndUnregisterResources()) {
+                Logger::instance().error(L"encoder",
+                    L"NVENC session retained because its inputs could not be retired safely");
+                return false;
+            }
+            if (!destroyBitstreamBuffers()) {
+                return false;
+            }
+            if (api.nvEncDestroyEncoder(session) != NV_ENC_SUCCESS) {
+                Logger::instance().error(L"encoder", L"nvEncDestroyEncoder failed; session retained");
+                return false;
+            }
             session = nullptr;
+            sessionDevice.Reset();
+            sessionFlushed = false;
         }
         if (module) {
             FreeLibrary(module);
             module = nullptr;
         }
+        return true;
     }
 };
 
@@ -1133,16 +1199,34 @@ NvencEncoder::~NvencEncoder() {
     shutdown();
 }
 
+void NvencEncoder::abandonImpl() {
+#if BACKTRACK_HAS_NVENC
+    // A failed retirement may still have driver work referencing the session,
+    // its mappings, leases, and device. Keep the whole state alive for the
+    // process lifetime instead of destroying storage underneath the driver.
+    static auto* abandoned = new std::vector<std::unique_ptr<Impl>>();
+    abandoned->push_back(std::move(impl_));
+    impl_ = std::make_unique<Impl>();
+#endif
+}
+
 bool NvencEncoder::initialize(D3DDevice& device, const VideoSettings& settings) {
+#if BACKTRACK_HAS_NVENC
+    {
+        std::scoped_lock lock(impl_->mutex);
+        if (!impl_->shutdownEncoder()) {
+            abandonImpl();
+        }
+    }
+#endif
     std::scoped_lock lock(impl_->mutex);
 #if BACKTRACK_HAS_NVENC
-    impl_->shutdownEncoder();
+    impl_->availableAtomic.store(false, std::memory_order_release);
 #endif
     impl_->settings = settings;
     impl_->forceKeyFrame = true;
     impl_->caps = {};
     impl_->encoderStats = {};
-    impl_->availableAtomic.store(false, std::memory_order_release);
     impl_->caps.backendName = L"NVENC";
 #if BACKTRACK_HAS_NVENC
     impl_->caps.adapterName = device.adapterName();
@@ -1165,10 +1249,12 @@ void NvencEncoder::requestKeyFrame() {
     impl_->forceKeyFrame = true;
 }
 
-void NvencEncoder::resetInputResources() {
+bool NvencEncoder::resetInputResources() {
     std::scoped_lock lock(impl_->mutex);
 #if BACKTRACK_HAS_NVENC
-    impl_->flushAndUnregisterResources();
+    return impl_->flushAndUnregisterResources();
+#else
+    return true;
 #endif
 }
 
@@ -1201,9 +1287,16 @@ void NvencEncoder::drain(std::vector<EncodedPacket>& packets) {
 }
 
 void NvencEncoder::shutdown() {
+#if BACKTRACK_HAS_NVENC
+    {
+        std::scoped_lock lock(impl_->mutex);
+        if (!impl_->shutdownEncoder()) {
+            abandonImpl();
+        }
+    }
+#endif
     std::scoped_lock lock(impl_->mutex);
 #if BACKTRACK_HAS_NVENC
-    impl_->shutdownEncoder();
     impl_->availableAtomic.store(false, std::memory_order_release);
 #endif
     impl_->caps.available = false;
@@ -1239,6 +1332,20 @@ EncoderStats NvencEncoder::stats() const {
 DXGI_FORMAT NvencEncoder::preferredInputFormat() const {
     // NVENC registers BGRA D3D11 textures directly (NV_ENC_BUFFER_FORMAT_ARGB).
     return DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+uint32_t NvencEncoder::inputRetentionBudget() const {
+#if BACKTRACK_HAS_NVENC
+    // Accepted inputs stay mapped and pinned until their output is locked;
+    // pending outputs are bounded by the bitstream buffers we created, which
+    // already account for lookahead and B-frame delay (min 4). This is what
+    // the encoder-feeding pool must hold so deep lookahead cannot starve the
+    // producer.
+    return impl_ ? impl_->desiredBitstreamBufferCount() : 0;
+#else
+    // The stub accepts nothing, so it pins nothing.
+    return 0;
+#endif
 }
 
 } // namespace backtrack

@@ -56,7 +56,7 @@ void logUnsupportedFormatOnce(const AudioPacket& packet) {
         Logger::instance().warning(L"audio",
             std::wstring(L"Dropping ") + track +
             L" with an unsupported capture format; the track is skipped until the "
-            L"device produces a PCM or float format again");
+            L"device produces a supported PCM or float format");
     }
 }
 
@@ -105,14 +105,17 @@ AudioFormatInfo parseAudioFormat(const WaveFormatBlob& blob) {
 }
 
 bool audioFormatUsable(const AudioFormatInfo& format) {
-    const uint16_t bytesPerSample = format.bitsPerSample / 8;
-    return format.encoding != AudioSampleEncoding::Unsupported &&
-           format.bitsPerSample > 0 &&
-           format.bitsPerSample % 8 == 0 &&
-           bytesPerSample > 0 &&
+    const bool supportedEncoding =
+        (format.encoding == AudioSampleEncoding::Pcm &&
+         (format.bitsPerSample == 8 || format.bitsPerSample == 16 ||
+          format.bitsPerSample == 24 || format.bitsPerSample == 32)) ||
+        (format.encoding == AudioSampleEncoding::Float && format.bitsPerSample == 32);
+    const uint32_t minBlockAlign = static_cast<uint32_t>(format.channels) * (format.bitsPerSample / 8);
+    return supportedEncoding &&
            format.channels > 0 &&
            format.samplesPerSec > 0 &&
-           format.blockAlign >= static_cast<uint16_t>(format.channels * bytesPerSample);
+           format.blockAlign > 0 &&
+           format.blockAlign >= minBlockAlign;
 }
 
 float decodeInterleavedSample(const uint8_t* sample, const AudioFormatInfo& info) {
@@ -150,7 +153,8 @@ bool isCanonicalAudioFormat(const AudioFormatInfo& info) {
     return info.encoding == AudioSampleEncoding::Float &&
            info.bitsPerSample == kCanonicalAudioBitsPerSample &&
            info.channels == kCanonicalAudioChannels &&
-           info.samplesPerSec == kCanonicalAudioSampleRate;
+           info.samplesPerSec == kCanonicalAudioSampleRate &&
+           info.blockAlign == kCanonicalAudioChannels * (kCanonicalAudioBitsPerSample / 8);
 }
 
 void applyMuteGain(std::span<float> samples, float gain, bool muted) {
@@ -298,13 +302,13 @@ bool convertAudioPacketToCanonical(AudioPacket& packet) {
     }
 
     const AudioFormatInfo source = parseAudioFormat(*packet.format);
-    if (packet.bytes.empty()) {
-        packet.frameCount = 0;
-        return true;
-    }
     if (!audioFormatUsable(source)) {
         logUnsupportedFormatOnce(packet);
         return false;
+    }
+    if (packet.bytes.empty()) {
+        packet.frameCount = 0;
+        return true;
     }
 
     const size_t totalFrames = packet.bytes.size() / source.blockAlign;

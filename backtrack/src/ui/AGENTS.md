@@ -9,7 +9,7 @@ icon.
 ## Ownership
 
 - Owns: everything in `MainWindow.h` and the `MainWindow*.cpp` split,
-  `UiHelpers.*`, `UiIds.h`, and `ClipDragDrop.cpp`.
+  `DiagnosticsLog.*`, `UiHelpers.*`, `UiIds.h`, and `ClipDragDrop.cpp`.
 - Does not own: pipeline behavior (`app`), clip file operations (`clips`), or
   the settings file (`settings`). It edits an `AppSettings` value and hands it
   to `RecorderController::updateSettings` through the controller queue.
@@ -30,6 +30,11 @@ icon.
   - `MainWindowController.cpp` hotkeys, tray, auto record, game integrations,
     keyboard shortcuts
   - `ClipDragDrop.cpp` drag-and-drop shell plumbing
+- `DiagnosticsLog` requires the live logger to flush before copying a bounded
+  snapshot to an exclusively created sibling; it replaces the selected
+  destination by handle and only attempts to remove its own staging file on
+  failure. it rejects the live log and its aliases as destinations. the
+  diagnostics tail is best-effort.
 - Control ids, timers, messages, tray ids and the shared theme colors live in
   `UiIds.h`. Never inline a control id or a color in a `.cpp`; a literal cannot
   be found, renamed, or themed. Per-page row geometry (label and control x,
@@ -55,19 +60,31 @@ icon.
   only special-cases the mute button's owner-drawn icon.
 - `MainWindow::create` registers two window classes: the main window
   (`kBacktrackMainWindowClassName`, shared with `Application`) and a
-  `BacktrackPageHost` child per page. The page host owns its own painting,
-  scrolling and hover tracking, and forwards `WM_COMMAND`, `WM_NOTIFY`,
-  `WM_MEASUREITEM`, `WM_DRAWITEM` and `WM_CTLCOLOR*` to the main window.
+  `BacktrackPageHost` child per page. hosts use `WS_EX_CONTROLPARENT` for
+  dialog-key traversal; hidden hosts are excluded. the page host owns its own
+  painting, scrolling and hover tracking, and forwards `WM_COMMAND`,
+  `WM_NOTIFY`, `WM_MEASUREITEM`, `WM_DRAWITEM` and `WM_CTLCOLOR*` to the main
+  window.
+- replay tags are sidecars on the saved clip; kill tags do not move it into
+  another directory.
 - The UI thread owns every `HWND`. Work that can block (controller actions,
-  thumbnail generation, the GitHub update check, the League and voice services)
-  runs on a worker and reports back through a posted message
-  (`kControllerActionCompleteMessage`, `kClipThumbnailReadyMessage`,
-  `kUpdateCheckCompleteMessage`, `kLeagueKillDetectedMessage`,
-  `kVoiceCommandMessage`). A worker must never touch a control.
-  `kControllerActionCompleteMessage` and `kClipThumbnailReadyMessage` carry a
-  heap object in `lParam` that the UI thread takes ownership of; a failed post
-  means the worker deleted it instead, and `stopThumbnailWorker` drains whatever
-  is still queued.
+  library scans, thumbnail generation, the GitHub update check, the League and
+  voice services) runs on a worker and reports back through a posted message
+  (`kControllerActionCompleteMessage`, `kLibraryScanReadyMessage`,
+  `kClipThumbnailReadyMessage`, `kUpdateCheckCompleteMessage`,
+  `kLeagueKillDetectedMessage`, `kVoiceCommandMessage`). A worker must never
+  touch a control. `kControllerActionCompleteMessage` carries a heap object in
+  `lParam` that the UI thread takes ownership of; a failed post means the worker
+  deleted it instead. Scan and thumbnail workers publish one replaceable result
+  under their mutex and post a parameterless message, so a superseded result is
+  never queued twice; shutdown signals and joins both workers before window
+  destruction.
+- the update check uses a cancellable async WinHTTP request with a total
+  deadline. shutdown signals and joins its worker before window destruction;
+  pending callbacks retain their request buffers and parent handles.
+- notification playback keeps asynchronous sound buffers alive until replaced.
+  custom WAV loading and its volume scaling happen outside the playback mutex;
+  contended optional feedback is skipped rather than blocking the caller.
 - Controller actions are serialized through one worker thread and a busy timer
   (`queueControllerAction`, `kControllerBusySoftTimeoutMs`). The timer only
   rewrites the status line; it never clears the pending flag, so a second
@@ -77,7 +94,10 @@ icon.
 - Each page owns a persistent host window, but only Diagnostics keeps its
   controls. `switchPage` tears the previous page down and rebuilds every other
   page (`storeCurrentPageCache`, `loadPageCache`, `invalidatePageCache`),
-  because Library thumbnail callbacks can arrive after a tab switch. Any code
+  because Library scan and thumbnail callbacks can arrive after a tab switch.
+  Leaving Library cancels the scan and releases its thumbnail cache; the clip
+  snapshot and selection stay, and returning rebuilds from them and starts a
+  scan. Any code
   that builds controls must also null and rebind its member pointers in
   `rebindPageControlPointers`; a stale pointer makes `readVisibleSettingsInto`
   read a dead HWND and silently flip that setting back.
@@ -86,9 +106,13 @@ icon.
   has a defaulted `operator==`. Do not hand-roll a per-field comparison, and do
   not touch the filesystem from the dirty pass: it runs per keystroke, so the
   clip-folder and ring-folder checks live in `ensureFoldersExist`, which only
-  the save path calls. `commitSettings` owns sanitize plus startup registration
-  plus save plus the dirty baseline, so every save site routes through it
-  instead of repeating the sequence.
+  the save path calls. `MainWindow` starts from the application's snapshot, not
+  a second load. `commitSettings` advances the saved baseline and applies
+  startup registration and ui preferences only after publication succeeds.
+  failed saves retain drafts for retry; a failed startup read blocks writes
+  until restart so defaults cannot replace an unreadable file. immediate log
+  level and library view commits overlay only their field on the saved snapshot.
+  page construction never replaces that snapshot from the controller.
 - Dark theme is applied by hand: `applyDarkTheme` per control (DWM dark mode
   plus `SetWindowTheme`) and the owner-draw and `WM_CTLCOLOR*` handlers, which
   return the brushes created in `create`. There is no theming API to hook.
@@ -105,20 +129,22 @@ icon.
   selection source the painter reads; mouse clicks set it in `armClipDrag`,
   keyboard row changes follow to the row's first tile in
   `onClipSelectionChanged`.
-- `refreshClips()` is the full folder rescan and runs on the UI thread. A
-  single-clip action (favorite, delete, rename) updates that one `clips_` entry
-  and repaints instead; only a rescan may reach for `ClipManager::listClips`. A
-  rescan is a folder walk plus a shell property read per clip, which is what
-  freezes the window when a library action rescans. An in-place update must
-  carry over every field it does not itself change - notably `duration100ns`,
-  which only the shell property read populates - and re-sort the vector when
-  the entry's sort key moved. `ClipManager::listClips` sorts by modified time
-  then filename descending; a rename preserves modified time but changes the
-  name, so it re-sorts on that comparator and then re-reads
-  `selectedClipIndex_`. Delete and rename re-queue missing thumbnails through
-  `refreshThumbnailsAfterLibraryEdit`, which reuses the current generation so
-  in-flight decodes survive; only a rescan or view-mode switch may bump the
-  generation through `loadClipThumbnails`.
+- `refreshClips()` keeps the current snapshot and starts one serial scan
+  worker; it never calls `ClipManager::listClips` on the UI thread. A scan is
+  identified by generation and clip directory, and `handleLibraryScanReady`
+  rejects a result whose generation or directory no longer matches, or whose
+  page has gone. Re-refreshing replaces the pending request rather than queuing
+  another. A single-clip action (favorite, delete, rename) updates that one
+  `clips_` entry and repaints instead. An in-place update must carry over every
+  field it does not itself change - notably `duration100ns`, which only the
+  shell property read populates - and re-sort the vector when the entry's sort
+  key moved. `ClipManager::listClips` sorts by modified time then filename
+  descending; a rename preserves modified time but changes the name, so it
+  re-sorts on that comparator and then re-reads `selectedClipIndex_`. Delete
+  and rename re-queue missing thumbnails through
+  `refreshThumbnailsAfterLibraryEdit`; an edit that keeps the working-set range
+  keeps the generation so in-flight decodes survive, while a rescan, view
+  switch, or range change replaces the queue and bumps it.
 - Muted labels are themed by `mutedLabels_` membership, never by reading the
   label text: `rebuildSoundSeparationRows` registers muted labels there,
   `detachPageControl` and the page-teardown clears unregister them. The set is
@@ -170,7 +196,8 @@ icon.
   focus. Library Delete/Favorite/Rename buttons and the rename box enable only
   while a clip is selected (`updateLibraryActionButtons`).
 - The tray Exit menu prompts to save dirty settings exactly like `WM_CLOSE`;
-  either path may abort the exit.
+  either path may abort the exit. auto record uses applied controller settings,
+  not drafts.
 - `applyVisibleSettings` checks the controller busy flag before persisting
   anything, so a save that loses the race cannot leave disk saved without the
   recorder ever receiving `ApplySettings`.
@@ -183,11 +210,15 @@ icon.
   the Gallery layout branch clears them on entry, so a previous page's cards
   can never paint behind the Library. `rebuildSettingsCategoryBody` restores
   focus to the rebuilt counterpart of the focused control.
-- `loadClipThumbnails` decodes visible rows first (stable partition on the
-  request queue); completion order and the generation protocol are unchanged.
-  Single-clip edits re-queue through `refreshThumbnailsAfterLibraryEdit`
-  without bumping the generation; picker cancellations stay silent but genuine
-  dialog failures are logged (`pickFileForOpen` / `pickFolder`).
+- `loadClipThumbnails` and `updateThumbnailWorkingSet` bound thumbnail work and
+  retention to the visible Gallery rows plus one overscan row, capped by
+  `kMaxLibraryThumbnails` (48). The worker queue is replaced on every working-set
+  change, the cache drops every key outside the new range, and a result is
+  accepted only for the current generation and range. Leaving Library releases
+  every thumbnail bitmap. Single-clip edits re-queue through
+  `refreshThumbnailsAfterLibraryEdit`; an edit within the same range keeps the
+  generation, a range change bumps it; picker cancellations stay silent but
+  genuine dialog failures are logged (`pickFileForOpen` / `pickFolder`).
 - Gap clicks in Gallery select nothing: `armClipDrag` records the pre-click
   listbox cursor and `onClipSelectionChanged` restores it instead of following
   to the row's first tile. Row-level rebuilds park focus on the owning combo
@@ -195,9 +226,19 @@ icon.
 
 ## Verification
 
-No automated UI test. Build, then exercise the affected page manually: settings
+`LoggerDiagnosticsTests.cpp` covers log export without a window.
+`MainWindowSettingsTests.cpp` covers settings publication, preferences and
+applied auto record. `MainWindowNotificationTests.cpp` covers busy feedback
+while loading or playback is blocked. `MainWindowUpdateCheckTests.cpp` covers
+loopback success, slow progress, stop and destruction.
+`MainWindowAccessibilityTests.cpp` exercises dialog-key traversal in a visible
+window and needs an interactive desktop. `MainWindowLibraryTests.cpp` covers a
+blocked scan with a responsive window and page change, stale scan rejection,
+view switches keeping the snapshot/selection without a rescan, and the
+thumbnail working-set budget; these suites still need CTest
+registration. build, then exercise the affected page manually: settings
 round-trip through a restart, hotkeys from another application, tray
-restore/exit, library rename and delete, and the Diagnostics page.
+restore/exit, library rename and delete, and Diagnostics.
 
 ## Child DOX Index
 

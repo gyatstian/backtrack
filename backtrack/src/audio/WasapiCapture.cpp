@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <vector>
 
 namespace backtrack {
@@ -59,6 +60,98 @@ const wchar_t* trackName(AudioTrack track) {
 EDataFlow dataFlowFor(AudioTrack track) {
     return track == AudioTrack::Microphone ? eCapture : eRender;
 }
+
+class DefaultEndpointNotification final : public IMMNotificationClient {
+public:
+    explicit DefaultEndpointNotification(EDataFlow flow) : flow_(flow) {}
+
+    HRESULT initialize(HANDLE wakeEvent) {
+        if (!DuplicateHandle(GetCurrentProcess(), wakeEvent, GetCurrentProcess(), &wakeEvent_, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMMNotificationClient)) {
+            *object = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG refs = --refs_;
+        if (!refs) delete this;
+        return refs;
+    }
+
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR, DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR, const PROPERTYKEY) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR) override {
+        // An in-flight callback can outlive unregistration.
+        AddRef();
+        if (active_.load(std::memory_order_acquire) && flow == flow_ && role == eConsole) {
+            generation_.fetch_add(1, std::memory_order_release);
+            SetEvent(wakeEvent_);
+        }
+        Release();
+        return S_OK;
+    }
+
+    uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
+    void deactivate() { active_.store(false, std::memory_order_release); }
+
+private:
+    ~DefaultEndpointNotification() {
+        if (wakeEvent_) CloseHandle(wakeEvent_);
+    }
+
+    std::atomic<ULONG> refs_{1};
+    std::atomic<uint64_t> generation_{0};
+    std::atomic<bool> active_{true};
+    const EDataFlow flow_;
+    HANDLE wakeEvent_ = nullptr;
+};
+
+class ScopedDefaultEndpointNotification {
+public:
+    HRESULT start(IMMDeviceEnumerator* enumerator, EDataFlow flow, HANDLE wakeEvent) {
+        notification_.Attach(new (std::nothrow) DefaultEndpointNotification(flow));
+        if (!notification_) return E_OUTOFMEMORY;
+        HRESULT hr = notification_->initialize(wakeEvent);
+        if (FAILED(hr)) return hr;
+        hr = enumerator->RegisterEndpointNotificationCallback(notification_.Get());
+        if (SUCCEEDED(hr)) enumerator_ = enumerator;
+        return hr;
+    }
+
+    ~ScopedDefaultEndpointNotification() {
+        if (!enumerator_) return;
+        notification_->deactivate();
+        const HRESULT hr = enumerator_->UnregisterEndpointNotificationCallback(notification_.Get());
+        if (FAILED(hr)) {
+            // A failed unregister may leave the system holding this raw pointer.
+            notification_.Detach();
+            try {
+                Logger::instance().warning(L"audio", L"Could not unregister default endpoint notification: " + hresultToString(hr));
+            } catch (...) {
+            }
+        }
+    }
+
+    uint64_t generation() const { return notification_ ? notification_->generation() : 0; }
+    bool changedSince(uint64_t generation) const { return this->generation() != generation; }
+
+private:
+    Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator_;
+    Microsoft::WRL::ComPtr<DefaultEndpointNotification> notification_;
+};
 
 std::wstring propertyString(IPropertyStore* store, const PROPERTYKEY& key) {
     PROPVARIANT value;
@@ -155,6 +248,17 @@ std::wstring sessionDisplayName(IAudioSessionControl* session) {
     }
     CoTaskMemFree(rawName);
     return name;
+}
+
+// Takes ownership of a CoTaskMem-allocated string the way IMMDevice::GetId and
+// IAudioSessionControl2::GetSessionInstanceIdentifier hand it out.
+std::wstring takeCoTaskMemString(LPWSTR value) {
+    if (!value) {
+        return {};
+    }
+    std::wstring text = value;
+    CoTaskMemFree(value);
+    return text;
 }
 
 class AudioActivationCompletionHandler final : public IActivateAudioInterfaceCompletionHandler {
@@ -452,9 +556,11 @@ SessionMuteStore& sessionMuteStore() {
 // Collects every live foreign render session. False when the endpoint
 // enumeration itself failed, in which case the caller leaves everything
 // untouched. Only the sweep logs that failure; the mute path stays silent.
+// COM is initialized by the caller and stays initialized for the whole store
+// call: the candidates' callbacks hold ISimpleAudioVolume, so they must be
+// invoked and released before that apartment goes away.
 bool enumerateForeignRenderSessions(
     DWORD currentProcessId, std::vector<SessionMuteCandidate>& out, bool logFailures) {
-    ScopedComInitialization com(COINIT_MULTITHREADED);
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
     if (FAILED(hr) || !enumerator) {
@@ -482,6 +588,11 @@ bool enumerateForeignRenderSessions(
         if (FAILED(endpoints->Item(endpointIndex, &endpoint)) || !endpoint) {
             continue;
         }
+
+        LPWSTR endpointIdRaw = nullptr;
+        const std::wstring endpointId = SUCCEEDED(endpoint->GetId(&endpointIdRaw))
+            ? takeCoTaskMemString(endpointIdRaw)
+            : std::wstring();
 
         Microsoft::WRL::ComPtr<IAudioSessionManager2> sessionManager;
         if (FAILED(endpoint->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &sessionManager)) ||
@@ -527,14 +638,25 @@ bool enumerateForeignRenderSessions(
                 continue;
             }
 
+            LPWSTR instanceIdRaw = nullptr;
+            const std::wstring instanceId = SUCCEEDED(session2->GetSessionInstanceIdentifier(&instanceIdRaw))
+                ? takeCoTaskMemString(instanceIdRaw)
+                : std::wstring();
+
             BOOL muted = FALSE;
-            volume->GetMute(&muted);
+            // A failed read leaves the previous state unknown; the store refuses
+            // to mute then instead of guessing what to restore.
+            const bool muteStateKnown = SUCCEEDED(volume->GetMute(&muted));
             // The lambda holds the volume alive, so the session cannot die
-            // between enumeration and restore.
+            // between enumeration and the store's SetMute. It is never stored
+            // beyond the store call.
             out.push_back(SessionMuteCandidate{
                 static_cast<uint32_t>(processId),
                 key,
+                endpointId,
+                instanceId,
                 muted == TRUE,
+                muteStateKnown,
                 [volume](bool mute) {
                     return SUCCEEDED(volume->SetMute(mute ? TRUE : FALSE, nullptr));
                 },
@@ -555,18 +677,34 @@ bool isProcessAlive(DWORD processId) {
 } // namespace
 
 void WasapiCapture::emergencyRestoreSessionMutes() noexcept {
-    sessionMuteStore().emergencyRestore();
+    try {
+        // COM must be initialized on this thread for the whole store call, and
+        // the call releases every interface it created before it returns. The
+        // crash path may run on a thread that never touched COM (SEH filter,
+        // terminate handler, console control handler).
+        ScopedComInitialization com(COINIT_MULTITHREADED);
+        const DWORD currentProcessId = GetCurrentProcessId();
+        sessionMuteStore().emergencyRestore(
+            [&](std::vector<SessionMuteCandidate>& sessions) {
+                return enumerateForeignRenderSessions(currentProcessId, sessions, false);
+            });
+    } catch (...) {
+        // the singleton may not have been constructed before the fatal exit.
+    }
 }
 
 void WasapiCapture::restoreOrphanedSessionMutes() {
     // Startup sweep for mutes applied by a previous crashed session. Runs
     // under the single-instance mutex, so no concurrent session can apply
-    // fresh mutes while sweeping.
+    // fresh mutes while sweeping. COM is initialized here and balanced again
+    // before Application's OleInitialize runs.
+    ScopedComInitialization com(COINIT_MULTITHREADED);
     const DWORD currentProcessId = GetCurrentProcessId();
     const auto result = sessionMuteStore().sweepOrphans(
         [&](std::vector<SessionMuteCandidate>& sessions) {
             return enumerateForeignRenderSessions(currentProcessId, sessions, true);
-        });
+        },
+        isProcessAlive);
     if (!result) {
         return;
     }
@@ -575,10 +713,19 @@ void WasapiCapture::restoreOrphanedSessionMutes() {
         L"Orphaned session-mute sweep restored " + std::to_wstring(result->restored) +
         L" audio session(s); " + std::to_wstring(result->unmatched) +
         L" journaled entr(y/ies) no longer matched");
+    if (result->journalFailed) {
+        Logger::instance().warning(L"audio",
+            L"Orphaned session-mute sweep could not update the mute journal; it stays for the next launch");
+    }
 }
 
 
-uint32_t WasapiCapture::applySessionMutesForExecutables(const std::vector<std::wstring>& mutedExecutableKeys) {
+SessionMuteApplyResult WasapiCapture::applySessionMutesForExecutables(
+    const std::vector<std::wstring>& mutedExecutableKeys) {
+    // One apartment for enumeration, every callback invocation, and the release
+    // of the temporary ISimpleAudioVolume interfaces. The store retains none of
+    // them, so nothing COM-owned escapes this scope.
+    ScopedComInitialization com(COINIT_MULTITHREADED);
     const DWORD currentProcessId = GetCurrentProcessId();
     return sessionMuteStore().apply(
         mutedExecutableKeys,
@@ -588,8 +735,14 @@ uint32_t WasapiCapture::applySessionMutesForExecutables(const std::vector<std::w
         isProcessAlive);
 }
 
-void WasapiCapture::clearSessionMutes() {
-    sessionMuteStore().clear();
+SessionMuteRestoreResult WasapiCapture::clearSessionMutes() {
+    ScopedComInitialization com(COINIT_MULTITHREADED);
+    const DWORD currentProcessId = GetCurrentProcessId();
+    return sessionMuteStore().clear(
+        [&](std::vector<SessionMuteCandidate>& sessions) {
+            return enumerateForeignRenderSessions(currentProcessId, sessions, false);
+        },
+        isProcessAlive);
 }
 
 std::vector<AudioSessionAppInfo> WasapiCapture::enumerateOpenApps() {
@@ -781,12 +934,8 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
     HRESULT hr = com.result();
     ScopedMmcssTask mmcss(L"Pro Audio", AVRT_PRIORITY_HIGH);
 
-    // A WASAPI capture client dies with AUDCLNT_E_DEVICE_INVALIDATED whenever the
-    // endpoint disappears or Windows switches default devices (headset unplugged,
-    // Bluetooth drop, device swapped). If the thread just stopped there the
-    // settings checkbox would stay "on" while no audio ever reached the replay
-    // buffer again. Instead, rebuild the audio client and reconnect with backoff
-    // so a recovered or newly selected device is picked up automatically.
+    // Endpoint loss is retried; a healthy default endpoint needs an explicit
+    // notification because changing the Windows default need not invalidate it.
     constexpr int64_t kMaxReconnectDelayMs = 2000;
     int64_t reconnectDelayMs = 250;
     unsigned reconnectCount = 0;
@@ -808,14 +957,17 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
                 std::wstring(L"WASAPI capture reconnect attempt ") + std::to_wstring(reconnectCount) +
                 L" for " + trackName(track) + L" pending; next retry in " + std::to_wstring(delayMs) + L"ms");
         }
-        if (WaitForSingleObject(wakeEvent_, static_cast<DWORD>(delayMs)) == WAIT_OBJECT_0 && stopRequested_) {
+        if (stopRequested_) {
             return false;
         }
+        WaitForSingleObject(wakeEvent_, static_cast<DWORD>(delayMs));
         reconnectDelayMs = std::min<int64_t>(reconnectDelayMs * 2, kMaxReconnectDelayMs);
-        return true;
+        return !stopRequested_;
     };
 
     while (!stopRequested_) {
+        ScopedDefaultEndpointNotification defaultNotification;
+        uint64_t defaultGeneration = 0;
         Microsoft::WRL::ComPtr<IAudioClient> audioClient;
         if (options.processLoopback) {
             hr = activateProcessLoopbackAudioClient(options.processId, options.processLoopbackMode, &audioClient);
@@ -831,8 +983,10 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
             }
         } else {
             Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
-            hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
-            if (FAILED(hr)) {
+            hr = options.createEnumerator
+                ? options.createEnumerator(enumerator.GetAddressOf())
+                : CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+            if (FAILED(hr) || !enumerator) {
                 if (reconnectCount == 0) {
                     Logger::instance().error(L"audio", L"CoCreateInstance(MMDeviceEnumerator) failed: " + hresultToString(hr));
                 }
@@ -843,18 +997,26 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
             }
 
             Microsoft::WRL::ComPtr<IMMDevice> endpoint;
-            if (!options.deviceId.empty()) {
-                hr = enumerator->GetDevice(options.deviceId.c_str(), &endpoint);
-                if (FAILED(hr) && reconnectCount == 0) {
-                    Logger::instance().warning(L"audio", std::wstring(L"Configured audio device was not found for ") + trackName(track) + L"; falling back to default");
+            if (options.deviceId.empty()) {
+                hr = defaultNotification.start(enumerator.Get(), dataFlowFor(track), wakeEvent_);
+                if (FAILED(hr)) {
+                    if (reconnectCount == 0) {
+                        Logger::instance().error(L"audio", std::wstring(L"Default endpoint notification failed for ") + trackName(track) + L": " + hresultToString(hr));
+                    }
+                    if (!reconnectBackoff(false)) {
+                        break;
+                    }
+                    continue;
                 }
-            }
-            if (!endpoint) {
+                // Subscribe before resolving so changes during setup cannot be lost.
+                defaultGeneration = defaultNotification.generation();
                 hr = enumerator->GetDefaultAudioEndpoint(dataFlowFor(track), eConsole, &endpoint);
+            } else {
+                hr = enumerator->GetDevice(options.deviceId.c_str(), &endpoint);
             }
-            if (FAILED(hr)) {
+            if (FAILED(hr) || !endpoint) {
                 if (reconnectCount == 0) {
-                    Logger::instance().error(L"audio", std::wstring(L"GetDefaultAudioEndpoint failed for ") + trackName(track) + L": " + hresultToString(hr));
+                    Logger::instance().error(L"audio", std::wstring(options.deviceId.empty() ? L"GetDefaultAudioEndpoint failed for " : L"Configured audio device was not found for ") + trackName(track) + L": " + hresultToString(hr));
                 }
                 if (!reconnectBackoff(false)) {
                     break;
@@ -944,6 +1106,13 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
             continue;
         }
 
+        if (stopRequested_ || defaultNotification.changedSince(defaultGeneration)) {
+            audioClient->Stop();
+            running_ = false;
+            signalStarted(false);
+            continue;
+        }
+
         const bool reconnected = reconnectCount > 0;
         reconnectCount = 0;
         reconnectDelayMs = 250;
@@ -963,8 +1132,11 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
 
         int64_t nextPacketPts100ns = -1;
         bool sessionLost = false;
-        while (!stopRequested_ && !sessionLost) {
+        while (!stopRequested_ && !sessionLost && !defaultNotification.changedSince(defaultGeneration)) {
             WaitForSingleObject(wakeEvent_, 20);
+            if (!stopRequested_ && defaultNotification.changedSince(defaultGeneration)) {
+                break;
+            }
 
             UINT32 packetFrames = 0;
             hr = captureClient->GetNextPacketSize(&packetFrames);
@@ -974,7 +1146,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
                 break;
             }
 
-            while (packetFrames > 0) {
+            while (packetFrames > 0 && (stopRequested_ || !defaultNotification.changedSince(defaultGeneration))) {
                 BYTE* data = nullptr;
                 UINT32 framesAvailable = 0;
                 DWORD flags = 0;
@@ -1046,6 +1218,13 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         audioClient->Stop();
         running_ = false;
 
+        if (stopRequested_) {
+            break;
+        }
+        if (defaultNotification.changedSince(defaultGeneration)) {
+            Logger::instance().info(L"audio", std::wstring(L"Default endpoint changed for ") + trackName(track) + L"; reconnecting");
+            continue;
+        }
         if (sessionLost) {
             if (!reconnectBackoff(true)) {
                 break;

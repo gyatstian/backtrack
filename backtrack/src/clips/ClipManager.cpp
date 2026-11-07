@@ -1,4 +1,6 @@
 #include "clips/ClipManager.h"
+#include "clips/AtomicWrite.h"
+#include "clips/ClipStorage.h"
 
 #include "core/Logger.h"
 
@@ -48,6 +50,25 @@ bool hasMp4Extension(const std::filesystem::path& path) {
         return static_cast<wchar_t>(towlower(ch));
     });
     return extension == L".mp4";
+}
+
+// shortcut: legacy clips matching the staging suffix in .backtrack_tmp remain unlisted; revisit with ownership metadata.
+bool isLegacyStagedMp4(const std::filesystem::path& path) {
+    std::wstring parent = path.parent_path().filename().wstring();
+    std::wstring stem = path.stem().wstring();
+    const auto lower = [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); };
+    std::transform(parent.begin(), parent.end(), parent.begin(), lower);
+    std::transform(stem.begin(), stem.end(), stem.begin(), lower);
+    if (parent != L".backtrack_tmp") {
+        return false;
+    }
+    const auto position = stem.rfind(L".publish");
+    if (position == std::wstring::npos) {
+        return false;
+    }
+    const auto suffix = stem.substr(position + 8);
+    return suffix.empty() || (suffix.size() > 1 && suffix.front() == L'.' &&
+        std::all_of(suffix.begin() + 1, suffix.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; }));
 }
 
 bool isValidClipStem(const std::wstring& value) {
@@ -140,7 +161,7 @@ void ClipManager::setDirectory(std::filesystem::path directory) {
     directory_ = std::move(directory);
 }
 
-std::vector<ClipInfo> ClipManager::listClips() const {
+std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancelled) const {
     std::vector<ClipInfo> clips;
     std::unordered_set<std::wstring> liveDurationKeys;
     std::error_code error;
@@ -160,9 +181,10 @@ std::vector<ClipInfo> ClipManager::listClips() const {
             return;
         }
         for (; iterator != end; iterator.increment(error)) {
+            if (cancelled && cancelled()) return;
             const auto& entry = *iterator;
             const auto path = entry.path();
-            if (!entry.is_regular_file(error) || error || !hasMp4Extension(path)) {
+            if (!entry.is_regular_file(error) || error || !hasMp4Extension(path) || isLegacyStagedMp4(path)) {
                 error = {};
                 continue;
             }
@@ -200,37 +222,16 @@ std::vector<ClipInfo> ClipManager::listClips() const {
         }
     };
 
-    appendDirectoryClips(directory_);
-    // Per-game subfolders (and the legacy clips/ directory): one level deep,
-    // skipping dot-directories like .backtrack_tmp whose staged .publish.mp4
-    // files are not finished clips.
-    std::filesystem::directory_iterator rootIterator(directory_, error);
-    const std::filesystem::directory_iterator rootEnd;
+    const auto roots = ClipStorage::clipRoots(directory_, error, cancelled);
     if (error) {
         Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
         error = {};
-    } else {
-        for (; rootIterator != rootEnd; rootIterator.increment(error)) {
-            if (error) {
-                error = {};
-                continue;
-            }
-            const auto& entry = *rootIterator;
-            const std::wstring fileName = entry.path().filename().wstring();
-            if (fileName.empty() || fileName.front() == L'.') {
-                continue;
-            }
-            if (!entry.is_directory(error) || error) {
-                error = {};
-                continue;
-            }
-            appendDirectoryClips(entry.path());
-        }
-        if (error) {
-            Logger::instance().warning(L"clips", L"Could not finish enumerating clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-            error = {};
-        }
     }
+    for (const auto& root : roots) {
+        if (cancelled && cancelled()) return {};
+        appendDirectoryClips(root);
+    }
+    if (cancelled && cancelled()) return {};
 
     // Drop cache entries for clips that no longer exist so the cache cannot
     // grow without bound across deletions/renames.
@@ -291,6 +292,11 @@ bool ClipManager::removeClip(const std::filesystem::path& path) const {
 }
 
 bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstring& newStem) const {
+    return renameClipImpl(path, newStem, nullptr);
+}
+
+bool ClipManager::renameClipImpl(const std::filesystem::path& path, const std::wstring& newStem,
+                                 void (*beforeMove)(const std::filesystem::path&)) const {
     if (!isManagedClipPath(path)) {
         Logger::instance().warning(L"clips", L"Rejected rename outside the clip directory: " + path.wstring());
         return false;
@@ -306,8 +312,10 @@ bool ClipManager::renameClip(const std::filesystem::path& path, const std::wstri
         Logger::instance().warning(L"clips", L"Could not rename clip because the target already exists: " + target.wstring());
         return false;
     }
-    std::filesystem::rename(path, target, error);
-    if (error) {
+    // The hook lets the regression create a destination after the precheck.
+    if (beforeMove) beforeMove(target);
+    if (!MoveFileW(path.c_str(), target.c_str())) {
+        error = {static_cast<int>(GetLastError()), std::system_category()};
         Logger::instance().warning(L"clips", L"Could not rename clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
         return false;
     }
@@ -341,11 +349,20 @@ bool ClipManager::setFavorite(const std::filesystem::path& path, bool favorite) 
     const auto marker = favoriteMarker(path);
     std::error_code error;
     if (favorite) {
-        std::ofstream stream(marker, std::ios::out | std::ios::trunc);
-        if (!stream.is_open()) {
-            Logger::instance().warning(L"clips", L"Could not create favorite marker: " + marker.wstring());
+        const HANDLE file = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            CloseHandle(file);
+            return true;
         }
-        return stream.is_open();
+        const DWORD createError = GetLastError();
+        if ((createError == ERROR_FILE_EXISTS || createError == ERROR_ALREADY_EXISTS) &&
+            std::filesystem::is_regular_file(marker, error) && !error) {
+            return true;
+        }
+        Logger::instance().warning(L"clips", L"Could not create favorite marker: " + marker.wstring() +
+            L" (Win32 error " + std::to_wstring(createError) + L")");
+        return false;
     }
     std::filesystem::remove(marker, error);
     if (error) {
@@ -370,17 +387,15 @@ bool ClipManager::addTag(const std::filesystem::path& path, const std::wstring& 
         tags.push_back(normalized);
     }
 
-    const auto filePath = tagFile(path);
-    std::ofstream stream(filePath, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!stream.is_open()) {
-        Logger::instance().warning(L"clips", L"Could not write clip tags: " + filePath.wstring());
-        return false;
-    }
+    std::string contents;
     for (const auto& existing : tags) {
-        stream << wideToUtf8(existing) << "\n";
+        contents += wideToUtf8(existing) + "\n";
     }
-    if (!stream) {
-        Logger::instance().warning(L"clips", L"Could not finish writing clip tags: " + filePath.wstring());
+    const auto filePath = tagFile(path);
+    const auto error = atomicWriteSibling(filePath, contents);
+    if (error) {
+        Logger::instance().warning(L"clips", L"Could not write clip tags: " + filePath.wstring() +
+            L" (" + utf8ToWide(error.message()) + L")");
         return false;
     }
     return true;

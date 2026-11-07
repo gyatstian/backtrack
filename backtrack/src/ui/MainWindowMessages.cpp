@@ -182,6 +182,7 @@ LRESULT CALLBACK MainWindow::clipListSubclassProc(HWND window, UINT message, WPA
             }
             self->clipDragArmed_ = false;
             self->clipDragPath_.clear();
+            self->requestThumbnailUpdate();
             return defaultResult;
         }
         break;
@@ -196,6 +197,16 @@ LRESULT CALLBACK MainWindow::clipListSubclassProc(HWND window, UINT message, WPA
             return 0;
         }
         break;
+    case WM_VSCROLL:
+    case WM_KEYDOWN:
+    case WM_SIZE:
+    case LB_SETTOPINDEX:
+    case LB_SETCURSEL:
+    case LB_SETITEMHEIGHT: {
+        const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+        if (self) self->requestThumbnailUpdate();
+        return result;
+    }
     case WM_NCDESTROY:
         RemoveWindowSubclass(window, clipListSubclassProc, subclassId);
         break;
@@ -411,15 +422,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             if (notification == CBN_SELCHANGE) {
                 int level = static_cast<int>(settings_.logLevel);
                 if (readEnumCombo(reinterpret_cast<HWND>(lParam), kLogLevelComboEntries, level)) {
-                    settings_.logLevel = static_cast<LogLevel>(level);
-                    Logger::instance().setMinLevel(settings_.logLevel);
-                    // Same immediate-save contract as the Library view buttons:
-                    // the write is the save, so it becomes the dirty-check
-                    // baseline. Without this the tab stays dirty forever for a
-                    // value already on disk.
-                    commitSettings();
-                    Logger::instance().info(L"ui", std::wstring(L"Log level changed to ") + logLevelName(settings_.logLevel));
-                    setStatus(std::wstring(L"Log level: ") + logLevelName(settings_.logLevel));
+                    setDiagnosticLogLevel(static_cast<LogLevel>(level));
                 }
             }
             return 0;
@@ -493,13 +496,16 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case kVoiceCommandMessage:
         requestSaveReplay(L"voice command");
         return 0;
-    case kClipThumbnailReadyMessage: {
-        std::unique_ptr<ThumbnailResult> result(reinterpret_cast<ThumbnailResult*>(lParam));
-        if (result) {
-            handleClipThumbnailReady(*result);
-        }
+    case kClipThumbnailReadyMessage:
+        handleClipThumbnailReady();
         return 0;
-    }
+    case kLibraryScanReadyMessage:
+        handleLibraryScanReady();
+        return 0;
+    case kLibraryThumbnailUpdateMessage:
+        thumbnailUpdatePosted_ = false;
+        updateThumbnailWorkingSet();
+        return 0;
     case WM_NOTIFY:
         break;
     case WM_DPICHANGED: {
@@ -668,6 +674,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         removeTrayIcon();
         hotkeys_.unregisterHotkeys(window_);
         stopGameIntegrations();
+        stopLibraryScanWorker();
         stopThumbnailWorker();
         releaseClipThumbnailCache();
         stopControllerWorker();
@@ -904,12 +911,12 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             if (thumbnail && thumbnail->bitmap) {
                 // Tile-sized scaled copy is cached per clip; repaints (hover,
                 // selection, scroll) become plain BitBlts instead of a
-                // HALFTONE StretchBlt per tile. The thumbnailCache_ entry
-                // owns the tile copy, so write through to the entry; the slot
-                // fields are only load-time mirrors and would leave the entry
-                // pointing at freed memory if regenerated here.
+                // HALFTONE StretchBlt per tile. The thumbnailCache_ entry owns
+                // both bitmaps; the slot only carries the base handle.
                 const auto cache = thumbnailCache_.find(thumbnailCacheKey(clip.path));
-                if (cache != thumbnailCache_.end() && cache->second.bitmap) {
+                if (cache != thumbnailCache_.end() && cache->second.bitmap &&
+                    preview.right - preview.left <= kGalleryThumbnailWidth &&
+                    preview.bottom - preview.top <= kGalleryThumbnailHeight) {
                     drawBitmapFitCached(
                         item.hDC,
                         cache->second.bitmap,

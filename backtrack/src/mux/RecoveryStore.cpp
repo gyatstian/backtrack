@@ -1,8 +1,11 @@
 #include "mux/Mp4Muxer.h"
 #include "mux/RecoveryStore.h"
 
+#include "clips/ClipStorage.h"
 #include "core/Logger.h"
 
+#include <algorithm>
+#include <array>
 #include <charconv>
 #include <chrono>
 #include <fstream>
@@ -143,41 +146,35 @@ bool publishWithRetry(const std::filesystem::path& source, const std::filesystem
 }
 
 std::filesystem::path uniqueRecoveredOutputPath(const std::filesystem::path& clipDirectory, const std::wstring& stem) {
-    // Tries to claim candidate exclusively by creating an empty placeholder
-    // (fail-if-exists), so nothing else can take the name while recovery muxes.
-    // Falls back to existence probing when file creation is not possible.
-    auto tryClaim = [&clipDirectory](const std::wstring& fileName) -> std::optional<std::filesystem::path> {
+    // A recovery output must be claimed exclusively before muxing.
+    DWORD lastError = ERROR_SUCCESS;
+    auto tryClaim = [&clipDirectory, &lastError](const std::wstring& fileName) -> std::optional<std::filesystem::path> {
         const std::filesystem::path candidate = clipDirectory / fileName;
-        const HANDLE handle = CreateFileW(
-            candidate.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_HIDDEN, nullptr);
-        if (handle != INVALID_HANDLE_VALUE) {
-            CloseHandle(handle);
-            return candidate;
-        }
-        const DWORD error = GetLastError();
-        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
-            std::error_code probeError;
-            if (!std::filesystem::exists(candidate, probeError) || probeError) {
-                return candidate;
-            }
-        }
+        lastError = ClipStorage::tryReserveClipOutput(candidate);
+        if (lastError == ERROR_SUCCESS) return candidate;
         return std::nullopt;
+    };
+    const auto failed = [&lastError] {
+        return lastError != ERROR_FILE_EXISTS && lastError != ERROR_ALREADY_EXISTS;
     };
 
     if (auto claimed = tryClaim(stem + L".mp4")) {
         return *claimed;
     }
+    if (failed()) return {};
     if (auto claimed = tryClaim(stem + L"_recovered.mp4")) {
         return *claimed;
     }
+    if (failed()) return {};
     for (uint32_t suffix = 2; suffix < 1000; ++suffix) {
         if (auto claimed = tryClaim(stem + L"_recovered_" + std::to_wstring(suffix) + L".mp4")) {
             return *claimed;
         }
+        if (failed()) return {};
     }
     const std::filesystem::path tickCandidate =
         clipDirectory / (stem + L"_recovered_" + std::to_wstring(GetTickCount64()) + L".mp4");
-    return tryClaim(tickCandidate.filename().wstring()).value_or(tickCandidate);
+    return tryClaim(tickCandidate.filename().wstring()).value_or(std::filesystem::path{});
 }
 
 // Parses one "sample" line's columns into sample. All numbers must be
@@ -280,12 +277,15 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
             damagedMetadata = !parseUInt32Strict(parts[1], manifest.inputs.height);
         } else if (parts[0] == "bitrateKbps" && parts.size() >= 2) {
             damagedMetadata = !parseUInt32Strict(parts[1], manifest.inputs.bitrateKbps);
-        } else if (parts[0] == "video" && parts.size() >= 2) {
-            manifest.inputs.videoPath = tempDirectory / std::filesystem::path(parts[1]);
-        } else if (parts[0] == "systemAudio" && parts.size() >= 2) {
-            manifest.inputs.systemAudioPath = tempDirectory / std::filesystem::path(parts[1]);
-        } else if (parts[0] == "microphoneAudio" && parts.size() >= 2) {
-            manifest.inputs.microphoneAudioPath = tempDirectory / std::filesystem::path(parts[1]);
+        } else if ((parts[0] == "video" || parts[0] == "systemAudio" || parts[0] == "microphoneAudio") && parts.size() >= 2) {
+            const std::filesystem::path name(parts[1]);
+            damagedMetadata = name.empty() || name != name.filename() || name == L"." || name == L".." ||
+                              name.has_root_path() || name.native().find(L':') != std::wstring::npos;
+            if (!damagedMetadata) {
+                auto& destination = parts[0] == "video" ? manifest.inputs.videoPath :
+                    (parts[0] == "systemAudio" ? manifest.inputs.systemAudioPath : manifest.inputs.microphoneAudioPath);
+                destination = tempDirectory / name;
+            }
         } else if (parts[0] == "samples" && parts.size() >= 2) {
             uint64_t count = 0;
             if (parseUInt64Strict(parts[1], count)) {
@@ -355,6 +355,31 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
 }
 
 } // namespace
+
+std::filesystem::path createUniqueDirectory(
+    const std::filesystem::path& preferredPath, std::error_code& error) {
+    std::filesystem::create_directories(preferredPath.parent_path(), error);
+    if (error) {
+        return {};
+    }
+    for (uint64_t suffix = 0;; ++suffix) {
+        auto candidate = preferredPath;
+        if (suffix != 0) {
+            candidate += L"_" + std::to_wstring(suffix);
+        }
+        error.clear();
+        if (std::filesystem::create_directory(candidate, error)) {
+            return candidate;
+        }
+        if (error && error != std::errc::file_exists) {
+            return {};
+        }
+        if (suffix == (std::numeric_limits<uint64_t>::max)()) {
+            error = std::make_error_code(std::errc::file_exists);
+            return {};
+        }
+    }
+}
 
 // Forces cached file data out to the medium so a rename published right after
 // cannot point at bytes still sitting in volatile cache during a power loss.
@@ -483,16 +508,6 @@ void writeReadme(const MuxedInputs& inputs, const std::filesystem::path& tempDir
     stream << "\nThe recovery.tsv file contains packet timing used by Backtrack's native muxer.\n";
 }
 
-void clearStaleManifest(const std::filesystem::path& tempDirectory) {
-    const std::wstring staleManifestNames[] = {
-        std::wstring(kRecoveryManifestName),
-        std::wstring(kRecoveryManifestName) + L".tmp"};
-    for (const auto& staleName : staleManifestNames) {
-        std::error_code removeError;
-        std::filesystem::remove(tempDirectory / staleName, removeError);
-    }
-}
-
 // Estimate covers the caller's byte count plus unmeasured container overhead.
 // A failed volume query is not a failure: let the writers surface any real
 // problem instead of blocking a save on a transient query error.
@@ -523,12 +538,10 @@ MuxPublishResult publishMuxedInputs(
     const std::filesystem::path& outputPath,
     const std::filesystem::path& tempDirectory,
     std::wstring* errorDetail) {
-    // Mirror of the recording finalize path, shared with the replay save: the
-    // manifest (and readme) is persisted before muxing, so a failed save keeps
-    // the elementary streams recoverable via "Recover Failed" or the startup
-    // sweep instead of destroying them.
-    const bool manifestWritten = writeManifest(inputs, tempDirectory);
-    writeReadme(inputs, tempDirectory);
+    // a failed rewrite must not remove a recording's incremental manifest.
+    if (writeManifest(inputs, tempDirectory)) {
+        writeReadme(inputs, tempDirectory);
+    }
 
     std::wstring muxErrorDetail;
     // Same retry wrapper for both paths: a transient Media Foundation
@@ -540,33 +553,32 @@ MuxPublishResult publishMuxedInputs(
     // Only an empty output-name reservation may be removed; a real file that
     // appeared at the target in the meantime must survive.
     removeEmptyOutputReservation(outputPath);
-    if (manifestWritten) {
-        // The manifest exactly describes the streams on disk: keep the
-        // directory so the clip stays recoverable.
-        if (errorDetail) {
-            *errorDetail = preservedRecordingDetail(
-                outputPath,
-                tempDirectory,
-                inputs,
-                muxErrorDetail.empty() ? L"MP4 muxing failed; see log for details" : muxErrorDetail);
-        }
-        Logger::instance().warning(L"mux",
-            L"MP4 mux failed; preserved elementary streams for recovery in " + tempDirectory.wstring());
-        return MuxPublishResult::kPreservedForRecovery;
-    }
-    // Every elementary-stream write above was verified before this point, so a
-    // manifest that will not publish means the disk or the folder failed, not
-    // that a scanner briefly held recovery.tsv (that race is retried inside
-    // writeManifest). A directory with streams but no manifest is skipped by
-    // recoverLatestFailedRecording and swept as garbage later, so keeping it
-    // would only promise a recovery that cannot happen.
+    const auto detail = preserveFailedRecording(
+        inputs, outputPath, tempDirectory,
+        muxErrorDetail.empty() ? L"MP4 muxing failed; see log for details" : muxErrorDetail);
     if (errorDetail) {
-        *errorDetail = muxErrorDetail.empty() ? L"MP4 muxing failed; see log for details" : muxErrorDetail;
+        *errorDetail = detail;
     }
-    Logger::instance().warning(L"mux",
-        L"MP4 mux failed and no recovery manifest could be written; removing temporary files for " +
-        outputPath.wstring());
-    return MuxPublishResult::kFailed;
+    Logger::instance().warning(L"mux", detail);
+    return MuxPublishResult::kPreserved;
+}
+
+std::wstring preserveFailedRecording(
+    const MuxedInputs& inputs,
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& tempDirectory,
+    const std::wstring& reason) {
+    std::error_code error;
+    if (!std::filesystem::exists(manifestPathFor(tempDirectory), error) && !error &&
+        !inputs.videoSamples.empty()) {
+        writeManifest(inputs, tempDirectory);
+    }
+    RecoveryManifest manifest;
+    if (readRecoveryManifest(tempDirectory, manifest)) {
+        return preservedRecordingDetail(outputPath, tempDirectory, manifest.inputs, reason);
+    }
+    return reason + L". Preserved temporary streams in " + tempDirectory.wstring() +
+        L". Automatic recovery could not verify timing data; the streams may need manual recovery.";
 }
 
 std::wstring preservedRecordingDetail(
@@ -574,6 +586,7 @@ std::wstring preservedRecordingDetail(
     const std::filesystem::path& tempDirectory,
     const MuxedInputs& inputs,
     const std::wstring& reason) {
+    const auto outputDirectory = outputPath.parent_path().empty() ? std::filesystem::path(L".") : outputPath.parent_path();
     std::wstring detail;
     if (!reason.empty()) {
         detail = reason + L". ";
@@ -581,7 +594,8 @@ std::wstring preservedRecordingDetail(
     return detail +
            L"Preserved " + std::to_wstring(inputs.videoSamples.size()) +
            L" video packets and elementary streams in " + tempDirectory.wstring() +
-           L". Use Recover Failed to retry, or recover manually from the preserved video/audio files.";
+           L". Use Recover Failed in the clip library, or retry with " + outputDirectory.wstring() +
+           L" as the library. The video/audio files can also be recovered manually.";
 }
 
 bool muxToMp4WithRetry(
@@ -601,11 +615,7 @@ bool muxToMp4WithRetry(
             break;
         }
 
-        // A sharing violation means another process still holds the staged or
-        // published name. Rotate to an alternate staging name
-        // (<stem>.publish.<n>.mp4) so the next attempt writes to a fresh file
-        // instead of colliding with the same handle again, and back off while
-        // waiting for it to be released.
+        // rotate the preferred staging directory after a sharing violation.
         if (win32Error == ERROR_SHARING_VIOLATION || win32Error == ERROR_LOCK_VIOLATION) {
             ++stagingVariant;
         }
@@ -623,196 +633,225 @@ bool muxToMp4WithRetry(
     return false;
 }
 
+namespace {
+
+constexpr wchar_t kRecoveredMarkerName[] = L".backtrack_recovered";
+
+struct LocatedManifest {
+    std::filesystem::path outputDirectory;
+    RecoveryManifest manifest;
+    std::filesystem::file_time_type modified{};
+};
+
+bool outputIdentity(const std::filesystem::path& path, std::array<DWORD, 7>& identity) {
+    const HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info{};
+    const bool ok = GetFileInformationByHandle(file, &info) != FALSE;
+    CloseHandle(file);
+    if (!ok || (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        (info.nFileSizeHigh == 0 && info.nFileSizeLow == 0)) return false;
+    identity = {info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow,
+                info.nFileSizeHigh, info.nFileSizeLow,
+                info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime};
+    return true;
+}
+
+bool alreadyRecovered(const LocatedManifest& located) {
+    std::error_code error;
+    std::filesystem::directory_iterator it(located.manifest.tempDirectory, error), end;
+    for (; !error && it != end; it.increment(error)) {
+        const std::wstring name = it->path().filename().wstring();
+        const std::wstring prefix = kRecoveredMarkerName;
+        if (!name.starts_with(prefix)) continue;
+        const auto suffix = name.substr(prefix.size());
+        if (!suffix.empty() && (suffix.size() < 2 || suffix.front() != L'_' ||
+            !std::all_of(suffix.begin() + 1, suffix.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; }))) continue;
+        std::error_code entryError;
+        const auto markerTime = it->last_write_time(entryError);
+        if (entryError || markerTime < located.modified) continue;
+        std::ifstream stream(it->path(), std::ios::binary);
+        std::string magic, outputName;
+        if (!std::getline(stream, magic) || magic != "backtrack-recovered-v2" || !std::getline(stream, outputName)) continue;
+        const std::filesystem::path fileName(utf8ToWide(outputName));
+        if (fileName.empty() || fileName != fileName.filename() || fileName.has_root_path() ||
+            fileName.native().find(L':') != std::wstring::npos) continue;
+        std::array<DWORD, 7> expected{}, actual{};
+        for (auto& value : expected) stream >> value;
+        if (stream && outputIdentity(located.outputDirectory / fileName, actual) && expected == actual) return true;
+    }
+    return false;
+}
+
+void markRecovered(const LocatedManifest& located, const std::filesystem::path& output) {
+    std::array<DWORD, 7> identity{};
+    if (!outputIdentity(output, identity)) {
+        Logger::instance().warning(L"mux", L"Could not identify recovered clip: " + output.wstring());
+        return;
+    }
+    HANDLE file = INVALID_HANDLE_VALUE;
+    std::filesystem::path marker;
+    for (uint32_t suffix = 0; suffix < 10000; ++suffix) {
+        marker = located.manifest.tempDirectory /
+            (std::wstring(kRecoveredMarkerName) + (suffix ? L"_" + std::to_wstring(suffix) : L""));
+        file = CreateFileW(marker.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) break;
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) break;
+    }
+    if (file == INVALID_HANDLE_VALUE) {
+        Logger::instance().warning(L"mux", L"Could not mark preserved recovery as completed: " + marker.wstring());
+        return;
+    }
+    std::string text = "backtrack-recovered-v2\n" + wideToUtf8(output.filename().wstring()) + "\n";
+    for (const auto value : identity) text += std::to_string(value) + " ";
+    text += '\n';
+    DWORD written = 0;
+    const bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr) &&
+                    written == static_cast<DWORD>(text.size()) && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!ok) {
+        Logger::instance().warning(L"mux", L"Could not finish recovery marker: " + marker.wstring());
+    }
+}
+
+std::vector<LocatedManifest> findManifests(const std::filesystem::path& clipDirectory) {
+    std::vector<LocatedManifest> result;
+    std::error_code error;
+    const auto roots = ClipStorage::clipRoots(clipDirectory, error);
+    if (error) {
+        Logger::instance().warning(L"mux", L"Could not enumerate clip roots in " + clipDirectory.wstring() +
+                                   L" (" + utf8ToWide(error.message()) + L")");
+    }
+    for (const auto& outputDirectory : roots) {
+        const auto root = recoveryRoot(outputDirectory);
+        if (!ClipStorage::isDirectoryWithoutReparsePoint(root)) {
+            continue;
+        }
+        error.clear();
+        std::filesystem::directory_iterator it(root, error), end;
+        if (error) {
+            Logger::instance().warning(L"mux", L"Could not enumerate recovery data in " + root.wstring() +
+                                       L" (" + utf8ToWide(error.message()) + L")");
+            continue;
+        }
+        for (; !error && it != end; it.increment(error)) {
+            const auto session = it->path();
+            if (!ClipStorage::isDirectoryWithoutReparsePoint(session)) {
+                continue;
+            }
+            LocatedManifest located;
+            located.outputDirectory = outputDirectory;
+            if (!readRecoveryManifest(session, located.manifest)) {
+                continue;
+            }
+            std::error_code timeError;
+            located.modified = std::filesystem::last_write_time(manifestPathFor(session), timeError);
+            if (!timeError && !alreadyRecovered(located)) {
+                result.push_back(std::move(located));
+            }
+        }
+        if (error) {
+            Logger::instance().warning(L"mux", L"Could not finish enumerating recovery data in " + root.wstring() +
+                                       L" (" + utf8ToWide(error.message()) + L")");
+        }
+    }
+    return result;
+}
+
+bool copyRecoveryInput(const std::filesystem::path& source, const std::filesystem::path& destination) {
+    if (source.empty()) {
+        return true;
+    }
+    const DWORD attributes = GetFileAttributesW(source.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+        return false;
+    }
+    return CreateHardLinkW(destination.c_str(), source.c_str(), nullptr) ||
+           CopyFileW(source.c_str(), destination.c_str(), TRUE);
+}
+
+std::filesystem::path recoverManifest(const LocatedManifest& located, std::wstring& detail) {
+    const auto& manifest = located.manifest;
+    std::error_code error;
+    const auto work = createUniqueDirectory(manifest.tempDirectory.parent_path() / L".backtrack_recovery_work", error);
+    if (work.empty()) {
+        detail = L"Could not create recovery work directory beside " + manifest.tempDirectory.wstring();
+        return {};
+    }
+    struct WorkCleanup {
+        std::filesystem::path path;
+        ~WorkCleanup() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+            if (error) {
+                Logger::instance().warning(L"mux", L"Could not remove recovery work directory: " + path.wstring());
+            }
+        }
+    } cleanup{work};
+
+    // The muxer writes mixed_audio.wav beside its inputs; legacy sessions can
+    // contain unrelated files with that name, so mux only from owned work files.
+    auto inputs = manifest.inputs;
+    const auto video = work / (inputs.codec == VideoCodec::H264 ? L"video.h264" : L"video.hevc");
+    const auto system = work / L"system.wav";
+    const auto microphone = work / L"microphone.wav";
+    if (!copyRecoveryInput(inputs.videoPath, video) ||
+        !copyRecoveryInput(inputs.systemAudioPath, system) ||
+        !copyRecoveryInput(inputs.microphoneAudioPath, microphone)) {
+        detail = L"Could not copy recovery streams from " + manifest.tempDirectory.wstring();
+        return {};
+    }
+    inputs.videoPath = video;
+    if (!inputs.systemAudioPath.empty()) inputs.systemAudioPath = system;
+    if (!inputs.microphoneAudioPath.empty()) inputs.microphoneAudioPath = microphone;
+
+    const auto output = uniqueRecoveredOutputPath(located.outputDirectory, manifest.tempDirectory.filename().wstring());
+    if (output.empty()) {
+        detail = L"Could not reserve a recovery output in " + located.outputDirectory.wstring();
+        return {};
+    }
+    std::wstring muxError;
+    if (!muxToMp4WithRetry(inputs, output, &muxError)) {
+        removeEmptyOutputReservation(output);
+        detail = preservedRecordingDetail(output, manifest.tempDirectory, manifest.inputs, muxError);
+        return {};
+    }
+
+    // Old session directories are not evidence that every file in them is ours.
+    markRecovered(located, output);
+    detail = L"Recovered failed recording to " + output.filename().wstring();
+    Logger::instance().info(L"mux", L"Recovered failed recording: " + output.wstring());
+    return output;
+}
+
+} // namespace
+
 std::filesystem::path recoverLatestFailedRecording(
     const std::filesystem::path& clipDirectory,
     std::wstring& detail) {
     detail.clear();
-    const std::filesystem::path root = recoveryRoot(clipDirectory);
-    std::error_code error;
-    if (clipDirectory.empty() || !std::filesystem::exists(root, error)) {
-        detail = L"No failed recording recovery data was found";
+    auto manifests = findManifests(clipDirectory);
+    if (manifests.empty()) {
+        detail = L"No recoverable failed recording manifest was found in " + clipDirectory.wstring();
         return {};
     }
-
-    std::optional<RecoveryManifest> selected;
-    std::filesystem::file_time_type selectedTime{};
-    std::filesystem::directory_iterator iterator(root, error);
-    const std::filesystem::directory_iterator end;
-    if (error) {
-        detail = L"Could not enumerate failed recording recovery data in " + root.wstring();
-        return {};
-    }
-
-    for (; iterator != end; iterator.increment(error)) {
-        const auto& entry = *iterator;
-        if (error) {
-            error = {};
-            continue;
-        }
-        if (!entry.is_directory(error) || error) {
-            error = {};
-            continue;
-        }
-
-        RecoveryManifest manifest;
-        if (!readRecoveryManifest(entry.path(), manifest)) {
-            continue;
-        }
-
-        const auto manifestPath = manifestPathFor(entry.path());
-        const auto modified = std::filesystem::last_write_time(manifestPath, error);
-        if (error) {
-            error = {};
-        }
-        if (!selected || modified > selectedTime) {
-            selected = std::move(manifest);
-            selectedTime = modified;
-        }
-    }
-
-    if (!selected) {
-        detail = L"No recoverable failed recording manifest was found in " + root.wstring();
-        return {};
-    }
-
-    const std::wstring stem = selected->tempDirectory.filename().wstring();
-    const std::filesystem::path outputPath = uniqueRecoveredOutputPath(clipDirectory, stem);
-    std::wstring muxError;
-    if (!muxToMp4WithRetry(selected->inputs, outputPath, &muxError)) {
-        // Never delete real content on a failed recovery; the muxer publishes
-        // atomically, so only an empty name reservation could be ours.
-        removeEmptyOutputReservation(outputPath);
-        detail = preservedRecordingDetail(outputPath, selected->tempDirectory, selected->inputs, muxError);
-        return {};
-    }
-
-    std::error_code cleanupError;
-    std::filesystem::remove_all(selected->tempDirectory, cleanupError);
-    if (cleanupError) {
-        Logger::instance().warning(L"mux", L"Recovered recording but could not remove recovery directory: " + selected->tempDirectory.wstring());
-    }
-
-    detail = L"Recovered failed recording to " + outputPath.filename().wstring();
-    Logger::instance().info(L"mux", L"Recovered failed recording: " + outputPath.wstring());
-    return outputPath;
+    const auto selected = std::max_element(manifests.begin(), manifests.end(),
+        [](const LocatedManifest& a, const LocatedManifest& b) { return a.modified < b.modified; });
+    return recoverManifest(*selected, detail);
 }
 
-void sweepOrphanedRecoveryData(const std::filesystem::path& clipDirectory, std::chrono::hours maxAge) {
-    if (clipDirectory.empty()) {
-        return;
-    }
-    const std::filesystem::path root = recoveryRoot(clipDirectory);
-    std::error_code error;
-    if (!std::filesystem::exists(root, error) || error) {
-        return; // Nothing was ever staged: no crash leftovers to clean.
-    }
-
-    // Recover the newest valid manifest before any cleanup runs. This is the
-    // only automatic chance to turn a crashed session's preserved streams into
-    // a clip; recoverLatestFailedRecording removes its directory on success
-    // and preserves the newest one on failure (mux error), leaving it for the
-    // manual "Recover Failed" action or for age-based deletion below.
-    std::wstring detail;
-    const auto recovered = recoverLatestFailedRecording(clipDirectory, detail);
-    if (!recovered.empty()) {
-        Logger::instance().info(L"mux", L"Startup sweep recovered interrupted recording: " + recovered.wstring());
-    } else if (!detail.empty()) {
-        Logger::instance().info(L"mux", L"Startup sweep found nothing recoverable: " + detail);
-    }
-
-    // Everything remaining in the recovery root older than the threshold is
-    // leaked from an old crashed session; delete it. Younger leftovers stay so
-    // a recent failure can still be recovered manually.
-    const auto cutoff = std::filesystem::file_time_type::clock::now() - maxAge;
-    std::size_t removedEntries = 0;
-    std::filesystem::directory_iterator iterator(root, error);
-    const std::filesystem::directory_iterator end;
-    if (error) {
-        Logger::instance().warning(L"mux",
-            L"Startup sweep could not enumerate recovery data in " + root.wstring() +
-            L" (" + utf8ToWide(error.message()) + L")");
-        return;
-    }
-    for (; iterator != end; iterator.increment(error)) {
-        if (error) {
-            error = {};
-            continue;
-        }
-        const auto& entry = *iterator;
-        std::error_code entryError;
-        const auto modified = entry.last_write_time(entryError);
-        if (entryError || modified >= cutoff) {
-            continue; // Missing timestamp or still fresh: leave it alone.
-        }
-        const auto path = entry.path();
-        std::error_code removeError;
-        if (entry.is_directory(entryError) && !entryError) {
-            std::filesystem::remove_all(path, removeError);
-        } else {
-            std::filesystem::remove(path, removeError);
-        }
-        if (removeError) {
-            Logger::instance().warning(L"mux", L"Startup sweep could not remove orphaned recovery data: " + path.wstring());
-        } else {
-            ++removedEntries;
-            Logger::instance().info(L"mux", L"Startup sweep removed orphaned recovery data: " + path.wstring());
+void sweepOrphanedRecoveryData(const std::filesystem::path& clipDirectory, std::chrono::hours /*maxAge*/) {
+    for (const auto& located : findManifests(clipDirectory)) {
+        std::wstring detail;
+        if (recoverManifest(located, detail).empty()) {
+            Logger::instance().warning(L"mux", L"Startup recovery failed: " + detail);
         }
     }
-    if (removedEntries > 0) {
-        Logger::instance().info(L"mux",
-            L"Startup sweep removed " + std::to_wstring(removedEntries) +
-            L" orphaned recovery entries from " + root.wstring());
-    }
-
-    // Stale output-name reservations: empty hidden .mp4 placeholders left in
-    // the clips folder when a session died between claiming a name and
-    // publishing. Identified precisely by the hidden attribute plus zero size,
-    // so real content is never touched.
-    auto isHiddenFile = [](const std::filesystem::path& path) {
-        const DWORD attributes = GetFileAttributesW(path.c_str());
-        return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_HIDDEN) != 0;
-    };
-    std::filesystem::directory_iterator clipIterator(clipDirectory, error);
-    if (error) {
-        error = {};
-        return;
-    }
-    std::size_t removedReservations = 0;
-    for (; clipIterator != end; clipIterator.increment(error)) {
-        if (error) {
-            error = {};
-            continue;
-        }
-        const auto& entry = *clipIterator;
-        std::error_code entryError;
-        if (!entry.is_regular_file(entryError) || entryError) {
-            continue;
-        }
-        const auto path = entry.path();
-        if (!isHiddenFile(path)) {
-            continue;
-        }
-        std::error_code sizeError;
-        if (std::filesystem::file_size(path, sizeError) != 0 || sizeError) {
-            continue;
-        }
-        const auto modified = entry.last_write_time(entryError);
-        if (entryError || modified >= cutoff) {
-            continue;
-        }
-        std::error_code removeError;
-        std::filesystem::remove(path, removeError);
-        if (removeError) {
-            Logger::instance().warning(L"mux", L"Startup sweep could not remove stale clip name reservation: " + path.wstring());
-        } else {
-            ++removedReservations;
-            Logger::instance().info(L"mux", L"Startup sweep removed stale clip name reservation: " + path.wstring());
-        }
-    }
-    if (removedReservations > 0) {
-        Logger::instance().info(L"mux",
-            L"Startup sweep removed " + std::to_wstring(removedReservations) + L" stale clip name reservation(s)");
-    }
+    // A hidden empty file alone does not prove ownership of a legacy reservation.
 }
 
 } // namespace RecoveryStore

@@ -168,7 +168,9 @@ std::wstring withHotkeyWarning(std::wstring status, bool hotkeysOk, const std::w
 void playActionIndicator(
     UINT type,
     uint32_t volumePercent = 100,
-    const std::filesystem::path& customSuccessSoundPath = {});
+    const std::filesystem::path& customSuccessSoundPath = {},
+    std::vector<uint8_t> (*loadWav)(const std::filesystem::path&) = nullptr,
+    BOOL (WINAPI* playSound)(LPCWSTR, HMODULE, DWORD) = nullptr);
 std::wstring thumbnailCacheKey(const std::filesystem::path& path);
 std::wstring appNameFromPath(const std::filesystem::path& path);
 // Shared file/folder pickers so the three manual-app/sound pickers and the two

@@ -27,8 +27,7 @@ public:
     // dxgiTextureBytes for their footprint; flags stay options-driven.
     //   WGC copy pool / DD pool      {rtv, srv}       -> SRV|RTV
     //   Scaler output / copy pool    {outputView, srv iff BGRA} -> RTV (+SRV)
-    //   VP input copy texture        {}               -> 0 (strict drivers
-    //                                                reject SRV with E_INVALIDARG)
+    // VP input copies are not pool builds and use zero bind flags directly.
     static UINT bindFlagsFor(const GpuPoolBuildOptions& options) {
         UINT flags = 0;
         if (options.wantSrv) {

@@ -13,9 +13,12 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -28,13 +31,28 @@ namespace backtrack {
 
 class MainWindow {
 public:
-    MainWindow(RecorderController& controller, SettingsStore& settingsStore);
+    MainWindow(RecorderController& controller, SettingsStore& settingsStore,
+               const AppSettings& startupSettings, SettingsStore::LoadStatus startupStatus);
     ~MainWindow();
 
     bool create(HINSTANCE instance, int showCommand, bool startMinimized);
     int runMessageLoop();
 
 private:
+    friend struct MainWindowSettingsTestAccess;
+    friend struct MainWindowAccessibilityTestAccess;
+    friend struct MainWindowNotificationTestAccess;
+    friend struct MainWindowUpdateCheckTestAccess;
+    friend struct MainWindowLibraryTestAccess;
+
+    struct UpdateCheckTarget {
+        std::wstring host;
+        uint16_t port;
+        DWORD accessType;
+        bool secure;
+        std::chrono::milliseconds timeout;
+    };
+
     enum class Page {
         Capture = 0,
         Library = 1,
@@ -103,15 +121,12 @@ private:
         bool placedValid = false;
     };
 
+    // Bounds retained thumbnails (base plus tile copy) to the visible Gallery
+    // window; see updateThumbnailWorkingSet.
+    static constexpr size_t kMaxLibraryThumbnails = 48;
+
     struct ClipThumbnail {
         HBITMAP bitmap = nullptr;
-        // Load-time mirrors of the matching thumbnailCache_ entry's tile copy
-        // (see ThumbnailCacheEntry::tileBitmap). Non-owning and not used for
-        // drawing: paint code resolves the owning entry directly so the tile
-        // cache is regenerated on exactly one owner.
-        HBITMAP tileBitmap = nullptr;
-        int tileWidth = 0;
-        int tileHeight = 0;
         bool loading = false;
         bool unavailable = false;
     };
@@ -128,6 +143,17 @@ private:
         int tileWidth = 0;
         int tileHeight = 0;
         bool unavailable = false;
+    };
+
+    struct LibraryScanRequest {
+        uint64_t generation = 0;
+        std::filesystem::path directory;
+    };
+
+    struct LibraryScanResult {
+        LibraryScanRequest request;
+        std::vector<ClipInfo> clips;
+        bool failed = false;
     };
 
     struct ThumbnailRequest {
@@ -198,7 +224,10 @@ private:
     HWND addSectionLabel(const wchar_t* text, int x, int y, int width);
     void setDefaultFont(HWND control);
     void createUpdateButton();
+    static std::optional<std::wstring> fetchLatestReleaseVersion(
+        const UpdateCheckTarget& target, const std::atomic<bool>& stopping);
     void startUpdateCheck();
+    void startUpdateCheck(UpdateCheckTarget target);
     void stopUpdateCheck();
     void handleUpdateCheckComplete(bool updateAvailable);
 
@@ -221,11 +250,8 @@ private:
     // readVisibleSettingsInto so the per-keystroke dirty pass never touches
     // the filesystem. Reads the folders readVisibleSettingsInto just stored.
     bool ensureFoldersExist();
-    // Single owner of sanitize + startup registration + save + dirty baseline,
-    // so no save site can persist without normalizing or leave dirty tracking
-    // stale. Hotkey registration stays in applyVisibleSettings: its result
-    // feeds the ApplySettings controller action, not persistence.
-    void commitSettings();
+    bool commitSettings(const AppSettings& candidate);
+    void setDiagnosticLogLevel(LogLevel level);
     bool computeSettingsDirty();
     void stashVisibleSettings();
     void applyVisibleSettings();
@@ -295,7 +321,6 @@ private:
     void destroyAutoRecordRows();
     void releaseAutoRecordRowIcons();
     void removeAutoRecordApp(size_t index);
-    void updateStartupRegistration();
     void browseClipFolder();
     void browseRingDirectory();
     void browseCustomNotificationSound();
@@ -305,19 +330,22 @@ private:
     // recording receives no packets from an enabled audio input (>2s).
     void updateAudioLivenessWarning(const RecordingStats& stats);
     void refreshClips();
+    void cancelLibraryScan();
+    void stopLibraryScanWorker();
+    void libraryScanWorkerLoop();
+    void handleLibraryScanReady();
     void populateClipListRows();
     void setLibraryViewMode(LibraryViewMode mode);
     void clearClipThumbnails();
     void releaseClipThumbnailCache();
-    void pruneClipThumbnailCache();
     void loadClipThumbnails();
-    // Re-queues missing thumbnails without bumping the generation, so rapid
-    // single-clip edits do not starve the worker by discarding in-flight work.
+    void requestThumbnailUpdate();
+    void updateThumbnailWorkingSet();
     void refreshThumbnailsAfterLibraryEdit();
     void startThumbnailWorker();
     void stopThumbnailWorker();
     void thumbnailWorkerLoop();
-    void handleClipThumbnailReady(ThumbnailResult& result);
+    void handleClipThumbnailReady();
     size_t clipIndexFromListItem(UINT itemId) const;
     size_t clipIndexAtPoint(POINT point) const;
     size_t clipIndexForPath(const std::filesystem::path& path) const;
@@ -341,8 +369,9 @@ private:
     void handleLeagueKillDetected();
     // Auto record watcher: polls running apps on a timer and toggles recording
     // through the controller queue. See pollAutoRecord().
-    void pollAutoRecord();
-    std::optional<std::wstring> runningAutoRecordAppName() const;
+    void pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps = nullptr);
+    static std::optional<std::wstring> matchingAutoRecordAppName(
+        const AppSettings& applied, const std::vector<AudioSessionAppInfo>& openApps);
     void startRecordingForAutoRecord(const std::wstring& appName);
     void stopRecordingForAutoRecord();
     void startControllerWorker();
@@ -370,10 +399,10 @@ private:
     RecorderController& controller_;
     SettingsStore& settingsStore_;
     AppSettings settings_;
-    // Pristine baseline of the last saved/loaded settings. The Save button is
-    // shown only when the visible settings differ from this snapshot, so
-    // reverting an edit back to its saved value hides the button again.
+    // Last loaded or published snapshot, or first-run defaults. A failed
+    // startup read leaves only a fallback and blocks publication.
     AppSettings savedSettings_;
+    bool startupSettingsReadable_ = false;
     ClipManager clipManager_;
     HotkeyService hotkeys_;
     LeagueOfLegendsIntegration leagueIntegration_;
@@ -417,6 +446,7 @@ private:
     std::array<PageCache, 4> pageCaches_{};
     std::vector<HWND> pageControls_;
     std::vector<ClipInfo> clips_;
+    std::filesystem::path clipsDirectory_;
 
     HWND bitrateEdit_ = nullptr;
     HWND codecCombo_ = nullptr;
@@ -546,6 +576,9 @@ private:
     std::vector<AppListRowControls> autoRecordRows_;
     std::vector<ClipThumbnail> clipThumbnails_;
     std::unordered_map<std::wstring, ThumbnailCacheEntry> thumbnailCache_;
+    size_t thumbnailFirst_ = 0;
+    size_t thumbnailLast_ = 0;
+    bool thumbnailUpdatePosted_ = false;
     uint32_t recordHotkeyModifiers_ = 0;
     uint32_t recordHotkeyVirtualKey_ = 0;
     uint32_t replayHotkeyModifiers_ = 0;
@@ -569,12 +602,28 @@ private:
     std::wstring controllerBusyStatus_;
     std::thread updateCheckThread_;
     std::atomic<bool> updateCheckStopping_{false};
+    std::thread libraryScanWorker_;
+    std::mutex libraryScanMutex_;
+    std::condition_variable libraryScanCv_;
+    std::optional<LibraryScanRequest> libraryScanRequest_;
+    std::optional<LibraryScanResult> libraryScanResult_;
+    std::atomic<uint64_t> libraryScanGeneration_{0};
+    bool libraryScanStopping_ = false;
+    bool libraryScanPending_ = false;
+    bool libraryScanMessagePosted_ = false;
+    // Test seam: replaces ClipManager::listClips on the scan worker.
+    std::function<std::vector<ClipInfo>(const std::filesystem::path&, const std::function<bool()>&)>
+        libraryScanOverride_;
     std::thread thumbnailWorker_;
     std::mutex thumbnailQueueMutex_;
     std::condition_variable thumbnailQueueCv_;
     std::deque<ThumbnailRequest> thumbnailQueue_;
+    std::optional<ThumbnailResult> thumbnailResult_;
     std::atomic<uint64_t> thumbnailGeneration_{0};
     bool thumbnailWorkerStopping_ = false;
+    bool thumbnailWorkingSetDirty_ = false;
+    // Test access suppresses the real decoder; production leaves this false.
+    bool thumbnailWorkerSuppressed_ = false;
     SteadyClock::time_point killClipTagDeadline_ = SteadyClock::time_point::min();
 };
 

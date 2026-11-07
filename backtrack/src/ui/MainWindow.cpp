@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <cwctype>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -42,25 +43,29 @@ namespace {
 
 constexpr wchar_t kGithubHost[] = L"api.github.com";
 constexpr wchar_t kLatestReleasePath[] = L"/repos/gyatstian/backtrack/releases/latest";
+constexpr auto kUpdateCheckTimeout = std::chrono::seconds(5);
 
-std::optional<std::wstring> fetchLatestReleaseVersion() {
+} // namespace
+
+std::optional<std::wstring> MainWindow::fetchLatestReleaseVersion(
+    const UpdateCheckTarget& target, const std::atomic<bool>& stopping) {
+    if (stopping.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
     // Carries the real build so a triage log identifies the version that made
     // the request; a literal here drifts from kCurrentAppVersion on release.
     const std::wstring userAgent = std::wstring(L"Backtrack/") + std::wstring(kCurrentAppVersion);
-    InternetHandle session(WinHttpOpen(
-        userAgent.c_str(),
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        0));
-    if (!session) {
+    auto handles = std::make_shared<AsyncHttpHandles>();
+    handles->session.reset(WinHttpOpen(
+        userAgent.c_str(), target.accessType, WINHTTP_NO_PROXY_NAME,
+        WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC));
+    if (!handles->session) {
         return std::nullopt;
     }
 
-    WinHttpSetTimeouts(session.value, 2000, 2000, 2000, 2000);
-
-    InternetHandle connection(WinHttpConnect(session.value, kGithubHost, INTERNET_DEFAULT_HTTPS_PORT, 0));
-    if (!connection) {
+    WinHttpSetTimeouts(handles->session.value, 2000, 2000, 2000, 2000);
+    handles->connection.reset(WinHttpConnect(handles->session.value, target.host.c_str(), target.port, 0));
+    if (!handles->connection) {
         return std::nullopt;
     }
 
@@ -68,27 +73,28 @@ std::optional<std::wstring> fetchLatestReleaseVersion() {
         L"User-Agent: " + userAgent + L"\r\n"
         L"Accept: application/vnd.github+json\r\n"
         L"X-GitHub-Api-Version: 2022-11-28\r\n";
+    const CancellableHttpSession session{handles, &stopping, target.timeout, target.secure};
     // Internet host: default proxy and real cert validation (no cert ignore).
-    const auto body = httpGetBody(session.value, connection.value, kLatestReleasePath, headers.c_str(), false, L"ui");
+    const auto body = httpGetBody(session, handles->connection.value, kLatestReleasePath, headers.c_str(), false, L"ui");
     if (!body) {
         return std::nullopt;
     }
     return jsonStringField(*body, "tag_name");
 }
 
-} // namespace
-
-MainWindow::MainWindow(RecorderController& controller, SettingsStore& settingsStore)
+MainWindow::MainWindow(RecorderController& controller, SettingsStore& settingsStore,
+                       const AppSettings& startupSettings, SettingsStore::LoadStatus startupStatus)
     : controller_(controller),
       settingsStore_(settingsStore),
-      settings_(settingsStore.load()),
+      settings_(startupSettings),
+      savedSettings_(startupSettings),
+      startupSettingsReadable_(startupStatus != SettingsStore::LoadStatus::Failed),
       clipManager_(settings_.clipDirectory),
       leagueIntegration_([this] {
           if (window_ && IsWindow(window_)) {
               PostMessageW(window_, kLeagueKillDetectedMessage, 0, 0);
           }
       }) {
-    savedSettings_ = settings_;
     libraryViewMode_ = settings_.libraryGalleryView ? LibraryViewMode::Gallery : LibraryViewMode::List;
     recordHotkeyModifiers_ = settings_.hotkeys.startStopModifiers;
     recordHotkeyVirtualKey_ = settings_.hotkeys.startStopVirtualKey;
@@ -99,6 +105,7 @@ MainWindow::MainWindow(RecorderController& controller, SettingsStore& settingsSt
 MainWindow::~MainWindow() {
     stopUpdateCheck();
     stopGameIntegrations();
+    stopLibraryScanWorker();
     stopThumbnailWorker();
     stopControllerWorker();
     releaseClipThumbnailCache();
@@ -237,7 +244,7 @@ bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized
 
     for (size_t index = 0; index < pageCaches_.size(); ++index) {
         pageCaches_[index].host = CreateWindowExW(
-            0,
+            WS_EX_CONTROLPARENT,
             pageHostClass.lpszClassName,
             nullptr,
             WS_CHILD | WS_VSCROLL | WS_CLIPCHILDREN,
@@ -330,29 +337,44 @@ void MainWindow::createUpdateButton() {
 }
 
 void MainWindow::startUpdateCheck() {
+    startUpdateCheck({kGithubHost, INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, true, kUpdateCheckTimeout});
+}
+
+void MainWindow::startUpdateCheck(UpdateCheckTarget target) {
     if (updateCheckThread_.joinable()) {
         return;
     }
-    updateCheckStopping_.store(false);
-    updateCheckThread_ = std::thread([this] {
-        const auto latestVersion = fetchLatestReleaseVersion();
-        if (!latestVersion) {
-            Logger::instance().debug(L"ui", L"Update check failed");
-            return;
-        }
+    updateCheckStopping_.store(false, std::memory_order_release);
+    const HWND window = window_;
+    updateCheckThread_ = std::thread([this, window, target = std::move(target)] {
+        setThreadDescriptionSafe(L"Backtrack update check");
+        try {
+            const auto latestVersion = fetchLatestReleaseVersion(target, updateCheckStopping_);
+            if (updateCheckStopping_.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!latestVersion) {
+                Logger::instance().debug(L"ui", L"Update check failed");
+                return;
+            }
 
-        const bool updateAvailable = *latestVersion != kCurrentAppVersion;
-        Logger::instance().info(
-            L"ui",
-            std::wstring(L"Latest release: ") + *latestVersion + L"; current: " + std::wstring(kCurrentAppVersion));
-        if (!updateCheckStopping_.load() && window_ && IsWindow(window_)) {
-            PostMessageW(window_, kUpdateCheckCompleteMessage, updateAvailable ? 1 : 0, 0);
+            const bool updateAvailable = *latestVersion != kCurrentAppVersion;
+            Logger::instance().info(
+                L"ui",
+                std::wstring(L"Latest release: ") + *latestVersion + L"; current: " + std::wstring(kCurrentAppVersion));
+            if (!updateCheckStopping_.load(std::memory_order_acquire) && window && IsWindow(window)) {
+                PostMessageW(window, kUpdateCheckCompleteMessage, updateAvailable ? 1 : 0, 0);
+            }
+        } catch (const std::exception& error) {
+            Logger::instance().warning(L"ui", std::wstring(L"Update check failed: ") + utf8ToWide(error.what()));
+        } catch (...) {
+            Logger::instance().warning(L"ui", L"Update check failed unexpectedly");
         }
     });
 }
 
 void MainWindow::stopUpdateCheck() {
-    updateCheckStopping_.store(true);
+    updateCheckStopping_.store(true, std::memory_order_release);
     if (updateCheckThread_.joinable()) {
         updateCheckThread_.join();
     }
@@ -587,9 +609,11 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
             result.ok = controller_.startRecording();
             result.startedRecording = result.ok;
             playActionIndicator(result.ok ? MB_OK : MB_ICONHAND, controller_.settings().notificationSoundVolumePercent);
+            const std::wstring detail = trimText(controller_.lastRecordingError());
             result.status = result.ok
                 ? L"Recording started"
-                : actionFailureStatus(L"Recording could not start", controller_.encoderCapabilities(), controller_.stats());
+                : (!detail.empty() ? L"Recording could not start: " + detail
+                                   : actionFailureStatus(L"Recording could not start", controller_.encoderCapabilities(), controller_.stats()));
         }
         break;
     case ControllerActionKind::SaveReplay:
@@ -598,23 +622,6 @@ MainWindow::ControllerActionResult MainWindow::executeControllerAction(const Con
         result.savedReplay = !result.clipPath.empty();
         if (result.savedReplay && !action.replayTag.empty()) {
             ClipManager manager(controller_.settings().clipDirectory);
-            if (action.replayTag == L"Kill clip") {
-                const auto clipsDirectory = result.clipPath.parent_path() / L"clips";
-                auto organizedPath = clipsDirectory / result.clipPath.filename();
-                std::error_code error;
-                std::filesystem::create_directories(clipsDirectory, error);
-                for (unsigned int suffix = 2; !error && std::filesystem::exists(organizedPath, error); ++suffix) {
-                    organizedPath = clipsDirectory / (result.clipPath.stem().wstring() + L"_" + std::to_wstring(suffix) + result.clipPath.extension().wstring());
-                }
-                if (!error) {
-                    std::filesystem::rename(result.clipPath, organizedPath, error);
-                }
-                if (error) {
-                    Logger::instance().warning(L"ui", L"Could not move kill clip to " + clipsDirectory.wstring() + L": " + utf8ToWide(error.message()));
-                } else {
-                    result.clipPath = organizedPath;
-                }
-            }
             if (!manager.addTag(result.clipPath, action.replayTag)) {
                 Logger::instance().warning(L"ui", L"Could not tag saved replay: " + result.clipPath.wstring());
             }

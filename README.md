@@ -127,7 +127,7 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release
 ```
 
-Four suites always build: `VideoTimelineSchedulerTests`, `AudioConvertTests`, `ReplayBufferTests`, and `SettingsClipGuardTests`. A fifth, `AudioDenoiseTests`, is added when noise suppression is enabled.
+34 suites always build. `NvencLifecycleTests` and `AmfEncoderTests` are added when the NVENC and AMF headers are found (both are vendored), and `AudioDenoiseTests` when noise suppression is enabled. What each suite covers is listed in `backtrack/tests/AGENTS.md`.
 
 The recording and replay hotkeys are configurable in Settings. The clip folder is configurable in the Capture settings. Audio devices, sound separation, resolution, encoder tuning, GPU protection, and game integrations are all configured in the Settings page.
 

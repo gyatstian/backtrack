@@ -45,23 +45,26 @@ std::shared_ptr<const WaveFormatBlob> pcmFormat(uint16_t channels, uint32_t rate
     return makeBlob(format);
 }
 
-// {00000003-0000-0010-8000-00aa00389b71}: IEEE float sub-format for
-// WAVEFORMATEXTENSIBLE (defined here so the test does not need ksmedia.h).
+// WAVEFORMATEXTENSIBLE sub-formats, defined here without ksmedia.h.
+constexpr GUID kPcmSubFormat = {
+    0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 constexpr GUID kFloatSubFormat = {
     0x00000003, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
 
-std::shared_ptr<const WaveFormatBlob> floatExtensibleFormat(uint16_t channels, uint32_t rate) {
+std::shared_ptr<const WaveFormatBlob> extensibleFormat(
+    uint16_t channels, uint32_t rate, uint16_t bits, const GUID& subFormat,
+    uint16_t padding = 0, uint16_t validBits = 0) {
     WAVEFORMATEXTENSIBLE format{};
     format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
     format.Format.nChannels = channels;
     format.Format.nSamplesPerSec = rate;
-    format.Format.wBitsPerSample = 32;
-    format.Format.nBlockAlign = static_cast<uint16_t>(channels * 4);
+    format.Format.wBitsPerSample = bits;
+    format.Format.nBlockAlign = static_cast<uint16_t>(channels * (bits / 8) + padding);
     format.Format.nAvgBytesPerSec = rate * format.Format.nBlockAlign;
     format.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
-    format.Samples.wValidBitsPerSample = 32;
+    format.Samples.wValidBitsPerSample = validBits == 0 ? bits : validBits;
     format.dwChannelMask = channels == 1 ? 0x4 : (channels == 2 ? 0x3 : 0x3F);
-    format.SubFormat = kFloatSubFormat;
+    format.SubFormat = subFormat;
     auto blob = std::make_shared<WaveFormatBlob>();
     const auto* bytes = reinterpret_cast<const uint8_t*>(&format);
     blob->bytes.assign(bytes, bytes + sizeof(format));
@@ -101,12 +104,103 @@ void testCanonicalPassthrough() {
         }
     }
 
+    const auto originalBytes = packet.bytes;
     expect(backtrack::convertAudioPacketToCanonical(packet), "canonical passthrough was rejected");
     const AudioFormatInfo info = backtrack::parseAudioFormat(*packet.format);
     expect(backtrack::isCanonicalAudioFormat(info), "passthrough lost the canonical format");
+    expect(packet.bytes == originalBytes, "passthrough changed the payload");
     expect(packet.frameCount == 480, "passthrough changed the frame count");
     expect(packet.pts100ns == 12345, "conversion touched PTS");
     expect(std::fabs(sampleAt(packet, 0, 0) + 0.25f) < 1e-6f, "passthrough corrupted samples");
+}
+
+void testPaddedStereoFloatIsRepacked() {
+    WAVEFORMATEX format{};
+    format.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+    format.nChannels = 2;
+    format.nSamplesPerSec = 48000;
+    format.wBitsPerSample = 32;
+    format.nBlockAlign = 12;
+    format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+    const std::shared_ptr<const WaveFormatBlob> formats[] = {
+        makeBlob(format), extensibleFormat(2, 48000, 32, kFloatSubFormat, 4)};
+    constexpr uint32_t kFrames = 3;
+    constexpr float samples[kFrames][2] = {{0.25f, -0.5f}, {0.75f, -0.25f}, {-0.75f, 0.5f}};
+
+    for (const auto& blob : formats) {
+        AudioPacket packet;
+        packet.format = blob;
+        packet.frameCount = 99;
+        packet.pts100ns = 12345;
+        packet.bytes.assign(kFrames * format.nBlockAlign, 0x7f);
+        for (uint32_t frame = 0; frame < kFrames; ++frame) {
+            std::memcpy(packet.bytes.data() + frame * format.nBlockAlign, samples[frame], sizeof(samples[frame]));
+        }
+
+        const AudioFormatInfo input = backtrack::parseAudioFormat(*packet.format);
+        expect(backtrack::audioFormatUsable(input), "padded stereo float format should be usable");
+        expect(!backtrack::isCanonicalAudioFormat(input), "padded stereo float is not canonical");
+        expect(backtrack::convertAudioPacketToCanonical(packet), "padded stereo float conversion failed");
+        expect(packet.frameCount == kFrames && packet.bytes.size() == kFrames * 2 * sizeof(float),
+            "padded stereo float was not tightly repacked");
+        expect(packet.pts100ns == 12345, "padded stereo conversion changed PTS");
+        expect(packet.format->bytes == backtrack::canonicalAudioFormat().bytes,
+            "padded stereo conversion did not emit the canonical format");
+        for (uint32_t frame = 0; frame < kFrames; ++frame) {
+            for (int channel = 0; channel < 2; ++channel) {
+                expect(sampleAt(packet, frame, channel) == samples[frame][channel],
+                    "padded stereo conversion corrupted samples");
+            }
+        }
+    }
+}
+
+void testSupportedSampleWidths() {
+    struct SampleCase {
+        uint16_t tag;
+        uint16_t bits;
+        uint16_t validBits;
+        uint8_t left[4];
+        uint8_t right[4];
+    };
+    const SampleCase cases[] = {
+        {WAVE_FORMAT_PCM, 8, 8, {0xc0}, {0x40}},
+        {WAVE_FORMAT_PCM, 16, 16, {0x00, 0x40}, {0x00, 0xc0}},
+        {WAVE_FORMAT_PCM, 24, 24, {0x00, 0x00, 0x40}, {0x00, 0x00, 0xc0}},
+        {WAVE_FORMAT_PCM, 32, 32, {0x00, 0x00, 0x00, 0x40}, {0x00, 0x00, 0x00, 0xc0}},
+        {WAVE_FORMAT_PCM, 32, 24, {0x00, 0x00, 0x00, 0x40}, {0x00, 0x00, 0x00, 0xc0}},
+        {WAVE_FORMAT_IEEE_FLOAT, 32, 32, {0x00, 0x00, 0x00, 0x3f}, {0x00, 0x00, 0x00, 0xbf}},
+    };
+    for (const SampleCase& sample : cases) {
+        WAVEFORMATEX format{};
+        format.wFormatTag = sample.tag;
+        format.nChannels = 2;
+        format.nSamplesPerSec = 48000;
+        format.wBitsPerSample = sample.bits;
+        const uint16_t sampleBytes = sample.bits / 8;
+        format.nBlockAlign = static_cast<uint16_t>(2 * sampleBytes);
+        format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+        const GUID& subFormat = sample.tag == WAVE_FORMAT_PCM ? kPcmSubFormat : kFloatSubFormat;
+        const std::shared_ptr<const WaveFormatBlob> formats[] = {
+            makeBlob(format), extensibleFormat(2, 48000, sample.bits, subFormat, 0, sample.validBits)};
+        for (const auto& blob : formats) {
+            AudioPacket packet;
+            packet.format = blob;
+            packet.bytes.resize(format.nBlockAlign);
+            std::memcpy(packet.bytes.data(), sample.left, sampleBytes);
+            std::memcpy(packet.bytes.data() + sampleBytes, sample.right, sampleBytes);
+
+            expect(backtrack::audioFormatUsable(backtrack::parseAudioFormat(*packet.format)),
+                "supported sample width was rejected");
+            expect(backtrack::convertAudioPacketToCanonical(packet), "supported sample conversion failed");
+            expect(packet.frameCount == 1 && packet.bytes.size() == 2 * sizeof(float),
+                "supported sample conversion has the wrong size");
+            expect(backtrack::isCanonicalAudioFormat(backtrack::parseAudioFormat(*packet.format)),
+                "supported sample conversion did not produce canonical audio");
+            expect(sampleAt(packet, 0, 0) == 0.5f && sampleAt(packet, 0, 1) == -0.5f,
+                "supported sample conversion corrupted amplitudes");
+        }
+    }
 }
 
 void testMonoPcm16ResampleAndDuplication() {
@@ -152,7 +246,7 @@ void testFormatChangeMidStreamIsTransparent() {
     // one identical canonical format so timeline writers never see a mismatch.
     std::vector<AudioPacket> packets(2);
     packets[0].track = AudioTrack::System;
-    packets[0].format = floatExtensibleFormat(2, 44100);
+    packets[0].format = extensibleFormat(2, 44100, 32, kFloatSubFormat);
     packets[0].frameCount = 441;
     packets[0].bytes.resize(441 * 2 * sizeof(float));
 
@@ -170,6 +264,100 @@ void testFormatChangeMidStreamIsTransparent() {
         "converted formats differ between packets");
     expect(packets[0].frameCount == 480, "44.1k stereo resample produced the wrong length");
     expect(packets[1].frameCount == 480, "48k mono passthrough produced the wrong length");
+}
+
+void testInvalidFormatsAreRejected() {
+    struct InvalidFormat {
+        uint16_t tag;
+        uint16_t bits;
+        uint16_t channels;
+        uint16_t blockAlign;
+        uint32_t rate;
+        const char* message;
+    };
+    const InvalidFormat cases[] = {
+        {WAVE_FORMAT_PCM, 16, 32768, 0, 48000, "wrapped zero stride was accepted"},
+        {WAVE_FORMAT_PCM, 16, 32768, 65535, 48000, "unrepresentable stride was accepted"},
+        {WAVE_FORMAT_PCM, 16, 32769, 2, 48000, "wrapped nonzero stride was accepted"},
+        {WAVE_FORMAT_PCM, 16, 2, 0, 48000, "zero stride was accepted"},
+        {WAVE_FORMAT_PCM, 16, 2, 3, 48000, "short PCM stride was accepted"},
+        {WAVE_FORMAT_IEEE_FLOAT, 32, 2, 7, 48000, "short float stride was accepted"},
+        {WAVE_FORMAT_PCM, 64, 2, 16, 48000, "64-bit PCM was accepted"},
+        {WAVE_FORMAT_IEEE_FLOAT, 64, 2, 16, 48000, "64-bit float was accepted"},
+        {WAVE_FORMAT_IEEE_FLOAT, 16, 2, 4, 48000, "16-bit float was accepted"},
+        {WAVE_FORMAT_IEEE_FLOAT, 24, 2, 6, 48000, "24-bit float was accepted"},
+        {WAVE_FORMAT_PCM, 12, 2, 4, 48000, "12-bit PCM was accepted"},
+        {WAVE_FORMAT_PCM, 16, 0, 4, 48000, "zero channels were accepted"},
+        {WAVE_FORMAT_PCM, 16, 2, 4, 0, "zero sample rate was accepted"},
+    };
+    for (const InvalidFormat& invalid : cases) {
+        WAVEFORMATEX format{};
+        format.wFormatTag = invalid.tag;
+        format.wBitsPerSample = invalid.bits;
+        format.nChannels = invalid.channels;
+        format.nSamplesPerSec = invalid.rate;
+        format.nBlockAlign = invalid.blockAlign;
+        format.nAvgBytesPerSec = invalid.rate * invalid.blockAlign;
+        AudioPacket packet;
+        packet.format = makeBlob(format);
+        packet.frameCount = 7;
+        packet.bytes.assign(32, 0x7f);
+        const auto originalBytes = packet.bytes;
+        const auto originalFormat = packet.format;
+        expect(!backtrack::audioFormatUsable(backtrack::parseAudioFormat(*packet.format)), invalid.message);
+        expect(!backtrack::convertAudioPacketToCanonical(packet), invalid.message);
+        expect(packet.bytes == originalBytes && packet.format == originalFormat && packet.frameCount == 7,
+            "rejected conversion modified the packet");
+        packet.bytes.clear();
+        expect(!backtrack::convertAudioPacketToCanonical(packet), invalid.message);
+    }
+
+    struct ExtensibleCase {
+        GUID subFormat;
+        AudioSampleEncoding encoding;
+    };
+    const ExtensibleCase extensibleCases[] = {
+        {kPcmSubFormat, AudioSampleEncoding::Pcm}, {kFloatSubFormat, AudioSampleEncoding::Float}};
+    for (const ExtensibleCase& format : extensibleCases) {
+        AudioPacket packet;
+        packet.format = extensibleFormat(2, 48000, 64, format.subFormat);
+        packet.bytes.assign(16, 0x7f);
+        const AudioFormatInfo info = backtrack::parseAudioFormat(*packet.format);
+        expect(info.encoding == format.encoding && info.bitsPerSample == 64,
+            "64-bit extensible format was not parsed");
+        expect(!backtrack::audioFormatUsable(info) && !backtrack::convertAudioPacketToCanonical(packet),
+            "64-bit extensible format was accepted");
+    }
+
+    AudioFormatInfo canonical = backtrack::parseAudioFormat(backtrack::canonicalAudioFormat());
+    canonical.blockAlign = 0;
+    expect(!backtrack::isCanonicalAudioFormat(canonical), "zero-stride format was marked canonical");
+
+    AudioPacket empty;
+    empty.format = pcmFormat(1, 48000, 16);
+    empty.frameCount = 7;
+    expect(backtrack::convertAudioPacketToCanonical(empty) && empty.frameCount == 0,
+        "empty packet with a valid format was rejected");
+}
+
+void testLargestRepresentableStride() {
+    AudioPacket packet;
+    packet.format = pcmFormat(32767, 48000, 16);
+    packet.bytes.resize(65534);
+    const int16_t firstSamples[] = {16384, -16384};
+    std::memcpy(packet.bytes.data(), firstSamples, sizeof(firstSamples));
+    AudioFormatInfo info = backtrack::parseAudioFormat(*packet.format);
+    expect(backtrack::audioFormatUsable(info), "largest PCM16 stride was rejected");
+    expect(backtrack::convertAudioPacketToCanonical(packet), "largest PCM16 stride could not be converted");
+    expect(packet.frameCount == 1 && packet.bytes.size() == 2 * sizeof(float),
+        "largest PCM16 stride produced the wrong output size");
+    expect(sampleAt(packet, 0, 0) == 0.5f && sampleAt(packet, 0, 1) == -0.5f,
+        "largest PCM16 stride produced the wrong samples");
+
+    info.bitsPerSample = 8;
+    info.channels = 65535;
+    info.blockAlign = 65535;
+    expect(backtrack::audioFormatUsable(info), "largest PCM8 stride was rejected");
 }
 
 void testUnsupportedFormatDropped() {
@@ -202,7 +390,7 @@ void testSurroundDownmixKeepsCenterAndDropsLfe() {
     constexpr uint32_t kFrames = 480;
     AudioPacket packet;
     packet.track = AudioTrack::System;
-    packet.format = floatExtensibleFormat(6, 48000);
+    packet.format = extensibleFormat(6, 48000, 32, kFloatSubFormat);
     packet.frameCount = kFrames;
     packet.bytes.resize(static_cast<size_t>(kFrames) * 6 * sizeof(float));
     constexpr float kFl = 0.25f;
@@ -269,8 +457,12 @@ void testMuteGainPrimitive() {
 int main() {
     try {
         testCanonicalPassthrough();
+        testPaddedStereoFloatIsRepacked();
+        testSupportedSampleWidths();
         testMonoPcm16ResampleAndDuplication();
         testFormatChangeMidStreamIsTransparent();
+        testInvalidFormatsAreRejected();
+        testLargestRepresentableStride();
         testUnsupportedFormatDropped();
         testSilenceStaysSilent();
         testSurroundDownmixKeepsCenterAndDropsLfe();

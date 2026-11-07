@@ -4,39 +4,37 @@
 
 Turning a recording into a playable file: the MP4 container write through
 Media Foundation's MPEG-4 sink writer, the WAV writer behind each audio track,
-and the crash recovery store that keeps a killed recording recoverable.
+the read-back of the mixed track the mux writes into the MP4, and the crash
+recovery store that keeps a killed recording recoverable.
 
 ## Ownership
 
-- Owns: `Mp4Muxer`, `RecoveryStore`, `WavWriter`,
-  `removeEmptyOutputReservation`.
+- Owns: `Mp4Muxer`, `RecoveryStore`, `WavWriter`, `WavReader` (the mux-side
+  read-back and its large-file extent recovery), `removeEmptyOutputReservation`.
 - Does not own: the audio mixing decision and the mux PCM target format
-  (`audio/AudioMix.h`), the output name reservation policy (that lives in
-  `RecorderController::nextClipPath`), or the replay buffer that feeds it.
+  (`audio/AudioMix.h`), the WAV parser itself (`audio/WavReader.h`), normal
+  output-name reservation (`clips/ClipStorage.h`, used by `RecorderController`),
+  or the replay buffer that feeds it.
 
 ## Local Contracts
 
-- Recording is two stages. `startRecording` opens the elementary video stream
-  and starts the incremental recovery manifest; each track's WAV opens lazily on
-  its first audio packet, because the writer's format comes from that packet.
-  `finalize` muxes into the MP4 and returns the published path, or `{}` with
-  `lastError()` set. `abort` gives up without publishing. `finalize` and
-  `ReplayBuffer::saveTo` share the `RecoveryStore::publishMuxedInputs` tail:
-  a mux failure keeps the temp directory only when the manifest was published;
-  a write failure, a recording with no video, or a mux failure with no
-  publishable manifest deletes it.
+- `startRecording` opens a video stream and incremental manifest; WAV tracks
+  open lazily on their first audio packet. `finalize` publishes an MP4 or
+  returns `{}` with `lastError()` set. write and mux failures retain the
+  session, including a usable incremental prefix when a rewrite fails; without
+  verifiable timing, the error points to the streams for manual recovery.
+  `abort` explicitly discards only an active recording. a recording with no
+  encoded video may be discarded.
 - Audio that arrives before the first video packet is held in `pendingAudio_`
   (at most 512 packets) and flushed when that packet anchors the timeline, so
   short recordings and pre-keyframe audio are not dropped.
-- Publishing is staged. The MP4 is written to
-  `<output dir>/.backtrack_tmp/<stem>.publish[.n].mp4`, flushed to disk, then
-  moved into place with `MOVEFILE_WRITE_THROUGH`, so a crash can never leave a
-  partial MP4 at the clip path. The publish is fail-if-exists: anything already
-  at the target that is not our own empty hidden reservation is never
-  overwritten. `stagingVariant` is zero-based and `muxToMp4WithRetry` owns the
-  rotation - it retries any failure up to four attempts with growing backoff,
-  rotating the variant only on `ERROR_SHARING_VIOLATION` /
-  `ERROR_LOCK_VIOLATION` (antivirus, indexer, Explorer preview).
+- `RecoveryStore::createUniqueDirectory` exclusively creates each recording or
+  replay session under `<output dir>/.backtrack_tmp/` and each MP4 staging
+  attempt inside its session. never reuse an existing directory. the staged
+  MP4 is flushed and moved with `MOVEFILE_WRITE_THROUGH`; the final move is
+  fail-if-exists except for an empty hidden name reservation. mux retries use a
+  bounded backoff and rotate the preferred staging variant for sharing or lock
+  violations.
 - Audio and video share one 100 ns timeline. `MFSampleExtension_DecodeTimestamp`
   is set only when some sample has a DTS differing from its PTS, and both tracks
   are measured from the same `timeBase` (the first sample's DTS, or its PTS when
@@ -48,8 +46,9 @@ and the crash recovery store that keeps a killed recording recoverable.
 - System and microphone audio are mixed into one PCM track by
   `buildMixedPcmAudio` and encoded as a single AAC stream. If that stream cannot
   be configured the save falls back to video-only rather than failing; if the
-  mix cannot be written (disk full) it does fail, because the source WAVs were
-  readable and the alternative is a silently truncated audio track.
+  mix cannot be written (disk full) or an expected source WAV cannot be read
+  back it does fail, because the alternative is a silently truncated or
+  audio-less track.
 - Incremental crash recovery is a contract, not an optimization:
   `appendManifestSampleLocked` appends one `sample` line to `recovery.tsv` per
   written packet and flushes at GOP boundaries, so the manifest is at most the
@@ -57,20 +56,12 @@ and the crash recovery store that keeps a killed recording recoverable.
   than that, which is what the end-of-stream trim in recovery exists for. An
   audio track registers itself in the manifest as soon as its WAV opens. Keep
   the GOP-boundary flush.
-- The manifest names elementary streams by bare file name and is resolved
-  relative to its own directory, so every stream must stay beside
-  `recovery.tsv` in the same `.backtrack_tmp/<stem>/` folder. `writeManifest`
-  publishes atomically through `recovery.tsv.tmp`; anything that truncates those
-  streams underneath it (the replay save path does, via
-  `RecoveryStore::clearStaleManifest`) must delete both files
-  first and republish a fresh manifest before muxing, or a stale table would
-  describe bytes that no longer exist. The publish retries a sharing, lock, or
-  access-denied violation on the same bounded budget as the staged MP4 (`publishWithRetry`),
-  because the manifest is already written and flushed when it runs and a
-  scanner holding `recovery.tsv` would otherwise cost a complete recording. A
-  `false` return therefore means a real write failure (full disk, denied or
-  vanished folder), not a lost race - callers may treat the directory as
-  unrecoverable and delete it, and must not report it to the user as preserved.
+- manifest streams live beside `recovery.tsv` and are resolved relative to it.
+  `writeManifest` atomically publishes through `recovery.tsv.tmp`, retrying
+  sharing, lock, and access-denied failures. a failed rewrite must not replace
+  or delete an incremental manifest. `preserveFailedRecording` validates its
+  prefix and only creates a manifest if none exists; it retains streams even
+  when timing cannot be verified.
 - A 7-column manifest carries no DTS-validity flag, so `hasDts` is inferred as
   `dts100ns != pts100ns` (their writers stored the presentation time whenever
   the decode time was invalid). Column 8 carries the explicit flag and wins.
@@ -79,18 +70,15 @@ and the crash recovery store that keeps a killed recording recoverable.
   tail keeps the valid prefix, and samples reaching past the end of the
   elementary stream are dropped. Every number must parse as a complete token, so
   a line torn mid-digits cannot become a plausible-but-wrong offset.
-- `recoverLatestFailedRecording` rebuilds exactly one clip: the newest valid
-  manifest under `<clip dir>/.backtrack_tmp/`, published to a claimed output
-  name (`<stem>.mp4`, then `<stem>_recovered.mp4`, then
-  `<stem>_recovered_<n>.mp4`). On success it deletes its directory; on failure it
-  keeps it for the manual "Recover Failed" action.
-- `RecoveryStore::sweepOrphanedRecoveryData` is startup maintenance: it first
-  gives the newest valid manifest a chance to become a clip, then deletes
-  entries under `.backtrack_tmp` (leftover session directories and stale
-  staging files) plus hidden zero-byte regular files in the clip directory,
-  all older than `maxAge` (24 h by default). It runs on a worker thread at
-  startup and must not race with new recordings; `RecorderController` serializes
-  it.
+- `recoverLatestFailedRecording` selects the newest valid manifest across the
+  `ClipStorage` roots and publishes to its original output root with an
+  exclusively claimed name. startup attempts every recoverable session once;
+  `RecorderController` serializes the sweep against saves and manual recovery.
+- recovery muxes from an exclusively created work directory, hard-linking or
+  copying inputs so mixed audio cannot overwrite legacy content. original
+  sessions and legacy ambiguous hidden reservations remain untouched. a completed
+  session gets an exclusive marker when possible; a missing or invalid marker
+  can cause a later duplicate recovery, never deletion of its streams.
 - Video PTS regression with no decode timestamps is warned about once, not
   corrected: the MP4 timeline cannot represent it, and the sample table is the
   honest record. A DTS that lands before `timeBase` is warned about and clamped
@@ -102,10 +90,9 @@ and the crash recovery store that keeps a killed recording recoverable.
   (window-bounded by the replay `[start, end]`):
   - A packet whose format differs from the WAV the writer opened is dropped, not
     appended. Appending wrong-rate bytes corrupts the timeline silently.
-  - A PTS gap is filled with silence, capped at 10 s per gap; past the cap the
-    pacing pointer resyncs to the incoming packet and the timeline is compressed
-    rather than inflated with hours of silence. Keep both sites on this rule;
-    they drifted once and the replay path had no cap at all.
+  - A PTS gap is filled with the full gap's silence so the saved audio keeps
+    the real gap duration; the timeline is never compressed, so post-outage
+    audio stays aligned with the unchanged video track.
   - A temporary-WAV write error fails the save: `finalize` reports it for a
     recording, `saveTo` returns it for a replay, rather than publishing
     truncated audio.
@@ -113,12 +100,20 @@ and the crash recovery store that keeps a killed recording recoverable.
   replay tracks, and the mixed PCM copy in `audio/AudioMix.cpp`. It patches the
   RIFF and data sizes on `close`, so a process killed before that leaves zeroed
   fields - `parseWav` recovers from that by falling back to the real file size.
-  Passing the 4 GiB RIFF limit truncates audio on purpose and is not a write
-  error, so long recordings still save.
-- `removeEmptyOutputReservation` deletes only a hidden, zero-byte regular file,
-  which is how a claimed clip name is distinguished from a user's own empty
-  `.mp4`. Real content is never removed. Any change here risks deleting user
-  data.
+  Writes past the 4 GiB RIFF boundary keep going (large-file internal audio) and
+  the header clamps both sizes to the uint32 maximum on `close`, so the data
+  chunk declares "runs to EOF". `parseWav` trusts the declared extent while it
+  is plausible and therefore caps such a file at the boundary; every reader that
+  must see the whole payload extends a data size field of uint32 maximum to the
+  real file size - `audio/AudioMix.cpp` for the mix sources and `parseMuxWav`
+  (`mux/WavReader.h`) for the mixed track the mux writes into the MP4. A smaller
+  declared data size means real trailing chunks and is never extended. The mux
+  reads the mixed track through `parseMuxWav`, and a mixed track that cannot be
+  read back fails the save instead of publishing a truncated or audio-less
+  track.
+- `removeEmptyOutputReservation` deletes only a hidden, zero-byte regular file
+  at a claimed output path. those attributes cannot prove identity if another
+  process replaces the reservation.
 - `MuxedInputs` (`mux/MuxedInputs.h`) is the shared hand-off shape between the muxer, the recovery
   store, and `audio/AudioMix.h`. Extending it means updating all three.
   `effectiveDts` / `hasEffectiveDts` (`mux/MuxedInputs.h`) is the one DTS-validity
@@ -128,12 +123,9 @@ and the crash recovery store that keeps a killed recording recoverable.
   (`coalesceVideoDuration100ns`, 60 s ceiling) both writers use. The `dts != pts` test stays where
   detection, not validity, is meant: the sink's `hasDecodeTimestamps` flag and
   the legacy-manifest `hasDts` inference in `RecoveryStore`.
-- `RecoveryStore::flushFileToDisk` is the one disk-flush helper, declared in
-  `RecoveryStore.h` and used by both publishes (the staged MP4 and the manifest).
-  It takes a `DWORD&` out-param so a sharing violation stays distinguishable from
-  a full disk or a denied write; the manifest publish logs that error, because
-  `writeManifest`'s `false` return tells its caller the directory is
-  unrecoverable and the Win32 reason is the only evidence of why.
+- `RecoveryStore::flushFileToDisk` flushes the staged MP4 and manifest; its
+  `DWORD&` reports the Win32 error. a failed manifest rewrite does not imply
+  that an earlier manifest is unusable.
 - `RecoveryStore::ensureFreeDiskSpace` is the one free-space preflight for both
   save paths (`Mp4Muxer::muxToMp4` with real file sizes, `ReplayBuffer::saveTo`
   with snapshot byte totals before writing streams).
@@ -151,14 +143,27 @@ and the crash recovery store that keeps a killed recording recoverable.
 
 ## Verification
 
+- `StorageLayoutTests` (CTest) covers nested recovery and collision
+  preservation: recovery muxes an owned work copy, so the original sessions and
+  their streams are retained, and a completed recovery is marked so the sweep
+  does not repeat it.
 - `ReplayBufferTests` (CTest) links the real `RecoveryStore.cpp` and
   `WavWriter.cpp` and stubs `Mp4Muxer::muxToMp4` at link time. It covers the
   manifest round trip and its atomic publish, the end-of-stream tail trim, a
   torn final line, a non-contiguous tail, a declared-count shortfall, rejection
-  of damaged metadata, and a WAV whose header was never patched.
-- `Mp4Muxer.cpp` has no unit test by design (it pulls in Media Foundation);
-  verify it by recording and saving a replay, then confirm
-  `recoverLatestFailedRecording` rebuilds a clip from a killed session.
+  of damaged metadata, a WAV whose header was never patched, and that a PTS gap
+  keeps its full duration in the saved replay audio.
+- `AudioPersistenceTests` (CTest) covers `paceAudioPacket`'s full-gap fill (a
+  long outage keeps its duration on the saved timeline) and `WavWriter` keeping
+  writes past the 4 GiB RIFF boundary.
+- `Mp4MuxerTests` (CTest, the only Media Foundation-linked suite) covers
+  recording write-failure retention, inactive abort, same-name retry, and the
+  mux WAV extent (`parseMuxWav`): a clamped data size keeps the payload past the
+  RIFF boundary with the frame count and duration covering it, while a
+  well-formed extent and a real trailing chunk are left alone. The MP4 write
+  itself (that the trailing audio lands in the track) still needs a hand check,
+  together with recording and replay publication and recovery of a killed
+  session in the app.
 
 ## Child DOX Index
 

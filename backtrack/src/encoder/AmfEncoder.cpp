@@ -12,6 +12,7 @@
 #include <chrono>
 #include <deque>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -218,40 +219,20 @@ struct AmfEncoder::Impl {
 
     std::deque<PendingInput> inFlight;
     std::deque<EncodedPacket> readyPackets;
-    // Each inFlight entry pins a capture texture lease plus an AMF surface
-    // wrapper until its output packet is harvested. If QueryOutput starves,
-    // unbounded growth would pin every capture pool slot and stall capture
-    // itself. The floor covers low-latency profiles; lookahead legitimately
-    // keeps roughly its configured depth of inputs unharvested, so the cap
-    // scales with it instead of shedding frames during normal fill.
+    // Bound pinned capture leases, with headroom for the actual B-frame pattern.
     static constexpr size_t kMinInFlightCap = 16;
-    // Hard lifetime for an accepted-but-unharvested frame. This backend has
-    // no B-frame reordering and pre-analysis does not delay outputs, so a
-    // healthy encoder drains every input within a few frame intervals. An
-    // input older than this bound means the driver stopped producing output;
-    // escalate to an encoder fault instead of querying a dead component
-    // forever and pinning capture leases.
     static constexpr auto kInFlightMaxAge = kEncoderInFlightMaxAge;
     uint64_t inFlightDropCount = 0;
+    uint32_t bFrameDelayFrames = 0;
+    bool bFramesUnavailable = false;
+    bool preAnalysisUnavailable = false;
 
     size_t inFlightCap() const {
-        if (!caps.effective.lookahead) {
-            return kMinInFlightCap;
-        }
-        return std::max<size_t>(
-            kMinInFlightCap,
-            static_cast<size_t>(caps.effective.lookaheadDepth) + 8);
+        return std::max<size_t>(kMinInFlightCap, static_cast<size_t>(bFrameDelayFrames) + 8);
     }
 
-    // Total pipeline depth between accepting an input and emitting its
-    // output: B-frame reordering (B_PIC_PATTERN 2) plus configured lookahead.
-    // DecodeOrderTimestamps must warm up with this so its pending queue
-    // settles at exactly this size; a smaller value makes every output look
-    // like a swallowed frame once the pipeline fills, tripping the desync
-    // watchdog on each output.
     uint32_t reorderDelayFrames() const {
-        return (caps.effective.bFrames ? 2u : 0u) +
-               (caps.effective.lookahead ? caps.effective.lookaheadDepth : 0u);
+        return bFrameDelayFrames;
     }
     DecodeOrderTimestamps decodeTimestamps;
 
@@ -306,6 +287,43 @@ struct AmfEncoder::Impl {
             return false;
         }
         return value.ToInt64() == expected;
+    }
+
+    bool confirmPreAnalysisDisabled(const wchar_t* name, bool disabled) {
+        amf::AMFVariant value;
+        if (encoder->GetProperty(name, &value) == AMF_OK &&
+            (value.type == amf::AMF_VARIANT_BOOL || value.type == amf::AMF_VARIANT_INT64)) {
+            if (!value.ToBool()) {
+                return true;
+            }
+        } else if (disabled || preAnalysisUnavailable) {
+            // Unsupported hardware and the SDK default both leave pre-analysis off.
+            return true;
+        }
+        caps.detail = L"AMF pre-analysis could not be disabled or verified";
+        return false;
+    }
+
+    bool establishAvcBFrameDelay(bool requested, bool applied) {
+        amf::AMFVariant value;
+        if (encoder->GetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, &value) == AMF_OK &&
+            value.type == amf::AMF_VARIANT_INT64) {
+            const int64_t pattern = value.ToInt64();
+            if (pattern < 0 || static_cast<uint64_t>(pattern) > (std::numeric_limits<uint32_t>::max)()) {
+                caps.detail = L"AMF returned an invalid B-frame pattern";
+                return false;
+            }
+            bFrameDelayFrames = static_cast<uint32_t>(pattern);
+            return true;
+        }
+        // If readback is unavailable, do not retain an unverified B-frame request.
+        bFrameDelayFrames = 0;
+        if ((!requested && applied) || bFramesUnavailable ||
+            setProp(encoder, AMF_VIDEO_ENCODER_B_PIC_PATTERN, amf::AMFVariant(static_cast<amf_int64>(0)))) {
+            return true;
+        }
+        caps.detail = L"AMF B-frame pattern could not be disabled or verified";
+        return false;
     }
 
     bool verifyRateProperty(const wchar_t* name, const AMFRate& expected) const {
@@ -463,14 +481,21 @@ struct AmfEncoder::Impl {
         caps.backendName = L"AMF";
         caps.h264 = true;
         caps.hevc = true;
+        caps.bFrames = false;
+        caps.multipleReferenceFrames = false;
+        caps.lookahead = false;
+        bFramesUnavailable = false;
+        preAnalysisUnavailable = false;
 
         amf::AMFCapsPtr encoderCaps;
         if (encoder && encoder->GetCaps(&encoderCaps) == AMF_OK && encoderCaps) {
             const wchar_t* bframeCap = isHevc() ? nullptr : AMF_VIDEO_ENCODER_CAP_BFRAMES;
             if (bframeCap) {
                 amf::AMFVariant value;
-                if (encoderCaps->GetProperty(bframeCap, &value) == AMF_OK) {
+                if (encoderCaps->GetProperty(bframeCap, &value) == AMF_OK &&
+                    (value.type == amf::AMF_VARIANT_BOOL || value.type == amf::AMF_VARIANT_INT64)) {
                     caps.bFrames = value.ToBool();
+                    bFramesUnavailable = !caps.bFrames;
                 }
             }
             const wchar_t* maxRefCap = isHevc()
@@ -484,8 +509,9 @@ struct AmfEncoder::Impl {
                 ? AMF_VIDEO_ENCODER_HEVC_CAP_PRE_ANALYSIS
                 : AMF_VIDEO_ENCODER_CAP_PRE_ANALYSIS;
             amf::AMFVariant paValue;
-            if (encoderCaps->GetProperty(paCap, &paValue) == AMF_OK) {
-                caps.lookahead = paValue.ToBool();
+            if (encoderCaps->GetProperty(paCap, &paValue) == AMF_OK &&
+                (paValue.type == amf::AMF_VARIANT_BOOL || paValue.type == amf::AMF_VARIANT_INT64)) {
+                preAnalysisUnavailable = !paValue.ToBool();
             }
 
             amf::AMFIOCapsPtr inputCaps;
@@ -536,8 +562,10 @@ struct AmfEncoder::Impl {
 
         // B-frames reorder output; keep them off when zero-latency/idle coalescing is desired.
         const bool useBFrames = effective.bFrames && caps.bFrames && !effective.zeroReorderDelay;
-        setProp(encoder, AMF_VIDEO_ENCODER_B_PIC_PATTERN,
+        const bool bPatternApplied = setProp(encoder, AMF_VIDEO_ENCODER_B_PIC_PATTERN,
                 amf::AMFVariant(static_cast<amf_int64>(useBFrames ? 2 : 0)));
+        const bool preAnalysisDisabled = setProp(encoder, AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE,
+                amf::AMFVariant(false));
 
         applyColorProperties(true);
 
@@ -574,18 +602,18 @@ struct AmfEncoder::Impl {
         }
         setProp(encoder, AMF_VIDEO_ENCODER_ENABLE_VBAQ, amf::AMFVariant(effective.spatialAQ));
 
-        if (effective.lookahead && caps.lookahead) {
-            setProp(encoder, AMF_VIDEO_ENCODER_PREENCODE_ENABLE,
-                    amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_PREENCODE_ENABLED)));
-        }
         const uint32_t refFrames = caps.multipleReferenceFrames
             ? std::clamp<uint32_t>(effective.referenceFrames, 1, 4)
             : 1;
         setProp(encoder, AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, amf::AMFVariant(static_cast<amf_int64>(refFrames)));
+        if (!establishAvcBFrameDelay(useBFrames, bPatternApplied) ||
+            !confirmPreAnalysisDisabled(AMF_VIDEO_ENCODER_PRE_ANALYSIS_ENABLE, preAnalysisDisabled)) {
+            return false;
+        }
 
         caps.effective = effective;
-        caps.effective.bFrames = useBFrames;
-        caps.effective.zeroReorderDelay = !useBFrames;
+        caps.effective.bFrames = bFrameDelayFrames != 0;
+        caps.effective.zeroReorderDelay = bFrameDelayFrames == 0;
         // This backend does not configure the features below; report them as
         // off instead of echoing requested-but-ignored settings.
         caps.effective.temporalAQ = false;
@@ -595,10 +623,8 @@ struct AmfEncoder::Impl {
         if (!caps.multipleReferenceFrames) {
             caps.effective.referenceFrames = 1;
         }
-        if (!caps.lookahead) {
-            caps.effective.lookahead = false;
-            caps.effective.lookaheadDepth = 0;
-        }
+        caps.effective.lookahead = false;
+        caps.effective.lookaheadDepth = 0;
         return true;
     }
 
@@ -622,6 +648,8 @@ struct AmfEncoder::Impl {
         // VPS/SPS/PPS on every IDR for clean mid-session mux starts.
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE,
                 amf::AMFVariant(static_cast<amf_int64>(AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED)));
+        const bool preAnalysisDisabled = setProp(encoder, AMF_VIDEO_ENCODER_HEVC_PRE_ANALYSIS_ENABLE,
+                amf::AMFVariant(false));
 
         applyColorProperties(true);
 
@@ -649,14 +677,15 @@ struct AmfEncoder::Impl {
             return false;
         }
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_ENABLE_VBAQ, amf::AMFVariant(effective.spatialAQ));
-        if (effective.lookahead && caps.lookahead) {
-            setProp(encoder, AMF_VIDEO_ENCODER_HEVC_PREENCODE_ENABLE, amf::AMFVariant(true));
-        }
         const uint32_t refFrames = caps.multipleReferenceFrames
             ? std::clamp<uint32_t>(effective.referenceFrames, 1, 4)
             : 1;
         setProp(encoder, AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES,
                 amf::AMFVariant(static_cast<amf_int64>(refFrames)));
+        if (!confirmPreAnalysisDisabled(AMF_VIDEO_ENCODER_HEVC_PRE_ANALYSIS_ENABLE, preAnalysisDisabled)) {
+            return false;
+        }
+        bFrameDelayFrames = 0;
 
         caps.effective = effective;
         caps.effective.bFrames = false; // AMF HEVC has no B-frame pattern control here.
@@ -670,11 +699,23 @@ struct AmfEncoder::Impl {
         if (!caps.multipleReferenceFrames) {
             caps.effective.referenceFrames = 1;
         }
-        if (!caps.lookahead) {
-            caps.effective.lookahead = false;
-            caps.effective.lookaheadDepth = 0;
-        }
+        caps.effective.lookahead = false;
+        caps.effective.lookaheadDepth = 0;
         return true;
+    }
+
+    void updateActiveDetail(const EncoderEffectiveSettings& requested) {
+        caps.detail = std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
+                      L" Direct3D 11 session active";
+        if (requested.lookahead) {
+            caps.detail += L"; lookahead is unsupported by the AMF backend";
+        }
+        if (requested.bFrames && !requested.zeroReorderDelay && !caps.effective.bFrames) {
+            caps.detail += L"; B-frames are unavailable";
+        }
+        if (requested.lookahead || (requested.bFrames && !requested.zeroReorderDelay && !caps.effective.bFrames)) {
+            Logger::instance().warning(L"encoder", caps.detail);
+        }
     }
 
     bool initializeEncoder(ID3D11Device* device, const std::wstring& adapterName) {
@@ -721,14 +762,12 @@ struct AmfEncoder::Impl {
         // sets at harvest time.
         verifyHeaderInsertionSettings();
 
-        // Outputs lag accepted inputs by the full reorder pipeline depth
-        // (B-frames plus lookahead); see reorderDelayFrames().
+        // Use the pattern established on the initialized component.
         decodeTimestamps.reset(reorderDelayFrames());
         cachedParameterSets.clear();
 
         caps.available = true;
-        caps.detail = std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
-                      L" Direct3D 11 session active";
+        updateActiveDetail(effective);
         publishAvailability(true);
 
         Logger::instance().info(L"encoder",
@@ -788,6 +827,7 @@ struct AmfEncoder::Impl {
         if (!factory || !context) {
             return false;
         }
+        const bool previouslyZeroReorder = caps.effective.zeroReorderDelay;
         Logger::instance().warning(L"encoder",
             std::wstring(L"AMF encoder input format changed to ") +
             (format == amf::AMF_SURFACE_NV12 ? L"NV12" : L"BGRA") +
@@ -796,7 +836,9 @@ struct AmfEncoder::Impl {
         // dropped with it; readyPackets stay queued across the re-creation.
         // Only inputs the old component never produced output for are released
         // (their surfaces and capture leases) below.
-        harvestOutputs(false);
+        if (!harvestOutputs(false)) {
+            return false;
+        }
         inFlight.clear();
         encoder->Terminate();
         encoder = nullptr;
@@ -819,9 +861,14 @@ struct AmfEncoder::Impl {
                 std::wstring(L"AMF re-initialization after input-format change failed: ") + caps.detail);
             return false;
         }
+        // The capture loop caches this flag until the pipeline is recreated.
+        if (previouslyZeroReorder && !caps.effective.zeroReorderDelay) {
+            return fail(L"AMF input-format change enabled B-frames; encoder faulted so the capture pipeline can recreate it");
+        }
 
         decodeTimestamps.reset(reorderDelayFrames());
         cachedParameterSets.clear();
+        updateActiveDetail(effective);
         consecutiveSubmitFailures = 0;
         forceKeyFrame = true;
         return true;
@@ -996,6 +1043,9 @@ struct AmfEncoder::Impl {
             frame.format == DXGI_FORMAT_NV12 ? amf::AMF_SURFACE_NV12 : amf::AMF_SURFACE_BGRA;
         if (wantedFormat != inputSurfaceFormat) {
             if (!switchInputFormat(wantedFormat)) {
+                if (encoderFaulted) {
+                    return false;
+                }
                 return fail(L"AMF encoder could not follow the capture input-format change; "
                             L"encoder faulted so the capture pipeline can recreate it");
             }
@@ -1293,10 +1343,9 @@ void AmfEncoder::requestKeyFrame() {
     impl_->forceKeyFrame = true;
 }
 
-void AmfEncoder::resetInputResources() {
-    // AMF wraps a fresh AMFSurface around each input texture, so there is no
-    // cached per-texture registration to release (unlike NVENC). The in-flight
-    // surface queue is cleared on drain/shutdown.
+bool AmfEncoder::resetInputResources() {
+    // AMF holds owned scaler outputs, not capture-source frames or registrations.
+    return true;
 }
 
 bool AmfEncoder::encodeFrame(const GpuFrame& frame, EncodedPacket& packet) {

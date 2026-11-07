@@ -56,7 +56,7 @@ bool WavWriter::open(const std::filesystem::path& path, const WaveFormatBlob& fo
     blockAlign_ = 0;
     samplesPerSec_ = 0;
     format_ = WaveFormatBlob{};
-    sizeLimitLogged_ = false;
+    riffBoundaryLogged_ = false;
     const WaveFormatBlob effectiveFormat = format.bytes.empty() ? fallbackPcmFormat() : format;
     if (effectiveFormat.bytes.size() < sizeof(WAVEFORMATEX)) {
         Logger::instance().warning(L"mux", L"Rejected WAV stream with invalid format metadata: " + path_.wstring());
@@ -92,36 +92,24 @@ bool WavWriter::write(const uint8_t* data, size_t size) {
     if (!data || size == 0) {
         return true;
     }
-    uint64_t bytesToWrite = size;
-    if (maxDataBytes_ > 0) {
-        if (dataBytes_ >= maxDataBytes_) {
-            if (!sizeLimitLogged_) {
-                Logger::instance().warning(L"mux", L"WAV stream reached the RIFF size limit; dropping additional audio: " + path_.wstring());
-                sizeLimitLogged_ = true;
-            }
-            // Deliberate cap, not a write error: audio past the 4 GiB RIFF
-            // boundary is dropped by design so long recordings still save.
-            return true;
-        }
-        uint64_t remaining = maxDataBytes_ - dataBytes_;
-        if (blockAlign_ > 0) {
-            remaining -= remaining % blockAlign_;
-        }
-        bytesToWrite = std::min<uint64_t>(bytesToWrite, remaining);
-        if (bytesToWrite < size && !sizeLimitLogged_) {
-            Logger::instance().warning(L"mux", L"WAV stream reached the RIFF size limit; truncating audio: " + path_.wstring());
-            sizeLimitLogged_ = true;
-        }
-    }
-    if (bytesToWrite == 0 || bytesToWrite > static_cast<uint64_t>((std::numeric_limits<std::streamsize>::max)())) {
+    if (size > static_cast<size_t>((std::numeric_limits<std::streamsize>::max)())) {
         return true;
     }
-    stream_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytesToWrite));
+    if (maxDataBytes_ > 0 && !riffBoundaryLogged_ && dataBytes_ + size > maxDataBytes_) {
+        // Large-file form: writes keep going past the 4 GiB RIFF boundary and
+        // the header clamps to the uint32 maximum on close (data runs to EOF).
+        // parseWav and the mix reader recover the extent from the real file
+        // size, so long recordings are not truncated on purpose anymore.
+        riffBoundaryLogged_ = true;
+        Logger::instance().warning(L"mux",
+            L"WAV stream crossed the 4 GiB RIFF boundary; audio continues with a clamped header: " + path_.wstring());
+    }
+    stream_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
     if (!stream_) {
         Logger::instance().error(L"mux", L"Could not write WAV audio data: " + path_.wstring());
         return false;
     }
-    dataBytes_ += bytesToWrite;
+    dataBytes_ += size;
     return true;
 }
 
@@ -139,10 +127,7 @@ bool WavWriter::writeSilenceFrames(uint64_t frames) {
     std::vector<uint8_t> silence(alignedChunkBytes, 0);
     const uint64_t maxFrames = (std::numeric_limits<uint64_t>::max)() / blockAlign_;
     uint64_t bytesRemaining = std::min<uint64_t>(frames, maxFrames) * blockAlign_;
-    while (bytesRemaining > 0 && (maxDataBytes_ == 0 || dataBytes_ < maxDataBytes_)) {
-        if (maxDataBytes_ > 0 && maxDataBytes_ - dataBytes_ < blockAlign_) {
-            break;
-        }
+    while (bytesRemaining > 0) {
         uint64_t bytesThisChunk = std::min<uint64_t>(bytesRemaining, silence.size());
         bytesThisChunk -= bytesThisChunk % blockAlign_;
         if (bytesThisChunk == 0) {
@@ -174,7 +159,7 @@ void WavWriter::reset() {
     maxDataBytes_ = 0;
     blockAlign_ = 0;
     samplesPerSec_ = 0;
-    sizeLimitLogged_ = false;
+    riffBoundaryLogged_ = false;
 }
 
 void WavWriter::writeHeader(const WaveFormatBlob& format) {

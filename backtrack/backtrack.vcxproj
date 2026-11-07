@@ -168,6 +168,17 @@
     </ClCompile>
   </ItemDefinitionGroup>
 
+  <!-- Two sources can share a file name (src\audio\WavReader.cpp and
+       src\mux\WavReader.cpp). The default $(IntDir)%(Filename).obj would make
+       them overwrite each other and drop one translation unit, so keep the
+       source folder in the object path. CMake emits the same per-file
+       ObjectFileName for duplicates. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <ObjectFileName>$(IntDir)%(RelativeDir)%(Filename).obj</ObjectFileName>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
   <ItemGroup>
     <!-- RnnoiseDenoiser.cpp is also matched by the src\**\*.cpp wildcard, so the
          wildcard must exclude it; the explicit entry below is the one that

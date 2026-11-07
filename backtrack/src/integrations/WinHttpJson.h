@@ -1,14 +1,19 @@
 #pragma once
 
-// Shared WinHTTP GET + tiny JSON reader for the GitHub update check (ui) and
-// the League live-client poll (integrations). One capped reader and one
-// \u-safe string parser instead of a diverging copy per caller.
+// shared WinHTTP GET and JSON string reader for the update check and League.
 #include <Windows.h>
 #include <winhttp.h>
 
 #include "core/Logger.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -45,6 +50,22 @@ struct InternetHandle {
 
     explicit operator bool() const {
         return value != nullptr;
+    }
+};
+
+struct AsyncHttpHandles {
+    InternetHandle session;
+    InternetHandle connection;
+};
+
+struct CancellableHttpSession {
+    std::shared_ptr<AsyncHttpHandles> handles;
+    const std::atomic<bool>* stopRequested = nullptr;
+    std::chrono::milliseconds timeout{5000};
+    bool secure = true;
+
+    operator HINTERNET() const {
+        return handles ? handles->session.value : nullptr;
     }
 };
 
@@ -171,9 +192,118 @@ inline std::optional<std::wstring> jsonStringField(std::string_view object, std:
     return parseJsonStringAt(object, pos);
 }
 
-// GETs path over an already-open session and connection: status-checked,
-// size-capped, and logged per stage. extraHeaders may be null; ignoreCert is
-// for the self-signed local game endpoint only, never for internet hosts.
+struct AsyncHttpRequestState {
+    std::shared_ptr<AsyncHttpHandles> handles;
+    std::array<char, 8192> buffer{};
+    std::mutex mutex;
+    std::condition_variable completed;
+    DWORD status = 0;
+    DWORD bytesRead = 0;
+};
+
+inline void CALLBACK httpRequestCallback(HINTERNET, DWORD_PTR context, DWORD status, void*, DWORD length) {
+    auto* owner = reinterpret_cast<std::shared_ptr<AsyncHttpRequestState>*>(context);
+    if (!owner) return;
+    if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) {
+        delete owner;
+        return;
+    }
+    if (status != WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE &&
+        status != WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE &&
+        status != WINHTTP_CALLBACK_STATUS_READ_COMPLETE &&
+        status != WINHTTP_CALLBACK_STATUS_REQUEST_ERROR) return;
+    auto state = *owner;
+    {
+        std::scoped_lock lock(state->mutex);
+        state->status = status;
+        state->bytesRead = length;
+    }
+    state->completed.notify_one();
+}
+
+// request storage and parents outlive cancellation until WinHTTP's final callback.
+inline std::optional<std::string> httpGetBody(
+    const CancellableHttpSession& session, HINTERNET connection, const wchar_t* path,
+    const wchar_t* extraHeaders, bool ignoreCert, const wchar_t* logSubsystem) {
+    const auto deadline = std::chrono::steady_clock::now() + session.timeout;
+    if (!session.handles || !session.handles->session || !connection ||
+        session.handles->connection.value != connection || !path) return std::nullopt;
+
+    auto state = std::make_shared<AsyncHttpRequestState>();
+    state->handles = session.handles;
+    InternetHandle request(WinHttpOpenRequest(connection, L"GET", path, nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, session.secure ? WINHTTP_FLAG_SECURE : 0));
+    if (!request) {
+        Logger::instance().debug(logSubsystem, L"HTTP GET request open failed");
+        return std::nullopt;
+    }
+
+    auto owner = std::make_unique<std::shared_ptr<AsyncHttpRequestState>>(state);
+    DWORD_PTR context = reinterpret_cast<DWORD_PTR>(owner.get());
+    if (!WinHttpSetOption(request.value, WINHTTP_OPTION_CONTEXT_VALUE, &context, sizeof(context)) ||
+        WinHttpSetStatusCallback(request.value, httpRequestCallback,
+            WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_HANDLES, 0) == WINHTTP_INVALID_STATUS_CALLBACK) {
+        Logger::instance().debug(logSubsystem, L"HTTP GET callback setup failed");
+        return std::nullopt;
+    }
+    owner.release();
+
+    if (ignoreCert && session.secure) {
+        DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+            SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+        WinHttpSetOption(request.value, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+    }
+
+    auto cancelled = [&] {
+        return (session.stopRequested && session.stopRequested->load(std::memory_order_acquire)) ||
+            std::chrono::steady_clock::now() >= deadline;
+    };
+    auto waitFor = [&](DWORD expected) {
+        std::unique_lock lock(state->mutex);
+        while (!state->status && !cancelled()) {
+            const auto wake = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+            state->completed.wait_until(lock, (std::min)(wake, deadline));
+        }
+        const bool ok = !cancelled() && state->status == expected;
+        state->status = 0;
+        return ok;
+    };
+
+    if (cancelled() || !WinHttpSendRequest(request.value,
+            extraHeaders ? extraHeaders : WINHTTP_NO_ADDITIONAL_HEADERS,
+            extraHeaders ? static_cast<DWORD>(-1) : 0, WINHTTP_NO_REQUEST_DATA, 0, 0, context) ||
+        !waitFor(WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE) ||
+        !WinHttpReceiveResponse(request.value, nullptr) ||
+        !waitFor(WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE)) {
+        Logger::instance().debug(logSubsystem, L"HTTP GET send/receive failed or cancelled");
+        return std::nullopt;
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusCodeSize = sizeof(statusCode);
+    if (!WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
+        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status");
+        return std::nullopt;
+    }
+
+    std::string body;
+    for (;;) {
+        if (cancelled() || !WinHttpReadData(request.value, state->buffer.data(),
+                static_cast<DWORD>(state->buffer.size()), nullptr) ||
+            !waitFor(WINHTTP_CALLBACK_STATUS_READ_COMPLETE)) return std::nullopt;
+        const DWORD read = state->bytesRead;
+        if (!read) return body;
+        if (read > kMaxHttpResponseBytes - body.size()) {
+            Logger::instance().warning(logSubsystem, L"HTTP GET body exceeds the 4 MiB cap; refusing");
+            return std::nullopt;
+        }
+        body.append(state->buffer.data(), read);
+    }
+}
+
+// shortcut: synchronous sessions cannot be actively cancelled; migrate the
+// update check to an async session before relying on a total deadline.
 inline std::optional<std::string> httpGetBody(
     HINTERNET session, HINTERNET connection, const wchar_t* path,
     const wchar_t* extraHeaders, bool ignoreCert, const wchar_t* logSubsystem) {

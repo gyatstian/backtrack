@@ -10,27 +10,40 @@ namespace backtrack {
 template <typename T>
 class SpscQueue {
 public:
+    // The ring storage is fixed for the queue's lifetime at this capacity;
+    // resetCapacity only ever lowers an atomic logical limit, so metadata
+    // observers (size()/capacity()) never race a backing-store reassignment.
     explicit SpscQueue(size_t capacity)
-        : buffer_(std::max<size_t>(capacity, 1) + 1) {
+        : buffer_(std::max<size_t>(capacity, 1) + 1),
+          capacity_(std::max<size_t>(capacity, 1)) {
     }
 
-    // Safe only when producer and consumer are stopped (no concurrent push/pop).
+    // Changes only the logical limit (clamped to the fixed storage) and never
+    // touches the backing vector, so size()/capacity() stay safe to call from
+    // any thread, even while this runs (the UI diagnostics timer reads the
+    // queue depth during a pipeline restart). Still legal only when producer
+    // and consumer are stopped (no concurrent push/pop).
     void resetCapacity(size_t capacity) {
         clear();
-        buffer_.assign(std::max<size_t>(capacity, 1) + 1, T{});
+        capacity_.store(std::min(std::max<size_t>(capacity, 1), buffer_.size() - 1),
+                        std::memory_order_relaxed);
         head_.store(0, std::memory_order_relaxed);
         tail_.store(0, std::memory_order_relaxed);
     }
 
     bool tryPush(T&& item) {
         const auto head = head_.load(std::memory_order_relaxed);
-        const auto next = increment(head);
-        if (next == tail_.load(std::memory_order_acquire)) {
+        const auto tail = tail_.load(std::memory_order_acquire);
+        // Enforce the logical limit against the fixed ring. The producer only
+        // advances head_, so a stale tail can only overestimate the count and
+        // never admits more than capacity() items.
+        const auto count = head >= tail ? head - tail : buffer_.size() - tail + head;
+        if (count >= capacity_.load(std::memory_order_relaxed)) {
             return false;
         }
 
         buffer_[head] = std::move(item);
-        head_.store(next, std::memory_order_release);
+        head_.store(increment(head), std::memory_order_release);
         return true;
     }
 
@@ -60,7 +73,7 @@ public:
     }
 
     size_t capacity() const {
-        return buffer_.empty() ? 0 : buffer_.size() - 1;
+        return capacity_.load(std::memory_order_relaxed);
     }
 
     void clear() {
@@ -77,6 +90,9 @@ private:
     std::vector<T> buffer_;
     alignas(64) std::atomic<size_t> head_{0};
     alignas(64) std::atomic<size_t> tail_{0};
+    // Logical item limit (<= buffer_.size() - 1). Only resetCapacity writes it
+    // (with both ends stopped); size()/capacity() read it lock-free.
+    alignas(64) std::atomic<size_t> capacity_{0};
 };
 
 } // namespace backtrack

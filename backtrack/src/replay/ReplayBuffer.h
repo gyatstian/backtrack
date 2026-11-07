@@ -44,10 +44,10 @@ public:
     void clear();
     size_t videoPacketCount() const;
     size_t videoKeyFrameCount() const;
-    // Duration (100ns) of muxable video currently buffered, from the first
-    // buffered keyframe to the newest packet end. 0 when empty or keyframe-less.
+    // Duration (100ns) from the cut keyframe to the latest retained
+    // presentation end. 0 when empty or keyframe-less.
     int64_t videoSpan100ns() const;
-    // PTS (100ns) of the newest buffered video packet, or 0 when empty. Lets a
+    // PTS (100ns) of the last decode-order video packet, or 0 when empty. Lets a
     // caller (saveReplay) detect a buffer whose content stopped advancing from
     // a stalled capture/encode pipeline; PTS-age trim alone cannot (heartbeats
     // keep emitting with advancing timestamps while the pipeline is idle).
@@ -57,10 +57,8 @@ public:
     // by its own lock rather than mutex_: queueing behind an in-flight ring
     // write on the encode thread would make the status text itself stutter.
     std::wstring storageFallbackReason() const;
-    // Startup maintenance: deletes a leftover ring folder from a killed session.
-    // Nothing else reclaims it - the recovery sweep only walks the clip
-    // library's .backtrack_tmp, and a ring file is pre-sized to the full
-    // capacity (up to 16 GiB). Only safe when no ring is open in this process.
+    // Legacy rings have no reliable ownership marker; startup preserves them.
+    // Newly created ring files are deleted by the OS when their handles close.
     static void removeOrphanedRing(const std::filesystem::path& storageDirectory);
 
 private:
@@ -142,8 +140,8 @@ private:
     bool ensureRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size);
     void freeRingSpaceLocked(uint64_t bytesNeeded);
     void freeAudioRingSpaceLocked(uint64_t bytesNeeded);
-    // Per-track space policy for the audio ring: waits on the save pin or
-    // evicts via freeAudioRingSpaceLocked (oldest-first).
+    // Audio ring space policy: waits on the save pin or evicts the physical
+    // prefix via freeAudioRingSpaceLocked.
     bool ensureAudioRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size);
     static int64_t diskAudioPacketEndPts100ns(const DiskAudioPacket& packet);
     // Caller must have secured space via the audio ring's ensureSpace; appends
@@ -235,11 +233,9 @@ private:
 
     // --- disk-backed audio backend (independent of the video backend) ---
     AudioBackend audioBackend_ = AudioBackend::Ram;
-    // Byte store for the audio ring; eviction is plain oldest-first across
-    // both tracks (freeAudioRingSpaceLocked), since audio has no keyframes.
+    // One queue matches the physical append order across both audio tracks.
     RingFile audioRing_;
-    std::deque<DiskAudioPacket> diskSystemAudio_;
-    std::deque<DiskAudioPacket> diskMicrophoneAudio_;
+    std::deque<DiskAudioPacket> diskAudio_;
     bool audioRingPendingClose_ = false;
 };
 

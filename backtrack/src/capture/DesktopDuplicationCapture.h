@@ -13,6 +13,46 @@
 
 namespace backtrack {
 
+// CPU-side pointer state carried across a capture-source rebuild on the same
+// output. DXGI reports the pointer shape only when it changes, so a fresh
+// duplication would composite no cursor until the next pointer update - a
+// visible blink on every pipeline recreate. The D3D resources are per-device
+// and are rebuilt on the new device.
+struct DesktopDuplicationCursorSnapshot {
+    std::vector<uint8_t> shapeBuffer;
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO shapeInfo{};
+    POINT position{};
+    bool visible = false;
+};
+
+struct DesktopDuplicationCursorCarry {
+    HMONITOR monitor = nullptr;
+    DesktopDuplicationCursorSnapshot snapshot;
+    bool valid = false;
+
+    // Only the same output keeps the last pointer state. A different target,
+    // or a cleared entry after device loss, must not draw a stale cursor.
+    bool restore(HMONITOR output, DesktopDuplicationCursorSnapshot& out) const {
+        if (!valid || output == nullptr || output != monitor) {
+            return false;
+        }
+        out = snapshot;
+        return true;
+    }
+
+    void store(HMONITOR output, const DesktopDuplicationCursorSnapshot& in) {
+        monitor = output;
+        snapshot = in;
+        valid = output != nullptr;
+    }
+
+    void clear() {
+        monitor = nullptr;
+        snapshot = {};
+        valid = false;
+    }
+};
+
 class DesktopDuplicationCapture final : public ICaptureSource {
 public:
     bool initialize(D3DDevice& device, const AppSettings& settings, const CaptureTarget& target) override;
@@ -25,9 +65,7 @@ public:
     uint64_t cursorOnlyFrames() const override { return cursorOnlyFrames_; }
     uint64_t resolutionChangeCount() const override { return resolutionChanges_; }
     uint64_t hdrChangeCount() const { return hdrChangeCount_; }
-    bool hdrActive() const { return hdrPin_.pinnedHdr(); }
-    bool hdrPinned() const override { return hdrPin_.pinnedHdr(); }
-    uint64_t hdrBridgedFrames() const override { return bridgedFrames_; }
+    bool hdrActive() const { return !pool_.empty() && isHdrCaptureFormat(format_); }
     void setCursorCaptureEnabled(bool enabled) override { captureCursor_ = enabled; }
 
 private:
@@ -38,22 +76,61 @@ private:
 
     bool createTexturePool(uint32_t width, uint32_t height, DXGI_FORMAT format, uint32_t poolSize);
     bool queryAdvancedColor();
-    void applyHdrUpgrade();
     void markLost(const wchar_t* reason, HRESULT hr);
     void releaseHeldFrame();
     void logAcquireFailureOnce(const wchar_t* reason, HRESULT hr);
 
     bool ensureCompositor();
-    // SDR->scRGB bridge for a pinned HDR session: stages the SDR surface and
-    // normalizes it into the HDR desktop copy. Staging/shader build runs
-    // outside the context lock; normalizeIntoDesktopCopy issues context work
-    // and needs the immediate-context mutex held like compositeCursor.
-    bool ensureBridgeResources(uint32_t width, uint32_t height, DXGI_FORMAT sdrFormat);
-    void normalizeIntoDesktopCopy();
     void updateCursorState(const DXGI_OUTDUPL_FRAME_INFO& frameInfo);
     bool refreshCursorShape(uint32_t bufferSize);
     bool buildCursorTexture();
     void compositeCursor(const std::shared_ptr<TextureSlot>& slot);
+    // Carry the pointer shape across a rebuild on the same output (see
+    // DesktopDuplicationCursorCarry).
+    bool restoreCarriedCursor();
+    void saveCarriedCursor();
+    void clearCarriedCursor();
+
+    // Rotated-display coordinate helpers. Desktop Duplication returns the
+    // image unrotated: ModeDesc/DesktopCoordinates and the reported cursor
+    // position live in physical (rotated) coordinates, while the texture,
+    // pool, and GpuFrame dimensions are unrotated. Header-inline so the
+    // rotation tests exercise the exact production math without a D3D device.
+    static void unrotatedDimensions(DXGI_MODE_ROTATION rotation, uint32_t& width, uint32_t& height) {
+        if (rotation == DXGI_MODE_ROTATION_ROTATE90 ||
+            rotation == DXGI_MODE_ROTATION_ROTATE270) {
+            const uint32_t temp = width;
+            width = height;
+            height = temp;
+        }
+    }
+
+    static void transformCursorPosition(DXGI_MODE_ROTATION rotation,
+        int32_t physX, int32_t physY,
+        uint32_t texW, uint32_t texH,
+        int32_t& outX, int32_t& outY) {
+        switch (rotation) {
+        case DXGI_MODE_ROTATION_ROTATE90:
+            // Physical (px, py) -> Texture (tx=py, ty=Ht-px-1)
+            outX = physY;
+            outY = static_cast<int32_t>(texH) - 1 - physX;
+            break;
+        case DXGI_MODE_ROTATION_ROTATE270:
+            // Physical (px, py) -> Texture (tx=Wt-py-1, ty=px)
+            outX = static_cast<int32_t>(texW) - 1 - physY;
+            outY = physX;
+            break;
+        case DXGI_MODE_ROTATION_ROTATE180:
+            // Physical (px, py) -> Texture (tx=Wt-px-1, ty=Ht-py-1)
+            outX = static_cast<int32_t>(texW) - 1 - physX;
+            outY = static_cast<int32_t>(texH) - 1 - physY;
+            break;
+        default:
+            outX = physX;
+            outY = physY;
+            break;
+        }
+    }
 
     D3DDevice* device_ = nullptr;
     HMONITOR monitor_ = nullptr;
@@ -68,16 +145,9 @@ private:
     uint32_t height_ = 0;
     uint32_t poolSize_ = 0;
     DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
-    // Pinned HDR interpretation (HdrSessionPin in HdrStability.h): once an
-    // HDR surface is seen the session stays HDR and every frame converts
-    // through the one tone-map mapping. hdrPollState_ is the raw 1 Hz
-    // GetDesc1 result, diagnostics only; surfaces decide pin and upgrades.
-    HdrSessionPin hdrPin_;
     bool hdrPollState_ = false;
+    bool legacyDuplication_ = false;
     uint64_t hdrChangeCount_ = 0;
-    // SDR surfaces normalized into a pinned HDR session (single mapping, so
-    // they encode identically to native HDR frames of the same desktop).
-    uint64_t bridgedFrames_ = 0;
     uint64_t resolutionChanges_ = 0;
     std::chrono::steady_clock::time_point lastHdrPollAt_{};
     bool deviceLost_ = false;
@@ -91,15 +161,6 @@ private:
 
     ComPtr<ID3D11Texture2D> desktopCopy_;
     ComPtr<ID3D11ShaderResourceView> desktopCopySrv_;
-    ComPtr<ID3D11RenderTargetView> desktopCopyRtv_; // bridge render target into desktopCopy_
-    // Bridge staging: last SDR surface, normalized per desktop change. Format
-    // follows the arriving SDR surface (BGRA in practice); one texture, so a
-    // format wobble recreates this instead of the 500 MB pool.
-    ComPtr<ID3D11Texture2D> bridgeStaging_;
-    ComPtr<ID3D11ShaderResourceView> bridgeStagingSrv_;
-    DXGI_FORMAT bridgeStagingFormat_ = DXGI_FORMAT_UNKNOWN;
-    ComPtr<ID3D11VertexShader> bridgeVs_;
-    ComPtr<ID3D11PixelShader> bridgePs_;
     bool captureCursor_ = true;
 
     std::vector<uint8_t> cursorShapeBuffer_;
@@ -121,6 +182,15 @@ private:
     ComPtr<ID3D11RasterizerState> cursorRasterizerState_;
     ComPtr<ID3D11SamplerState> cursorSampler_;
     bool compositorReady_ = false;
+
+    // Display rotation from DXGI_OUTDUPL_DESC. Desktop Duplication returns
+    // the image unrotated; the rotation value describes the physical display
+    // orientation. width_/height_ are the unrotated (texture) dimensions.
+    // Cursor position is transformed from physical to texture coordinates
+    // before compositing.
+    DXGI_MODE_ROTATION rotation_ = DXGI_MODE_ROTATION_UNSPECIFIED;
+
+    friend struct DesktopDuplicationRotationTestAccess;
 };
 
 } // namespace backtrack

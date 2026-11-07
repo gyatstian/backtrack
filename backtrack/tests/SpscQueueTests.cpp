@@ -1,9 +1,11 @@
 #include "core/SpscQueue.h"
 
+#include <atomic>
 #include <cstddef>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -180,6 +182,91 @@ void testResetCapacity() {
     expect(!queue.tryPop(item), "the one-slot ring handed out an extra item");
 }
 
+void testLogicalLimitEnforcedOverLargerStorage() {
+    // The ring storage is fixed for the queue's lifetime (8 slots here), so a
+    // reset to a smaller limit must be enforced by tryPush, not by shrinking
+    // the backing vector.
+    SpscQueue<Slot> queue(8);
+    queue.resetCapacity(2);
+    expect(queue.capacity() == 2, "resetCapacity did not apply the logical limit");
+    for (int id = 0; id < 2; ++id) {
+        expect(push(queue, id), "the queue refused an item below its logical limit");
+    }
+    expect(!push(queue, 99), "the queue accepted more than its logical limit");
+    expect(queue.size() == 2, "size() did not report the logical depth");
+
+    // A request above the fixed storage clamps to it, and the ring still
+    // refills to that full capacity.
+    queue.resetCapacity(32);
+    expect(queue.capacity() == 8, "a request above the fixed storage was not clamped");
+    for (int id = 0; id < 8; ++id) {
+        expect(push(queue, id), "the full-size ring refused an item below its capacity");
+    }
+    expect(!push(queue, -1), "the full-size ring accepted more than its capacity");
+}
+
+void testLogicalLimitAcrossWrappedIndices() {
+    // Logical limit 2 over an 8-slot ring: head and tail wrap inside a larger
+    // ring than the limit, so size() must stay truthful across full
+    // empty<->full cycles at every ring position.
+    SpscQueue<Slot> queue(8);
+    queue.resetCapacity(2);
+    Slot item{};
+    for (int round = 0; round < 64; ++round) {
+        for (int id = 0; id < 2; ++id) {
+            expect(push(queue, 100 * round + id), "refill below the logical limit failed");
+        }
+        expect(queue.size() == 2, "size() misreported a full logical queue");
+        expect(queue.size() <= queue.capacity(), "size() exceeded the logical capacity");
+        expect(!push(queue, -1), "the logical limit was not enforced at the wrap boundary");
+        for (int id = 0; id < 2; ++id) {
+            expect(queue.tryPop(item) && item.id == 100 * round + id,
+                   "wrapped items came back out of order");
+        }
+        expect(queue.size() == 0, "a drained logical queue reported depth");
+    }
+}
+
+void testConcurrentObserverReadsDuringReset() {
+    // The race the fix removes: the UI diagnostics timer reads size()/
+    // capacity() on one thread while the controller worker runs resetCapacity.
+    // The storage is fixed, so the observer only reads atomics and an
+    // immutable vector size; a race detector would flag the old backing-vector
+    // reassignment here. Both ends stay stopped (no push/pop), matching the
+    // reset contract.
+    SpscQueue<Slot> queue(8);
+    std::atomic<bool> stop{false};
+    std::atomic<bool> failed{false};
+    std::thread resetter([&]() {
+        size_t capacity = 1;
+        while (!stop.load(std::memory_order_relaxed)) {
+            queue.resetCapacity(capacity);
+            capacity = capacity >= 8 ? 1 : capacity + 1;
+        }
+    });
+    std::thread observer([&]() {
+        for (int i = 0; i < 200000 && !failed.load(std::memory_order_relaxed); ++i) {
+            const size_t depth = queue.size();
+            const size_t capacity = queue.capacity();
+            // depth can exceed the momentary logical limit (stale head/tail),
+            // but never the fixed storage; capacity is always a valid limit.
+            if (depth > 8 || capacity == 0 || capacity > 8) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+            std::this_thread::yield();
+        }
+        stop.store(true, std::memory_order_relaxed);
+    });
+    resetter.join();
+    observer.join();
+    expect(!failed.load(std::memory_order_relaxed),
+           "size()/capacity() returned an invalid value during a concurrent reset");
+    expect(queue.size() == 0, "the queue was not empty after the concurrent resets stopped");
+    const size_t capacity = queue.capacity();
+    expect(capacity >= 1 && capacity <= 8,
+           "the queue capacity was invalid after the concurrent resets stopped");
+}
+
 } // namespace
 
 int main() {
@@ -189,6 +276,9 @@ int main() {
         testSizeAcrossAWrap();
         testClearEmptiesWithoutLosingCapacity();
         testResetCapacity();
+        testLogicalLimitEnforcedOverLargerStorage();
+        testLogicalLimitAcrossWrappedIndices();
+        testConcurrentObserverReadsDuringReset();
         std::cout << "SpscQueue tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -23,6 +23,8 @@ public:
     std::mutex& immediateContextMutex() { return contextMutex_; }
 
 private:
+    friend struct D3D11FrameScalerTestAccess;
+
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGIAdapter1> adapter_;

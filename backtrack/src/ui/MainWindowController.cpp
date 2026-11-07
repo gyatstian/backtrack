@@ -110,16 +110,17 @@ void MainWindow::handleLeagueKillDetected() {
     setStatus(L"Kill detected; press replay hotkey within 6 seconds to tag it");
 }
 
-std::optional<std::wstring> MainWindow::runningAutoRecordAppName() const {
-    if (settings_.autoRecordApps.empty()) {
+std::optional<std::wstring> MainWindow::matchingAutoRecordAppName(
+    const AppSettings& applied, const std::vector<AudioSessionAppInfo>& openApps) {
+    if (!applied.autoRecordEnabled || applied.autoRecordApps.empty()) {
         return std::nullopt;
     }
     std::unordered_set<std::wstring> keys;
-    keys.reserve(settings_.autoRecordApps.size());
-    for (const auto& app : settings_.autoRecordApps) {
+    keys.reserve(applied.autoRecordApps.size());
+    for (const auto& app : applied.autoRecordApps) {
         keys.insert(normalizedPathKey(app.executablePath));
     }
-    for (const auto& open : WasapiCapture::enumerateOpenApps()) {
+    for (const auto& open : openApps) {
         if (keys.contains(normalizedPathKey(open.executablePath))) {
             return open.name.empty() ? std::optional<std::wstring>(appNameFromPath(open.executablePath))
                                      : std::optional<std::wstring>(open.name);
@@ -154,16 +155,17 @@ void MainWindow::stopRecordingForAutoRecord() {
     setStatus(L"Auto record: stopping recording");
 }
 
-void MainWindow::pollAutoRecord() {
+void MainWindow::pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps) {
     if (controllerActionPending_.load(std::memory_order_acquire)) {
         // Judge state once the in-flight action finishes; the next tick handles it.
         return;
     }
 
-    const bool featureOn =
-        settings_.autoRecordEnabled && !settings_.autoRecordApps.empty();
-    const auto runningName = runningAutoRecordAppName();
-    const bool running = featureOn && runningName.has_value();
+    const AppSettings applied = controller_.settings();
+    const auto runningName = applied.autoRecordEnabled && !applied.autoRecordApps.empty()
+        ? matchingAutoRecordAppName(applied, openApps ? *openApps : WasapiCapture::enumerateOpenApps())
+        : std::nullopt;
+    const bool running = runningName.has_value();
     const bool previousRunning = std::exchange(autoRecordAppRunning_, running);
 
     if (previousRunning && !running) {

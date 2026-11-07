@@ -1,5 +1,6 @@
 #pragma once
 
+#include "audio/SessionMuteStore.h"
 #include "core/Types.h"
 
 #include <atomic>
@@ -9,6 +10,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+struct IMMDeviceEnumerator;
 
 namespace backtrack {
 
@@ -27,10 +30,15 @@ public:
     static std::vector<AudioDeviceInfo> enumerateDevices(AudioTrack track);
     static std::vector<AudioSessionAppInfo> enumerateAudioSessionApps();
     static std::vector<AudioSessionAppInfo> enumerateOpenApps();
-    // Mutes active render sessions whose image path is in mutedExecutableKeys (lowercase paths).
-    // Restores any previously applied mutes that are no longer requested. Returns muted process count.
-    static uint32_t applySessionMutesForExecutables(const std::vector<std::wstring>& mutedExecutableKeys);
-    static void clearSessionMutes();
+    // Mutes every live render session whose image path is in mutedExecutableKeys
+    // (normalized paths), one mute per session instance, and restores sessions
+    // that are no longer requested. Returns what the exclusion actually
+    // established: callers must not record system audio while
+    // exclusionEstablished() is false.
+    static SessionMuteApplyResult applySessionMutesForExecutables(const std::vector<std::wstring>& mutedExecutableKeys);
+    // Restores every mute this process applied. Records that could not be
+    // verified stay journaled for the next launch.
+    static SessionMuteRestoreResult clearSessionMutes();
     // Startup sweep: restores foreign render sessions that a previous crashed
     // session left muted (tracked in a journal under the local app-data
     // directory). No-op when no journal exists.
@@ -47,12 +55,15 @@ public:
     WaveFormatBlob format() const;
 
 private:
+    friend struct WasapiCaptureTestAccess;
+
     struct CaptureOptions {
         AudioTrack track = AudioTrack::System;
         std::wstring deviceId;
         uint32_t processId = 0;
         bool processLoopback = false;
         ProcessLoopbackMode processLoopbackMode = ProcessLoopbackMode::IncludeTargetProcessTree;
+        std::function<HRESULT(IMMDeviceEnumerator**)> createEnumerator;
     };
 
     bool start(CaptureOptions options, AudioPacketCallback callback);

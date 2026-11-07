@@ -14,7 +14,10 @@ public:
 
     virtual bool initialize(D3DDevice& device, const VideoSettings& settings) = 0;
     virtual void requestKeyFrame() = 0;
-    virtual void resetInputResources() {}
+    // False means a cached registration, mapping, or input lease could not be
+    // retired. In-flight inputs keep their storage and pool lease until the
+    // driver confirms completion.
+    virtual bool resetInputResources() { return true; }
     // Single-packet form: true means `packet` holds one output, false means no
     // output was ready (never an error signal on its own).
     virtual bool encodeFrame(const GpuFrame& frame, EncodedPacket& packet) = 0;
@@ -46,6 +49,15 @@ public:
     // function video processor when the hardware encoder wants YUV, BGRA when
     // it takes RGB directly).
     virtual DXGI_FORMAT preferredInputFormat() const = 0;
+
+    // Maximum number of pool-backed input surfaces this encoder can hold
+    // (retain) before it must produce output. The encoder-feeding pool is
+    // sized from this, so a deep-lookahead session cannot exhaust it and drop
+    // frames. NVENC pins each accepted input's lease until its output is
+    // harvested (bounded by its bitstream buffers, which already account for
+    // lookahead and B-frame delay); AMF copies inputs and pins nothing, so it
+    // keeps the default 0.
+    virtual uint32_t inputRetentionBudget() const { return 0; }
 };
 
 } // namespace backtrack

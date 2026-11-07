@@ -1,5 +1,6 @@
 #pragma once
 
+#include "app/RecordingCutoffTracker.h"
 #include "audio/WasapiCapture.h"
 #include "capture/D3D11FrameScaler.h"
 #include "capture/D3DDevice.h"
@@ -11,7 +12,9 @@
 #include "mux/Mp4Muxer.h"
 #include "replay/ReplayBuffer.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <memory>
@@ -26,6 +29,35 @@ class MicrophoneAgc;
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
 class RnnoiseDenoiser;
 #endif
+
+// Pipeline-recreate predicate: a missing encoder is a fault even when D3D init
+// succeeded but capture init failed (finding 06), so the health check must not
+// read a null encoder as healthy the way `encoder_ && !encoder_->encoderAvailable()`
+// would.
+inline bool pipelineEncoderFaulted(const IEncoder* encoder) {
+    return !encoder || !encoder->encoderAvailable();
+}
+
+// Encoder-fault recreate pacing. A pipeline that faults again before it
+// published a packet is not a transient: a full GPU recreate every 500 ms
+// churns the capture source (cursor blink, replay gaps) without fixing it.
+// The first fault keeps the fast retry, and each further fault without a
+// published packet doubles the wait up to a cap. Any published packet resets
+// the streak.
+struct EncoderFaultBackoff {
+    static constexpr std::chrono::milliseconds kFirst{500};
+    static constexpr std::chrono::milliseconds kMax{8000};
+
+    std::chrono::milliseconds next() {
+        const std::chrono::milliseconds delay = delay_;
+        delay_ = std::min(delay_ * 2, kMax);
+        return delay;
+    }
+
+    void reset() { delay_ = kFirst; }
+
+    std::chrono::milliseconds delay_ = kFirst;
+};
 
 // Capture-session supervisor: the 5-state exclusive-fullscreen recovery
 // machine plus the flags that used to live as ~30 captureLoopImpl locals.
@@ -125,6 +157,7 @@ public:
 
     bool initialize(AppSettings settings);
     bool updateSettings(AppSettings settings);
+    void setUiPreferences(LogLevel logLevel, bool libraryGalleryView);
     bool startRecording();
     std::filesystem::path stopRecording();
     std::filesystem::path recoverFailedRecording();
@@ -154,6 +187,7 @@ private:
     // recovery state or muxes from it.
     void beginStartupSweep();
     void waitForStartupSweep();
+    bool discardFrameQueueAndWait();
     bool recreateGpuPipeline(const CaptureTarget& target, const wchar_t* reason, uint32_t adapterIndex);
     // exclusiveRecovery: DXGI monitor capture only, skipping the WGC window
     // path while a validated foreground window remains in exclusive fullscreen.
@@ -174,6 +208,12 @@ private:
     void audioLoopImpl();
     void handleAudioPacket(AudioPacket&& packet);
     void writeAudioPacket(AudioPacket&& packet);
+    // Single publication path for encoded packets: the muxer PTS gate, the
+    // recording keyframe gate, the replay buffer, and the recording-cutoff
+    // acknowledgement. Shared by the encode loop and the recreate drain so a
+    // mid-recording pipeline rebuild cannot strand the reorder tail.
+    void publishVideoPacket(EncodedPacket packet);
+    void notifyRecordingCutoffAcked();
     void refreshSystemAudioCapture(const AppSettings& settings);
     // Publishes the lock-free mirrors for hot UI-timer reads (replay enable,
     // GOP seconds, cursor preference). Called wherever settings_ is assigned
@@ -224,15 +264,31 @@ private:
 
     mutable std::mutex systemAudioCaptureMutex_;
     std::vector<std::wstring> systemAudioMutedExecutableKeys_;
+    // True while the last sound-separation apply could not guarantee the
+    // excluded apps are silent. System audio stays stopped then so excluded
+    // audio cannot reach a recording; the capture loop's 2 s poll retries.
+    // Guarded by systemAudioCaptureMutex_.
+    bool systemAudioExclusionFailed_ = false;
     mutable std::mutex recordingErrorMutex_;
     std::wstring lastRecordingError_;
 
     SpscQueue<GpuFrame> frameQueue_;
+    // Owned by the capture worker; stopPipeline releases them after encoder shutdown.
+    GpuFrame captureLastFrame_;
+    GpuFrame captureAcquiredFrame_;
     SpscQueue<AudioPacket> systemAudioQueue_;
     SpscQueue<AudioPacket> microphoneAudioQueue_;
     mutable std::mutex durationUpdateMutex_;
     std::mutex frameDiscardMutex_;
     std::condition_variable frameDiscardComplete_;
+    // Recording-stop cutoff handshake: the encode thread feeds submissions and
+    // publications into recordingCutoff_, stopRecording waits for the
+    // acknowledgement on recordingCutoffComplete_.
+    RecordingCutoffTracker recordingCutoff_;
+    mutable std::mutex recordingCutoffMutex_;
+    std::condition_variable recordingCutoffComplete_;
+    // Discarded inputs stay alive until the encoder has released registrations.
+    std::vector<GpuFrame> discardedFrames_;
     int64_t pendingDurationPts100ns_ = 0;
     int64_t pendingDuration100ns_ = 0;
     std::thread captureThread_;
@@ -247,6 +303,10 @@ private:
 
     std::atomic<bool> pipelineRunning_{false};
     std::atomic<bool> stopRequested_{false};
+    // Separated from stopRequested_ so the audio writer drains every packet
+    // enqueued before the WASAPI producers stop. stopPipeline sets this only
+    // after joining both producer threads, then signals the writer to exit.
+    std::atomic<bool> audioProducersFinished_{false};
     std::atomic<bool> recording_{false};
     std::atomic<bool> waitingForRecordingKeyFrame_{false};
     std::atomic<bool> discardQueuedFrames_{false};

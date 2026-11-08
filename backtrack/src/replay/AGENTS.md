@@ -167,6 +167,11 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
 - `newestVideoPts100ns` exists because PTS-age trimming cannot detect a stalled
   capture or encode pipeline; heartbeats keep advancing timestamps while the
   pipeline is idle. Callers use it to detect that case.
+- `trimLocked` accumulates evicted packet counts into `trimVideoEvicted_` /
+  `trimAudioEvicted_` (RAM and disk, video and audio) and logs one aggregate
+  info when either crosses the report threshold, instead of a line per pushed
+  packet. `saveTo` logs one save-start line naming the backends and the buffered
+  packet/byte counts.
 
 ## Work Guidance
 

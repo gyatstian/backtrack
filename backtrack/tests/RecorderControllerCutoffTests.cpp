@@ -195,6 +195,32 @@ void testEncoderFaultBackoff() {
            "a published packet must reset the backoff");
 }
 
+// averageEncodeMs is submit->output latency whose healthy floor is about one
+// frame period, so the probe must not warn on a healthy pipeline. It warns
+// only when the encoder is actually being fed near the target rate (an idle
+// hold submits a heartbeat IDR per GOP interval, not real flow) and latency
+// exceeds three frame periods.
+void testEncoderHealthProbe() {
+    // Healthy: ~one frame period of latency, feeding at the target rate.
+    expect(!backtrack::encoderBehindBudget(21.0, 60, 300, 5),
+           "healthy latency near one frame period must not warn");
+    // Latency above three frame periods while feeding at rate: a real stall.
+    expect(backtrack::encoderBehindBudget(200.0, 60, 300, 5),
+           "high latency while feeding at rate must warn");
+    // Same high latency but idle feed (heartbeats only): must not warn.
+    expect(!backtrack::encoderBehindBudget(200.0, 60, 3, 5),
+           "high latency from idle heartbeat holds must not warn");
+    // Just under the three-period threshold stays quiet.
+    expect(!backtrack::encoderBehindBudget(49.0, 60, 300, 5),
+           "latency under the three-period threshold must not warn");
+    // Unknown fps (0) falls back to the 16.667 ms budget.
+    expect(backtrack::encoderBehindBudget(200.0, 0, 100, 5),
+           "zero fps must fall back to a default budget");
+    // No expected-feed baseline: any feed rate is treated as fed.
+    expect(backtrack::encoderBehindBudget(200.0, 0, 0, 5),
+           "zero fps with no submissions must still warn on high latency");
+}
+
 } // namespace
 
 int main() {
@@ -208,6 +234,7 @@ int main() {
         testStopAndResetCycle();
         testMissingEncoderIsAFault();
         testEncoderFaultBackoff();
+        testEncoderHealthProbe();
         std::cout << "RecorderControllerCutoffTests: all tests passed" << std::endl;
         return 0;
     } catch (const std::exception& error) {

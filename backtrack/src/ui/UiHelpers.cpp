@@ -511,7 +511,7 @@ size_t soundSeparationIndexFromButtonId(int controlId, int baseId) {
 }
 
 bool isSettingsControlId(int controlId) {
-    // Deferred-settings controls only. The log-level combo and the library view
+    // Deferred-settings controls only. The logging-enabled checkbox and the library view
     // buttons persist immediately on selection, and the app-picker combos plus
     // every browse/refresh/manual/action button edit transient state or run an
     // action, so they stay out: adding one would park (or clear) the Save

@@ -4,6 +4,7 @@
 
 #include "audio/WasapiCapture.h"
 #include "core/AppVersion.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "integrations/WinHttpJson.h"
 #include "platform/Win32Util.h"
@@ -348,6 +349,7 @@ void MainWindow::startUpdateCheck(UpdateCheckTarget target) {
     const HWND window = window_;
     updateCheckThread_ = std::thread([this, window, target = std::move(target)] {
         setThreadDescriptionSafe(L"Backtrack update check");
+        LogContext::ScopedTask task(L"update-check");
         try {
             const auto latestVersion = fetchLatestReleaseVersion(target, updateCheckStopping_);
             if (updateCheckStopping_.load(std::memory_order_acquire)) {
@@ -434,6 +436,7 @@ void MainWindow::stopControllerWorker() {
 
 bool MainWindow::queueControllerAction(ControllerAction action, const std::wstring& busyStatus) {
     if (controllerActionPending_.exchange(true)) {
+        Logger::instance().info(L"ui", L"Controller action rejected: another action still in flight");
         setStatus(busyStatus);
         playActionIndicator(MB_ICONHAND, settings_.notificationSoundVolumePercent);
         return false;
@@ -493,12 +496,14 @@ void MainWindow::handleControllerBusySoftTimeout() {
     // Soft status only — do not clear pending (would allow double-complete races).
     const std::wstring base =
         controllerBusyStatus_.empty() ? L"Recorder is busy" : controllerBusyStatus_;
+    Logger::instance().info(L"ui", base + L" still working past soft timeout");
     setStatus(base + L" (still working...)");
     clearControllerBusyTimer();
 }
 
 void MainWindow::controllerWorkerLoop() {
     setThreadDescriptionSafe(L"Backtrack controller");
+    LogContext::ScopedTask task(L"controller-worker");
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
     try {

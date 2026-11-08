@@ -1,11 +1,14 @@
 #include "settings/SettingsStore.h"
 
 #include "clips/AtomicWrite.h"
+#include "core/LogContext.h"
+#include "core/LogTiming.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cwctype>
 #include <limits>
 #include <map>
@@ -205,6 +208,9 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
         const DWORD error = GetLastError();
         if (status && (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)) {
             *status = LoadStatus::Missing;
+            LogContext::breadcrumb(L"settings file missing; defaults used");
+        } else {
+            LogContext::breadcrumb(L"settings open failed (Win32 error " + std::to_wstring(error) + L")");
         }
         return sanitizeSettings(settings);
     }
@@ -229,6 +235,7 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     for (;;) {
         DWORD count = 0;
         if (!ReadFile(input.get(), buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr)) {
+            LogContext::breadcrumb(L"settings read failed (Win32 error " + std::to_wstring(GetLastError()) + L")");
             return sanitizeSettings(settings);
         }
         if (count == 0) {
@@ -329,7 +336,7 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
         readBool(values, L"general.pruneStaleMicrophoneConsentEntries", settings.pruneStaleMicrophoneConsentEntries);
     settings.exitToTray = readBool(values, L"general.exitToTray", settings.exitToTray);
     settings.checkForUpdates = readBool(values, L"general.checkForUpdates", settings.checkForUpdates);
-    settings.logLevel = logLevelFromName(readString(values, L"diagnostics.logLevel", logLevelName(settings.logLevel)), settings.logLevel);
+    settings.loggingEnabled = readBool(values, L"diagnostics.loggingEnabled", settings.loggingEnabled);
     settings.notificationSoundVolumePercent =
         readUInt(values, L"general.notificationSoundVolumePercent", settings.notificationSoundVolumePercent);
     settings.customNotificationSoundPath =
@@ -455,7 +462,7 @@ bool SettingsStore::save(const AppSettings& settings) const {
     output << L"general.pruneStaleMicrophoneConsentEntries=" << (normalized.pruneStaleMicrophoneConsentEntries ? 1 : 0) << L"\n";
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
     output << L"general.checkForUpdates=" << (normalized.checkForUpdates ? 1 : 0) << L"\n";
-    output << L"diagnostics.logLevel=" << logLevelName(normalized.logLevel) << L"\n";
+    output << L"diagnostics.loggingEnabled=" << (normalized.loggingEnabled ? 1 : 0) << L"\n";
     output << L"general.notificationSoundVolumePercent=" << normalized.notificationSoundVolumePercent << L"\n";
     output << L"general.customNotificationSoundPath=" << normalized.customNotificationSoundPath.wstring() << L"\n";
     output << L"capture.monitorIndex=" << normalized.monitorIndex << L"\n";
@@ -476,12 +483,16 @@ bool SettingsStore::save(const AppSettings& settings) const {
         return false;
     }
 
+    // Wrap the publish in a slow-path timer; save runs on the UI thread and a
+    // cold filesystem should not make a setting change feel hung.
+    const ScopedLatencyWarn publishSlow(L"settings", L"Settings publish slow", std::chrono::milliseconds(500));
     const auto error = atomicWriteSibling(path_, wideToUtf8(output.str()));
     if (error) {
         Logger::instance().error(L"settings", L"Could not publish settings file, previous settings kept: " +
             path_.wstring() + L" (Win32 error " + std::to_wstring(error.value()) + L")");
         return false;
     }
+    Logger::instance().info(L"settings", L"settings saved");
     return true;
 }
 
@@ -547,16 +558,6 @@ AppSettings sanitizeSettings(AppSettings settings) {
     return settings;
 }
 
-const wchar_t* codecName(VideoCodec codec) {
-    switch (codec) {
-    case VideoCodec::H264:
-        return L"h264";
-    case VideoCodec::Hevc:
-        return L"hevc";
-    }
-    return L"h264";
-}
-
 VideoCodec codecFromName(const std::wstring& value) {
     if (value == L"hevc" || value == L"HEVC" || value == L"h265" || value == L"H265") {
         return VideoCodec::Hevc;
@@ -614,26 +615,6 @@ ResolutionMode resolutionModeFromName(const std::wstring& value) {
     return ResolutionMode::P1080;
 }
 
-const wchar_t* encoderPresetName(EncoderPreset preset) {
-    switch (preset) {
-    case EncoderPreset::P1:
-        return L"p1";
-    case EncoderPreset::P2:
-        return L"p2";
-    case EncoderPreset::P3:
-        return L"p3";
-    case EncoderPreset::P4:
-        return L"p4";
-    case EncoderPreset::P5:
-        return L"p5";
-    case EncoderPreset::P6:
-        return L"p6";
-    case EncoderPreset::P7:
-        return L"p7";
-    }
-    return L"p4";
-}
-
 EncoderPreset encoderPresetFromName(const std::wstring& value) {
     if (value == L"p1" || value == L"P1") {
         return EncoderPreset::P1;
@@ -654,22 +635,6 @@ EncoderPreset encoderPresetFromName(const std::wstring& value) {
         return EncoderPreset::P7;
     }
     return EncoderPreset::P4;
-}
-
-const wchar_t* encoderModeName(EncoderMode mode) {
-    switch (mode) {
-    case EncoderMode::HighQuality:
-        return L"high-quality";
-    case EncoderMode::LowLatency:
-        return L"low-latency";
-    case EncoderMode::UltraLowLatency:
-        return L"ultra-low-latency";
-    case EncoderMode::Lossless:
-        return L"lossless";
-    case EncoderMode::UltraHighQuality:
-        return L"ultra-high-quality";
-    }
-    return L"high-quality";
 }
 
 EncoderMode encoderModeFromName(const std::wstring& value) {

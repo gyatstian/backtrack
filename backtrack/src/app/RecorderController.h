@@ -38,6 +38,20 @@ inline bool pipelineEncoderFaulted(const IEncoder* encoder) {
     return !encoder || !encoder->encoderAvailable();
 }
 
+// Encoder health-probe predicate. averageEncodeMs is submit->output latency
+// (EncoderCommon EMA), whose healthy floor is about one frame period, so a
+// one-period budget alarms on a healthy pipeline. Idle holds submit only a
+// heartbeat IDR per GOP interval, so gate on real feed rate (>= half the
+// target over the window) and warn only past three frame periods: the only
+// thing left that trips it is a genuine stall while frames are flowing.
+inline bool encoderBehindBudget(double averageEncodeMs, uint32_t fps,
+                                uint64_t submittedThisWindow, uint64_t windowSeconds) {
+    const double budgetMs = fps > 0 ? 1000.0 / fps : 16.667;
+    const uint64_t expected = static_cast<uint64_t>(fps) * windowSeconds;
+    const bool fedAtRate = expected == 0 || submittedThisWindow >= expected / 2;
+    return fedAtRate && averageEncodeMs > budgetMs * 3.0;
+}
+
 // Encoder-fault recreate pacing. A pipeline that faults again before it
 // published a packet is not a transient: a full GPU recreate every 500 ms
 // churns the capture source (cursor blink, replay gaps) without fixing it.
@@ -157,7 +171,7 @@ public:
 
     bool initialize(AppSettings settings);
     bool updateSettings(AppSettings settings);
-    void setUiPreferences(LogLevel logLevel, bool libraryGalleryView);
+    void setUiPreferences(bool libraryGalleryView, bool loggingEnabled);
     bool startRecording();
     std::filesystem::path stopRecording();
     std::filesystem::path recoverFailedRecording();
@@ -224,6 +238,11 @@ private:
     // running and replay is enabled. Reads lastEncodedVideoPts100ns_ against
     // the steady clock; no recovery logic. Safe to call from stats().
     void detectVideoPipelineStall() const;
+    // Audio-liveness watchdog (diagnostics only): warns once per episode when
+    // an enabled, running audio input stops delivering packets. Safe to call
+    // from stats(); the latch clears when a packet arrives in
+    // handleAudioPacket.
+    void detectSilentAudioInput() const;
     std::filesystem::path nextClipPath(const wchar_t* prefix, bool organizeIntoSubfolder) const;
     void setLastRecordingError(std::wstring error);
 
@@ -329,6 +348,10 @@ private:
     std::atomic<bool> replayEnabledMirror_{true};
     std::atomic<uint32_t> videoGopSecondsMirror_{2};
     std::atomic<bool> captureCursorMirror_{true};
+    // Audio-liveness watchdog mirrors: which audio inputs the user enabled, so
+    // the silent-input WARN fires only for an enabled, running source.
+    std::atomic<bool> captureSystemAudioMirror_{false};
+    std::atomic<bool> captureMicrophoneMirror_{false};
     // Set when the microphone stream restarts or AGC is toggled; the audio
     // writer resets the AGC envelope on its own thread before the next packet.
     std::atomic<bool> microphoneAgcResetPending_{true};
@@ -363,6 +386,9 @@ private:
     // telemetry in RecordingStats.
     std::atomic<int64_t> systemAudioLastPacketAt100ns_{0};
     std::atomic<int64_t> microphoneAudioLastPacketAt100ns_{0};
+    // One silent-input WARN per episode; cleared when a packet arrives.
+    mutable std::atomic<bool> systemAudioSilenceWarned_{false};
+    mutable std::atomic<bool> microphoneAudioSilenceWarned_{false};
     std::atomic<int64_t> lastEncodedVideoPts100ns_{0};
     std::atomic<int64_t> videoTimelineEndPts100ns_{0};
     // Pipeline-stall watchdog (diagnostics only). Tracks the newest encoded

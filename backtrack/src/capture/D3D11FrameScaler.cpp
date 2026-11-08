@@ -1,6 +1,7 @@
 #include "capture/D3D11FrameScaler.h"
 
 #include "capture/GpuPoolBuilder.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -86,6 +87,7 @@ bool D3D11FrameScaler::scale(
     }
     if (outcome == VpBltOutcome::DowngradeBgra && outputFormat == DXGI_FORMAT_NV12) {
         nv12Unavailable_ = true;
+        LogContext::breadcrumb(L"scaler NV12 output unavailable; falling back to BGRA");
         Logger::instance().warning(L"capture",
             L"Preferred NV12 encoder input failed at runtime; falling back to BGRA for this capture session");
         releaseResources();
@@ -269,6 +271,7 @@ D3D11FrameScaler::VpBltOutcome D3D11FrameScaler::tryVpBlt(
         // the cached VpState) with no pool rebuild.
         if (appliedHdrInputSpace_ && !hdrInputRejected_ && isHdrRejectionHr(bltHr)) {
             hdrInputRejected_ = true;
+            LogContext::breadcrumb(L"scaler rejected HDR input; SDR fallback");
             ++hdrRejectStrikes_;
             hdrRejectedAt_ = std::chrono::steady_clock::now();
             hdrRejectedFormat_ = input.format;
@@ -661,6 +664,7 @@ ID3D11VideoProcessorInputView* D3D11FrameScaler::inputViewFor(
     }
 
     useCopiedInput_ = true;
+    LogContext::breadcrumb(L"scaler using pooled input copy");
     inputViews_.clear();
     Logger::instance().warning(L"capture",
         L"Capture texture is not directly compatible with the D3D11 video processor (" +

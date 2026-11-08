@@ -1,6 +1,7 @@
 #include "capture/DesktopDuplicationCapture.h"
 
 #include "capture/GpuPoolBuilder.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -119,6 +120,7 @@ void DesktopDuplicationCapture::logAcquireFailureOnce(const wchar_t* reason, HRE
 
 void DesktopDuplicationCapture::markLost(const wchar_t* reason, HRESULT hr) {
     if (!deviceLost_) {
+        LogContext::breadcrumb(L"desktop duplication lost");
         logAcquireFailureOnce(reason, hr);
     }
     releaseHeldFrame();

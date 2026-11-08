@@ -106,13 +106,6 @@ inline constexpr EnumComboEntry kDiscordPresenceComboEntries[] = {
     {static_cast<int>(GameIntegrationSettings::DiscordRichPresenceMode::FullscreenOnly), L"Only on fullscreen apps/games"},
     {static_cast<int>(GameIntegrationSettings::DiscordRichPresenceMode::Off), L"Never"},
 };
-inline constexpr EnumComboEntry kLogLevelComboEntries[] = {
-    {static_cast<int>(LogLevel::Trace), L"Trace"},
-    {static_cast<int>(LogLevel::Debug), L"Debug"},
-    {static_cast<int>(LogLevel::Info), L"Info"},
-    {static_cast<int>(LogLevel::Warning), L"Warn"},
-    {static_cast<int>(LogLevel::Error), L"Error"},
-};
 
 // Fills a fresh combo from a table and selects the row holding currentValue.
 // An unknown value falls back to the first row rather than leaving no selection.

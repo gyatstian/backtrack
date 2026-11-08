@@ -47,17 +47,40 @@ const std::shared_ptr<const WaveFormatBlob>& canonicalAudioFormatPtr() {
     return blob;
 }
 
+// One-time format diagnostics shared by the rejection warning and the
+// recovery note: exactly one rejection line and one recovery line per process,
+// so a device that never leaves a broken format logs exactly one warning.
+static std::atomic<bool> g_formatRejected{false};
+static std::atomic<bool> g_formatRecoveredLogged{false};
+
 void logUnsupportedFormatOnce(const AudioPacket& packet) {
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-        const wchar_t* track = packet.track == AudioTrack::System
-            ? L"system audio"
-            : packet.track == AudioTrack::Microphone ? L"microphone" : L"audio";
-        Logger::instance().warning(L"audio",
-            std::wstring(L"Dropping ") + track +
-            L" with an unsupported capture format; the track is skipped until the "
-            L"device produces a supported PCM or float format");
+    if (g_formatRejected.exchange(true)) {
+        return;
     }
+    const wchar_t* track = packet.track == AudioTrack::System
+        ? L"system audio"
+        : packet.track == AudioTrack::Microphone ? L"microphone" : L"audio";
+    const AudioFormatInfo info = packet.format ? parseAudioFormat(*packet.format) : AudioFormatInfo{};
+    std::wstring encoding;
+    switch (info.encoding) {
+    case AudioSampleEncoding::Pcm: encoding = L"pcm"; break;
+    case AudioSampleEncoding::Float: encoding = L"float"; break;
+    default: encoding = L"other"; break;
+    }
+    Logger::instance().warning(L"audio",
+        std::wstring(L"Dropping ") + track +
+        L" with an unsupported capture format (" + encoding + L" " +
+        std::to_wstring(info.samplesPerSec) + L"Hz " +
+        std::to_wstring(info.channels) + L"ch " +
+        std::to_wstring(info.bitsPerSample) + L"bit); the track is skipped until the "
+        L"device produces a supported PCM or float format");
+}
+
+void logSupportedFormatRecoveredOnce() {
+    if (!g_formatRejected.load() || g_formatRecoveredLogged.exchange(true)) {
+        return;
+    }
+    Logger::instance().info(L"audio", L"Capture device returned a supported audio format; audio track resumed");
 }
 
 } // namespace
@@ -306,6 +329,7 @@ bool convertAudioPacketToCanonical(AudioPacket& packet) {
         logUnsupportedFormatOnce(packet);
         return false;
     }
+    logSupportedFormatRecoveredOnce();
     if (packet.bytes.empty()) {
         packet.frameCount = 0;
         return true;

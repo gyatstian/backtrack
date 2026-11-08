@@ -96,6 +96,12 @@ recovery store that keeps a killed recording recoverable.
   - A temporary-WAV write error fails the save: `finalize` reports it for a
     recording, `saveTo` returns it for a replay, rather than publishing
     truncated audio.
+  - `paceAudioPacket` accumulates gap-fill statistics into its `AudioGapStats&`
+    argument (fill events, silence bytes, max gap ms). Both callers own one
+    (`AudioTimelineState::gapStats` on the recording side, a local in
+    `ReplayBuffer::writeTimelineAudio`) and log one info line at
+    finalize/save when any gaps were filled; the per-packet path itself never
+    logs.
 - `WavWriter` is the single WAV implementation for the recording tracks, the
   replay tracks, and the mixed PCM copy in `audio/AudioMix.cpp`. It patches the
   RIFF and data sizes on `close`, so a process killed before that leaves zeroed

@@ -1,5 +1,6 @@
 #include "integrations/LeagueOfLegendsIntegration.h"
 
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "integrations/WinHttpJson.h"
 #include "platform/Win32Util.h"
@@ -276,6 +277,7 @@ void LeagueOfLegendsIntegration::setStats(bool gameAvailable, std::wstring lastE
 
 void LeagueOfLegendsIntegration::workerLoop() {
     setThreadDescriptionSafe(L"Backtrack League integration");
+    const LogContext::ScopedTask taskContext(L"league");
     Logger::instance().info(L"league", L"League of Legends integration started");
 
     try {
@@ -283,6 +285,9 @@ void LeagueOfLegendsIntegration::workerLoop() {
         bool baselineReady = false;
         int64_t lastEventId = -1;
         double lastEventTime = 0.0;
+        // Persistent-outage detection: warn once when two consecutive polls
+        // fail (one warning per outage episode; reset on recovery).
+        int consecutiveFailures = 0;
 
         // a cancelled request retains its old session and connection until
         // WinHTTP finishes closing it; later polls use a fresh pair on failure.
@@ -315,6 +320,10 @@ void LeagueOfLegendsIntegration::workerLoop() {
                     Logger::instance().info(L"league", L"League of Legends live client data is no longer available");
                 }
                 gameAvailable = false;
+                ++consecutiveFailures;
+                if (consecutiveFailures == 2) {
+                    Logger::instance().warning(L"league", L"League live client data unavailable (persistent HTTP failure)");
+                }
                 setStats(false, {});
                 baselineReady = false;
                 lastEventId = -1;
@@ -337,6 +346,7 @@ void LeagueOfLegendsIntegration::workerLoop() {
                 Logger::instance().info(L"league", L"League of Legends live client data detected");
             }
             gameAvailable = true;
+            consecutiveFailures = 0;
             setStats(true, {});
 
             if (!baselineReady || maxEventId < lastEventId || maxEventTime + 0.001 < lastEventTime) {

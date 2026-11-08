@@ -2,6 +2,7 @@
 #include "audio/SessionMuteStore.h"
 
 #include "core/Clock.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -55,6 +56,22 @@ const wchar_t* trackName(AudioTrack track) {
         return L"sound separation";
     }
     return L"audio";
+}
+
+// Terse negotiated-format description for the started/reconnected log lines.
+std::wstring waveFormatText(const WAVEFORMATEX& wf) {
+    std::wstring encoding;
+    if (wf.wFormatTag == WAVE_FORMAT_PCM) {
+        encoding = L"pcm";
+    } else if (wf.wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        encoding = L"float";
+    } else if (wf.wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+        encoding = L"ext";
+    } else {
+        encoding = L"tag-" + std::to_wstring(wf.wFormatTag);
+    }
+    return std::to_wstring(wf.nSamplesPerSec) + L"Hz/" + std::to_wstring(wf.nChannels) + L"ch/" +
+           std::to_wstring(wf.wBitsPerSample) + L"bit/" + encoding;
 }
 
 EDataFlow dataFlowFor(AudioTrack track) {
@@ -583,9 +600,13 @@ bool enumerateForeignRenderSessions(
 
     UINT endpointCount = 0;
     endpoints->GetCount(&endpointCount);
+    // Skips across the endpoint/session loops: a session we cannot read is
+    // not muted, so excluded audio can leak. One rate-limited line per call.
+    uint32_t skipped = 0;
     for (UINT endpointIndex = 0; endpointIndex < endpointCount; ++endpointIndex) {
         Microsoft::WRL::ComPtr<IMMDevice> endpoint;
         if (FAILED(endpoints->Item(endpointIndex, &endpoint)) || !endpoint) {
+            ++skipped;
             continue;
         }
 
@@ -597,11 +618,13 @@ bool enumerateForeignRenderSessions(
         Microsoft::WRL::ComPtr<IAudioSessionManager2> sessionManager;
         if (FAILED(endpoint->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &sessionManager)) ||
             !sessionManager) {
+            ++skipped;
             continue;
         }
 
         Microsoft::WRL::ComPtr<IAudioSessionEnumerator> sessions;
         if (FAILED(sessionManager->GetSessionEnumerator(&sessions)) || !sessions) {
+            ++skipped;
             continue;
         }
 
@@ -610,14 +633,17 @@ bool enumerateForeignRenderSessions(
         for (int sessionIndex = 0; sessionIndex < sessionCount; ++sessionIndex) {
             Microsoft::WRL::ComPtr<IAudioSessionControl> session;
             if (FAILED(sessions->GetSession(sessionIndex, &session)) || !session) {
+                ++skipped;
                 continue;
             }
 
             Microsoft::WRL::ComPtr<IAudioSessionControl2> session2;
             if (FAILED(session.As(&session2)) || !session2) {
+                ++skipped;
                 continue;
             }
             if (session2->IsSystemSoundsSession() == S_OK) {
+                ++skipped;
                 continue;
             }
 
@@ -625,16 +651,19 @@ bool enumerateForeignRenderSessions(
             if (FAILED(session2->GetProcessId(&processId)) ||
                 processId == 0 ||
                 processId == currentProcessId) {
+                ++skipped;
                 continue;
             }
 
             const std::wstring key = normalizedPathKey(processImagePath(processId));
             if (key.empty()) {
+                ++skipped;
                 continue;
             }
 
             Microsoft::WRL::ComPtr<ISimpleAudioVolume> volume;
             if (FAILED(session.As(&volume)) || !volume) {
+                ++skipped;
                 continue;
             }
 
@@ -662,6 +691,11 @@ bool enumerateForeignRenderSessions(
                 },
             });
         }
+    }
+    if (skipped > 0 && logFailures) {
+        Logger::instance().warning(L"audio",
+            L"Session-mute enumeration skipped " + std::to_wstring(skipped) +
+            L" endpoint/session(s); excluded audio may not be fully muted");
     }
     return true;
 }
@@ -908,6 +942,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
     setThreadDescriptionSafe(options.processLoopback
         ? L"Backtrack WASAPI app loopback"
         : (track == AudioTrack::System ? L"Backtrack WASAPI loopback" : L"Backtrack WASAPI microphone"));
+    const LogContext::ScopedTask taskContext(L"wasapi-" + std::wstring(trackName(track)));
 
     // Report activation success/failure to start() exactly once. On any failure
     // path we also clear running_ so pollers see the real state.
@@ -1050,8 +1085,10 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         }
 
         const auto streamFormat = std::make_shared<const WaveFormatBlob>(copyWaveFormat(mixFormat.get()));
+        bool formatChanged = false;
         {
             std::scoped_lock lock(formatMutex_);
+            formatChanged = format_.bytes != streamFormat->bytes;
             format_ = *streamFormat;
         }
 
@@ -1114,14 +1151,20 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         }
 
         const bool reconnected = reconnectCount > 0;
+        const unsigned reconnectAttempts = reconnectCount; // for the reconnected log line
         reconnectCount = 0;
         reconnectDelayMs = 250;
         running_ = true;
         signalStarted(true);
         if (reconnected) {
-            Logger::instance().info(L"audio", std::wstring(L"WASAPI capture reconnected for ") + trackName(track));
+            Logger::instance().info(L"audio",
+                std::wstring(L"WASAPI capture reconnected for ") + trackName(track) +
+                L" after " + std::to_wstring(reconnectAttempts) + L" attempt(s); format=" +
+                waveFormatText(*mixFormat) + (formatChanged ? L" (changed from previous)" : L""));
         } else {
-            Logger::instance().info(L"audio", std::wstring(L"WASAPI capture started for ") + trackName(track));
+            Logger::instance().info(L"audio",
+                std::wstring(L"WASAPI capture started for ") + trackName(track) +
+                L"; format=" + waveFormatText(*mixFormat));
         }
 
         const int64_t qpcCalibration100ns = qpcNow100ns();
@@ -1132,6 +1175,9 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
 
         int64_t nextPacketPts100ns = -1;
         bool sessionLost = false;
+        // Underrun probe: a packet arrival gap past 50 ms is a device stall or
+        // CPU starvation, not normal device cadence.
+        auto lastArrival = std::chrono::steady_clock::now();
         while (!stopRequested_ && !sessionLost && !defaultNotification.changedSince(defaultGeneration)) {
             WaitForSingleObject(wakeEvent_, 20);
             if (!stopRequested_ && defaultNotification.changedSince(defaultGeneration)) {
@@ -1184,6 +1230,16 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
                     discontinuity ||
                     drift100ns < -kAudioTimestampResyncThreshold100ns ||
                     drift100ns > kAudioTimestampResyncThreshold100ns;
+                if (resyncTimeline && hasTimeline) {
+                    // Mid-stream resync only (the first-packet !hasTimeline
+                    // case is expected, not a gap). Rate-limited by the logger.
+                    Logger::instance().warning(L"audio",
+                        L"WASAPI capture timeline resynced for " + std::wstring(trackName(track)) +
+                        L" (drift_ms=" +
+                        std::to_wstring(drift100ns / (kHundredNanosecondsPerSecond / 1000)) +
+                        L" discontinuity=" + (discontinuity ? L"yes" : L"no") +
+                        L"); audio gap expected");
+                }
                 packet.pts100ns = resyncTimeline ? capturedPts100ns : nextPacketPts100ns;
                 nextPacketPts100ns = packet.pts100ns + packetDuration100ns;
 
@@ -1206,6 +1262,20 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
                 }
 
                 callback(std::move(packet));
+
+                const auto arrival = std::chrono::steady_clock::now();
+                const auto gapMs = std::chrono::duration_cast<std::chrono::milliseconds>(arrival - lastArrival);
+                lastArrival = arrival;
+                if (gapMs >= std::chrono::milliseconds(50)) {
+                    // gap_ms is wall-clock packet-arrival spacing, not a count
+                    // of missing buffers: it grows through true silence too
+                    // (a silent loopback delivers nothing), so it is a
+                    // liveness hint, not proof of lost audio.
+                    Logger::instance().warning(L"audio",
+                        L"WASAPI capture underrun (gap_ms=" + std::to_wstring(gapMs.count()) +
+                        L" track=" + std::wstring(trackName(track)) +
+                        L"; packet-arrival gap, includes silence)");
+                }
 
                 hr = captureClient->GetNextPacketSize(&packetFrames);
                 if (FAILED(hr)) {

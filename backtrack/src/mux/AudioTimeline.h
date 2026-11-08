@@ -13,6 +13,21 @@ namespace backtrack {
 // end yet, so gaps are measured against the incoming packet alone.
 inline constexpr int64_t kNoAudioWindowEnd = (std::numeric_limits<int64_t>::max)();
 
+// Aggregated gap-fill accounting for one audio timeline. paceAudioPacket fills
+// it; the caller logs one line at finalize so gap statistics stay allocation-
+// light on the per-packet path.
+struct AudioGapStats {
+    uint64_t fillEvents = 0;
+    uint64_t fillBytes = 0;   // silence bytes written by gap-fill
+    uint64_t maxGapMs = 0;
+};
+
+inline void mergeAudioGapStats(AudioGapStats& into, const AudioGapStats& other) {
+    into.fillEvents += other.fillEvents;
+    into.fillBytes += other.fillBytes;
+    into.maxGapMs = std::max(into.maxGapMs, other.maxGapMs);
+}
+
 // Advances nextPts100ns across one packet on the shared audio timeline:
 // format mismatch is the caller's responsibility (checked by the caller),
 // fills the full PTS gap with silence so the saved audio keeps the real gap
@@ -31,7 +46,8 @@ inline bool paceAudioPacket(
     const AudioPacket& packet,
     int64_t endPts100ns,
     const wchar_t* /*logSubsystem*/,
-    const wchar_t* /*fileName*/) {
+    const wchar_t* /*fileName*/,
+    AudioGapStats& gapStats) {
     if (packet.frameCount == 0 || packet.bytes.empty()) {
         return true;
     }
@@ -68,6 +84,10 @@ inline bool paceAudioPacket(
         if (!writer.writeSilenceFrames(gapFrames)) {
             return false;
         }
+        ++gapStats.fillEvents;
+        gapStats.fillBytes += static_cast<uint64_t>(gapFrames) * blockAlign;
+        gapStats.maxGapMs = std::max<uint64_t>(gapStats.maxGapMs,
+            static_cast<uint64_t>(fill100ns / (kHundredNanosecondsPerSecond / 1000)));
         nextPts100ns += static_cast<int64_t>((gapFrames * kHundredNanosecondsPerSecond) / samplesPerSec);
         if (nextPts100ns >= endPts100ns) {
             return true;

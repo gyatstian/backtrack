@@ -93,8 +93,8 @@ void testEveryKeyFallsBackToItsDefault() {
         "a missing sound disk-backing key did not fall back to the default");
     expect(loaded.captureMicrophone == defaults.captureMicrophone,
         "a missing microphone key did not fall back to the default");
-    expect(loaded.logLevel == defaults.logLevel,
-        "a missing log level did not fall back to the default");
+    expect(loaded.loggingEnabled == defaults.loggingEnabled,
+        "a missing logging-enabled key did not fall back to the default");
     expect(loaded.libraryGalleryView == defaults.libraryGalleryView,
         "a missing library view key did not fall back to the default");
     expect(loaded.organizeClipsByGame == defaults.organizeClipsByGame,
@@ -109,7 +109,7 @@ void testEveryKeyFallsBackToItsDefault() {
         "video.resolutionMode=8k\n"
         "replay.seconds=-5\n"
         "capture.microphone=maybe\n"
-        "diagnostics.logLevel=shout\n"
+        "diagnostics.loggingEnabled=maybe\n"
         "library.viewMode=mosaic\n"
         "capture.backend=vulkan\n"
         "integrations.discordRichPresence=shout\n");
@@ -125,8 +125,8 @@ void testEveryKeyFallsBackToItsDefault() {
         "a negative replay window did not fall back to the default");
     expect(malformed.captureMicrophone == defaults.captureMicrophone,
         "a non-boolean microphone key did not fall back to the default");
-    expect(malformed.logLevel == defaults.logLevel,
-        "an unknown log level did not fall back through load()");
+    expect(malformed.loggingEnabled == defaults.loggingEnabled,
+        "a non-boolean logging-enabled key did not fall back through load()");
     expect(malformed.preferredCaptureBackend == defaults.preferredCaptureBackend,
         "an unknown capture backend did not fall back through load()");
 }
@@ -461,7 +461,7 @@ void testEverySerializedKeyRoundTrips() {
     original.followMouseMonitor = true;
     original.captureCursor = false;
     original.libraryGalleryView = true;
-    original.logLevel = backtrack::LogLevel::Warning;
+    original.loggingEnabled = false;
     original.hotkeys.startStopModifiers = MOD_CONTROL | MOD_SHIFT;
     original.hotkeys.startStopVirtualKey = VK_F7;
     original.hotkeys.saveReplayModifiers = MOD_ALT;
@@ -484,8 +484,8 @@ void testEverySerializedKeyRoundTrips() {
         detail << "a value did not survive save() and load(): fps " << original.video.fps
                << " -> " << reloaded.video.fps << ", preset "
                << static_cast<int>(original.video.encoderPreset) << " -> "
-               << static_cast<int>(reloaded.video.encoderPreset) << ", logLevel "
-               << static_cast<int>(original.logLevel) << " -> " << static_cast<int>(reloaded.logLevel)
+               << static_cast<int>(reloaded.video.encoderPreset) << ", logging "
+               << original.loggingEnabled << " -> " << reloaded.loggingEnabled
                << ", gallery " << original.libraryGalleryView << " -> " << reloaded.libraryGalleryView
                << ", ring '" << backtrack::wideToUtf8(original.replayRingDirectory.wstring()) << "' -> '"
                << backtrack::wideToUtf8(reloaded.replayRingDirectory.wstring()) << "'";

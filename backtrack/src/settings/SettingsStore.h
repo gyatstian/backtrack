@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/EncodingNames.h"
 #include "core/Types.h"
 
 #include <filesystem>
@@ -38,13 +39,10 @@ uint32_t supportedHotkeyModifiers(uint32_t modifiers);
 bool isSafeBareHotkey(uint32_t virtualKey);
 bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey);
 
-const wchar_t* codecName(VideoCodec codec);
 VideoCodec codecFromName(const std::wstring& value);
 const wchar_t* resolutionModeName(ResolutionMode mode);
 ResolutionMode resolutionModeFromName(const std::wstring& value);
-const wchar_t* encoderPresetName(EncoderPreset preset);
 EncoderPreset encoderPresetFromName(const std::wstring& value);
-const wchar_t* encoderModeName(EncoderMode mode);
 EncoderMode encoderModeFromName(const std::wstring& value);
 const wchar_t* encoderProfileName(EncoderProfile profile);
 EncoderProfile encoderProfileFromName(const std::wstring& value);

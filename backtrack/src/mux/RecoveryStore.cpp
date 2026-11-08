@@ -126,6 +126,13 @@ bool publishWithRetry(const std::filesystem::path& source, const std::filesystem
                 source.c_str(),
                 destination.c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            if (attempt > 1) {
+                Logger::instance().info(L"mux",
+                    L"Recovery manifest publish recovered on attempt " +
+                    std::to_wstring(attempt) + L"/" + std::to_wstring(kPublishAttempts) +
+                    L" after " + std::to_wstring(kPublishBackoffMs[attempt - 2].count()) +
+                    L"ms retry delay");
+            }
             return true;
         }
         const DWORD error = GetLastError();
@@ -609,6 +616,13 @@ bool muxToMp4WithRetry(
     for (int attempt = 1;; ++attempt) {
         DWORD win32Error = ERROR_SUCCESS;
         if (Mp4Muxer::muxToMp4(inputs, outputPath, &lastDetail, stagingVariant, &win32Error)) {
+            if (attempt > 1) {
+                Logger::instance().info(L"mux",
+                    L"Native MP4 mux recovered on attempt " +
+                    std::to_wstring(attempt) + L"/" + std::to_wstring(kPublishAttempts) +
+                    L" after " + std::to_wstring(kPublishBackoffMs[attempt - 2].count()) +
+                    L"ms retry delay");
+            }
             return true;
         }
         if (attempt >= kPublishAttempts) {
@@ -745,6 +759,8 @@ std::vector<LocatedManifest> findManifests(const std::filesystem::path& clipDire
             LocatedManifest located;
             located.outputDirectory = outputDirectory;
             if (!readRecoveryManifest(session, located.manifest)) {
+                Logger::instance().warning(L"mux",
+                    L"Ignoring unreadable recovery manifest: " + manifestPathFor(session).wstring());
                 continue;
             }
             std::error_code timeError;

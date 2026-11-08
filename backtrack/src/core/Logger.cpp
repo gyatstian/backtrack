@@ -1,8 +1,13 @@
 #include "core/Logger.h"
 
+#include "core/AppVersion.h"
+#include "core/LogContext.h"
+
 #include <Windows.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cwctype>
 #include <fstream>
 #include <iomanip>
@@ -36,10 +41,110 @@ std::wstring timestamp() {
     const auto time = std::chrono::system_clock::to_time_t(now);
     std::tm localTime{};
     localtime_s(&localTime, &time);
-
+    const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch() % std::chrono::seconds(1)).count();
     std::wstringstream stream;
-    stream << std::put_time(&localTime, L"%Y-%m-%d %H:%M:%S");
+    stream << std::put_time(&localTime, L"%H:%M:%S") << L"."
+           << std::setw(3) << std::setfill(L'0') << millis;
     return stream.str();
+}
+
+// Real OS build number. RtlGetVersion is the unmanifested, non-deprecated
+// source: GetVersionExW lies (returns 6.2 without a compatibility manifest)
+// and is deprecated. The struct mirrors RTL_OSVERSIONINFOW so winternl.h is
+// not needed.
+struct OsVersionInfo {
+    ULONG dwOSVersionInfoSize;
+    ULONG dwMajorVersion;
+    ULONG dwMinorVersion;
+    ULONG dwBuildNumber;
+    ULONG dwPlatformId;
+    WCHAR szCSDVersion[128];
+};
+using RtlGetVersionFn = LONG(WINAPI*)(OsVersionInfo*);
+
+std::wstring osVersionString() {
+    if (const HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll")) {
+        if (const auto fn = reinterpret_cast<RtlGetVersionFn>(
+                ::GetProcAddress(ntdll, "RtlGetVersion"))) {
+            OsVersionInfo info{};
+            info.dwOSVersionInfoSize = sizeof(info);
+            if (fn(&info) == 0) {  // STATUS_SUCCESS
+                // 10.0 build >= 22000 is Windows 11 (10.0 otherwise).
+                const std::wstring friendly =
+                    info.dwMajorVersion == 10 && info.dwBuildNumber >= 22000
+                    ? L"Windows 11"
+                    : L"Windows " + std::to_wstring(info.dwMajorVersion) + L"." +
+                          std::to_wstring(info.dwMinorVersion);
+                return friendly + L" (build " + std::to_wstring(info.dwBuildNumber) + L")";
+            }
+        }
+    }
+    return L"unknown";
+}
+
+std::wstring dateString() {
+    const auto now = std::chrono::system_clock::now();
+    const auto time = std::chrono::system_clock::to_time_t(now);
+    std::tm localTime{};
+    localtime_s(&localTime, &time);
+    std::wstringstream stream;
+    stream << std::put_time(&localTime, L"%Y-%m-%d");
+    return stream.str();
+}
+
+// Best-effort return addresses of the current call stack, as hex pointers.
+// PDBs are needed to turn these into symbols; they still distinguish "which
+// path logged this" when the same text has multiple callers.
+std::wstring captureStackTrace() {
+    void* frames[16] = {};
+    const USHORT count = RtlCaptureStackBackTrace(2, 16, frames, nullptr);
+    if (count == 0) {
+        return {};
+    }
+    std::wstring result;
+    for (USHORT index = 0; index < count; ++index) {
+        if (index > 0) {
+            result += L" ";
+        }
+        wchar_t buffer[32] = {};
+        swprintf_s(buffer, L"%p", frames[index]);
+        result += buffer;
+    }
+    return result;
+}
+
+// Mask values of known credential key names (token, secret, password, ...). No
+// call site logs secrets today; this keeps bundled logs safe if one is added.
+// Paths and window titles are handled at the call sites, never auto-masked
+// here - mangling a legitimate path is worse than an unredacted warning.
+void redactSecrets(std::wstring& line) {
+    static const wchar_t* const kKeys[] = {
+        L"token", L"secret", L"password", L"passwd", L"authorization",
+        L"api_key", L"apikey", L"api-key", L"access_token",
+    };
+    std::wstring lower = line;
+    for (wchar_t& ch : lower) {
+        ch = static_cast<wchar_t>(std::towlower(ch));
+    }
+    std::vector<std::pair<size_t, size_t>> ranges;  // value spans to mask
+    for (const wchar_t* key : kKeys) {
+        const std::wstring needle = std::wstring(key) + L"=";
+        for (size_t pos = lower.find(needle); pos != std::wstring::npos;
+             pos = lower.find(needle, pos + needle.size())) {
+            if (pos > 0 && (std::iswalnum(lower[pos - 1]) || lower[pos - 1] == L'_')) {
+                continue;  // part of a larger word ("mytoken=" is not the key)
+            }
+            const size_t valueStart = pos + needle.size();
+            const size_t valueEnd = line.find_first_of(L" \t,()", valueStart);
+            ranges.emplace_back(valueStart, valueEnd == std::wstring::npos ? line.size() : valueEnd);
+        }
+    }
+    std::sort(ranges.begin(), ranges.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (const auto& range : ranges) {
+        line.replace(range.first, range.second - range.first, L"***");
+    }
 }
 
 void archivePreviousLog(const std::filesystem::path& logPath) {
@@ -85,6 +190,10 @@ void Logger::initialize(const std::filesystem::path& logPath) {
     }
     rateStates_.clear();
     recentLines_.clear();
+    pendingGroup_ = {};
+    warnings_ = 0;
+    errors_ = 0;
+    rateLimitedLines_ = 0;
 }
 
 void Logger::setMinLevel(LogLevel level) {
@@ -97,9 +206,21 @@ LogLevel Logger::minLevel() const {
     return minLevel_;
 }
 
+void Logger::setEnabled(bool enabled) {
+    std::scoped_lock lock(mutex_);
+    enabled_ = enabled;
+}
+
+bool Logger::enabled() const {
+    std::scoped_lock lock(mutex_);
+    return enabled_;
+}
+
 void Logger::writeLine(const std::wstring& text) {
     // Caller holds mutex_.
-    std::wstring line = text;
+    std::wstring redacted = text;
+    redactSecrets(redacted);
+    std::wstring line = redacted;
     while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) {
         line.pop_back();
     }
@@ -111,9 +232,9 @@ void Logger::writeLine(const std::wstring& text) {
         // No per-line flush: it holds the global mutex across a disk write, so log
         // spam stalls the capture and encode threads. Lines reach disk when the
         // stream buffer fills, on Logger::flush(), or when the process exits.
-        stream_ << wideToUtf8(text);
+        stream_ << wideToUtf8(redacted);
     }
-    OutputDebugStringW(text.c_str());
+    OutputDebugStringW(redacted.c_str());
 }
 
 void Logger::write(LogLevel level, const std::wstring& message) {
@@ -144,21 +265,60 @@ void Logger::writeRateSummary(const std::wstring& message, const RateState& stat
 
 void Logger::writeLocked(LogLevel level, const wchar_t* subsystem, const std::wstring& message,
     std::chrono::steady_clock::time_point now) {
+    if (!enabled_) {
+        return;
+    }
     if (level < minLevel_) {
         return;
     }
+    if (level == LogLevel::Warning) {
+        ++warnings_;
+    } else if (level == LogLevel::Error) {
+        ++errors_;
+    }
+
+    // Consecutive-duplicate grouping runs before rate limiting: a burst of
+    // back-to-back identical lines collapses into one "(Nx)" line, and the
+    // rate limiter below still bounds the number of such lines per window for
+    // interleaved spam that grouping cannot merge. Errors group too; the stack
+    // and breadcrumb trail are captured at write time so a group flushed after
+    // its task scope ended still carries the original context.
+    const std::wstring subsystemStr = subsystem ? subsystem : L"";
+    if (pendingGroup_.active && pendingGroup_.level == level &&
+        pendingGroup_.subsystem == subsystemStr && pendingGroup_.message == message) {
+        ++pendingGroup_.count;
+        return;
+    }
+    flushPendingGroupLocked(now);
+    pendingGroup_.level = level;
+    pendingGroup_.subsystem = subsystemStr;
+    pendingGroup_.message = message;
+    pendingGroup_.task = LogContext::current();
+    pendingGroup_.trail = level == LogLevel::Error ? LogContext::trail() : std::wstring{};
+    pendingGroup_.stack = level == LogLevel::Error ? captureStackTrace() : std::wstring{};
+    pendingGroup_.count = 1;
+    pendingGroup_.active = true;
+}
+
+void Logger::flushPendingGroupLocked(std::chrono::steady_clock::time_point now) {
+    if (!pendingGroup_.active) {
+        return;
+    }
+    const PendingGroup group = std::move(pendingGroup_);
+    pendingGroup_.active = false;
 
     // Windowed per-message rate limiting. Errors are never throttled so real
     // failures always surface. Any other level is capped at kMaxPerWindow lines
     // per kRateWindow; excess occurrences are counted and reported as a single
     // summary line when the window rolls over. This bounds interleaved spam
     // (e.g. monitor-switch churn, retry loops) that previously produced tens of
-    // thousands of lines, without hiding sporadic events.
+    // thousands of lines, without hiding sporadic events. Keyed on the message
+    // text alone, so a grouped burst shares one budget with its ungrouped text.
     constexpr size_t kMaxPerWindow = 3;
 
     // Gate on level only. A minLevel_ condition here made the default Debug
     // configuration skip throttling entirely, so hot loops were never collapsed.
-    const bool throttleable = level != LogLevel::Error;
+    const bool throttleable = group.level != LogLevel::Error;
 
     if (throttleable) {
         // Bound memory: messages with embedded values (PIDs, dimensions) create
@@ -178,39 +338,100 @@ void Logger::writeLocked(LogLevel level, const wchar_t* subsystem, const std::ws
             }
         }
 
-        auto [it, inserted] = rateStates_.try_emplace(message);
+        auto [it, inserted] = rateStates_.try_emplace(group.message);
         auto& state = it->second;
         if (inserted || now - state.windowStart >= kRateWindow) {
             if (!inserted) {
-                writeRateSummary(message, state);
+                writeRateSummary(group.message, state);
             }
             state.windowStart = now;
             state.emitted = 0;
             state.suppressed = 0;
         }
-        state.level = level;
+        state.level = group.level;
         state.threadId = GetCurrentThreadId();
-        state.subsystem = subsystem ? subsystem : L"";
+        state.subsystem = group.subsystem;
 
         if (state.emitted >= kMaxPerWindow) {
             ++state.suppressed;
+            ++rateLimitedLines_;
             return;
         }
         ++state.emitted;
     }
 
     std::wstringstream line;
-    line << L"[" << timestamp() << L"] [" << levelName(level) << L"] [tid="
-         << GetCurrentThreadId() << L"]";
-    if (subsystem && *subsystem) {
-        line << L" [" << subsystem << L"]";
+    line << timestamp() << L" [" << levelName(group.level) << L"]";
+    if (!group.subsystem.empty()) {
+        line << L" [" << group.subsystem << L"]";
     }
-    line << L" " << message << L"\n";
+    line << L" " << group.message;
+    if (group.count > 1) {
+        line << L" (" << group.count << L"x)";
+    }
+
+    // Structured tail: correlation id from the thread's task context, and on
+    // ERROR the breadcrumb trail plus a stack trace.
+    std::wstring pairs;
+    if (!group.task.empty()) {
+        pairs = L"task=" + group.task;
+    }
+    if (group.level == LogLevel::Error) {
+        if (!group.trail.empty()) {
+            pairs += pairs.empty() ? L"trail=" + group.trail : L" trail=" + group.trail;
+        }
+        if (!group.stack.empty()) {
+            pairs += pairs.empty() ? L"stack=" + group.stack : L" stack=" + group.stack;
+        }
+    }
+    if (!pairs.empty()) {
+        line << L" (" << pairs << L")";
+    }
+    line << L"\n";
     writeLine(line.str());
+}
+
+void Logger::writeHeader() {
+    std::scoped_lock lock(mutex_);
+    if (!enabled_ || !stream_.is_open()) {
+        return;
+    }
+    std::wstringstream line;
+    line << L"===== Backtrack " << kCurrentAppVersion << L" =====\n";
+    writeLine(line.str());
+    line.str(L"");
+    line << L"date=" << dateString() << L" environment="
+#ifdef NDEBUG
+         << L"release"
+#else
+         << L"debug"
+#endif
+         << L"\n";
+    writeLine(line.str());
+    line.str(L"");
+    line << L"os=" << osVersionString() << L"\n";
+    writeLine(line.str());
+}
+
+void Logger::writeFooter() {
+    std::scoped_lock lock(mutex_);
+    if (!enabled_) {
+        return;
+    }
+    flushPendingGroupLocked(std::chrono::steady_clock::now());
+    if (!stream_.is_open()) {
+        return;
+    }
+    std::wstringstream line;
+    line << L"===== shutdown: errors=" << errors_ << L" warnings=" << warnings_
+         << L" rate-limited=" << rateLimitedLines_ << L" =====\n";
+    writeLine(line.str());
+    stream_.flush();
 }
 
 bool Logger::flush() {
     std::scoped_lock lock(mutex_);
+    flushPendingGroupLocked(std::chrono::steady_clock::now());
     if (!stream_.is_open()) {
         return false;
     }
@@ -223,8 +444,14 @@ std::filesystem::path Logger::currentPath() const {
     return logPath_;
 }
 
-std::vector<std::wstring> Logger::recentLines(size_t maxLines) const {
+std::vector<std::wstring> Logger::recentLines(size_t maxLines) {
     std::scoped_lock lock(mutex_);
+    if (!enabled_) {
+        return {};
+    }
+    // Flush the deferred duplicate group so the Diagnostics page shows the
+    // current tail, not a line held back for grouping.
+    flushPendingGroupLocked(std::chrono::steady_clock::now());
     if (maxLines == 0 || recentLines_.empty()) {
         return {};
     }
@@ -290,24 +517,6 @@ std::string wideToUtf8(const std::wstring& value) {
     std::string result(static_cast<size_t>(size), '\0');
     WideCharToMultiByte(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), size, nullptr, nullptr);
     return result;
-}
-
-const wchar_t* logLevelName(LogLevel level) {
-    return levelName(level);
-}
-
-LogLevel logLevelFromName(const std::wstring& value, LogLevel fallback) {
-    std::wstring normalized;
-    normalized.reserve(value.size());
-    for (const wchar_t ch : value) {
-        normalized.push_back(static_cast<wchar_t>(std::towlower(ch)));
-    }
-    if (normalized == L"trace") return LogLevel::Trace;
-    if (normalized == L"debug") return LogLevel::Debug;
-    if (normalized == L"info") return LogLevel::Info;
-    if (normalized == L"warn" || normalized == L"warning") return LogLevel::Warning;
-    if (normalized == L"error") return LogLevel::Error;
-    return fallback;
 }
 
 } // namespace backtrack

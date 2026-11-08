@@ -316,6 +316,8 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
             // A failed mixed-audio write is a hard error (disk full), not a
             // "save without audio" case: the source WAVs were already readable
             // and the mux would publish silently truncated audio.
+            Logger::instance().error(L"audio",
+                L"Failed to write mixed audio for MP4 mux (disk full?); MP4 save will fail");
             return false;
         }
     }

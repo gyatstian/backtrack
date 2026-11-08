@@ -1,6 +1,7 @@
 #include "encoder/AmfEncoder.h"
 
 #include "capture/D3DDevice.h"
+#include "core/EncodingNames.h"
 #include "core/Logger.h"
 #include "encoder/DecodeOrderTimestamps.h"
 #include "encoder/EncoderCommon.h"
@@ -773,7 +774,14 @@ struct AmfEncoder::Impl {
         Logger::instance().info(L"encoder",
             std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
             L" encoder initialized in zero-copy D3D11 mode at " +
-            std::to_wstring(settings.width) + L"x" + std::to_wstring(settings.height));
+            std::to_wstring(settings.width) + L"x" + std::to_wstring(settings.height) +
+            L", codec=" + codecName(settings.codec) +
+            L", bitrateKbps=" + std::to_wstring(settings.bitrateKbps) +
+            L", gopSeconds=" + std::to_wstring(settings.gopSeconds) +
+            L", preset=" + encoderPresetName(caps.effective.preset) +
+            L", mode=" + encoderModeName(caps.effective.mode) +
+            L", bFrames=" + (caps.effective.bFrames ? L"yes" : L"no") +
+            L", lookahead=" + (caps.effective.lookahead ? L"yes" : L"no"));
         return true;
     }
 
@@ -1073,6 +1081,18 @@ struct AmfEncoder::Impl {
 
         const auto start = std::chrono::steady_clock::now();
 
+        // AMF submit failures log on the 1st and every 300th consecutive one;
+        // the 30th escalates to a full session fault via fail().
+        auto noteSubmitFailure = [&](const wchar_t* what, AMF_RESULT r) {
+            const uint32_t failures = ++consecutiveSubmitFailures;
+            if (failures == 1 || (failures % 300) == 0) {
+                Logger::instance().warning(L"encoder",
+                    std::wstring(L"AMF ") + what + L" failed: " + amfResultName(r) +
+                    L" (count=" + std::to_wstring(failures) + L")");
+            }
+            return failures == kEncoderMaxConsecutiveFailures;
+        };
+
         // Hard lifetime for accepted-but-unharvested frames: a healthy driver
         // drains within a few frame intervals, so an input this old means the
         // encoder stopped producing output. Fault the session (the capture
@@ -1092,7 +1112,7 @@ struct AmfEncoder::Impl {
             // the stream never continues from a broken reference chain.
             forceKeyFrame = true;
             ++encoderStats.droppedFrames;
-            if (++consecutiveSubmitFailures == kEncoderMaxConsecutiveFailures) {
+            if (noteSubmitFailure(L"CreateSurfaceFromDX11Native", result)) {
                 return fail(L"AMF CreateSurfaceFromDX11Native failed repeatedly: " + amfResultName(result));
             }
             return popReadyPacket(packet);
@@ -1136,7 +1156,7 @@ struct AmfEncoder::Impl {
                 if (result == AMF_INPUT_FULL) {
                     return popReadyPacket(packet);
                 }
-                if (++consecutiveSubmitFailures == kEncoderMaxConsecutiveFailures) {
+                if (noteSubmitFailure(L"SubmitInput", result)) {
                     return fail(L"AMF SubmitInput failed repeatedly: " + amfResultName(result));
                 }
                 return popReadyPacket(packet);
@@ -1146,7 +1166,7 @@ struct AmfEncoder::Impl {
             // stream continues from a clean reference state.
             forceKeyFrame = true;
             ++encoderStats.droppedFrames;
-            if (++consecutiveSubmitFailures == kEncoderMaxConsecutiveFailures) {
+            if (noteSubmitFailure(L"SubmitInput", result)) {
                 return fail(L"AMF SubmitInput failed repeatedly: " + amfResultName(result));
             }
             return popReadyPacket(packet);

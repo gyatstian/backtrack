@@ -195,6 +195,11 @@ private:
     uint64_t ramAudioBytes_ = 0;
     size_t videoKeyFrames_ = 0;
     int64_t lastSaveEndPts100ns_ = 0;
+    // Trim eviction totals since the last trim report (replay/ReplayBuffer.cpp
+    // logs them as an info when either crosses the threshold, instead of one
+    // line per pushed packet).
+    uint64_t trimVideoEvicted_ = 0;
+    uint64_t trimAudioEvicted_ = 0;
     // GOP most recently seen by saveTo (VideoSettings is save-scoped), so
     // videoSpan100ns can mirror the save window cut. Default matches VideoSettings.
     uint32_t lastGopSeconds_ = 2;

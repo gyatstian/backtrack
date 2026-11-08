@@ -2,9 +2,11 @@
 #include "clips/AtomicWrite.h"
 #include "clips/ClipStorage.h"
 
+#include "core/LogContext.h"
 #include "core/Logger.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cwctype>
 #include <fstream>
 #include <propsys.h>
@@ -162,12 +164,16 @@ void ClipManager::setDirectory(std::filesystem::path directory) {
 }
 
 std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancelled) const {
+    const LogContext::ScopedTask taskContext(L"clips-scan");
+    const auto scanStart = std::chrono::steady_clock::now();
     std::vector<ClipInfo> clips;
     std::unordered_set<std::wstring> liveDurationKeys;
     std::error_code error;
     if (directory_.empty() || !std::filesystem::exists(directory_, error)) {
         if (error) {
             Logger::instance().warning(L"clips", L"Could not access clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        } else {
+            Logger::instance().warning(L"clips", L"Clip directory does not exist: " + directory_.wstring());
         }
         return clips;
     }
@@ -249,6 +255,10 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
         }
         return left.path.filename().wstring() > right.path.filename().wstring();
     });
+    const int64_t scanMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - scanStart).count();
+    Logger::instance().info(L"clips", L"Library scan complete: " + std::to_wstring(clips.size()) +
+        L" clips in " + std::to_wstring(scanMs) + L"ms");
     return clips;
 }
 
@@ -286,8 +296,16 @@ bool ClipManager::removeClip(const std::filesystem::path& path) const {
 
     error = {};
     std::filesystem::remove(favoriteMarker(path), error);
+    if (error) {
+        Logger::instance().warning(L"clips", L"Could not remove favorite marker after deleting clip: " +
+            favoriteMarker(path).wstring() + L" (" + utf8ToWide(error.message()) + L")");
+    }
     error = {};
     std::filesystem::remove(tagFile(path), error);
+    if (error) {
+        Logger::instance().warning(L"clips", L"Could not remove tag file after deleting clip: " +
+            tagFile(path).wstring() + L" (" + utf8ToWide(error.message()) + L")");
+    }
     return true;
 }
 
@@ -398,6 +416,7 @@ bool ClipManager::addTag(const std::filesystem::path& path, const std::wstring& 
             L" (" + utf8ToWide(error.message()) + L")");
         return false;
     }
+    Logger::instance().info(L"clips", L"Added tag to clip: " + path.wstring() + L" (" + normalized + L")");
     return true;
 }
 
@@ -409,15 +428,31 @@ bool ClipManager::isManagedClipPath(const std::filesystem::path& path) const {
     std::error_code error;
     const auto root = std::filesystem::weakly_canonical(directory_, error);
     if (error || root.empty()) {
+        if (error) {
+            Logger::instance().warning(L"clips", L"Could not validate clip path: " + path.wstring() +
+                L" (" + utf8ToWide(error.message()) + L")");
+        }
         return false;
     }
 
     const auto resolved = std::filesystem::weakly_canonical(path, error);
-    if (error || resolved.empty() || !isPathInsideDirectory(resolved, root)) {
+    if (error) {
+        Logger::instance().warning(L"clips", L"Could not validate clip path: " + path.wstring() +
+            L" (" + utf8ToWide(error.message()) + L")");
+        return false;
+    }
+    if (resolved.empty() || !isPathInsideDirectory(resolved, root)) {
         return false;
     }
 
-    return std::filesystem::is_regular_file(resolved, error) && !error;
+    if (!std::filesystem::is_regular_file(resolved, error)) {
+        if (error) {
+            Logger::instance().warning(L"clips", L"Could not validate clip path: " + path.wstring() +
+                L" (" + utf8ToWide(error.message()) + L")");
+        }
+        return false;
+    }
+    return true;
 }
 
 std::filesystem::path ClipManager::favoriteMarker(const std::filesystem::path& path) const {

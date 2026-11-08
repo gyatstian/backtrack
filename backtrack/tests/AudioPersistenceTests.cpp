@@ -185,6 +185,7 @@ void testLongOutagePreservesGapDuration() {
     WavWriter writer;
     expect(writer.open(path, pcm16Stereo()), "open failed");
     int64_t nextPts = 0;
+    backtrack::AudioGapStats gapStats;
 
     // Marker at 0 s: one second of audio on the timeline.
     AudioPacket first;
@@ -194,7 +195,7 @@ void testLongOutagePreservesGapDuration() {
     first.bytes.assign(48000 * 4, 0x80);
     expect(backtrack::paceAudioPacket(
                writer, nextPts, first,
-               (std::numeric_limits<int64_t>::max)(), L"test", L"timeline.wav"),
+               (std::numeric_limits<int64_t>::max)(), L"test", L"timeline.wav", gapStats),
         "pacing the first marker failed");
 
     // 40 s of silence, then a resume marker at 40 s: the saved audio must span
@@ -206,9 +207,13 @@ void testLongOutagePreservesGapDuration() {
     resumed.bytes.assign(48000 * 4, 0x7f);
     expect(backtrack::paceAudioPacket(
                writer, nextPts, resumed,
-               (std::numeric_limits<int64_t>::max)(), L"test", L"timeline.wav"),
+               (std::numeric_limits<int64_t>::max)(), L"test", L"timeline.wav", gapStats),
         "pacing the resumed marker failed");
     writer.close();
+
+    expect(gapStats.fillEvents == 1 && gapStats.fillBytes == 39ull * 48000 * 4 &&
+            gapStats.maxGapMs == 39000,
+        "the full-gap fill did not update the gap statistics");
 
     backtrack::WavInfo info;
     expect(backtrack::parseWav(path, info), "the outage WAV is unreadable");

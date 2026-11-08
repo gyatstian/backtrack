@@ -82,10 +82,6 @@ private:
 // Creates a high-resolution waitable timer (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
 // Windows 10 1803+). Returns nullptr on failure; caller falls back to coarse waits.
 HANDLE createHighResolutionWaitableTimer();
-// Waits up to timeoutMs using a high-resolution timer, immune to the global
-// system timer period. Returns true if it waited the requested duration,
-// false if the timer was unusable (caller should fall back).
-bool waitHighResolution(HANDLE timer, uint32_t timeoutMs);
 std::wstring moduleFilePath();
 bool updateWindowsStartupRegistration(bool enabled);
 void pruneStaleMicrophoneConsentEntries();

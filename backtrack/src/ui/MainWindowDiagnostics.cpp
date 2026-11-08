@@ -119,6 +119,25 @@ void MainWindow::saveLog() {
         tail << L"inactive";
     }
     tail << L"\n" << hdrStatusLine(tailStats) << L"\n";
+    // Runtime snapshot: the counters that matter when triaging a log. It is
+    // appended at save time, so it reflects the session so far, not shutdown.
+    tail << L"Runtime:\n";
+    tail << L"Average encode: " << tailStats.encoder.averageEncodeMs << L" ms\n";
+    tail << L"Encoder submissions/encoded/keyframes: " << tailStats.encoder.submittedFrames << L"/"
+         << tailStats.encoder.encodedFrames << L"/" << tailStats.encoder.keyFrames << L"\n";
+    tail << L"Frames dropped: " << tailStats.droppedFrames + tailStats.encoder.droppedFrames
+         << L" (gpu-protection " << tailStats.gpuProtectionDrops
+         << L", frame-queue " << tailStats.frameQueueDrops << L")\n";
+    tail << L"Source frames: " << tailStats.sourceFrames << L" (" << tailStats.sourceFramesPerSecond
+         << L"/s), timeline intervals: " << tailStats.capturedFrames << L" ("
+         << tailStats.timelineIntervalsPerSecond << L"/s)\n";
+    tail << L"Cadence dup / catch-up dup / coalesced idle: " << tailStats.cadenceDuplicateFrames << L"/"
+         << tailStats.catchUpDuplicateFrames << L"/" << tailStats.coalescedIdleIntervals << L"\n";
+    tail << L"Replay packets: " << tailStats.replayVideoPackets << L", keyframes: "
+         << tailStats.replayKeyFrames << L"\n";
+    tail << L"System audio queue drops: " << tailStats.systemAudioQueueDrops
+         << L", mic queue drops: " << tailStats.microphoneAudioQueueDrops << L"\n";
+    tail << L"Frame queue depth: " << tailStats.encoder.queueDepth << L"\n";
     if (const auto error = saveDiagnosticsLog(fileName, wideToUtf8(tail.str())); error) {
         setStatus(L"Could not save log: " + utf8ToWide(error.message()));
         return;
@@ -235,42 +254,46 @@ void MainWindow::updateStats() {
     }
 
     if (diagnosticLogLabel_) {
-        const auto lines = Logger::instance().recentLines(12);
-        std::wstringstream stream;
-        if (lines.empty()) {
-            stream << L"No log lines available";
+        if (!Logger::instance().enabled()) {
+            setText(diagnosticLogLabel_, L"Logging is disabled");
         } else {
-            // Collapse runs of identical consecutive lines into "line (Nx)".
-            // Compare message after structured timestamp/level/thread/tag fields.
-            auto messageKey = [](const std::wstring& line) -> std::wstring {
-                size_t pos = 0;
-                while (pos < line.size() && line[pos] == L'[') {
-                    const size_t close = line.find(L']', pos + 1);
-                    if (close == std::wstring::npos) {
-                        return line;
+            const auto lines = Logger::instance().recentLines(12);
+            std::wstringstream stream;
+            if (lines.empty()) {
+                stream << L"No log lines available";
+            } else {
+                // Collapse runs of identical consecutive lines into "line (Nx)".
+                // Compare message after structured timestamp/level/thread/tag fields.
+                auto messageKey = [](const std::wstring& line) -> std::wstring {
+                    size_t pos = 0;
+                    while (pos < line.size() && line[pos] == L'[') {
+                        const size_t close = line.find(L']', pos + 1);
+                        if (close == std::wstring::npos) {
+                            return line;
+                        }
+                        pos = close + 1;
+                        while (pos < line.size() && line[pos] == L' ') {
+                            ++pos;
+                        }
                     }
-                    pos = close + 1;
-                    while (pos < line.size() && line[pos] == L' ') {
-                        ++pos;
+                    return line.substr(pos);
+                };
+                for (size_t i = 0; i < lines.size();) {
+                    const std::wstring key = messageKey(lines[i]);
+                    size_t count = 1;
+                    while (i + count < lines.size() && messageKey(lines[i + count]) == key) {
+                        ++count;
                     }
+                    stream << lines[i];
+                    if (count > 1) {
+                        stream << L" (" << count << L"x)";
+                    }
+                    stream << L"\r\n";
+                    i += count;
                 }
-                return line.substr(pos);
-            };
-            for (size_t i = 0; i < lines.size();) {
-                const std::wstring key = messageKey(lines[i]);
-                size_t count = 1;
-                while (i + count < lines.size() && messageKey(lines[i + count]) == key) {
-                    ++count;
-                }
-                stream << lines[i];
-                if (count > 1) {
-                    stream << L" (" << count << L"x)";
-                }
-                stream << L"\r\n";
-                i += count;
             }
+            setText(diagnosticLogLabel_, stream.str());
         }
-        setText(diagnosticLogLabel_, stream.str());
     }
 
     updateAudioLivenessWarning(stats);

@@ -108,6 +108,7 @@ void MainWindow::rebindPageControlPointers() {
     statsLabel_ = nullptr;
     capsLabel_ = nullptr;
     diagnosticLogLabel_ = nullptr;
+    loggingEnabledCheck_ = nullptr;
     clipList_ = nullptr;
     listViewButton_ = nullptr;
     galleryViewButton_ = nullptr;
@@ -251,6 +252,7 @@ void MainWindow::rebindPageControlPointers() {
     statsLabel_ = child(kStatsLabelId);
     capsLabel_ = child(kCapsLabelId);
     diagnosticLogLabel_ = child(kDiagnosticLogLabelId);
+    loggingEnabledCheck_ = child(kLoggingEnabledCheckId);
     clipList_ = child(kClipListId);
     listViewButton_ = child(kClipListViewButtonId);
     galleryViewButton_ = child(kClipGalleryViewButtonId);
@@ -537,6 +539,7 @@ void MainWindow::clearPageControls() {
     statsLabel_ = nullptr;
     capsLabel_ = nullptr;
     diagnosticLogLabel_ = nullptr;
+    loggingEnabledCheck_ = nullptr;
     clipList_ = nullptr;
     listViewButton_ = nullptr;
     galleryViewButton_ = nullptr;
@@ -1676,16 +1679,23 @@ void MainWindow::buildCapturePage() {
 }
 
 void MainWindow::buildStatsPage() {
+    // Read-only multiline edits: they wrap to the column width and scroll
+    // internally; the subclass keeps Tab/Shift+Tab moving focus.
+    auto makeReadOnlyEdit = [&](const wchar_t* text, int x, int y, int width, int height, int id) {
+        HWND edit = addControl(L"EDIT", text, WS_BORDER | ES_MULTILINE | ES_READONLY | ES_LEFT | WS_VSCROLL | WS_TABSTOP, x, y, width, height, id);
+        SetWindowSubclass(edit, readOnlyEditSubclassProc, 1, reinterpret_cast<DWORD_PTR>(this));
+        return edit;
+    };
     addSectionLabel(L"Runtime", 44, 78, 220);
-    statsLabel_ = addControl(L"STATIC", L"", SS_LEFT, 44, 112, 350, 330, kStatsLabelId);
+    statsLabel_ = makeReadOnlyEdit(L"", 44, 112, 350, 330, kStatsLabelId);
     addSectionLabel(L"Encoder", 464, 78, 220);
-    capsLabel_ = addControl(L"STATIC", L"", SS_LEFT, 464, 112, 350, 330, kCapsLabelId);
+    capsLabel_ = makeReadOnlyEdit(L"", 464, 112, 350, 330, kCapsLabelId);
     addSectionLabel(L"Recent Log", 44, 484, 220);
-    HWND logLevel = addControl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP | WS_VSCROLL, 416, 480, 132, 160, kLogLevelComboId);
-    fillEnumCombo(logLevel, kLogLevelComboEntries, static_cast<int>(settings_.logLevel));
+    loggingEnabledCheck_ = addControl(L"BUTTON", L"Enable logging", BS_AUTOCHECKBOX | WS_TABSTOP, 44, 484, 160, 26, kLoggingEnabledCheckId);
+    SendMessageW(loggingEnabledCheck_, BM_SETCHECK, settings_.loggingEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
     addControl(L"BUTTON", L"Open Folder", BS_PUSHBUTTON | WS_TABSTOP, 560, 480, 132, 30, kOpenLogFolderButtonId);
     addControl(L"BUTTON", L"Save Log", BS_PUSHBUTTON | WS_TABSTOP, 704, 480, 120, 30, kSaveLogButtonId);
-    diagnosticLogLabel_ = addControl(L"STATIC", L"", SS_LEFT, 44, 518, 780, 150, kDiagnosticLogLabelId);
+    diagnosticLogLabel_ = makeReadOnlyEdit(L"", 44, 518, 780, 150, kDiagnosticLogLabelId);
     updateStats();
 }
 

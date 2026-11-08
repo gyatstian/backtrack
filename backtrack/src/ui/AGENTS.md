@@ -34,7 +34,9 @@ icon.
   snapshot to an exclusively created sibling; it replaces the selected
   destination by handle and only attempts to remove its own staging file on
   failure. it rejects the live log and its aliases as destinations. the
-  diagnostics tail is best-effort.
+  diagnostics tail is best-effort. the saved log tail appends the session
+  runtime snapshot (encoder, drop and replay counters) so a triage copy
+  carries the numbers that matter.
 - Control ids, timers, messages, tray ids and the shared theme colors live in
   `UiIds.h`. Never inline a control id or a color in a `.cpp`; a literal cannot
   be found, renamed, or themed. Per-page row geometry (label and control x,
@@ -110,8 +112,8 @@ icon.
   a second load. `commitSettings` advances the saved baseline and applies
   startup registration and ui preferences only after publication succeeds.
   failed saves retain drafts for retry; a failed startup read blocks writes
-  until restart so defaults cannot replace an unreadable file. immediate log
-  level and library view commits overlay only their field on the saved snapshot.
+  until restart so defaults cannot replace an unreadable file. immediate logging
+  enabled and library view commits overlay only their field on the saved snapshot.
   page construction never replaces that snapshot from the controller.
 - Dark theme is applied by hand: `applyDarkTheme` per control (DWM dark mode
   plus `SetWindowTheme`) and the owner-draw and `WM_CTLCOLOR*` handlers, which
@@ -120,6 +122,11 @@ icon.
   and `layoutCurrentPage` scales x and width from it to the available column
   width with `MulDiv`; heights and fonts are never scaled. `WM_DPICHANGED` only
   adopts the suggested window rect and relayouts.
+- Diagnostics bypasses the generic two-column layout: a dedicated branch in
+  `layoutCurrentPage` places its three sections (Runtime, Encoder, Recent Log)
+  side by side at equal width. Each body is a read-only multiline `EDIT` that
+  wraps to the column and scrolls inside itself; the subclass drops
+  `DLGC_WANTALLKEYS` so Tab still moves focus.
 - Gallery tile geometry is not duplicated: the painter and the click handler
   both go through `galleryTileRect` / `galleryTileColumnAt`, and both use
   `kGalleryTileGap` (including `galleryItemHeightForWidth`, so the budgeted
@@ -134,7 +141,8 @@ icon.
   identified by generation and clip directory, and `handleLibraryScanReady`
   rejects a result whose generation or directory no longer matches, or whose
   page has gone. Re-refreshing replaces the pending request rather than queuing
-  another. A single-clip action (favorite, delete, rename) updates that one
+  another. `LibraryScanResult::durationMs` is set by the scan worker so the
+  ready handler can log scan timing. A single-clip action (favorite, delete, rename) updates that one
   `clips_` entry and repaints instead. An in-place update must carry over every
   field it does not itself change - notably `duration100ns`, which only the
   shell property read populates - and re-sort the vector when the entry's sort

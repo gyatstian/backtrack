@@ -3,6 +3,7 @@
 #include "audio/AudioConvert.h"
 #include "audio/AudioMix.h"
 #include "audio/WavReader.h"
+#include "core/LogTiming.h"
 #include "core/Logger.h"
 #include "mux/AudioTimeline.h"
 #include "mux/RecoveryStore.h"
@@ -542,6 +543,7 @@ void Mp4Muxer::writeAudioPacket(const AudioPacket& packet) {
         // recordings and pre-keyframe audio are not silently dropped.
         constexpr size_t kMaxPendingAudioPackets = 512;
         if (pendingAudio_.size() >= kMaxPendingAudioPackets) {
+            Logger::instance().warning(L"mux", L"Pre-keyframe audio buffer overflow; dropped oldest packet");
             pendingAudio_.erase(pendingAudio_.begin());
         }
         pendingAudio_.push_back(packet);
@@ -586,6 +588,18 @@ std::filesystem::path Mp4Muxer::finalize() {
         flushPendingAudioLocked();
         systemAudio_.writer.close();
         microphoneAudio_.writer.close();
+        {
+            // One gap-fill aggregate per recording; zero events stays silent.
+            AudioGapStats combined;
+            mergeAudioGapStats(combined, systemAudio_.gapStats);
+            mergeAudioGapStats(combined, microphoneAudio_.gapStats);
+            if (combined.fillEvents > 0) {
+                Logger::instance().info(L"mux",
+                    L"Recording audio: gap-fills=" + std::to_wstring(combined.fillEvents) +
+                    L" events, total_silence=" + std::to_wstring(combined.fillBytes) +
+                    L"B, max_gap_ms=" + std::to_wstring(combined.maxGapMs));
+            }
+        }
         pendingAudio_.clear();
         // The full manifest below is rewritten with exact counts/durations;
         // close the incremental handle first so both never interleave.
@@ -792,7 +806,8 @@ void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPa
             packet,
             kNoAudioWindowEnd,
             L"mux",
-            fileName)) {
+            fileName,
+            state.gapStats)) {
         noteAudioWriteFailedLocked(fileName);
     }
 }
@@ -966,6 +981,18 @@ bool Mp4Muxer::muxToMp4(
     if (FAILED(hr)) {
         return fail(L"MF Finalize failed " + formatHresult(hr) + L" after " + std::to_wstring(elapsedMs) + L"ms");
     }
+    // Offline mux of already-compressed streams: a total save past twice the
+    // buffered video window (or 60 s, whichever is larger) points at a slow
+    // disk, not the encode.
+    int64_t videoWindow100ns = 0;
+    for (const auto& sample : inputs.videoSamples) {
+        videoWindow100ns = std::max<int64_t>(videoWindow100ns, sample.pts100ns + sample.duration100ns);
+    }
+    const int64_t muxBudgetMs = std::max<int64_t>(
+        60000, (videoWindow100ns * 2) / kHundredNanosecondsPerSecond * 1000);
+    logLatencyWarn(L"mux", L"MP4 mux exceeded budget", muxStart,
+        std::chrono::milliseconds(muxBudgetMs),
+        L"window_s=" + std::to_wstring(videoWindow100ns / kHundredNanosecondsPerSecond));
     // Release the sink's handle before flushing and moving the staged file.
     writer.Reset();
 
@@ -998,8 +1025,18 @@ bool Mp4Muxer::muxToMp4(
         return fail(L"Finished MP4 could not be moved into place at " + outputPath.wstring() +
                     L" (Win32 error " + std::to_wstring(moveError) + L")");
     }
+    const uint64_t sizeBytes = fileSizeOrZero(outputPath);
+    const double sizeMiB = static_cast<double>(sizeBytes) / (1024.0 * 1024.0);
+    const double rateMiBs = elapsedMs > 0 ? (sizeMiB * 1000.0) / static_cast<double>(elapsedMs) : 0.0;
+    const auto fixed1 = [](double value) {
+        std::wstringstream ss;
+        ss << std::fixed << std::setprecision(1) << value;
+        return ss.str();
+    };
     Logger::instance().info(L"mux",
-        L"Native MP4 mux complete: " + outputPath.wstring() + L" in " + std::to_wstring(elapsedMs) + L"ms");
+        L"Native MP4 mux complete: " + outputPath.wstring() + L" size=" +
+        std::to_wstring(sizeBytes) + L"B (" + fixed1(sizeMiB) + L" MiB) in " +
+        std::to_wstring(elapsedMs) + L"ms (" + fixed1(rateMiBs) + L" MiB/s)");
     return true;
 }
 

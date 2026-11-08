@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Types.h"
+#include "mux/AudioTimeline.h"
 #include "mux/MuxedInputs.h"
 #include "mux/WavWriter.h"
 
@@ -45,6 +46,8 @@ private:
     struct AudioTimelineState {
         WavWriter writer;
         int64_t nextPts100ns = 0;
+        // Gap-fill accounting for the finalize summary (mux/AudioTimeline.h).
+        AudioGapStats gapStats;
         // Set once when a packet arrives whose format differs from the WAV the
         // writer was opened with; such packets are dropped instead of copied
         // raw (which would append wrong-rate samples and skew the timeline).

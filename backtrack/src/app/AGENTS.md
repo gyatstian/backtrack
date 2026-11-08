@@ -67,6 +67,19 @@ recording-stop drain handshake.
   - `captureLoop`, `encodeLoop`, `audioLoop`: each has a thin wrapper that
     catches everything around an `*Impl` body. `beginStartupSweep` wraps its
     sweep lambda the same way. New threads follow the same split.
+  - The three worker loops and `saveReplay` each open a
+    `LogContext::ScopedTask` (labels `capture` / `encode` / `audio` /
+    `saveReplay`) so every line from a worker carries `task=...`, and the
+    encode loop probes `encoder_->stats().averageEncodeMs` against the frame
+    budget every 5 s (WARN on sustained overrun). `averageEncodeMs` is
+    submit->output latency whose healthy floor is about one frame period, so
+    `encoderBehindBudget` gates the probe on real feed rate (>= half the target
+    submissions in the window; idle holds submit only a heartbeat IDR per GOP
+    interval) and a three-frame-period threshold, otherwise a healthy pipeline
+    or an idle desktop alarms forever. Drop branches in `emitFrame`
+    and the audio canonicalize-failure drop log rate-limited WARNs; the save
+    and ring-push latency WARNs live in `app` (via `core/LogTiming.h`) and
+    `replay`.
   - `pipelineGpuMutex_` serializes GPU resource teardown and recreation.
     Per-operation immediate-context access uses `D3DDevice::immediateContextMutex()`.
     The encode worker starts before the capture worker can request a discard.
@@ -150,6 +163,11 @@ recording-stop drain handshake.
   fields directly. Microphone gain runs on canonical floats through
   `audio/applyMuteGain`; `sanitizeSettings` owns the 0-200 % range, so the
   call site never re-clamps.
+- The non-exclusive soft-stall recovery (`No frames for Xms; recreating
+  capture source`) is gated on recent user input (`userInputIdleMs()`): a
+  static desktop with no input is normal WGC silence (DWM presents nothing),
+  so recreating the source there is churn. Only a no-frame stretch while the
+  user is interacting is treated as a wedged source worth tearing down.
 - HDR capture is automatic, never a setting. `createCaptureSource` prefers
   Desktop Duplication on an advanced-color monitor (WGC stays fixed-BGRA and
   leans on DWM pre-tonemap, which washes out); WGC remains the fallback when DD

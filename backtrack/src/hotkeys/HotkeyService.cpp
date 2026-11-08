@@ -1,5 +1,6 @@
 #include "hotkeys/HotkeyService.h"
 
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "settings/SettingsStore.h"
 
@@ -117,6 +118,8 @@ bool HotkeyService::registerHotkeys(HWND window, const HotkeySettings& settings)
                 activeService_ = nullptr;
             }
             Logger::instance().warning(L"hotkeys", keyboardHookFailureMessage(hookError));
+        } else {
+            LogContext::breadcrumb(L"fullscreen hook armed");
         }
     }
 
@@ -169,11 +172,18 @@ bool HotkeyService::registerHotkeys(HWND window, const HotkeySettings& settings)
         unregisterHotkeys(window);
         return false;
     }
+    Logger::instance().info(L"hotkeys",
+        L"Hotkeys registered: start/stop " +
+        hotkeyName(settings.startStopModifiers, settings.startStopVirtualKey) +
+        L", save replay " +
+        hotkeyName(settings.saveReplayModifiers, settings.saveReplayVirtualKey) +
+        (wantsHook ? L"; fullscreen hook active" : L"; no fullscreen hook"));
     return true;
 }
 
 void HotkeyService::unregisterHotkeys(HWND window) {
     if (keyboardHook_) {
+        LogContext::breadcrumb(L"fullscreen hook released");
         UnhookWindowsHookEx(keyboardHook_);
         keyboardHook_ = nullptr;
     }
@@ -194,6 +204,7 @@ void HotkeyService::unregisterHotkeys(HWND window) {
     saveReplayPressed_ = false;
     startStopHookTick_ = 0;
     saveReplayHookTick_ = 0;
+    Logger::instance().info(L"hotkeys", L"Hotkeys unregistered; fullscreen hook released");
 }
 
 bool HotkeyService::shouldHandleHotkeyMessage(int id, LPARAM lParam) const {

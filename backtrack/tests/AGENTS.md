@@ -104,7 +104,8 @@ build.
   - `RecorderControllerCutoffTests`, `RecorderControllerLeaseTests`,
     `RecorderControllerShutdownOrderingTests` - header-inline controller
     helpers only (`RecordingCutoffTracker.h`, `CaptureFrameHandoff.h`,
-    `AudioDrain.h`, `pipelineEncoderFaulted`, `EncoderFaultBackoff`), no
+    `AudioDrain.h`, `pipelineEncoderFaulted`, `EncoderFaultBackoff`,
+    `encoderBehindBudget`), no
     controller sources.
   - `DesktopDuplicationRotationTests` - `capture/DesktopDuplicationCapture.h`'s
     header-inline rotation helpers and cursor carry, no D3D device.

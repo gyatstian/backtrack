@@ -2,6 +2,7 @@
 
 #include "audio/AudioConvert.h"
 #include "core/Clock.h"
+#include "core/LogTiming.h"
 #include "core/Logger.h"
 #include "encoder/BitstreamUtils.h"
 #include "mux/AudioTimeline.h"
@@ -177,6 +178,7 @@ bool writeTimelineAudio(
     // replay window end as the write bound.
     const std::wstring fileName = path.filename().wstring();
     int64_t nextPts100ns = startPts100ns;
+    AudioGapStats gapStats;
     for (const auto& packet : audio) {
         if (packet->frameCount == 0 || packet->bytes.empty()) {
             continue;
@@ -184,12 +186,18 @@ bool writeTimelineAudio(
         if (!packetFormatMatches(*packet)) {
             continue;
         }
-        if (!paceAudioPacket(writer, nextPts100ns, *packet, endPts100ns, L"replay", fileName.c_str())) {
+        if (!paceAudioPacket(writer, nextPts100ns, *packet, endPts100ns, L"replay", fileName.c_str(), gapStats)) {
             return false;
         }
         if (nextPts100ns >= endPts100ns) {
             break;
         }
+    }
+    if (gapStats.fillEvents > 0) {
+        Logger::instance().info(L"replay",
+            L"Recording audio: gap-fills=" + std::to_wstring(gapStats.fillEvents) +
+            L" events, total_silence=" + std::to_wstring(gapStats.fillBytes) +
+            L"B, max_gap_ms=" + std::to_wstring(gapStats.maxGapMs));
     }
     writer.close();
     return true;
@@ -528,11 +536,24 @@ void ReplayBuffer::pushVideo(EncodedPacket packet) {
 
     if (videoBackend_ == VideoBackend::Disk) {
         const auto size = static_cast<uint32_t>(packet.bytes.size());
-        if (!ensureRingSpaceLocked(lock, size)) {
+        const auto ensureStart = std::chrono::steady_clock::now();
+        const bool fit = ensureRingSpaceLocked(lock, size);
+        // Ring-space eviction can stall on the pin wait and on disk IO, so it
+        // gets its own budget separate from the append write below.
+        logLatencyWarn(L"replay", L"Replay video ring space ensure exceeded budget", ensureStart,
+            std::chrono::milliseconds(100), L"bytes=" + std::to_wstring(size));
+        if (!fit) {
             // Cannot ever fit (packet larger than the whole ring): drop it.
+            Logger::instance().warning(L"replay", L"Replay video ring full; incoming frame dropped");
             return;
         }
+        const auto pushStart = std::chrono::steady_clock::now();
         if (appendRingLocked(packet)) {
+            // A synchronous ring write runs on the encode thread under mutex_,
+            // so a slow disk stalls encode and the UI stats path. Warn when a
+            // push exceeds 100 ms.
+            logLatencyWarn(L"replay", L"Replay video ring push exceeded budget", pushStart,
+                std::chrono::milliseconds(100), L"bytes=" + std::to_wstring(size));
             return;
         }
         // Ring storage failed (typically disk full): discard the buffered
@@ -594,10 +615,20 @@ void ReplayBuffer::pushAudio(AudioPacket packet) {
     }
     if (audioBackend_ == AudioBackend::Disk) {
         const auto size = static_cast<uint32_t>(packet.bytes.size());
-        if (!ensureAudioRingSpaceLocked(lock, size)) {
+        const auto ensureStart = std::chrono::steady_clock::now();
+        const bool fit = ensureAudioRingSpaceLocked(lock, size);
+        // Ring-space eviction can stall on the pin wait and on disk IO, so it
+        // gets its own budget separate from the append write below.
+        logLatencyWarn(L"replay", L"Replay audio ring space ensure exceeded budget", ensureStart,
+            std::chrono::milliseconds(100), L"bytes=" + std::to_wstring(size));
+        if (!fit) {
+            Logger::instance().warning(L"replay", L"Replay audio ring full; incoming audio packet dropped");
             return;
         }
+        const auto pushStart = std::chrono::steady_clock::now();
         if (appendAudioRingLocked(packet)) {
+            logLatencyWarn(L"replay", L"Replay audio ring push exceeded budget", pushStart,
+                std::chrono::milliseconds(100), L"bytes=" + std::to_wstring(size));
             return;
         }
         failOverAudioToRamLocked(
@@ -647,6 +678,7 @@ bool ReplayBuffer::saveTo(
     std::vector<uint8_t> codecHeaderBytes;
     bool diskMode = false;
     bool diskAudioMode = false;
+    uint64_t videoBytes = 0;
     // Read under the same lock as the packet snapshot: a concurrent configure
     // can replace the ring files, and the pin release below may close them too.
     std::filesystem::path ringPath;
@@ -664,6 +696,7 @@ bool ReplayBuffer::saveTo(
                 snapshot.meta = entry.meta;
                 snapshot.first = entry.first;
                 snapshot.second = entry.second;
+                videoBytes += entry.first.byteCount + entry.second.byteCount;
                 video.push_back(std::move(snapshot));
             }
         } else {
@@ -676,6 +709,7 @@ bool ReplayBuffer::saveTo(
                 snapshot.meta.hasDts = packet->hasDts;
                 snapshot.meta.duration100ns = packet->duration100ns;
                 snapshot.meta.keyFrame = packet->keyFrame;
+                videoBytes += packet->bytes.size();
                 video.push_back(std::move(snapshot));
             }
         }
@@ -696,6 +730,13 @@ bool ReplayBuffer::saveTo(
             ++savePinsRefs_;
         }
     }
+    Logger::instance().info(L"replay",
+        L"Replay save started: " + std::to_wstring(video.size()) +
+        L" video packets (" + std::to_wstring(videoBytes) + L"B) and " +
+        std::to_wstring(systemAudio.size() + microphoneAudio.size()) +
+        L" audio packets buffered (" +
+        (diskMode ? L"disk" : L"RAM") + L" video, " +
+        (diskAudioMode ? L"disk" : L"RAM") + L" audio)");
     // Releases the pin on every path (early returns included) once the ring
     // bytes have been consumed; also performs a ring close that the pin had
     // deferred, then resumes age-based trimming of the disk backends.
@@ -1186,6 +1227,7 @@ void ReplayBuffer::trimLocked() {
                     --diskVideoKeyFrames_;
                 }
                 diskVideo_.pop_front();
+                ++trimVideoEvicted_;
             };
 
             while (!diskVideo_.empty() && diskVideo_.front().meta.pts100ns < oldestAllowed) {
@@ -1226,6 +1268,7 @@ void ReplayBuffer::trimLocked() {
                     --videoKeyFrames_;
                 }
                 video_.pop_front();
+                ++trimVideoEvicted_;
             }
         };
 
@@ -1279,12 +1322,14 @@ void ReplayBuffer::trimLocked() {
     };
     auto dropRamAudio = [this](const std::shared_ptr<const AudioPacket>& packet) {
         ramAudioBytes_ -= packet->bytes.size();
+        ++trimAudioEvicted_;
     };
     auto diskAudioEndPts = [](const DiskAudioPacket& packet) {
         return diskAudioPacketEndPts100ns(packet);
     };
     auto releaseDiskAudio = [this](const DiskAudioPacket& packet) {
         audioRing_.releaseBytes(packet.first.byteCount + packet.second.byteCount);
+        ++trimAudioEvicted_;
     };
 
     const bool videoEmpty = videoBackend_ == VideoBackend::Disk ? diskVideo_.empty() : video_.empty();
@@ -1332,6 +1377,18 @@ void ReplayBuffer::trimLocked() {
         auto& oldest = systemPts <= microphonePts ? systemAudio_ : microphoneAudio_;
         ramAudioBytes_ -= oldest.front()->bytes.size();
         oldest.pop_front();
+        ++trimAudioEvicted_;
+    }
+    // One low-frequency summary instead of a per-push line: steady-state trim
+    // evicts on every push, so report when either counter crosses the threshold.
+    constexpr uint64_t kTrimReportEvery = 2000;
+    if (trimVideoEvicted_ >= kTrimReportEvery || trimAudioEvicted_ >= kTrimReportEvery) {
+        Logger::instance().info(L"replay",
+            L"Replay trim evicted " + std::to_wstring(trimVideoEvicted_) +
+            L" video and " + std::to_wstring(trimAudioEvicted_) +
+            L" audio packets since last report");
+        trimVideoEvicted_ = 0;
+        trimAudioEvicted_ = 0;
     }
     publishCountersLocked();
 }

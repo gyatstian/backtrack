@@ -11,6 +11,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cwchar>
 #include <cwctype>
@@ -403,15 +404,34 @@ void setThreadDescriptionSafe(const wchar_t* description) {
         GetProcAddress(GetModuleHandleW(L"Kernel32.dll"), "SetThreadDescription"));
     if (fn) {
         fn(GetCurrentThread(), description);
+        return;
+    }
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+        Logger::instance().warning(L"platform",
+            L"SetThreadDescription unavailable; worker thread names will not be set");
     }
 }
 
 HANDLE enableMmcssForThread(const wchar_t* taskName, AVRT_PRIORITY priority) {
     DWORD taskIndex = 0;
     HANDLE handle = AvSetMmThreadCharacteristicsW(taskName, &taskIndex);
-    if (handle) {
-        AvSetMmThreadPriority(handle, priority);
+    if (!handle) {
+        Logger::instance().warning(L"platform",
+            L"MMCSS registration failed for task \"" + std::wstring(taskName) +
+            L"\" (Win32 error " + std::to_wstring(GetLastError()) +
+            L"); thread runs without real-time priority");
+        return handle;
     }
+    if (!AvSetMmThreadPriority(handle, priority)) {
+        Logger::instance().warning(L"platform",
+            L"MMCSS priority raise failed for task \"" + std::wstring(taskName) +
+            L"\" (Win32 error " + std::to_wstring(GetLastError()) +
+            L"); thread stays at profile default");
+    }
+    Logger::instance().info(L"platform",
+        L"MMCSS \"" + std::wstring(taskName) + L"\" registered for thread " +
+        std::to_wstring(GetCurrentThreadId()));
     return handle;
 }
 
@@ -463,21 +483,6 @@ HANDLE createHighResolutionWaitableTimer() {
         CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
         TIMER_ALL_ACCESS);
     return timer;
-}
-
-bool waitHighResolution(HANDLE timer, uint32_t timeoutMs) {
-    if (!timer || timeoutMs == 0) {
-        return false;
-    }
-    // Negative 100ns units = relative due time. High-resolution timers ignore
-    // the global system timer period, so this fires close to the requested
-    // duration regardless of timeBeginPeriod state.
-    LARGE_INTEGER dueTime{};
-    dueTime.QuadPart = -static_cast<LONGLONG>(timeoutMs) * 10000LL;
-    if (!SetWaitableTimerEx(timer, &dueTime, 0, nullptr, nullptr, nullptr, 0)) {
-        return false;
-    }
-    return WaitForSingleObject(timer, timeoutMs + 1) != WAIT_FAILED;
 }
 
 std::wstring moduleFilePath() {
@@ -634,6 +639,9 @@ HMONITOR monitorFromIndex(uint32_t index) {
         reinterpret_cast<LPARAM>(&state));
 
     if (!state.monitor && index != 0) {
+        Logger::instance().warning(L"platform",
+            L"Configured monitor index " + std::to_wstring(index) +
+            L" not found; falling back to primary monitor");
         return monitorFromIndex(0);
     }
 
@@ -806,6 +814,11 @@ uint32_t dxgiHardwareEncoderAdapterOr(uint32_t preferredAdapterIndex) {
             break;
         }
         if (SUCCEEDED(hr) && dxgiAdapterSupportsHardwareEncode(adapterIndex)) {
+            if (adapterIndex != preferredAdapterIndex) {
+                Logger::instance().info(L"platform",
+                    L"Preferred adapter " + std::to_wstring(preferredAdapterIndex) +
+                    L" has no hardware encoder; using adapter " + std::to_wstring(adapterIndex));
+            }
             return adapterIndex;
         }
     }

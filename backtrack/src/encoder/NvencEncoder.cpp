@@ -1,7 +1,9 @@
 #include "encoder/NvencEncoder.h"
 
 #include "capture/D3DDevice.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
+#include "core/EncodingNames.h"
 #include "encoder/DecodeOrderTimestamps.h"
 #include "encoder/EncoderCommon.h"
 
@@ -539,6 +541,15 @@ struct NvencEncoder::Impl {
         Logger::instance().info(L"encoder",
             L"NVENC initialized in D3D11 mode at " +
             std::to_wstring(settings.width) + L"x" + std::to_wstring(settings.height) +
+            L", codec=" + codecName(settings.codec) +
+            L", bitrateKbps=" + std::to_wstring(settings.bitrateKbps) +
+            L", gopSeconds=" + std::to_wstring(settings.gopSeconds) +
+            L", preset=" + encoderPresetName(caps.effective.preset) +
+            L", mode=" + encoderModeName(caps.effective.mode) +
+            L", bFrames=" + (caps.effective.bFrames ? L"yes" : L"no") +
+            L", lookahead=" + (caps.effective.lookahead ? L"yes" : L"no") +
+            (caps.effective.lookahead
+                ? L" depth=" + std::to_wstring(caps.effective.lookaheadDepth) : L"") +
             L" with " + std::to_wstring(bitstreamBufferCount) + L" output buffers");
         return true;
     }
@@ -684,7 +695,11 @@ struct NvencEncoder::Impl {
             return nullptr;
         }
 
+        const uint32_t starvation = consecutiveOutputBufferStarvation;
         consecutiveOutputBufferStarvation = 0;
+        if (starvation > 0) {
+            LogContext::breadcrumb(L"NVENC output buffers drained after starvation");
+        }
         NV_ENC_OUTPUT_PTR bitstream = availableBitstreams.front();
         availableBitstreams.pop_front();
         return bitstream;
@@ -936,6 +951,7 @@ struct NvencEncoder::Impl {
             if (pending.mapped != nullptr && pending.inputTexture == texture) {
                 forceKeyFrame = true;
                 ++encoderStats.droppedFrames;
+                Logger::instance().warning(L"encoder", L"NVENC frame dropped: input texture still mapped; keyframe re-armed");
                 return popReadyPacket(packet);
             }
         }
@@ -943,6 +959,7 @@ struct NvencEncoder::Impl {
             if (retained.inputTexture == texture) {
                 forceKeyFrame = true;
                 ++encoderStats.droppedFrames;
+                Logger::instance().warning(L"encoder", L"NVENC frame dropped: retained input mapping; keyframe re-armed");
                 return popReadyPacket(packet);
             }
         }
@@ -953,6 +970,7 @@ struct NvencEncoder::Impl {
             // the stream never continues from a broken reference chain.
             forceKeyFrame = true;
             ++encoderStats.droppedFrames;
+            Logger::instance().warning(L"encoder", L"NVENC frame dropped: no registered input resource; keyframe re-armed");
             // Pop rather than returning false: a ready tail from earlier
             // harvests must not strand behind this drop.
             return popReadyPacket(packet);

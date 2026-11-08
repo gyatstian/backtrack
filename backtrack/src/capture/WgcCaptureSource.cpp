@@ -2,6 +2,7 @@
 
 #include "capture/D3DDevice.h"
 #include "capture/WgcCopyPool.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -47,6 +48,9 @@ struct WgcCaptureSource::Impl {
     WgcCopyPool pool;
     uint64_t zeroCopyLeaseDrops = 0;
     uint64_t frameIndex = 0;
+    // Stale pooled frames drained per capture session; reported once at
+    // shutdown (see shutdown()).
+    uint64_t stalePooledFrames = 0;
     uint32_t width = 0;
     uint32_t height = 0;
     bool zeroCopy = true;
@@ -154,6 +158,8 @@ struct WgcCaptureSource::Impl {
             closedToken = item.Closed([this](auto&, auto&) {
                 deviceLost.store(true);
                 signalFrameEvent();
+                Logger::instance().warning(L"capture", L"WGC capture item closed by the system; capture session lost");
+                LogContext::breadcrumb(L"WGC capture item closed by the system");
             });
 
             session = framePool.CreateCaptureSession(item);
@@ -257,6 +263,7 @@ struct WgcCaptureSource::Impl {
             // adds latency and auto-reset events used to lose these wakeups.
             while (auto newerFrame = framePool.TryGetNextFrame()) {
                 frame = std::move(newerFrame);
+                ++stalePooledFrames;
             }
 
             const auto size = frame.ContentSize();
@@ -354,6 +361,11 @@ struct WgcCaptureSource::Impl {
     }
 
     void shutdown() {
+        if (stalePooledFrames > 0) {
+            Logger::instance().info(L"capture",
+                L"WGC drained and discarded " + std::to_wstring(stalePooledFrames) +
+                L" stale pooled frames during capture");
+        }
         // Revoke callbacks first so free-threaded FrameArrived cannot re-enter
         // while session/framePool are closing (known WinRT hang class).
         try {
@@ -457,6 +469,7 @@ struct WgcCaptureSource::Impl {
 
         recreateDeferrals = 0;
         if (!zeroCopy && !pool.create(device->device(), width, height, texturePoolSize)) {
+            Logger::instance().warning(L"capture", L"WGC frame pool recreate: texture pool create failed; capture lost");
             deviceLost.store(true);
             recreatePending = false;
             return;

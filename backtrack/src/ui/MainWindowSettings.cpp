@@ -3,6 +3,8 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
+#include "core/LogContext.h"
+#include "core/LogTiming.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -356,18 +358,17 @@ bool MainWindow::commitSettings(const AppSettings& candidate) {
     if (startupChanged) {
         updateWindowsStartupRegistration(savedSettings_.startWithWindowsMinimized);
     }
-    Logger::instance().setMinLevel(savedSettings_.logLevel);
-    controller_.setUiPreferences(savedSettings_.logLevel, savedSettings_.libraryGalleryView);
+    Logger::instance().setEnabled(normalized.loggingEnabled);
+    controller_.setUiPreferences(normalized.libraryGalleryView, normalized.loggingEnabled);
     return true;
 }
 
-void MainWindow::setDiagnosticLogLevel(LogLevel level) {
-    settings_.logLevel = level;
+void MainWindow::setLoggingEnabled(bool enabled) {
+    settings_.loggingEnabled = enabled;
     AppSettings candidate = savedSettings_;
-    candidate.logLevel = level;
+    candidate.loggingEnabled = enabled;
     if (commitSettings(candidate)) {
-        Logger::instance().info(L"ui", std::wstring(L"Log level changed to ") + logLevelName(level));
-        setStatus(std::wstring(L"Log level: ") + logLevelName(level));
+        setStatus(enabled ? L"Logging enabled" : L"Logging disabled");
     }
     markSettingsDirty();
 }
@@ -395,7 +396,11 @@ void MainWindow::applyVisibleSettings() {
         return;
     }
     clipManager_.setDirectory(settings_.clipDirectory);
-    const bool hotkeysOk = hotkeys_.registerHotkeys(window_, settings_.hotkeys);
+    const bool hotkeysOk = [&] {
+        const ScopedLatencyWarn slowHotkeys(L"ui", L"Hotkey registration exceeded budget",
+            std::chrono::milliseconds(100));
+        return hotkeys_.registerHotkeys(window_, settings_.hotkeys);
+    }();
     const std::wstring hotkeyError = hotkeys_.lastErrorMessage();
     ControllerAction action;
     action.kind = ControllerActionKind::ApplySettings;
@@ -506,14 +511,6 @@ bool MainWindow::promptSaveSettingsIfDirty(bool allowCancel) {
                 layoutCurrentPage();
                 requestThumbnailUpdate();
                 InvalidateRect(clipList_, nullptr, FALSE);
-            }
-        }
-        const HWND diagnosticsHost = pageCaches_[static_cast<size_t>(Page::Diagnostics)].host;
-        const HWND logLevel = diagnosticsHost ? GetDlgItem(diagnosticsHost, kLogLevelComboId) : nullptr;
-        for (size_t index = 0; logLevel && index < std::size(kLogLevelComboEntries); ++index) {
-            if (kLogLevelComboEntries[index].value == static_cast<int>(settings_.logLevel)) {
-                SendMessageW(logLevel, CB_SETCURSEL, static_cast<WPARAM>(index), 0);
-                break;
             }
         }
         recordHotkeyModifiers_ = settings_.hotkeys.startStopModifiers;
@@ -677,6 +674,10 @@ void MainWindow::loadAudioDeviceCombos() {
 }
 
 void MainWindow::refreshAvailableApps(HWND combo, std::vector<AudioSessionAppInfo>& available, bool hasMuteToggle) {
+    // Enumeration walks audio sessions and process windows; a slow refresh must
+    // not look like a hang, so warn when it breaches its budget.
+    const ScopedLatencyWarn slowRefresh(L"ui", L"App list refresh exceeded budget",
+        std::chrono::milliseconds(100));
     // Sound separation watches audio sessions as well as visible windows;
     // auto record only matches visible windows by executable path.
     std::map<std::wstring, AudioSessionAppInfo> appsByPath;

@@ -154,6 +154,7 @@ private:
         LibraryScanRequest request;
         std::vector<ClipInfo> clips;
         bool failed = false;
+        int64_t durationMs = 0;
     };
 
     struct ThumbnailRequest {
@@ -205,6 +206,7 @@ private:
     static LRESULT CALLBACK pageHostProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK clipListSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
     static LRESULT CALLBACK comboBoxSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
+    static LRESULT CALLBACK readOnlyEditSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
     static LRESULT CALLBACK statusHelpSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData);
     LRESULT handleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
@@ -251,7 +253,7 @@ private:
     // the filesystem. Reads the folders readVisibleSettingsInto just stored.
     bool ensureFoldersExist();
     bool commitSettings(const AppSettings& candidate);
-    void setDiagnosticLogLevel(LogLevel level);
+    void setLoggingEnabled(bool enabled);
     bool computeSettingsDirty();
     void stashVisibleSettings();
     void applyVisibleSettings();
@@ -466,6 +468,7 @@ private:
     HWND statsLabel_ = nullptr;
     HWND capsLabel_ = nullptr;
     HWND diagnosticLogLabel_ = nullptr;
+    HWND loggingEnabledCheck_ = nullptr;
     HWND clipList_ = nullptr;
     HWND listViewButton_ = nullptr;
     HWND galleryViewButton_ = nullptr;

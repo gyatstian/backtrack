@@ -3,6 +3,7 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
+#include "core/LogTiming.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -234,6 +235,23 @@ LRESULT CALLBACK MainWindow::comboBoxSubclassProc(HWND window, UINT message, WPA
     return DefSubclassProc(window, message, wParam, lParam);
 }
 
+LRESULT CALLBACK MainWindow::readOnlyEditSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
+    switch (message) {
+    case WM_GETDLGCODE:
+        // A multiline edit asks for all keys by default, so Tab and Shift+Tab
+        // insert tab characters instead of moving focus. These are read-only
+        // text views; drop DLGC_WANTALLKEYS so dialog navigation drives focus
+        // while arrow keys still scroll the text.
+        return DLGC_WANTCHARS | DLGC_WANTARROWS;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(window, readOnlyEditSubclassProc, subclassId);
+        break;
+    default:
+        break;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
 LRESULT CALLBACK MainWindow::statusHelpSubclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR subclassId, DWORD_PTR refData) {
     auto* self = reinterpret_cast<MainWindow*>(refData);
     switch (message) {
@@ -418,12 +436,10 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
-        case kLogLevelComboId:
-            if (notification == CBN_SELCHANGE) {
-                int level = static_cast<int>(settings_.logLevel);
-                if (readEnumCombo(reinterpret_cast<HWND>(lParam), kLogLevelComboEntries, level)) {
-                    setDiagnosticLogLevel(static_cast<LogLevel>(level));
-                }
+        case kLoggingEnabledCheckId:
+            if (notification == BN_CLICKED) {
+                const bool enabled = SendMessageW(reinterpret_cast<HWND>(lParam), BM_GETCHECK, 0, 0) == BST_CHECKED;
+                setLoggingEnabled(enabled);
             }
             return 0;
         case kRecoverFailedRecordingButtonId: {
@@ -562,6 +578,7 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         break;
     case WM_TIMER:
         if (wParam == kDiagnosticsTimerId) {
+            const auto tickStart = std::chrono::steady_clock::now();
             if (IsWindowVisible(window_) && !IsIconic(window_) &&
                 (page_ == Page::Diagnostics || controller_.isRecording())) {
                 if (page_ == Page::Diagnostics) {
@@ -574,6 +591,10 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             } else {
                 updateDiagnosticsTimer();
             }
+            // UI-thread health probe: a diagnostics tick past 50 ms means the
+            // UI thread blocked behind a controller or ring mutex.
+            logLatencyWarn(L"ui", L"Diagnostics timer tick exceeded budget", tickStart,
+                std::chrono::milliseconds(50));
             return 0;
         }
         if (wParam == kControllerBusyTimerId) {

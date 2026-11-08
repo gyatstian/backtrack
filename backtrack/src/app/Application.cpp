@@ -74,7 +74,9 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     // can still race on the swap.
     HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, kBacktrackSingleInstanceMutexName);
     if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
-        requestExistingInstanceActivation();
+        if (!requestExistingInstanceActivation()) {
+            Logger::instance().warning(L"app", L"Existing Backtrack instance not found; activation skipped");
+        }
         CloseHandle(instanceMutex);
         return 0;
     }
@@ -84,7 +86,8 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     const bool normalizationFailed = !settingsStore_.normalizeLoaded(settings, settingsStatus);
 
     Logger::instance().initialize(localAppDataPath() / L"logs" / L"backtrack.log");
-    Logger::instance().setMinLevel(settings.logLevel);
+    Logger::instance().setEnabled(settings.loggingEnabled);
+    Logger::instance().writeHeader();
     Logger::instance().info(L"Backtrack starting");
     if (settingsStatus == SettingsStore::LoadStatus::Failed) {
         Logger::instance().error(L"settings", L"Could not read settings; startup normalization was skipped");
@@ -94,7 +97,7 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     if (!instanceMutex) {
         Logger::instance().warning(L"Single-instance mutex could not be created; continuing without duplicate launch protection");
     }
-    Logger::instance().info(L"app", std::wstring(L"Session config: logLevel=") + logLevelName(settings.logLevel) +
+    Logger::instance().info(L"app", std::wstring(L"Session config: logging=") + (settings.loggingEnabled ? L"enabled" : L"disabled") +
                                      L", captureBackend=" + captureBackendName(settings.preferredCaptureBackend) +
                                      L", replay=" + (settings.replay.enabled ? L"enabled" : L"disabled") +
                                      L", resolution=" + std::to_wstring(settings.video.width) + L"x" +
@@ -119,6 +122,9 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     }
 
     const HRESULT com = OleInitialize(nullptr);
+    if (FAILED(com)) {
+        Logger::instance().warning(L"app", L"OleInitialize failed (hr=" + hresultToString(com) + L"); clipboard/drag-drop may be unavailable");
+    }
 
     controller_.initialize(settings);
     // The startup sweep of crash-recovery leftovers (recover newest valid
@@ -128,14 +134,6 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     // remuxed. RecorderController serializes the sweep against recording,
     // replay saves, and manual recovery; the single-instance mutex held below
     // until exit still guarantees no concurrent session.
-    const auto capabilities = controller_.encoderCapabilities();
-    Logger::instance().info(
-        L"app",
-        L"Environment: adapter=" + (capabilities.adapterName.empty() ? L"unknown" : capabilities.adapterName) +
-            L", encoder=" + (capabilities.backendName.empty() ? L"unknown" : capabilities.backendName) +
-            L", encoderAvailable=" + (capabilities.available ? L"yes" : L"no") +
-            L", H264=" + (capabilities.h264 ? L"yes" : L"no") +
-            L", HEVC=" + (capabilities.hevc ? L"yes" : L"no"));
 
     MainWindow window(controller_, settingsStore_, settings, settingsStatus);
     const bool startMinimized = settings.startWithWindowsMinimized &&
@@ -155,6 +153,7 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     const int result = window.runMessageLoop();
     controller_.shutdown();
     Logger::instance().info(L"Backtrack exiting");
+    Logger::instance().writeFooter();
 
     if (SUCCEEDED(com)) {
         OleUninitialize();

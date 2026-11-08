@@ -283,7 +283,7 @@ inline std::optional<std::string> httpGetBody(
     DWORD statusCodeSize = sizeof(statusCode);
     if (!WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
-        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status");
+        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status=" + std::to_wstring(statusCode));
         return std::nullopt;
     }
 
@@ -354,7 +354,7 @@ inline std::optional<std::string> httpGetBody(
             &statusCodeSize,
             WINHTTP_NO_HEADER_INDEX) ||
         statusCode != 200) {
-        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status");
+        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status=" + std::to_wstring(statusCode));
         return std::nullopt;
     }
 

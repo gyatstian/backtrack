@@ -242,6 +242,116 @@ bool MainWindow::layoutCurrentPage() {
         return changed || listChanged;
     }
 
+    if (page_ == Page::Diagnostics) {
+        // Three sections side by side, each a third of the viewport. Each
+        // body is a multiline read-only edit with its own vertical scrollbar,
+        // so long text wraps to the column width and scrolls inside the
+        // column instead of growing the page.
+        const int contentWidth = std::max(1, viewportWidth - kLayoutPadding * 2);
+        const int columnWidth = std::max(80, (contentWidth - kLayoutColumnGap * 2) / 3);
+        const int colLeft[3] = {
+            kLayoutPadding,
+            kLayoutPadding + columnWidth + kLayoutColumnGap,
+            kLayoutPadding + (columnWidth + kLayoutColumnGap) * 2,
+        };
+        const int headingHeight = 24;
+        const int yHeading = kLayoutPadding;
+        const int yBody = yHeading + headingHeight + 12;
+        const int toolbarHeight = 28;
+        const int toolbarGap = 8;
+        const int yCheck = yBody;
+        const int yButtons = yCheck + toolbarHeight + toolbarGap;
+        const int yLogEdit = yButtons + toolbarHeight + toolbarGap + 2;
+        const int editBottom = viewportHeight - kLayoutPadding;
+        const int editHeight = std::max(60, editBottom - yBody);
+        const int logEditHeight = std::max(40, editBottom - yLogEdit);
+
+        pageContentHeight_ = editBottom + kLayoutPadding;
+        const int maxScroll = std::max(0, pageContentHeight_ - viewportHeight);
+        pageScrollY_ = std::clamp(pageScrollY_, 0, maxScroll);
+
+        bool changed = false;
+        auto findLayoutItem = [&](HWND control) -> LayoutItem* {
+            for (auto& item : layoutItems_) {
+                if (item.control == control) {
+                    return &item;
+                }
+            }
+            return nullptr;
+        };
+        auto move = [&](HWND control, int x, int y, int width, int height) {
+            if (control) {
+                if (LayoutItem* cached = findLayoutItem(control)) {
+                    const RECT placed{x, y - pageScrollY_, x + width, y - pageScrollY_ + height};
+                    if (cached->placedValid &&
+                        cached->placed.left == placed.left &&
+                        cached->placed.top == placed.top &&
+                        cached->placed.right == placed.right &&
+                        cached->placed.bottom == placed.bottom) {
+                        showWindowIfHidden(control);
+                        return;
+                    }
+                    cached->placed = placed;
+                    cached->placedValid = true;
+                }
+                changed = moveWindowIfChanged(control, x, y - pageScrollY_, width, height) || changed;
+                changed = showWindowIfHidden(control) || changed;
+            }
+        };
+
+        // Headings in build order map to the three columns.
+        int col = 0;
+        for (const auto& item : layoutItems_) {
+            if (!item.control || item.kind == LayoutItem::Kind::Footer || !item.sectionHeading) {
+                continue;
+            }
+            if (col < 3) {
+                move(item.control, colLeft[col], yHeading, columnWidth, headingHeight);
+            }
+            ++col;
+        }
+
+        move(statsLabel_, colLeft[0], yBody, columnWidth, editHeight);
+        move(capsLabel_, colLeft[1], yBody, columnWidth, editHeight);
+
+        // Recent-log controls stack so they never overlap at the minimum
+        // window width: Enable logging on its own row, the two actions on the
+        // next. Buttons keep fixed widths and stay right-aligned in the column.
+        const int saveWidth = 78;
+        const int openWidth = 90;
+        const int buttonGap = 8;
+        const int buttonsWidth = saveWidth + openWidth + buttonGap;
+        move(loggingEnabledCheck_, colLeft[2], yCheck, columnWidth, toolbarHeight);
+        move(GetDlgItem(pageHost_, kOpenLogFolderButtonId), colLeft[2] + columnWidth - buttonsWidth, yButtons, openWidth, toolbarHeight);
+        move(GetDlgItem(pageHost_, kSaveLogButtonId), colLeft[2] + columnWidth - saveWidth, yButtons, saveWidth, toolbarHeight);
+        move(diagnosticLogLabel_, colLeft[2], yLogEdit, columnWidth, logEditHeight);
+
+        sectionPanels_.clear();
+        constexpr int kPanelPadding = 8;
+        for (int index = 0; index < 3; ++index) {
+            sectionPanels_.push_back(RECT{
+                colLeft[index] - kPanelPadding,
+                yHeading - kPanelPadding,
+                std::min<LONG>(viewportWidth, colLeft[index] + columnWidth + kPanelPadding),
+                editBottom + kPanelPadding});
+        }
+
+        SCROLLINFO scroll{};
+        scroll.cbSize = sizeof(scroll);
+        scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        scroll.nMin = 0;
+        scroll.nMax = std::max(0, pageContentHeight_ - 1);
+        scroll.nPage = static_cast<UINT>(viewportHeight);
+        scroll.nPos = pageScrollY_;
+        SetScrollInfo(pageHost_, SB_VERT, &scroll, TRUE);
+        ShowScrollBar(pageHost_, SB_VERT, pageContentHeight_ > viewportHeight);
+
+        if (changed) {
+            InvalidateRect(pageHost_, nullptr, FALSE);
+        }
+        return changed;
+    }
+
     struct Bounds {
         bool present = false;
         int left = std::numeric_limits<int>::max();

@@ -1,6 +1,8 @@
 #include "voice/VoiceCommandService.h"
 
+#include "core/LogContext.h"
 #include "core/Logger.h"
+#include "platform/Win32Util.h"
 #include "ui/UiIds.h"
 
 #include <sapi.h>
@@ -99,6 +101,8 @@ void VoiceCommandService::setStatus(bool ready, std::wstring status) {
 }
 
 void VoiceCommandService::run(VoiceCommandMode mode) {
+    setThreadDescriptionSafe(L"Backtrack voice recognition");
+    LogContext::ScopedTask task(L"voice");
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(comResult)) {
         ++initializationFailures_;
@@ -109,11 +113,15 @@ void VoiceCommandService::run(VoiceCommandMode mode) {
     ComPtr<ISpRecognizer> recognizer;
     ComPtr<ISpRecoContext> context;
     ComPtr<ISpRecoGrammar> grammar;
+    // Name the failing step so the init error pinpoints which SAPI call broke.
+    const wchar_t* initStep = L"recognizer creation";
     HRESULT hr = CoCreateInstance(CLSID_SpInprocRecognizer, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&recognizer));
     if (SUCCEEDED(hr)) {
         ComPtr<ISpAudio> audio;
+        initStep = L"audio input creation";
         hr = CoCreateInstance(CLSID_SpMMAudioIn, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&audio));
         if (SUCCEEDED(hr)) {
+            initStep = L"SetInput";
             hr = recognizer->SetInput(audio.Get(), TRUE);
         }
     }
@@ -124,41 +132,52 @@ void VoiceCommandService::run(VoiceCommandMode mode) {
         return;
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"CreateRecoContext";
         hr = recognizer->CreateRecoContext(&context);
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"SetNotifyWin32Event";
         hr = context->SetNotifyWin32Event();
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"SetInterest";
         hr = context->SetInterest(SPFEI(SPEI_RECOGNITION), SPFEI(SPEI_RECOGNITION));
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"CreateGrammar";
         hr = context->CreateGrammar(1, &grammar);
     }
 
     SPSTATEHANDLE rule = nullptr;
     if (SUCCEEDED(hr)) {
+        initStep = L"GetRule";
         hr = grammar->GetRule(L"BacktrackCommand", kCommandRuleId, SPRAF_TopLevel | SPRAF_Active, TRUE, &rule);
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"AddWordTransition";
         hr = grammar->AddWordTransition(rule, nullptr, phraseFor(mode), L" ", SPWT_LEXICAL, 1.0f, nullptr);
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"Commit";
         hr = grammar->Commit(0);
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"SetRuleState";
         hr = grammar->SetRuleState(L"BacktrackCommand", nullptr, SPRS_ACTIVE);
     }
     if (SUCCEEDED(hr)) {
+        initStep = L"SetRecoState";
         hr = recognizer->SetRecoState(SPRST_ACTIVE);
     }
 
     HANDLE speechEvent = context ? context->GetNotifyEventHandle() : INVALID_HANDLE_VALUE;
     if (FAILED(hr) || speechEvent == INVALID_HANDLE_VALUE) {
         ++initializationFailures_;
-        const std::wstring status = FAILED(hr) ? hrStatus(L"Windows speech recognition", hr) : L"Windows speech event unavailable";
+        const std::wstring status = FAILED(hr)
+            ? hrStatus(L"Windows speech recognition", hr) + L" at " + initStep
+            : L"Windows speech event unavailable";
         setStatus(false, status);
-        Logger::instance().warning(L"voice", status);
+        Logger::instance().error(L"voice", status);
         CoUninitialize();
         return;
     }
@@ -166,6 +185,54 @@ void VoiceCommandService::run(VoiceCommandMode mode) {
     setStatus(true, std::wstring(L"listening for ") + phraseFor(mode));
     Logger::instance().info(L"voice", std::wstring(L"Offline voice command ready: ") + phraseFor(mode));
     ULONGLONG lastAcceptedTick = 0;
+    // Per-cause rejection accounting: one aggregate info instead of a line per
+    // noisy input; reported on a 60s cadence, on the next accepted command, or
+    // at stop.
+    uint64_t rejectedNoResult = 0;
+    uint64_t rejectedRuleMismatch = 0;
+    uint64_t rejectedLowConfidence = 0;
+    uint64_t rejectedCooldown = 0;
+    uint64_t rejectedWindowUnavailable = 0;
+    uint64_t rejectedPostFailed = 0;
+    auto reportRejections = [&] {
+        const uint64_t total = rejectedNoResult + rejectedRuleMismatch + rejectedLowConfidence +
+            rejectedCooldown + rejectedWindowUnavailable + rejectedPostFailed;
+        if (total == 0) {
+            return;
+        }
+        std::wstring detail;
+        auto add = [&](uint64_t count, const wchar_t* cause) {
+            if (count == 0) {
+                return;
+            }
+            if (!detail.empty()) {
+                detail += L", ";
+            }
+            detail += std::to_wstring(count) + L" " + cause;
+        };
+        add(rejectedNoResult, L"no result");
+        add(rejectedRuleMismatch, L"wrong rule");
+        add(rejectedLowConfidence, L"low confidence");
+        add(rejectedCooldown, L"cooldown");
+        add(rejectedWindowUnavailable, L"window unavailable");
+        add(rejectedPostFailed, L"post failed");
+        Logger::instance().info(L"voice",
+            L"Voice recognition rejected " + std::to_wstring(total) + L" inputs (" + detail + L")");
+        rejectedNoResult = 0;
+        rejectedRuleMismatch = 0;
+        rejectedLowConfidence = 0;
+        rejectedCooldown = 0;
+        rejectedWindowUnavailable = 0;
+        rejectedPostFailed = 0;
+    };
+    auto lastRejectionReport = std::chrono::steady_clock::now();
+    auto reportIfDue = [&] {
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - lastRejectionReport).count() >= 60) {
+            reportRejections();
+            lastRejectionReport = std::chrono::steady_clock::now();
+        }
+    };
     HANDLE events[] = {stopEvent_, speechEvent};
     while (true) {
         const DWORD wait = WaitForMultipleObjects(2, events, FALSE, INFINITE);
@@ -187,14 +254,30 @@ void VoiceCommandService::run(VoiceCommandMode mode) {
             SPPHRASE* phrase = nullptr;
             if (!result || FAILED(result->GetPhrase(&phrase)) || !phrase) {
                 ++rejected_;
+                ++rejectedNoResult;
+                reportIfDue();
                 continue;
             }
             const bool ruleMatches = phrase->Rule.ulId == kCommandRuleId;
             const bool confidenceOk = phrase->Rule.Confidence != SP_LOW_CONFIDENCE;
             CoTaskMemFree(phrase);
             const ULONGLONG now = GetTickCount64();
-            if (!ruleMatches || !confidenceOk || (lastAcceptedTick != 0 && now - lastAcceptedTick < kCooldownMs)) {
+            if (!ruleMatches) {
                 ++rejected_;
+                ++rejectedRuleMismatch;
+                reportIfDue();
+                continue;
+            }
+            if (!confidenceOk) {
+                ++rejected_;
+                ++rejectedLowConfidence;
+                reportIfDue();
+                continue;
+            }
+            if (lastAcceptedTick != 0 && now - lastAcceptedTick < kCooldownMs) {
+                ++rejected_;
+                ++rejectedCooldown;
+                reportIfDue();
                 continue;
             }
 
@@ -203,15 +286,30 @@ void VoiceCommandService::run(VoiceCommandMode mode) {
                 std::scoped_lock lock(stateMutex_);
                 window = window_;
             }
-            if (!enabled_.load() || !window || !PostMessageW(window, ui_ids::kVoiceCommandMessage, 0, 0)) {
+            if (!enabled_.load() || !window) {
                 ++rejected_;
+                ++rejectedWindowUnavailable;
+                reportIfDue();
+                continue;
+            }
+            if (!PostMessageW(window, ui_ids::kVoiceCommandMessage, 0, 0)) {
+                ++rejected_;
+                ++rejectedPostFailed;
+                LogContext::breadcrumb(L"voice command post to window failed");
+                Logger::instance().warning(L"voice", L"Could not post voice command to the window; command lost");
+                reportIfDue();
                 continue;
             }
             lastAcceptedTick = now;
             ++accepted_;
+            // A real command is a natural report point for what got rejected.
+            reportRejections();
+            lastRejectionReport = std::chrono::steady_clock::now();
         }
     }
 
+    reportRejections();
+    Logger::instance().info(L"voice", L"Voice recognition stopped");
     recognizer->SetRecoState(SPRST_INACTIVE);
     grammar->SetRuleState(L"BacktrackCommand", nullptr, SPRS_INACTIVE);
     setStatus(false, enabled_.load() ? L"stopped" : L"disabled");

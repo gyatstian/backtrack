@@ -10,8 +10,7 @@ Windows startup registration, microphone privacy cleanup, and the constants
 
 ## Ownership
 
-- Owns: everything in `platform/Win32Util.*`, plus the `platform/Retry.h`
-  bounded-retry skeleton (call sites still run their own loops).
+- Owns: everything in `platform/Win32Util.*`.
 - Does not own: any pipeline behavior. This folder answers questions about the
   environment; it does not capture, encode, or record.
 

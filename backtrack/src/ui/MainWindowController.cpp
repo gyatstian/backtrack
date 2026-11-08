@@ -3,6 +3,8 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
+#include "core/LogContext.h"
+#include "core/LogTiming.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -156,6 +158,10 @@ void MainWindow::stopRecordingForAutoRecord() {
 }
 
 void MainWindow::pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps) {
+    // Polling walks open app sessions on a 1s timer; a slow enumeration should
+    // surface instead of silently delaying the UI thread.
+    const ScopedLatencyWarn slowPoll(L"ui", L"Auto record poll exceeded budget",
+        std::chrono::milliseconds(50));
     if (controllerActionPending_.load(std::memory_order_acquire)) {
         // Judge state once the in-flight action finishes; the next tick handles it.
         return;

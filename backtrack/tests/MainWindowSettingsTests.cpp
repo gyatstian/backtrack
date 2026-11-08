@@ -21,7 +21,7 @@ struct MainWindowSettingsTestAccess {
     static const std::wstring& status(const MainWindow& window) { return window.statusText_; }
     static void markDirty(MainWindow& window) { window.markSettingsDirty(); }
     static void apply(MainWindow& window) { window.applyVisibleSettings(); }
-    static void logLevel(MainWindow& window, LogLevel level) { window.setDiagnosticLogLevel(level); }
+    static void loggingEnabled(MainWindow& window, bool enabled) { window.setLoggingEnabled(enabled); }
     static void gallery(MainWindow& window, bool enabled) {
         window.setLibraryViewMode(enabled ? MainWindow::LibraryViewMode::Gallery : MainWindow::LibraryViewMode::List);
     }
@@ -165,7 +165,7 @@ void testFailedStartupReadNeverOverwritesFile() {
     expect(status == SettingsStore::LoadStatus::Failed, "startup read should have failed");
     RecorderController controller;
     MainWindow window(controller, store, fallback, status);
-    MainWindowSettingsTestAccess::logLevel(window, LogLevel::Error);
+    MainWindowSettingsTestAccess::loggingEnabled(window, false);
     expect(MainWindowSettingsTestAccess::dirty(window), "blocked preference was not kept as a draft");
     expect(MainWindowSettingsTestAccess::status(window).find(L"restart") != std::wstring::npos,
            "unreadable startup did not explain how to recover");
@@ -179,14 +179,13 @@ void testImmediatePreferencesPreserveDraftsAndSavedValues() {
     expect(store.save(initial), "could not save preference fixture");
     RecorderController controller;
     expect(controller.initialize(initial), "could not initialize preference controller");
-    Logger::instance().setMinLevel(initial.logLevel);
     MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Loaded);
     {
         ExclusiveFile lock(store.path());
-        MainWindowSettingsTestAccess::logLevel(window, LogLevel::Warning);
-        expect(MainWindowSettingsTestAccess::dirty(window), "failed log save was not dirty");
+        MainWindowSettingsTestAccess::loggingEnabled(window, false);
+        expect(MainWindowSettingsTestAccess::dirty(window), "failed logging save was not dirty");
         expect(MainWindowSettingsTestAccess::status(window).find(L"could not be saved") != std::wstring::npos,
-               "failed log save reported success");
+               "failed logging save reported success");
         {
             MainWindow viewWindow(controller, store, initial, SettingsStore::LoadStatus::Loaded);
             MainWindowSettingsTestAccess::gallery(viewWindow, true);
@@ -198,44 +197,44 @@ void testImmediatePreferencesPreserveDraftsAndSavedValues() {
         expect(MainWindowSettingsTestAccess::saved(window) == initial,
                "failed immediate save changed the baseline");
         expect(MainWindowSettingsTestAccess::dirty(window), "failed immediate saves were not dirty");
-        expect(controller.settings().logLevel == initial.logLevel &&
+        expect(controller.settings().loggingEnabled == initial.loggingEnabled &&
                !controller.settings().libraryGalleryView &&
-               Logger::instance().minLevel() == initial.logLevel,
+               Logger::instance().enabled() == initial.loggingEnabled,
                "failed immediate save changed an applied authority");
     }
     MainWindowSettingsTestAccess::draft(window).video.fps = 45;
     MainWindowSettingsTestAccess::markDirty(window);
-    MainWindowSettingsTestAccess::logLevel(window, LogLevel::Warning);
+    MainWindowSettingsTestAccess::loggingEnabled(window, false);
     auto saved = store.load();
-    expect(saved.logLevel == LogLevel::Warning && !saved.libraryGalleryView && saved.video.fps == 120,
-           "log retry persisted unrelated drafts");
-    expect(MainWindowSettingsTestAccess::dirty(window), "log retry cleared other drafts");
+    expect(saved.loggingEnabled == false && !saved.libraryGalleryView && saved.video.fps == 120,
+           "logging retry persisted unrelated drafts");
+    expect(MainWindowSettingsTestAccess::dirty(window), "logging retry cleared other drafts");
     MainWindowSettingsTestAccess::gallery(window, true);
     saved = store.load();
-    expect(saved.logLevel == LogLevel::Warning && saved.libraryGalleryView && saved.video.fps == 120,
+    expect(saved.loggingEnabled == false && saved.libraryGalleryView && saved.video.fps == 120,
            "view retry lost a committed preference or persisted an unrelated draft");
     expect(MainWindowSettingsTestAccess::draft(window).video.fps == 45 &&
            MainWindowSettingsTestAccess::dirty(window), "immediate saves lost a draft");
-    expect(controller.settings().logLevel == LogLevel::Warning && controller.settings().libraryGalleryView,
+    expect(controller.settings().loggingEnabled == false && controller.settings().libraryGalleryView,
            "immediate saves did not update controller preferences");
 
     auto staleAction = initial;
     staleAction.video.fps = 90;
     expect(controller.updateSettings(staleAction), "stale action could not be applied");
-    expect(controller.settings().logLevel == LogLevel::Warning && controller.settings().libraryGalleryView,
+    expect(controller.settings().loggingEnabled == false && controller.settings().libraryGalleryView,
            "stale queued action replaced committed preferences");
     expect(MainWindowSettingsTestAccess::commitDraft(window), "could not commit independent draft");
-    controller.setUiPreferences(initial.logLevel, initial.libraryGalleryView);
+    controller.setUiPreferences(initial.libraryGalleryView, initial.loggingEnabled);
     MainWindowSettingsTestAccess::switchPages(window);
     expect(MainWindowSettingsTestAccess::draft(window).video.fps == 45 &&
            MainWindowSettingsTestAccess::saved(window).video.fps == 45 &&
-           MainWindowSettingsTestAccess::draft(window).logLevel == LogLevel::Warning &&
+           MainWindowSettingsTestAccess::draft(window).loggingEnabled == false &&
            MainWindowSettingsTestAccess::saved(window).libraryGalleryView,
            "page construction replaced the published snapshot with stale controller state");
-    MainWindowSettingsTestAccess::logLevel(window, LogLevel::Error);
+    MainWindowSettingsTestAccess::loggingEnabled(window, true);
     saved = store.load();
-    expect(saved.video.fps == 45 && saved.libraryGalleryView && saved.logLevel == LogLevel::Error &&
-           controller.settings().libraryGalleryView && controller.settings().logLevel == LogLevel::Error,
+    expect(saved.video.fps == 45 && saved.libraryGalleryView && saved.loggingEnabled == true &&
+           controller.settings().libraryGalleryView && controller.settings().loggingEnabled == true,
            "later independent commit lost published settings");
 }
 

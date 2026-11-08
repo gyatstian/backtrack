@@ -251,7 +251,7 @@ struct AppSettings {
     bool followFocusedMonitor = false;
     bool followMouseMonitor = false;
     bool captureCursor = true;
-    LogLevel logLevel = LogLevel::Debug;
+    bool loggingEnabled = true;
     bool operator==(const AppSettings&) const = default;
 };
 

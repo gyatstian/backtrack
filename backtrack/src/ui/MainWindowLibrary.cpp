@@ -3,6 +3,7 @@
 #include "ui/UiIds.h"
 
 #include "audio/WasapiCapture.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "resource.h"
@@ -253,6 +254,7 @@ void MainWindow::stopThumbnailWorker() {
 
 void MainWindow::thumbnailWorkerLoop() {
     setThreadDescriptionSafe(L"Backtrack thumbnails");
+    LogContext::ScopedTask task(L"thumbnails");
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     try {
@@ -496,6 +498,7 @@ void MainWindow::beginClipDrag() {
     result = DoDragDrop(dataObject.Get(), dropSource, DROPEFFECT_COPY, &effect);
     dropSource->Release();
     if (result == DRAGDROP_S_DROP && effect != DROPEFFECT_NONE) {
+        Logger::instance().info(L"ui", L"Clip dropped to Shell: " + path.filename().wstring());
         setStatus(L"Dropped " + path.filename().wstring());
     } else if (FAILED(result)) {
         Logger::instance().warning(L"ui", L"Shell file drag failed for " + path.wstring() + L"; HRESULT=" + std::to_wstring(result));
@@ -577,6 +580,7 @@ void MainWindow::stopLibraryScanWorker() {
 
 void MainWindow::libraryScanWorkerLoop() {
     setThreadDescriptionSafe(L"Backtrack library scan");
+    LogContext::ScopedTask task(L"library-scan");
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     try {
         ClipManager manager;
@@ -594,6 +598,7 @@ void MainWindow::libraryScanWorkerLoop() {
             };
             LibraryScanResult result;
             result.request = request;
+            const auto scanStart = std::chrono::steady_clock::now();
             try {
                 if (libraryScanOverride_) {
                     result.clips = libraryScanOverride_(request.directory, cancelled);
@@ -605,6 +610,8 @@ void MainWindow::libraryScanWorkerLoop() {
                 result.failed = true;
                 Logger::instance().error(L"ui", L"Library scan failed");
             }
+            result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - scanStart).count();
             if (cancelled()) continue;
             {
                 std::scoped_lock lock(libraryScanMutex_);
@@ -656,7 +663,7 @@ void MainWindow::handleLibraryScanReady() {
     onClipSelectionChanged();
     loadClipThumbnails();
     Logger::instance().info(L"ui", L"Library refreshed: " + std::to_wstring(clips_.size()) + L" clips in " +
-        clipsDirectory_.wstring());
+        clipsDirectory_.wstring() + L" (" + std::to_wstring(result->durationMs) + L"ms)");
     std::wstring status = clips_.empty() ? L"No clips found" :
         std::to_wstring(clips_.size()) + (clips_.size() == 1 ? L" clip found" : L" clips found");
     if (std::any_of(clipThumbnails_.begin(), clipThumbnails_.end(), [](const ClipThumbnail& thumbnail) {

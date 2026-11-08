@@ -7,8 +7,8 @@ the lock-free queue used between threads, and the app version constant.
 
 ## Ownership
 
-- Owns: `core/Types.h`, `core/Clock.h`, `core/Logger.*`, `core/SpscQueue.h`,
-  `core/AppVersion.h`.
+- Owns: `core/Types.h`, `core/Clock.h`, `core/EncodingNames.h`, `core/Logger.*`,
+  `core/LogContext.h`, `core/LogTiming.h`, `core/SpscQueue.h`, `core/AppVersion.h`.
 - Does not own: any behavior that belongs to a domain. `Types.h` describes data,
   it does not act on it.
 
@@ -36,7 +36,9 @@ the lock-free queue used between threads, and the app version constant.
   parse branch and the serialize branch in `SettingsStore.cpp`, the id in
   `ui/UiIds.h`, and the control plus its read in `ui` (`UiHelpers.cpp` also
   needs the id in `isSettingsControlId` or the page never goes dirty). An
-  enum-valued setting also needs a `Name` / `FromName` pair in
+  enum-valued setting also needs a `Name` / `FromName` pair: the `Name` side for
+  codec/preset/mode lives in `core/EncodingNames.h` (shared with the encoders
+  and the diagnostics page), the rest and all `FromName` parsing stay in
   `settings/SettingsStore.h`; a value that can be out of range also needs a
   clamp in `sanitizeSettings`. A field behind `BACKTRACK_HAS_NOISE_SUPPRESSION`
   is wrapped in that `#ifdef` at every site that touches it.
@@ -47,18 +49,44 @@ the lock-free queue used between threads, and the app version constant.
   negative, so nothing in this folder may use a sentinel value; see
   `src/AGENTS.md` for the boundary rule.
 - `Logger` is a process singleton, safe from any thread. `initialize` once at
-  startup, then `setMinLevel`; it renames any previous log to `<path>.old` and
-  clears the rate-limit and recent-line state. It keeps both a file and a
-  200-line `recentLines` deque for the Diagnostics page. Rate limiting is keyed
-  on the message text alone: level, subsystem, and thread id are recorded for
-  the summary line but are not part of the key, so the same text from two
-  callers shares one budget of 3 lines per rolling 10 s window. suppressed
-  occurrences produce one `(rate limited N occurrences ...)` line when that
-  window rolls over or an expired key is pruned; the summary uses the last
-  occurrence's level, subsystem, and thread. `Error` is never throttled. the
-  file stream is buffered, not flushed per line; `flush` reports whether the
-  file stream was open and flushed successfully. flush before export or a fatal
-  exit.
+  startup, then `setEnabled` (logging defaults on; when off no line is written
+  anywhere); it renames any previous log to `<path>.old` and
+  clears the rate-limit, recent-line, and pending-group state. The minimum
+  level is fixed at `Trace` (most verbose) so no call site is ever filtered.
+  `writeHeader` logs
+  the project version, date, environment, and OS build once at startup (the per-line
+  timestamp is `HH:mm:ss.SSS`); `writeFooter` logs a shutdown summary of
+  error/warning/rate-limited counts. It keeps both a file and a 200-line
+  `recentLines` deque for the Diagnostics page.
+- Consecutive-duplicate grouping runs before the rate limiter: back-to-back
+  identical lines (same level, subsystem, and message) collapse into one `(Nx)`
+  line, emitted when a different message arrives, on `flush`, or on export. The
+  windowed rate limiter still bounds interleaved/hot spam that grouping cannot
+  merge. Both are keyed on the message text alone: level, subsystem, and thread id
+  are recorded for the summary line but are not part of the key, so the same text
+  from two callers shares one budget of 3 lines per rolling 10 s window. suppressed
+  occurrences produce one `(rate limited N occurrences ...)` line when that window
+  rolls over or an expired key is pruned; the summary uses the last occurrence's
+  level, subsystem, and thread. `Error` is never throttled (but still groups). the
+  file stream is buffered, not flushed per line; `flush` first emits any deferred
+  duplicate group and reports whether the file stream was open and flushed
+  successfully. flush before export or a fatal exit.
+- Task correlation and breadcrumbs come from `core/LogContext.h` (header-only):
+  `LogContext::ScopedTask` labels the calling thread's task, and `Logger` appends
+  `task=<label>` to every line from it. A per-thread 25-entry breadcrumb ring
+  records silent state transitions (`LogContext::breadcrumb`); on ERROR the logger
+  attaches the `trail=...` (relative-ms breadcrumbs) and a best-effort `stack=...`
+  of return addresses (needs PDBs to symbolize). Task label, trail, and stack are
+  captured at write time, so a line flushed after its task scope ends keeps its
+  context. `core/LogTiming.h` (header-only) provides `ScopedLatencyWarn` /
+  `logLatencyWarn` for latency-budget WARNs on hot paths; their messages flow
+  through the same text-keyed rate limiter, so no per-callsite suppression state
+  is needed.
+- `redactSecrets` masks values of known credential key names (`token=`, `password=`,
+  ...) on every written line, defensively - no call site logs secrets today. Paths
+  and window titles are NOT auto-redacted; instrumentation sites must avoid logging
+  them (replay save lines log the output path, which embeds the foreground window
+  title).
 - `SpscQueue<T>` is header-only and lock-free with exactly one producer and one
   consumer. `tryPush` returns false when full and leaves the caller's item
   untouched, so the overflow policy belongs to the caller, which must count it;

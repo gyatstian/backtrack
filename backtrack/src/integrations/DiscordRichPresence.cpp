@@ -1,5 +1,6 @@
 #include "integrations/DiscordRichPresence.h"
 
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 
@@ -208,6 +209,7 @@ void DiscordRichPresence::stop() {
 
 void DiscordRichPresence::workerLoop() {
     setThreadDescriptionSafe(L"Backtrack Discord integration");
+    const LogContext::ScopedTask taskContext(L"discord");
     Logger::instance().info(L"discord", L"Discord Rich Presence integration started");
 
     // An exception leaving a std::thread entry point calls std::terminate, so an
@@ -461,6 +463,8 @@ bool DiscordRichPresence::drainInbox() {
             std::wstring(L"Discord IPC recv opcode=") + std::to_wstring(opcode) + L" payload=" + widePayload);
 
         if (opcode == kOpcodeClose) {
+            Logger::instance().warning(L"discord",
+                L"Discord IPC closed by peer: " + (widePayload.empty() ? std::wstring(L"no close message") : widePayload));
             return false;
         }
     }

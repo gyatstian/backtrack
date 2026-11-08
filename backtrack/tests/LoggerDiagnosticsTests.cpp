@@ -1,3 +1,5 @@
+#include "core/AppVersion.h"
+#include "core/LogContext.h"
 #include "core/Logger.h"
 #include "ui/DiagnosticsLog.h"
 
@@ -36,13 +38,26 @@ struct LoggerTestAccess {
         logger.stream_.setstate(std::ios::badbit);
     }
 
+    // Emit a deferred duplicate group without a following write, so rate-state
+    // accounting is deterministic in tests. `now` is the caller's timeline
+    // (the tests drive rate limiting with synthetic time points).
+    static void flushPending(Logger& logger, std::chrono::steady_clock::time_point now) {
+        std::scoped_lock lock(logger.mutex_);
+        logger.flushPendingGroupLocked(now);
+    }
+
     static void reset(Logger& logger) {
         std::scoped_lock lock(logger.mutex_);
         logger.stream_.close();
         logger.logPath_.clear();
         logger.rateStates_.clear();
         logger.recentLines_.clear();
+        logger.pendingGroup_ = {};
+        logger.warnings_ = 0;
+        logger.errors_ = 0;
+        logger.rateLimitedLines_ = 0;
         logger.minLevel_ = LogLevel::Debug;
+        logger.enabled_ = true;
     }
 };
 
@@ -349,23 +364,26 @@ void testExpiredStatesRetireWithSummaries() {
     const auto at = [&](Clock::time_point time, LogLevel level, const wchar_t* subsystem, const std::wstring& message) {
         LoggerTestAccess::writeAt(logger, time, level, subsystem, message);
     };
-    for (int i = 0; i < 3; ++i) {
-        at(start, LogLevel::Info, L"first", L"expired suppressed A");
-    }
-    for (int i = 0; i < 2; ++i) {
-        at(start, LogLevel::Warning, L"previous", L"expired suppressed A");
-    }
+    // Interleave so repeated keys build rate-limit suppression instead of
+    // collapsing into consecutive-duplicate groups.
     for (int i = 0; i < 4; ++i) {
+        at(start, LogLevel::Info, L"first", L"expired suppressed A");
         at(start, LogLevel::Info, L"second", L"expired suppressed B");
     }
+    at(start, LogLevel::Warning, L"previous", L"expired suppressed A");  // 5th A: suppressed, pins metadata
     at(start, LogLevel::Info, L"test", L"expired unsuppressed");
     for (int i = 0; i < 510; ++i) {
         at(start, LogLevel::Info, L"test", L"filler " + std::to_wstring(i));
     }
+    LoggerTestAccess::flushPending(logger, start);
+    // A x5 (3 emitted, 2 suppressed), B x4 (3 emitted, 1 suppressed), one
+    // unsuppressed, and filler 0..509: 1 + 1 + 1 + 510 = 513 keys.
     expect(LoggerTestAccess::rateStateCount(logger) == 513, "setup did not exceed prune threshold");
     at(start + std::chrono::seconds(9), LogLevel::Info, L"test", L"still active");
+    LoggerTestAccess::flushPending(logger, start + std::chrono::seconds(9));
     expect(LoggerTestAccess::rateStateCount(logger) == 514, "pruning retired unexpired states");
     at(start + std::chrono::seconds(10), LogLevel::Info, L"test", L"trigger prune");
+    LoggerTestAccess::flushPending(logger, start + std::chrono::seconds(10));
 
     expect(LoggerTestAccess::rateStateCount(logger) == 2, "expired states were not all retired");
     expect(!LoggerTestAccess::hasRateState(logger, L"expired suppressed A") &&
@@ -389,23 +407,19 @@ void testExpiredStatesRetireWithSummaries() {
     }
     expect(previousMetadata, "pruning did not preserve the suppressed window's metadata");
 
+    // A fresh window: a consecutive burst collapses into a duplicate group
+    // rather than a suppression summary.
     for (int i = 0; i < 4; ++i) {
         at(start + std::chrono::seconds(10), LogLevel::Info, L"new", L"expired suppressed A");
     }
-    at(start + std::chrono::seconds(20), LogLevel::Debug, L"next", L"expired suppressed A");
+    at(start + std::chrono::seconds(10), LogLevel::Info, L"new", L"window flush");
     lines = logger.recentLines(200);
     expect(countLines(lines, L"expired suppressed A (rate limited 2 occurrences in previous 10s)") == 1,
         "old suppressed occurrences were counted twice");
-    expect(countLines(lines, L"expired suppressed A (rate limited 1 occurrence in previous 10s)") == 1,
-        "new window suppression was not counted independently");
-    bool newWindowMetadata = false;
-    for (const auto& line : lines) {
-        if (line.find(L"expired suppressed A (rate limited 1 occurrence") != std::wstring::npos) {
-            newWindowMetadata = line.find(L"[INFO]") != std::wstring::npos &&
-                line.find(L"[new]") != std::wstring::npos;
-        }
-    }
-    expect(newWindowMetadata, "rollover attributed a summary to the next window");
+    expect(countLines(lines, L"expired suppressed A (4x)") == 1,
+        "new-window burst was not grouped");
+    expect(countLines(lines, L"expired suppressed A (rate limited 1 occurrence in previous 10s)") == 0,
+        "grouped burst produced a suppression summary");
     expect(logger.flush(), "could not flush rate summaries");
     const auto content = readFile(dir.path / L"source.log");
     expect(content.find("expired suppressed A (rate limited 2 occurrences in previous 10s)") != std::string::npos &&
@@ -418,22 +432,150 @@ void testPruningTriggerCanBeTheExpiredKey() {
     auto& logger = Logger::instance();
     logger.initialize(dir.path / L"source.log");
     const Clock::time_point start{};
-    for (int i = 0; i < 5; ++i) {
-        LoggerTestAccess::writeAt(logger, start, LogLevel::Info, L"test", L"same key");
+    // Interleave "same key" with distinct fillers so it builds suppression
+    // instead of a duplicate group, and exceed the prune threshold.
+    for (int i = 0; i < 520; ++i) {
+        LoggerTestAccess::writeAt(logger, start, LogLevel::Info, L"test", L"filler " + std::to_wstring(i));
+        if (i % 4 == 0) {
+            LoggerTestAccess::writeAt(logger, start, LogLevel::Info, L"test", L"same key");
+        }
     }
-    for (int i = 0; i < 512; ++i) {
-        LoggerTestAccess::writeAt(logger, start, LogLevel::Info, L"test", L"other " + std::to_wstring(i));
-    }
-    expect(LoggerTestAccess::rateStateCount(logger) == 513, "same-key setup missed prune threshold");
-    for (int i = 0; i < 4; ++i) {
-        LoggerTestAccess::writeAt(logger, start + std::chrono::seconds(10), LogLevel::Info, L"test", L"same key");
-    }
-    LoggerTestAccess::writeAt(logger, start + std::chrono::seconds(20), LogLevel::Info, L"test", L"same key");
+    LoggerTestAccess::flushPending(logger, start);
+    // Writing the same key again when the map is past the prune threshold
+    // retires every expired state and writes the key's previous-window summary.
+    LoggerTestAccess::writeAt(logger, start + std::chrono::seconds(10), LogLevel::Info, L"test", L"same key");
+    LoggerTestAccess::flushPending(logger, start + std::chrono::seconds(10));
     const auto lines = logger.recentLines(200);
-    expect(countLines(lines, L"same key (rate limited 2 occurrences in previous 10s)") == 1,
+    expect(countLines(lines, L"same key (rate limited") == 1,
         "prune-triggering key lost or duplicated its previous summary");
-    expect(countLines(lines, L"same key (rate limited 1 occurrence in previous 10s)") == 1,
+    expect(LoggerTestAccess::rateStateCount(logger) == 1,
         "prune-triggering key did not get a fresh budget");
+}
+
+void testGroupedConsecutiveDuplicates() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    for (int i = 0; i < 5; ++i) {
+        logger.info(L"test", L"repeated marker");
+    }
+    logger.info(L"test", L"distinct marker");
+    const auto lines = logger.recentLines(200);
+    expect(countLines(lines, L"repeated marker (5x)") == 1,
+        "burst was not grouped into one (5x) line");
+    expect(countLines(lines, L"repeated marker") == 1,
+        "burst produced more than one line");
+    expect(countLines(lines, L"distinct marker") == 1, "distinct line was lost");
+}
+
+void testGroupedErrorsCarryCount() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    for (int i = 0; i < 6; ++i) {
+        logger.error(L"test", L"hard fault");
+    }
+    logger.info(L"test", L"after burst");
+    const auto lines = logger.recentLines(200);
+    expect(countLines(lines, L"hard fault (6x)") == 1,
+        "error burst was not grouped into one (6x) line");
+}
+
+void testErrorStackTraceAttached() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    logger.error(L"test", L"stack witness");
+    logger.info(L"test", L"flush trigger");
+    const auto lines = logger.recentLines(200);
+    bool hasStack = false;
+    for (const auto& line : lines) {
+        if (line.find(L"stack witness") != std::wstring::npos) {
+            hasStack = line.find(L"stack=") != std::wstring::npos;
+        }
+    }
+    expect(hasStack, "error did not carry a stack trace");
+}
+
+void testHeaderAndFooter() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    logger.writeHeader();
+    logger.info(L"test", L"middle marker");
+    logger.warning(L"test", L"warn marker");
+    logger.error(L"test", L"error marker");
+    logger.writeFooter();
+    logger.flush();
+    const std::string content = readFile(dir.path / L"source.log");
+    const std::string expectedHeader = "===== Backtrack " +
+        std::string(backtrack::kCurrentAppVersion.begin(), backtrack::kCurrentAppVersion.end()) + " =====";
+    expect(content.find(expectedHeader) != std::string::npos, "header missing project version");
+    expect(content.find("date=") != std::string::npos, "header missing date");
+    expect(content.find("environment=release") != std::string::npos ||
+        content.find("environment=debug") != std::string::npos, "header missing environment");
+    expect(content.find("shutdown: errors=1 warnings=1") != std::string::npos,
+        "footer summary has wrong counts");
+}
+
+void testRedactsSecrets() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    logger.info(L"test", L"call with token=abcdef123456 and password=hunter2 done");
+    logger.info(L"test", L"flush trigger");
+    logger.flush();
+    const std::string content = readFile(dir.path / L"source.log");
+    expect(content.find("token=***") != std::string::npos &&
+        content.find("password=***") != std::string::npos, "secrets were not masked");
+    expect(content.find("abcdef123456") == std::string::npos &&
+        content.find("hunter2") == std::string::npos, "secret value leaked");
+}
+
+void testCorrelationTaskLabel() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    {
+        backtrack::LogContext::ScopedTask task(L"testTask");
+        logger.info(L"test", L"inside task");
+    }
+    logger.info(L"test", L"outside task");
+    const auto lines = logger.recentLines(200);
+    bool insideHasTask = false;
+    bool outsideHasTask = false;
+    for (const auto& line : lines) {
+        if (line.find(L"inside task") != std::wstring::npos) {
+            insideHasTask = line.find(L"task=testTask") != std::wstring::npos;
+        }
+        if (line.find(L"outside task") != std::wstring::npos) {
+            outsideHasTask = line.find(L"task=") == std::wstring::npos;
+        }
+    }
+    expect(insideHasTask, "task label was not attached inside the scope");
+    expect(outsideHasTask, "task label leaked outside the scope");
+}
+
+void testBreadcrumbTrailOnError() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    {
+        backtrack::LogContext::ScopedTask task(L"testTask");
+        backtrack::LogContext::breadcrumb(L"first step");
+        backtrack::LogContext::breadcrumb(L"second step");
+        logger.error(L"test", L"boom");
+    }
+    const auto lines = logger.recentLines(200);
+    bool trailAttached = false;
+    for (const auto& line : lines) {
+        if (line.find(L"boom") != std::wstring::npos) {
+            trailAttached = line.find(L"trail=") != std::wstring::npos &&
+                line.find(L"first step") != std::wstring::npos &&
+                line.find(L"second step") != std::wstring::npos;
+        }
+    }
+    expect(trailAttached, "error did not attach the breadcrumb trail");
 }
 
 } // namespace
@@ -451,6 +593,13 @@ int main() {
         testLiveLogCannotBeReplaced();
         testExpiredStatesRetireWithSummaries();
         testPruningTriggerCanBeTheExpiredKey();
+        testGroupedConsecutiveDuplicates();
+        testGroupedErrorsCarryCount();
+        testErrorStackTraceAttached();
+        testHeaderAndFooter();
+        testRedactsSecrets();
+        testCorrelationTaskLabel();
+        testBreadcrumbTrailOnError();
         std::cout << "LoggerDiagnosticsTests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -28,8 +28,12 @@ every child shares.
 - All logging goes through `core/Logger.h` with a subsystem label
   (`Logger::instance().info(L"mux", ...)`). The logger spends at most 3 lines
   per 10 s per distinct message text - the key is the text alone, shared across
-  levels, subsystems and threads - and never throttles `Error`. Vary the text
+  levels, subsystems and threads - and never throttles `Error`; back-to-back
+  identical lines group into one `(Nx)` line. Vary the text
   when every event matters; do not add your own suppression state.
+  Worker threads label themselves with `LogContext::ScopedTask` so every line
+  carries `task=...`, and latency-budget WARNs go through `core/LogTiming.h`.
+  Both headers are header-only.
 - Long-lived Win32 or SDK handles live behind a `struct Impl` +
   `std::unique_ptr` so headers stay cheap to include (see `WgcCaptureSource`,
   `NvencEncoder`, `AmfEncoder`).

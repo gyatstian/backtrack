@@ -22,9 +22,15 @@ public:
     void initialize(const std::filesystem::path& logPath);
     void setMinLevel(LogLevel level);
     LogLevel minLevel() const;
+    void setEnabled(bool enabled);
+    bool enabled() const;
     void write(LogLevel level, const std::wstring& message);
     void write(LogLevel level, const wchar_t* subsystem, const std::wstring& message);
-    std::vector<std::wstring> recentLines(size_t maxLines) const;
+    // Log the session header (project version, date, environment) at startup
+    // and the warning/error summary at shutdown.
+    void writeHeader();
+    void writeFooter();
+    std::vector<std::wstring> recentLines(size_t maxLines);
     std::filesystem::path currentPath() const;
     bool flush();
 
@@ -46,11 +52,15 @@ private:
     void writeLine(const std::wstring& text);
     void writeLocked(LogLevel level, const wchar_t* subsystem, const std::wstring& message,
         std::chrono::steady_clock::time_point now);
+    // caller holds mutex_. Flushes the deferred consecutive-duplicate group, if
+    // any, through the rate limiter.
+    void flushPendingGroupLocked(std::chrono::steady_clock::time_point now);
 
     mutable std::mutex mutex_;
     std::filesystem::path logPath_;
     std::ofstream stream_;
-    LogLevel minLevel_ = LogLevel::Debug;
+    LogLevel minLevel_ = LogLevel::Trace;  // highest verbosity; always logs everything
+    bool enabled_ = true;
     std::deque<std::wstring> recentLines_;
 
     // Windowed per-message rate limiting. Each distinct message text is allowed
@@ -69,12 +79,29 @@ private:
     // caller holds mutex_; summaries must not re-enter the rate limiter.
     void writeRateSummary(const std::wstring& message, const RateState& state);
     std::unordered_map<std::wstring, RateState> rateStates_;
+
+    // Consecutive-duplicate grouping: back-to-back identical messages collapse
+    // into one line with a "(Nx)" suffix, flushed when a different message
+    // arrives (or on flush/export/shutdown). Suppressed occurrences are still
+    // counted for the shutdown summary.
+    struct PendingGroup {
+        LogLevel level = LogLevel::Info;
+        std::wstring subsystem;
+        std::wstring message;
+        std::wstring task;   // correlation label captured at write time
+        std::wstring trail;  // error only: breadcrumbs at write time
+        std::wstring stack;  // error only: return addresses at write time
+        size_t count = 0;
+        bool active = false;
+    };
+    PendingGroup pendingGroup_;
+    size_t warnings_ = 0;       // WARN events that passed minLevel
+    size_t errors_ = 0;         // ERROR events that passed minLevel
+    size_t rateLimitedLines_ = 0; // occurrences suppressed by the rate limiter
 };
 
 std::wstring hresultToString(HRESULT hr);
 std::wstring utf8ToWide(const std::string& value);
 std::string wideToUtf8(const std::wstring& value);
-const wchar_t* logLevelName(LogLevel level);
-LogLevel logLevelFromName(const std::wstring& value, LogLevel fallback = LogLevel::Debug);
 
 } // namespace backtrack

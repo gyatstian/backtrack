@@ -17,6 +17,13 @@ namespace backtrack {
 
 using AudioPacketCallback = std::function<void(AudioPacket&&)>;
 
+// Installs the pooled allocator that AudioPacket::bytes draws from, so the
+// WASAPI capture thread does no CRT heap work per device callback. Must run
+// before any AudioPacket is constructed: a pmr vector binds its resource at
+// construction, and RecorderController builds its audio queues (257 packets
+// each) in its constructor. wWinMain calls this before constructing Application.
+void ensureAudioPacketPool();
+
 enum class ProcessLoopbackMode {
     IncludeTargetProcessTree,
     ExcludeTargetProcessTree,

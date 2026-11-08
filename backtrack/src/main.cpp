@@ -68,6 +68,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCo
     SetUnhandledExceptionFilter(unhandledExceptionFilter);
     std::set_terminate(terminateHandler);
     SetConsoleCtrlHandler(consoleCtrlHandler, TRUE);
+    // Before Application: RecorderController's audio queues construct
+    // AudioPacket payload vectors, and a pmr vector binds its resource then.
+    backtrack::ensureAudioPacketPool();
     backtrack::Application app;
     return app.run(instance, commandLine, showCommand);
 }

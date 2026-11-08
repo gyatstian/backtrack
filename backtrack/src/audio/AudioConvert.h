@@ -2,8 +2,10 @@
 
 #include "core/Types.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace backtrack {
 
@@ -48,6 +50,22 @@ WaveFormatBlob canonicalAudioFormat();
 // True when info describes exactly the canonical ingest format.
 bool isCanonicalAudioFormat(const AudioFormatInfo& info);
 
+// Reusable working set for convertAudioPacketToCanonical. One owner per writer
+// thread (RecorderController::writeAudioPacket); never shared across threads.
+// Reusing it removes the per-packet heap allocations for the fold-down weights
+// and the converted float block.
+struct AudioConvertScratch {
+    // Left/right weights for one source channel in a stereo downmix.
+    struct Weight {
+        size_t offset = 0;
+        float left = 0.0f;
+        float right = 0.0f;
+    };
+
+    std::vector<Weight> weights;
+    std::vector<float> converted;
+};
+
 // Converts a captured packet to the canonical format in place: any supported
 // PCM/float bit depth and channel count is resampled (linear interpolation)
 // to stereo float32 at kCanonicalAudioSampleRate. PTS is left untouched; it
@@ -55,6 +73,9 @@ bool isCanonicalAudioFormat(const AudioFormatInfo& info);
 // packet's format cannot be interpreted; callers must then drop the packet
 // instead of writing its bytes into a differently formatted stream.
 bool convertAudioPacketToCanonical(AudioPacket& packet);
+
+// As above, reusing the caller's scratch to avoid per-packet allocations.
+bool convertAudioPacketToCanonical(AudioPacket& packet, AudioConvertScratch& scratch);
 
 // Pure gain/mute for canonical float samples (post-canonicalization only).
 // No format lookup, no clamp of the gain itself: sanitizeSettings owns the

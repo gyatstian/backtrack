@@ -153,6 +153,10 @@ icon.
   `refreshThumbnailsAfterLibraryEdit`; an edit that keeps the working-set range
   keeps the generation so in-flight decodes survive, while a rescan, view
   switch, or range change replaces the queue and bumps it.
+  `populateClipListRows` also rebuilds the painter's per-clip derived text
+  (`clipDisplayText_`: filename, duration/size/tags, lowercase thumbnail key),
+  so any path that mutates `clips_` must reach it; favorite is paint-only and
+  does not.
 - Muted labels are themed by `mutedLabels_` membership, never by reading the
   label text: `rebuildSoundSeparationRows` registers muted labels there,
   `detachPageControl` and the page-teardown clears unregister them. The set is
@@ -206,6 +210,10 @@ icon.
 - The tray Exit menu prompts to save dirty settings exactly like `WM_CLOSE`;
   either path may abort the exit. auto record uses applied controller settings,
   not drafts.
+- The auto record poll walks the open-app list only until it owns a recording
+  of a matched app; in that stable state it liveness-checks the stored process
+  id plus its membership in the applied list, and falls back to the desktop
+  walk only when the match is lost.
 - `applyVisibleSettings` checks the controller busy flag before persisting
   anything, so a save that loses the race cannot leave disk saved without the
   recorder ever receiving `ApplySettings`.

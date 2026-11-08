@@ -679,6 +679,20 @@ void MainWindow::populateClipListRows() {
         return;
     }
 
+    // Row text and the thumbnail key are pure functions of ClipInfo; build
+    // them once per clips_ change so paints only concatenate strings.
+    clipDisplayText_.clear();
+    clipDisplayText_.reserve(clips_.size());
+    for (const auto& clip : clips_) {
+        ClipDisplayText display;
+        display.filename = clip.path.filename().wstring();
+        display.duration = durationToText(clip.duration100ns);
+        display.bytes = bytesToText(clip.bytes);
+        display.tags = tagsToText(clip.tags);
+        display.thumbnailKey = thumbnailCacheKey(clip.path);
+        clipDisplayText_.push_back(std::move(display));
+    }
+
     ScopedRedrawLock redraw(clipList_);
     SendMessageW(clipList_, LB_RESETCONTENT, 0, 0);
     if (clips_.empty()) {
@@ -686,6 +700,13 @@ void MainWindow::populateClipListRows() {
         updateLibraryActionButtons();
         return;
     }
+
+    // Preallocate the listbox's item array so the per-clip LB_ADDSTRING burst
+    // does not reallocate for every row.
+    const size_t rowCount = libraryViewMode_ == LibraryViewMode::Gallery
+        ? (clips_.size() + kGalleryClipColumns - 1) / kGalleryClipColumns
+        : clips_.size();
+    SendMessageW(clipList_, LB_INITSTORAGE, static_cast<WPARAM>(rowCount), 0);
 
     if (libraryViewMode_ == LibraryViewMode::Gallery) {
         const size_t rows = (clips_.size() + kGalleryClipColumns - 1) / kGalleryClipColumns;

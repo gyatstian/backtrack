@@ -82,6 +82,11 @@ GPU scaler that converts frames to whatever the active encoder wants.
   `setCursorCaptureEnabled` only flips a flag the next acquired frame reads.
   `hdrBypass` avoids 8-bit quantization on scRGB targets. HDR cursor color,
   white level, and XOR approximations still need hardware validation.
+  `desktopCopy_` is written only when a cursor is actually composited; otherwise
+  the acquired surface is copied straight into the slot and `desktopCopyDirty_`
+  marks the intermediate stale, so a cursor that reappears refreshes it before
+  compositing. Both copies must run while the frame is held (before
+  `releaseHeldFrame`), because DXGI invalidates the acquired surface on release.
   DXGI reports the pointer shape only when it changes, so the CPU-side
   shape/position/visibility is carried across a rebuild on the same output
   (`DesktopDuplicationCursorCarry`) instead of blanking the cursor until the
@@ -143,7 +148,10 @@ GPU scaler that converts frames to whatever the active encoder wants.
   has a second cap, `wgcMaxZeroCopyLeases` (`framePoolSize - 1`, the frame pool
   itself is `wgcFramePoolSizeForQueueLimit`: `frameQueueLimit + 2`, 3..8);
   hitting it drops that frame onto the copy path instead of holding the
-  `Direct3D11CaptureFrame`.
+  `Direct3D11CaptureFrame`. Lease objects are recycled from a pool of exactly
+  `wgcMaxZeroCopyLeases` blocks, so the capture thread does not allocate per
+  frame; the deleter clears the pinned frame before the block returns to the
+  freelist, so a lease handed to the encoder is never reused in flight.
 - The scaler's output pool is the encoder-feeding pool and is sized separately:
   `encoderFeedingPoolSizeFor(queueLimit, encoderRetention)` (`queueLimit +
   retention + 1`, clamped 5..64) from the encoder's `inputRetentionBudget`,

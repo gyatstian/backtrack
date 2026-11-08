@@ -13,6 +13,8 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <type_traits>
+#include <vector>
 
 namespace backtrack {
 
@@ -28,9 +30,10 @@ struct RingExtent {
 // byte count. Eviction policy stays with the caller (video realigns to the
 // next keyframe so the buffer stays decodable, audio evicts in insertion
 // order), passed into ensureSpace as a callback, because the queues
-// being evicted live in ReplayBuffer. The save pin lives there too: while a
-// save holds it, pushes wait instead of evicting, so trimming can never drop
-// bytes an in-flight save has not read yet.
+// being evicted live in ReplayBuffer. The save read cursor lives here too:
+// a save marks the prefix it has read (markSaveConsumed) and eviction may
+// reclaim only that prefix, so trimming can never drop bytes an in-flight
+// save has not read yet.
 class RingFile {
 public:
     bool open(const std::filesystem::path& directory, const wchar_t* fileName, uint64_t capacityBytes) {
@@ -83,6 +86,8 @@ public:
         writeOffset_ = 0;
         liveBytes_ = 0;
         writeFailed_ = false;
+        saveConsumedBytes_ = 0;
+        clearOperationPool();
         return true;
     }
 
@@ -94,6 +99,9 @@ public:
         path_.clear();
         writeOffset_ = 0;
         liveBytes_ = 0;
+        saveConsumedBytes_ = 0;
+        // The pooled duplicate handles reference the closed file.
+        clearOperationPool();
     }
 
     bool isOpen() const {
@@ -125,6 +133,29 @@ public:
         liveBytes_ -= byteCount;
     }
 
+    // Read progress of an in-flight save, counted in ring bytes from the front
+    // of the live span. The save marks bytes it has read (markSaveConsumed);
+    // eviction may then reclaim only that consumed prefix, so a save never
+    // loses bytes it has not read yet. Reset when a save starts and on ring
+    // open/close; zero while no save is consuming.
+    void resetSaveConsumed() {
+        saveConsumedBytes_ = 0;
+    }
+    void markSaveConsumed(uint64_t byteCount) {
+        saveConsumedBytes_ += byteCount;
+    }
+    // Release `byteCount` from the front, allowed only when those bytes lie
+    // inside the prefix the in-flight save has already read. False when they
+    // do not - the caller must wait for the save to consume further.
+    bool releaseConsumedPrefix(uint64_t byteCount) {
+        if (byteCount > saveConsumedBytes_) {
+            return false;
+        }
+        liveBytes_ -= byteCount;
+        saveConsumedBytes_ -= byteCount;
+        return true;
+    }
+
     // Drops the accounting but keeps the write cursor where it is: re-zeroing
     // it would point the next push at offset 0, the most likely place for a
     // still-pinned save to have unread bytes.
@@ -138,7 +169,7 @@ public:
         if (!file_ || size == 0) {
             return size == 0;
         }
-        return transfer(file_, false, offset, destination, size, Win32Io{}, kRingIoTimeoutMs);
+        return transfer(file_, false, offset, destination, size, Win32Io{}, kRingIoTimeoutMs, this);
     }
 
     // Wrap-split write at the cursor; records the one or two extents and
@@ -150,17 +181,18 @@ public:
         return writeWrappedImpl(data, size, first, second, what, Win32Io{}, kRingIoTimeoutMs);
     }
 
-    // Waits (while a save pins refs) or evicts oldest packets until size
-    // bytes of ring space are free. False when the request can never fit.
-    // evictIfUnpinned frees at least enough for size (the caller's per-track
-    // policy); isEmpty reports that nothing is left to evict.
-    template <typename EvictIfUnpinned, typename IsEmpty>
+    // Evicts oldest packets until size bytes of ring space are free, or waits
+    // while a save pins the buffer and the consumed prefix alone cannot free
+    // enough. False when the request can never fit. The evict callback frees
+    // at least enough for size (the caller's per-track policy); isEmpty
+    // reports that nothing is left to evict.
+    template <typename Evict, typename IsEmpty>
     bool ensureSpace(
         std::unique_lock<std::mutex>& lock,
         uint32_t size,
         unsigned& pinRefs,
         std::condition_variable& space,
-        EvictIfUnpinned&& evictIfUnpinned,
+        Evict&& evict,
         IsEmpty&& isEmpty,
         const wchar_t* what) {
         if (size > capacityBytes_) {
@@ -173,17 +205,18 @@ public:
             return true;
         }
         while (true) {
-            if (pinRefs) {
-                // A save is still consuming pinned refs; wait for it to finish
-                // rather than evicting packets it may not have read yet.
-                space.wait(lock);
-            } else {
-                evictIfUnpinned(size);
-            }
+            // The eviction policy releases only the prefix the in-flight save
+            // has already read (releaseConsumedPrefix); when that cannot free
+            // enough, the save must consume further before any progress.
+            evict(size);
             if (freeBytes() >= size) {
                 return true;
             }
-            if (!pinRefs && isEmpty()) {
+            if (pinRefs) {
+                space.wait(lock);
+                continue;
+            }
+            if (isEmpty()) {
                 // Everything evicted and still not enough cannot happen
                 // (size <= capacity), but bail out defensively instead of spinning.
                 Logger::instance().warning(L"replay",
@@ -201,6 +234,7 @@ public:
             CloseHandle(file_);
             file_ = nullptr;
         }
+        clearOperationPool();
     }
 
 private:
@@ -232,9 +266,34 @@ private:
         HANDLE file = nullptr;
         OVERLAPPED overlapped{};
         std::unique_ptr<uint8_t[]> buffer;
+        size_t bufferCapacity = 0;
         Io io;
         SRWLOCK drainLock = SRWLOCK_INIT;
     };
+
+    // Recycled transfer machinery for the production Win32Io path: the
+    // duplicated handle, event and owned buffer are ring-wide constants, so the
+    // happy path reuses them instead of re-creating them per transfer. Only the
+    // rare cancellation path detaches an operation (the drain callback deletes
+    // it); completed operations return here. Cleared when the ring file is
+    // replaced so no stale duplicate handle is ever reused.
+    std::shared_ptr<Operation<Win32Io>> acquireOperation() const {
+        std::scoped_lock lock(poolMutex_);
+        if (pool_.empty()) {
+            return nullptr;
+        }
+        auto operation = std::move(pool_.back());
+        pool_.pop_back();
+        return operation;
+    }
+    void releaseOperation(std::shared_ptr<Operation<Win32Io>> operation) const {
+        std::scoped_lock lock(poolMutex_);
+        pool_.push_back(std::move(operation));
+    }
+    void clearOperationPool() const {
+        std::scoped_lock lock(poolMutex_);
+        pool_.clear();
+    }
 
     template <typename Io>
     static void CALLBACK drain(PTP_CALLBACK_INSTANCE, void* context, PTP_WAIT wait, TP_WAIT_RESULT) noexcept {
@@ -260,51 +319,67 @@ private:
 
     template <typename Io>
     static bool transferChunk(HANDLE file, bool write, uint64_t offset, uint8_t* data, DWORD size,
-                              const Io& io, DWORD timeout, DWORD& moved, DWORD& error) {
+                              const Io& io, DWORD timeout, DWORD& moved, DWORD& error,
+                              const RingFile* pooled = nullptr) {
         std::shared_ptr<Operation<Io>> operation;
-        try {
-            operation = std::make_shared<Operation<Io>>(io);
-        } catch (const std::bad_alloc&) {
-            error = ERROR_NOT_ENOUGH_MEMORY;
-            return false;
+        if constexpr (std::is_same_v<Io, Win32Io>) {
+            if (pooled) {
+                operation = pooled->acquireOperation();
+            }
         }
-        operation->buffer.reset(new (std::nothrow) uint8_t[size]);
-        if (!operation->buffer) {
-            error = ERROR_NOT_ENOUGH_MEMORY;
-            return false;
+        if (!operation) {
+            try {
+                operation = std::make_shared<Operation<Io>>(io);
+            } catch (const std::bad_alloc&) {
+                error = ERROR_NOT_ENOUGH_MEMORY;
+                return false;
+            }
         }
-        if (!DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &operation->file,
+        auto returnToPool = [&]() {
+            if constexpr (std::is_same_v<Io, Win32Io>) {
+                if (pooled) {
+                    pooled->releaseOperation(operation);
+                }
+            }
+        };
+        if (!operation->buffer || operation->bufferCapacity < size) {
+            operation->buffer.reset(new (std::nothrow) uint8_t[size]);
+            if (!operation->buffer) {
+                error = ERROR_NOT_ENOUGH_MEMORY;
+                returnToPool();
+                return false;
+            }
+            operation->bufferCapacity = size;
+        }
+        if (!operation->file &&
+            !DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &operation->file,
                              0, FALSE, DUPLICATE_SAME_ACCESS)) {
             error = GetLastError();
+            returnToPool();
             return false;
         }
-        operation->overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!operation->overlapped.hEvent) {
-            error = GetLastError();
-            return false;
+            operation->overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!operation->overlapped.hEvent) {
+                error = GetLastError();
+                returnToPool();
+                return false;
+            }
         }
+        // The event and OVERLAPPED are reused on the pooled path; both must be
+        // back to their initial state before the next submit.
+        ResetEvent(operation->overlapped.hEvent);
         operation->overlapped.Offset = static_cast<DWORD>(offset & 0xFFFFFFFFu);
         operation->overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32);
         if (write) std::memcpy(operation->buffer.get(), data, size);
 
-        auto owner = std::unique_ptr<std::shared_ptr<Operation<Io>>>(
-            new (std::nothrow) std::shared_ptr<Operation<Io>>(operation));
-        if (!owner) {
-            error = ERROR_NOT_ENOUGH_MEMORY;
-            return false;
-        }
-        PTP_WAIT completion = CreateThreadpoolWait(drain<Io>, owner.get(), nullptr);
-        if (!completion) {
-            error = GetLastError();
-            return false;
-        }
         const ULONGLONG deadline = GetTickCount64() + timeout;
         const BOOL started = io.submit(operation->file, write, operation->buffer.get(), size,
                                        &moved, &operation->overlapped);
         if (!started) {
             error = GetLastError();
             if (error != ERROR_IO_PENDING) {
-                CloseThreadpoolWait(completion);
+                returnToPool();
                 return false;
             }
             const ULONGLONG now = GetTickCount64();
@@ -314,38 +389,53 @@ private:
             if (waitResult == WAIT_OBJECT_0) {
                 completed = io.result(operation->file, &operation->overlapped, &moved) != FALSE;
                 if (!completed && GetLastError() != ERROR_IO_INCOMPLETE) {
-                    CloseThreadpoolWait(completion);
                     error = write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT;
+                    returnToPool();
                     return false;
                 }
             }
             if (!completed) {
-                // Cancellation is only a request; the wait retains every kernel-visible object.
+                // Cancellation is only a request; the wait retains every
+                // kernel-visible object. The threadpool wait and its context
+                // are created only on this rare path - the happy path reaps
+                // synchronously and needs neither.
                 io.cancel(operation->file, &operation->overlapped);
+                auto owner = std::unique_ptr<std::shared_ptr<Operation<Io>>>(
+                    new (std::nothrow) std::shared_ptr<Operation<Io>>(operation));
+                if (!owner) {
+                    error = ERROR_NOT_ENOUGH_MEMORY;
+                    return false;
+                }
+                PTP_WAIT completion = CreateThreadpoolWait(drain<Io>, owner.get(), nullptr);
+                if (!completion) {
+                    error = GetLastError();
+                    return false;
+                }
                 owner.release();
                 SetThreadpoolWait(completion, operation->overlapped.hEvent, nullptr);
                 error = write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT;
                 return false;
             }
         }
-        CloseThreadpoolWait(completion);
         if (moved == 0 || moved > size) {
             error = write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT;
+            returnToPool();
             return false;
         }
         if (!write) std::memcpy(data, operation->buffer.get(), moved);
+        returnToPool();
         return true;
     }
 
     template <typename Io>
     static bool transfer(HANDLE file, bool write, uint64_t offset, uint8_t* data, uint32_t size,
-                         const Io& io, DWORD timeout) {
+                         const Io& io, DWORD timeout, const RingFile* pooled = nullptr) {
         uint32_t done = 0;
         while (done < size) {
             const DWORD chunk = static_cast<DWORD>((std::min<uint64_t>)(size - done, 16ull * 1024 * 1024));
             DWORD moved = 0;
             DWORD error = ERROR_SUCCESS;
-            if (!transferChunk(file, write, offset + done, data + done, chunk, io, timeout, moved, error)) {
+            if (!transferChunk(file, write, offset + done, data + done, chunk, io, timeout, moved, error, pooled)) {
                 SetLastError(error);
                 return false;
             }
@@ -364,7 +454,7 @@ private:
         const uint64_t firstSize = (std::min<uint64_t>)(size, capacityBytes_ - writeOffset_);
         const uint64_t secondSize = size - firstSize;
         auto writeAt = [&](uint64_t offset, const uint8_t* chunk, DWORD byteCount, const wchar_t* action) {
-            if (transfer(file_, true, offset, const_cast<uint8_t*>(chunk), byteCount, io, timeout)) return true;
+            if (transfer(file_, true, offset, const_cast<uint8_t*>(chunk), byteCount, io, timeout, this)) return true;
             const DWORD error = GetLastError();
             writeFailed_ = true;
             Logger::instance().warning(L"replay",
@@ -390,6 +480,11 @@ private:
     // Total bytes of all live refs; capacity minus this is the free gap the
     // write cursor may consume before it would collide with the oldest ref.
     uint64_t liveBytes_ = 0;
+    // Front-prefix read progress of an in-flight save (see markSaveConsumed).
+    uint64_t saveConsumedBytes_ = 0;
+    // Reusable transfer machinery for the happy path (see acquireOperation).
+    mutable std::mutex poolMutex_;
+    mutable std::vector<std::shared_ptr<Operation<Win32Io>>> pool_;
     bool writeFailed_ = false;
 };
 

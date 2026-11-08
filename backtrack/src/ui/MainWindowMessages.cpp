@@ -899,6 +899,7 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             }
 
             const auto& clip = clips_[clipIndex];
+            const ClipDisplayText* display = clipIndex < clipDisplayText_.size() ? &clipDisplayText_[clipIndex] : nullptr;
             const RECT tile = galleryTileRect(item.rcItem, column);
             // Single source of truth is the tile index: the listbox selects
             // per row, so ODS_SELECTED would light up column 0 of any selected
@@ -934,7 +935,7 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
                 // selection, scroll) become plain BitBlts instead of a
                 // HALFTONE StretchBlt per tile. The thumbnailCache_ entry owns
                 // both bitmaps; the slot only carries the base handle.
-                const auto cache = thumbnailCache_.find(thumbnailCacheKey(clip.path));
+                const auto cache = thumbnailCache_.find(display ? display->thumbnailKey : thumbnailCacheKey(clip.path));
                 if (cache != thumbnailCache_.end() && cache->second.bitmap &&
                     preview.right - preview.left <= kGalleryThumbnailWidth &&
                     preview.bottom - preview.top <= kGalleryThumbnailHeight) {
@@ -960,7 +961,9 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             nameRect.right -= 8;
             nameRect.top = preview.bottom + 8;
             nameRect.bottom = nameRect.top + 22;
-            std::wstring name = clip.favorite ? L"* " + clip.path.filename().wstring() : clip.path.filename().wstring();
+            std::wstring name = display
+                ? (clip.favorite ? L"* " + display->filename : display->filename)
+                : (clip.favorite ? L"* " + clip.path.filename().wstring() : clip.path.filename().wstring());
             SetBkMode(item.hDC, TRANSPARENT);
             SetTextColor(item.hDC, text);
             DrawTextW(item.hDC, name.c_str(), -1, &nameRect, DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
@@ -970,8 +973,10 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
             metaRect.right -= 8;
             metaRect.top = nameRect.bottom + 2;
             metaRect.bottom = tile.bottom - 6;
-            std::wstring meta = durationToText(clip.duration100ns) + L"  " + bytesToText(clip.bytes);
-            const std::wstring tagText = tagsToText(clip.tags);
+            std::wstring meta = display
+                ? display->duration + L"  " + display->bytes
+                : durationToText(clip.duration100ns) + L"  " + bytesToText(clip.bytes);
+            const std::wstring tagText = display ? display->tags : tagsToText(clip.tags);
             if (!tagText.empty()) {
                 meta += L"  " + tagText;
             }
@@ -1001,18 +1006,16 @@ void MainWindow::drawClipItem(const DRAWITEMSTRUCT& item) {
     FillRect(item.hDC, &item.rcItem, brush);
 
     const ClipInfo* clip = !emptyState && clipIndex < clips_.size() ? &clips_[clipIndex] : nullptr;
-    std::wstring name = emptyState ? L"No clips yet" : (clip ? clip->path.filename().wstring() : L"");
+    const ClipDisplayText* display = clip && clipIndex < clipDisplayText_.size() ? &clipDisplayText_[clipIndex] : nullptr;
+    std::wstring name = emptyState ? L"No clips yet" : (clip ? (display ? display->filename : clip->path.filename().wstring()) : L"");
     if (favorite) {
         name = L"* " + name;
     }
-    if (clip) {
-        const std::wstring tagText = tagsToText(clip->tags);
-        if (!tagText.empty()) {
-            name += L" [" + tagText + L"]";
-        }
+    if (clip && display && !display->tags.empty()) {
+        name += L" [" + display->tags + L"]";
     }
-    const std::wstring sizeText = clip ? bytesToText(clip->bytes) : L"";
-    const std::wstring durationText = clip ? durationToText(clip->duration100ns) : L"";
+    const std::wstring sizeText = clip ? (display ? display->bytes : bytesToText(clip->bytes)) : L"";
+    const std::wstring durationText = clip ? (display ? display->duration : durationToText(clip->duration100ns)) : L"";
 
     RECT sizeRect = item.rcItem;
     sizeRect.left = sizeRect.right - 98;

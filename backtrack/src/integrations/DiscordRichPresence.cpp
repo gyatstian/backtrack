@@ -219,6 +219,10 @@ void DiscordRichPresence::workerLoop() {
     try {
         std::string lastGameName;
         bool activityShown = false;
+        // foregroundApplicationName reads the exe's version resource; resolve
+        // it only when the foreground HWND changes, not on every poll.
+        HWND lastForegroundHwnd = nullptr;
+        std::wstring cachedForegroundName;
         // Session start for the elapsed timer. Set on the first activity send
         // and reused while "keep timer running" is selected, so app switches,
         // fullscreen gaps, and reconnects do not restart it.
@@ -257,8 +261,12 @@ void DiscordRichPresence::workerLoop() {
                     GameIntegrationSettings::DiscordRichPresenceMode::FullscreenOnly;
                 const bool fullscreen = !fullscreenOnly || foregroundWindowIsFullscreen();
                 if (fullscreen) {
-                    const std::wstring wideGame = foregroundApplicationName();
-                    const std::string gameName = wideToUtf8(wideGame);
+                    const HWND foreground = GetForegroundWindow();
+                    if (foreground != lastForegroundHwnd) {
+                        lastForegroundHwnd = foreground;
+                        cachedForegroundName = foregroundApplicationName();
+                    }
+                    const std::string gameName = wideToUtf8(cachedForegroundName);
                     if (gameName != lastGameName || !activityShown) {
                         const long long nowUnixSeconds =
                             std::chrono::duration_cast<std::chrono::seconds>(
@@ -279,7 +287,7 @@ void DiscordRichPresence::workerLoop() {
                         Logger::instance().debug(L"discord",
                             gameName.empty()
                                 ? std::wstring(L"Discord activity set: Clipping with Backtrack")
-                                : std::wstring(L"Discord activity set: Clipping ") + wideGame);
+                                : std::wstring(L"Discord activity set: Clipping ") + cachedForegroundName);
                     }
                 } else if (activityShown) {
                     // Foreground left fullscreen; clear the displayed activity.

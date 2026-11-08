@@ -194,6 +194,7 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     pool_.clear();
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
+    desktopCopyDirty_ = true;
     cursorOnlyFrameInterval_ = std::chrono::nanoseconds(
         1'000'000'000 / std::max<uint32_t>(1, settings.video.fps));
     nextCursorOnlyFrameAt_ = {};
@@ -439,31 +440,38 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         nextCursorOnlyFrameAt_ = now + cursorOnlyFrameInterval_;
         ++cursorOnlyFrames_;
     }
-    if (desktopChanged) {
-        std::scoped_lock lock(device_->immediateContextMutex());
-        device_->context()->CopyResource(desktopCopy_.Get(), acquiredTexture.Get());
-        haveContent_ = true;
-    }
-
-    releaseHeldFrame();
-
-    if (!haveContent_) {
-        return false;
-    }
-
     auto slot = pool_.acquireOrLog(L"Capture texture pool exhausted");
     if (!slot) {
+        releaseHeldFrame();
         return false;
     }
 
     const bool drawCursor = captureCursor_ && cursorVisible_ && cursorShapeValid_ && ensureCompositor();
     {
         std::scoped_lock lock(device_->immediateContextMutex());
-        device_->context()->CopyResource(slot->texture.Get(), desktopCopy_.Get());
+        // desktopCopy_ exists only to feed the cursor compositor's pixel shader.
+        // With nothing to draw, copy the acquire straight into the slot and leave
+        // desktopCopy_ stale (desktopCopyDirty_) so a cursor that reappears on a
+        // later frame composites over a freshly refreshed copy, not old content.
+        // The acquire is only valid while the frame is held, so both copies run
+        // before releaseHeldFrame below.
         if (drawCursor) {
+            if (desktopCopyDirty_ || desktopChanged) {
+                device_->context()->CopyResource(desktopCopy_.Get(), acquiredTexture.Get());
+                desktopCopyDirty_ = false;
+            }
+            device_->context()->CopyResource(slot->texture.Get(), desktopCopy_.Get());
             compositeCursor(slot);
+        } else if (desktopChanged || desktopCopyDirty_) {
+            device_->context()->CopyResource(slot->texture.Get(), acquiredTexture.Get());
+            desktopCopyDirty_ = true;
+        } else {
+            device_->context()->CopyResource(slot->texture.Get(), desktopCopy_.Get());
         }
+        haveContent_ = true;
     }
+
+    releaseHeldFrame();
 
     frame.texture = slot->texture;
     frame.lease = slot;
@@ -532,6 +540,7 @@ bool DesktopDuplicationCapture::createTexturePool(uint32_t width, uint32_t heigh
     desktopCopy_.Reset();
     desktopCopySrv_.Reset();
     haveContent_ = false;
+    desktopCopyDirty_ = true;
 
     // RENDER_TARGET lets us blend the cursor into the slot; the downstream scaler
     // consumes slots as a video-processor input surface, so the extra bind flag is

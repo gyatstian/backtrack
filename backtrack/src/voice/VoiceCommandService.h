@@ -43,6 +43,11 @@ private:
     std::atomic<uint64_t> rejected_{0};
     std::atomic<uint64_t> initializationFailures_{0};
     std::wstring status_ = L"disabled";
+    // Last configure() inputs, so an unchanged reconfigure (every save
+    // completion) skips the SAPI teardown/rebuild. UI thread only.
+    HWND configuredWindow_ = nullptr;
+    GameIntegrationSettings::VoiceCommandMode configuredMode_ = GameIntegrationSettings::VoiceCommandMode::Disabled;
+    bool configuredReplayEnabled_ = false;
 };
 
 } // namespace backtrack

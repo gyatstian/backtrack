@@ -21,6 +21,13 @@ microphone denoiser.
   `convertAudioPacketToCanonical` before it reaches a writer. A `false` return
   means the format could not be interpreted: drop the packet, never write its
   bytes into a stream that declares a different format.
+- `convertAudioPacketToCanonical` has a scratch-taking overload
+  (`AudioConvertScratch`) that reuses the fold-down weights and the converted
+  float block. The audio writer owns exactly one
+  (`RecorderController::audioConvertScratch_`); it is single-thread state, so
+  never share it across writers. The canonical fast path still allocates
+  nothing, and the memcpy back into `packet.bytes` stays because the conversion
+  reads the source bytes it writes.
 - The reason for canonicalization is that WASAPI silently changes mix format
   across reconnects (headset swap, default device change). Without it the WAV
   writers keep appending raw bytes declared in the first packet's format, which

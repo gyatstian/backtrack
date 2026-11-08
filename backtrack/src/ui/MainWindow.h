@@ -131,6 +131,18 @@ private:
         bool unavailable = false;
     };
 
+    // Paint-independent row text per clip. The duration/size/tags formatting
+    // and the lowercase thumbnail key are pure functions of ClipInfo, so
+    // recomputing them on every repaint (scroll, hover, selection) is waste.
+    // Rebuilt by populateClipListRows whenever clips_ changes.
+    struct ClipDisplayText {
+        std::wstring filename;
+        std::wstring duration;
+        std::wstring bytes;
+        std::wstring tags;
+        std::wstring thumbnailKey;
+    };
+
     struct ThumbnailCacheEntry {
         std::filesystem::file_time_type modifiedTime{};
         uintmax_t bytes = 0;
@@ -372,7 +384,7 @@ private:
     // Auto record watcher: polls running apps on a timer and toggles recording
     // through the controller queue. See pollAutoRecord().
     void pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps = nullptr);
-    static std::optional<std::wstring> matchingAutoRecordAppName(
+    static std::optional<AudioSessionAppInfo> matchingAutoRecordApp(
         const AppSettings& applied, const std::vector<AudioSessionAppInfo>& openApps);
     void startRecordingForAutoRecord(const std::wstring& appName);
     void stopRecordingForAutoRecord();
@@ -448,6 +460,7 @@ private:
     std::array<PageCache, 4> pageCaches_{};
     std::vector<HWND> pageControls_;
     std::vector<ClipInfo> clips_;
+    std::vector<ClipDisplayText> clipDisplayText_;
     std::filesystem::path clipsDirectory_;
 
     HWND bitrateEdit_ = nullptr;
@@ -595,6 +608,10 @@ private:
     bool autoRecordAppRunning_ = false;
     bool autoRecordOwnsRecording_ = false;
     bool autoRecordSuppressStart_ = false;
+    // Last app the auto-record poll matched (identity + display name). The
+    // stable-state tick liveness-checks this process id instead of walking the
+    // desktop; cleared when the match is lost.
+    AudioSessionAppInfo autoRecordMatchedApp_;
     std::thread controllerWorker_;
     std::mutex controllerQueueMutex_;
     std::condition_variable controllerQueueCv_;

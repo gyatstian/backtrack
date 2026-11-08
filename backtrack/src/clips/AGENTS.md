@@ -34,12 +34,15 @@ delete, favorite, and tag operations the UI offers.
   folders remain discoverable because they can contain game clips. output-name
   reservation avoids existing media files and orphaned sidecars.
 - `listClips()` scans those roots non-recursively and keeps regular, nonempty
-  `.mp4` files. legacy `.publish[.n].mp4` files directly in `.backtrack_tmp`
-  are excluded because they can be incomplete. results are sorted by modified
-  time then filename descending; stale duration cache entries are dropped. it
-  accepts a cancellation predicate, checked before each directory entry, root,
-  and final result; a cancelled scan returns empty. cancellation cannot
-  interrupt a shell property read already in progress.
+  `.mp4` files. the one pass over the library root also discovers the game
+  folders and their legacy `clips` children, under the same rules
+  `ClipStorage::clipRoots` applies to recovery discovery (no reparse points, one
+  level deep); keep the two in step. legacy `.publish[.n].mp4` files directly in
+  `.backtrack_tmp` are excluded because they can be incomplete. results are
+  sorted by modified time then filename descending; stale duration cache entries
+  are dropped. it accepts a cancellation predicate, checked before each
+  directory entry, root, and final result; a cancelled scan returns empty.
+  cancellation cannot interrupt a shell property read already in progress.
 - Durations come from the shell `System.Media.Duration` property, which opens a
   COM handler per file and parses the MP4 `moov` atom. The read is
   `GPS_BESTEFFORT` on purpose: `GPS_FASTPROPERTIESONLY` skips the MP4 handler

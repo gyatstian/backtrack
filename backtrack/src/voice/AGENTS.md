@@ -19,6 +19,10 @@ through Windows SAPI and posted back to the main window.
 - `configure(window, mode, replayEnabled)` is the only entry point. The service
   needs the window handle (to post results) and knows that saving a replay is
   only meaningful when the replay buffer is enabled.
+- `configure` early-returns when `(window, mode, replayEnabled)` is unchanged
+  from the last call, so save completion does not tear down and rebuild the
+  SAPI engine (including the slow `SetInput` mic open); a real change always
+  re-inits.
 - Modes are `Disabled`, `ClipThat`, and `RecordVideo`, from
   `GameIntegrationSettings::VoiceCommandMode`. The grammar has one rule,
   `BacktrackCommand`, whose only word transition is the mode's phrase

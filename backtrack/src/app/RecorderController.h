@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app/RecordingCutoffTracker.h"
+#include "audio/AudioConvert.h"
 #include "audio/WasapiCapture.h"
 #include "capture/D3D11FrameScaler.h"
 #include "capture/D3DDevice.h"
@@ -228,7 +229,9 @@ private:
     // mid-recording pipeline rebuild cannot strand the reorder tail.
     void publishVideoPacket(EncodedPacket packet);
     void notifyRecordingCutoffAcked();
-    void refreshSystemAudioCapture(const AppSettings& settings);
+    // mutedKeys is precomputed by the caller: it depends only on the settings
+    // snapshot that caller already holds for its whole pipeline run.
+    void refreshSystemAudioCapture(const AppSettings& settings, const std::vector<std::wstring>& mutedKeys);
     // Publishes the lock-free mirrors for hot UI-timer reads (replay enable,
     // GOP seconds, cursor preference). Called wherever settings_ is assigned
     // so the mirrors never drift from the sanitized source of truth.
@@ -356,6 +359,9 @@ private:
     // writer resets the AGC envelope on its own thread before the next packet.
     std::atomic<bool> microphoneAgcResetPending_{true};
     std::unique_ptr<MicrophoneAgc> microphoneAgc_;
+    // Canonicalization scratch owned by the audio writer thread: reused so
+    // conversion does not allocate per packet (see AudioConvertScratch).
+    AudioConvertScratch audioConvertScratch_;
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
     // Noise suppression mirrors the AGC pattern: an enable flag snapshot plus
     // a reset flag consumed on the audio writer thread. The scratch buffers

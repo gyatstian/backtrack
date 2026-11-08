@@ -30,6 +30,42 @@ namespace backtrack {
 struct WgcCaptureSource::Impl {
     struct DirectFrameLease {
         winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame frame{nullptr};
+        // Freelist link and origin for the recycle path below.
+        DirectFrameLease* next = nullptr;
+        bool pooled = false;
+    };
+
+    // Bounded recycle store for zero-copy leases: one block per possible
+    // in-flight lease, so acquire() cannot fail while outstanding < maxLeases
+    // (free == capacity - in flight). Held through a shared_ptr by every lease
+    // deleter, like the counter, so a lease outliving Impl stays valid.
+    struct LeasePool {
+        explicit LeasePool(uint32_t capacity)
+            : blocks(std::make_unique<DirectFrameLease[]>(capacity)) {
+            for (uint32_t i = 0; i < capacity; ++i) {
+                blocks[i].next = i + 1 < capacity ? &blocks[i + 1] : nullptr;
+            }
+            freeHead.store(capacity > 0 ? &blocks[0] : nullptr, std::memory_order_relaxed);
+        }
+
+        DirectFrameLease* acquire() {
+            DirectFrameLease* head = freeHead.load(std::memory_order_acquire);
+            while (head && !freeHead.compare_exchange_weak(head, head->next,
+                              std::memory_order_acq_rel, std::memory_order_acquire)) {
+            }
+            return head;
+        }
+
+        void recycle(DirectFrameLease* lease) {
+            DirectFrameLease* head = freeHead.load(std::memory_order_relaxed);
+            do {
+                lease->next = head;
+            } while (!freeHead.compare_exchange_weak(head, lease,
+                         std::memory_order_acq_rel, std::memory_order_relaxed));
+        }
+
+        std::unique_ptr<DirectFrameLease[]> blocks;
+        std::atomic<DirectFrameLease*> freeHead{nullptr};
     };
 
     D3DDevice* device = nullptr;
@@ -61,6 +97,8 @@ struct WgcCaptureSource::Impl {
     // shared_ptr so lease deleters stay valid if Impl is destroyed first.
     std::shared_ptr<std::atomic<uint32_t>> outstandingZeroCopyLeases =
         std::make_shared<std::atomic<uint32_t>>(0);
+    // Recycled zero-copy lease blocks; sized to the lease cap in initialize.
+    std::shared_ptr<LeasePool> leasePool;
     std::atomic<bool> deviceLost{false};
     // In-place content resizes handled via FramePool.Recreate. The capture
     // loop watches this counter to force an encoder IDR across size jumps.
@@ -87,6 +125,9 @@ struct WgcCaptureSource::Impl {
         // Bound WGC pool so in-flight zero-copy leases cannot exhaust it.
         // Keep at least one free slot for the next FrameArrived.
         framePoolSize = wgcFramePoolSizeForQueueLimit(settings.gpu.frameQueueLimit);
+        // One recycled block per possible in-flight lease, so the capture thread
+        // never allocates on the zero-copy path.
+        leasePool = std::make_shared<LeasePool>(wgcMaxZeroCopyLeases(framePoolSize));
         // FrameArrived can fire while capture work is running. Keep notification
         // asserted until the consumer has drained the frame pool.
         frameEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -331,11 +372,28 @@ struct WgcCaptureSource::Impl {
                 }
 
                 auto counter = outstandingZeroCopyLeases;
+                auto pool = leasePool;
+                DirectFrameLease* block = pool ? pool->acquire() : nullptr;
+                const bool pooled = block != nullptr;
+                if (!block) {
+                    // Unreachable while outstanding < maxLeases; keep the old
+                    // allocate-on-demand behaviour rather than failing the frame.
+                    block = new DirectFrameLease{};
+                }
+                // Set before the shared_ptr: a throwing control-block allocation
+                // would otherwise run the deleter and free a pool-owned block.
+                block->pooled = pooled;
                 auto lease = std::shared_ptr<DirectFrameLease>(
-                    new DirectFrameLease{},
-                    [counter](DirectFrameLease* ptr) {
-                        delete ptr;
+                    block,
+                    [pool, counter](DirectFrameLease* ptr) {
+                        // Drop the pinned WGC frame before the block is reusable.
+                        ptr->frame = nullptr;
                         counter->fetch_sub(1, std::memory_order_acq_rel);
+                        if (ptr->pooled) {
+                            pool->recycle(ptr);
+                        } else {
+                            delete ptr;
+                        }
                     });
                 lease->frame = frame;
                 counter->fetch_add(1, std::memory_order_acq_rel);

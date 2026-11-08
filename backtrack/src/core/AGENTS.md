@@ -30,6 +30,14 @@ the lock-free queue used between threads, and the app version constant.
 - Every settings struct has a defaulted `operator==`. The UI dirty check
   (`MainWindow::computeSettingsDirty`) compares whole structs, so a new
   non-comparable member silently breaks "unsaved changes" detection.
+- `AudioPacket::bytes` is a `std::pmr::vector` so the WASAPI capture thread
+  allocates payloads from a pool instead of the CRT heap. A pmr vector binds its
+  resource at construction, so `ensureAudioPacketPool()`
+  (`audio/WasapiCapture.h`) must run before any `AudioPacket` exists: `wWinMain`
+  calls it before constructing `Application`, whose `RecorderController` builds
+  the audio queues. The pool is process-lifetime and never destroyed;
+  `WasapiCapture::stop` releases its unused chunks. Bytes are still retained per
+  packet by the replay buffer, so nothing recycles a live buffer.
 - Defaults live in the struct definition, once. `SettingsStore` reads and writes
   values; it does not carry a second copy of the defaults.
 - Adding a setting is one change across five sites: the field in `Types.h`, the

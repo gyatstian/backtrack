@@ -178,7 +178,11 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
         return clips;
     }
 
-    const auto appendDirectoryClips = [&](const std::filesystem::path& scanDirectory) {
+    // The root pass also discovers the game folders, so the library root is
+    // enumerated once instead of once for discovery and once for its clips.
+    std::vector<std::filesystem::path> subRoots;
+    const auto appendDirectoryClips = [&](const std::filesystem::path& scanDirectory,
+                                          std::vector<std::filesystem::path>* discovered) {
         std::filesystem::directory_iterator iterator(scanDirectory, error);
         const std::filesystem::directory_iterator end;
         if (error) {
@@ -190,6 +194,15 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
             if (cancelled && cancelled()) return;
             const auto& entry = *iterator;
             const auto path = entry.path();
+            if (discovered && ClipStorage::isDirectoryWithoutReparsePoint(path)) {
+                // Same roots ClipStorage::clipRoots yields: each game folder and
+                // its legacy clips child. Deeper levels are not scanned.
+                discovered->push_back(path);
+                const auto legacy = path / L"clips";
+                if (ClipStorage::isDirectoryWithoutReparsePoint(legacy)) {
+                    discovered->push_back(legacy);
+                }
+            }
             if (!entry.is_regular_file(error) || error || !hasMp4Extension(path) || isLegacyStagedMp4(path)) {
                 error = {};
                 continue;
@@ -228,14 +241,11 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
         }
     };
 
-    const auto roots = ClipStorage::clipRoots(directory_, error, cancelled);
-    if (error) {
-        Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-        error = {};
-    }
-    for (const auto& root : roots) {
+    appendDirectoryClips(directory_, &subRoots);
+    if (cancelled && cancelled()) return {};
+    for (const auto& root : subRoots) {
         if (cancelled && cancelled()) return {};
-        appendDirectoryClips(root);
+        appendDirectoryClips(root, nullptr);
     }
     if (cancelled && cancelled()) return {};
 

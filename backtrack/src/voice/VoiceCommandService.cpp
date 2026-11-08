@@ -40,6 +40,16 @@ VoiceCommandService::~VoiceCommandService() {
 }
 
 void VoiceCommandService::configure(HWND window, VoiceCommandMode mode, bool replayEnabled) {
+    // Rebuilding the recognizer tears down the SAPI engine (including the slow
+    // SetInput mic open) and joins the worker; every controller action
+    // completion calls configure, so skip the rebuild when nothing changed.
+    if (window == configuredWindow_ && mode == configuredMode_ && replayEnabled == configuredReplayEnabled_) {
+        return;
+    }
+    configuredWindow_ = window;
+    configuredMode_ = mode;
+    configuredReplayEnabled_ = replayEnabled;
+
     stop();
     {
         std::scoped_lock lock(stateMutex_);

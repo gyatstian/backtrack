@@ -316,6 +316,11 @@ std::vector<DownmixGain> surroundDownmixGains(const WaveFormatBlob& blob, uint16
 } // namespace
 
 bool convertAudioPacketToCanonical(AudioPacket& packet) {
+    AudioConvertScratch scratch;
+    return convertAudioPacketToCanonical(packet, scratch);
+}
+
+bool convertAudioPacketToCanonical(AudioPacket& packet, AudioConvertScratch& scratch) {
     if (!packet.format) {
         if (!packet.bytes.empty()) {
             logUnsupportedFormatOnce(packet);
@@ -364,13 +369,10 @@ bool convertAudioPacketToCanonical(AudioPacket& packet) {
     // stereo maps front-left/front-right exactly as before, and layouts with
     // more than two channels fold down through a standard matrix so center
     // dialogue and surrounds survive instead of being dropped.
-    struct ChannelWeight {
-        size_t offset;
-        float left;
-        float right;
-    };
+    using Weight = AudioConvertScratch::Weight;
     const size_t sourceBytesPerSample = source.bitsPerSample / 8;
-    std::vector<ChannelWeight> weights;
+    std::vector<Weight>& weights = scratch.weights;
+    weights.clear();
     weights.reserve(source.channels);
     if (source.channels == 1) {
         weights.push_back({0, 1.0f, 1.0f});
@@ -406,7 +408,8 @@ bool convertAudioPacketToCanonical(AudioPacket& packet) {
     }
 
     const uint8_t* data = packet.bytes.data();
-    std::vector<float> converted(static_cast<size_t>(outputFrames) * 2);
+    std::vector<float>& converted = scratch.converted;
+    converted.resize(static_cast<size_t>(outputFrames) * 2);
     for (uint64_t frame = 0; frame < outputFrames; ++frame) {
         // Exact rational position of this output frame on the source timeline
         // (fixed-point instead of an accumulating float phase).
@@ -420,7 +423,7 @@ bool convertAudioPacketToCanonical(AudioPacket& packet) {
         const size_t base1 = static_cast<size_t>(nextFrame) * source.blockAlign;
         float left = 0.0f;
         float right = 0.0f;
-        for (const ChannelWeight& weight : weights) {
+        for (const Weight& weight : weights) {
             const float value0 = decodeInterleavedSample(data + base0 + weight.offset, source);
             const float value1 = decodeInterleavedSample(data + base1 + weight.offset, source);
             const float value = value0 + (value1 - value0) * fraction;

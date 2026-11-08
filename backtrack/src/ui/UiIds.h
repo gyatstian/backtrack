@@ -129,7 +129,7 @@ constexpr int kSingleOwnerDrawButtonIds[] = {
 constexpr UINT_PTR kDiagnosticsTimerId = 1;
 constexpr UINT_PTR kControllerBusyTimerId = 2;
 constexpr UINT_PTR kAutoRecordTimerId = 3;
-// Auto record polls the open-app list at this interval; cheap EnumWindows scan.
+// Auto record polls the open-app list at this interval.
 constexpr UINT kAutoRecordPollMs = 2000;
 constexpr UINT kDiagnosticsRefreshMs = 1000;
 constexpr UINT kControllerBusySoftTimeoutMs = 15000;

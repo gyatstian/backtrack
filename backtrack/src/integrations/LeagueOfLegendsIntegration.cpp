@@ -36,6 +36,29 @@ struct LiveEvent {
     std::wstring killerName;
 };
 
+struct EventFeed {
+    // Only events newer than the last seen id/time; the worker scans these
+    // for kills. maxEventId/maxEventTime cover the whole snapshot (falling
+    // back to the last seen values when it is empty) so the baseline-reset
+    // logic still sees every event, including the already-seen history.
+    std::vector<LiveEvent> events;
+    int64_t maxEventId = -1;
+    double maxEventTime = 0.0;
+};
+
+bool isNewEvent(int64_t eventId, double eventTime, int64_t lastEventId, double lastEventTime) {
+    if (eventId > lastEventId) {
+        return true;
+    }
+    if (eventId == lastEventId && eventTime > lastEventTime + 0.001) {
+        return true;
+    }
+    if (lastEventId <= 0 && eventTime > lastEventTime + 0.001) {
+        return true;
+    }
+    return false;
+}
+
 std::optional<int64_t> jsonIntField(std::string_view object, std::string_view field) {
     const std::string pattern = "\"" + std::string(field) + "\"";
     size_t pos = object.find(pattern);
@@ -101,16 +124,20 @@ std::optional<double> jsonDoubleField(std::string_view object, std::string_view 
     return value;
 }
 
-std::vector<LiveEvent> parseEvents(std::string_view json) {
-    std::vector<LiveEvent> events;
+EventFeed parseEvents(std::string_view json, int64_t lastEventId, double lastEventTime) {
+    EventFeed feed;
+    // An empty snapshot has no maxima and must not erase the baseline.
+    feed.maxEventId = lastEventId;
+    feed.maxEventTime = lastEventTime;
+    bool sawEvent = false;
 
     const size_t eventsKey = json.find("\"Events\"");
     if (eventsKey == std::string_view::npos) {
-        return events;
+        return feed;
     }
     const size_t arrayStart = json.find('[', eventsKey);
     if (arrayStart == std::string_view::npos) {
-        return events;
+        return feed;
     }
 
     bool inString = false;
@@ -152,18 +179,33 @@ std::vector<LiveEvent> parseEvents(std::string_view json) {
             --objectDepth;
             if (objectDepth == 0 && objectStart != std::string_view::npos) {
                 const auto object = json.substr(objectStart, index - objectStart + 1);
-                LiveEvent event;
-                event.eventId = jsonIntField(object, "EventID").value_or(-1);
-                event.eventTime = jsonDoubleField(object, "EventTime").value_or(0.0);
-                event.eventName = jsonStringField(object, "EventName").value_or(L"");
-                event.killerName = jsonStringField(object, "KillerName").value_or(L"");
-                events.push_back(std::move(event));
+                const int64_t eventId = jsonIntField(object, "EventID").value_or(-1);
+                const double eventTime = jsonDoubleField(object, "EventTime").value_or(0.0);
+                if (!sawEvent) {
+                    feed.maxEventId = eventId;
+                    feed.maxEventTime = eventTime;
+                    sawEvent = true;
+                } else {
+                    feed.maxEventId = std::max(feed.maxEventId, eventId);
+                    feed.maxEventTime = std::max(feed.maxEventTime, eventTime);
+                }
+                // The feed is ordered by event; only events past the last
+                // seen id/time can be new, so extract their names here and
+                // skip the (growing) already-seen history.
+                if (isNewEvent(eventId, eventTime, lastEventId, lastEventTime)) {
+                    LiveEvent event;
+                    event.eventId = eventId;
+                    event.eventTime = eventTime;
+                    event.eventName = jsonStringField(object, "EventName").value_or(L"");
+                    event.killerName = jsonStringField(object, "KillerName").value_or(L"");
+                    feed.events.push_back(std::move(event));
+                }
                 objectStart = std::string_view::npos;
             }
         }
     }
 
-    return events;
+    return feed;
 }
 
 std::wstring normalizedName(std::wstring value) {
@@ -208,19 +250,6 @@ bool isActivePlayerKill(const LiveEvent& event, const std::vector<std::wstring>&
     }
     const std::wstring killer = normalizedName(event.killerName);
     return std::find(activeNames.begin(), activeNames.end(), killer) != activeNames.end();
-}
-
-bool isNewEvent(const LiveEvent& event, int64_t lastEventId, double lastEventTime) {
-    if (event.eventId > lastEventId) {
-        return true;
-    }
-    if (event.eventId == lastEventId && event.eventTime > lastEventTime + 0.001) {
-        return true;
-    }
-    if (lastEventId <= 0 && event.eventTime > lastEventTime + 0.001) {
-        return true;
-    }
-    return false;
 }
 
 void sleepUntilNextPoll(std::atomic<bool>& stopRequested, std::chrono::milliseconds delay) {
@@ -333,14 +362,13 @@ void LeagueOfLegendsIntegration::workerLoop() {
             }
 
             const auto names = activePlayerNames(*activePlayer);
-            const auto events = parseEvents(*eventData);
-            // An empty snapshot has no maxima and must not erase the baseline.
-            int64_t maxEventId = events.empty() ? lastEventId : events.front().eventId;
-            double maxEventTime = events.empty() ? lastEventTime : events.front().eventTime;
-            for (const auto& event : events) {
-                maxEventId = std::max(maxEventId, event.eventId);
-                maxEventTime = std::max(maxEventTime, event.eventTime);
-            }
+            // parseEvents tracks the whole-snapshot maxima and only materializes
+            // events newer than the last seen id/time, so a long match's
+            // already-seen history is not re-extracted every poll.
+            const auto feed = parseEvents(*eventData, lastEventId, lastEventTime);
+            const auto& events = feed.events;
+            const int64_t maxEventId = feed.maxEventId;
+            const double maxEventTime = feed.maxEventTime;
 
             if (!gameAvailable) {
                 Logger::instance().info(L"league", L"League of Legends live client data detected");
@@ -357,10 +385,9 @@ void LeagueOfLegendsIntegration::workerLoop() {
                 continue;
             }
 
+            // Every materialized event already passed the isNewEvent gate in
+            // parseEvents, so only the kill match remains.
             for (const auto& event : events) {
-                if (!isNewEvent(event, lastEventId, lastEventTime)) {
-                    continue;
-                }
                 if (isActivePlayerKill(event, names)) {
                     Logger::instance().info(L"league", L"League of Legends kill detected for clip reminder");
                     if (killCallback_) {

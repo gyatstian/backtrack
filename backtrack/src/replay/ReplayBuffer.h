@@ -135,13 +135,20 @@ private:
     // packet payload to the ring and records its extents. False on any write
     // failure - the caller must then stop trusting the ring contents.
     bool appendRingLocked(const EncodedPacket& packet);
-    // Per-track space policy for the video ring: waits on the save pin or
-    // evicts via freeRingSpaceLocked (keyframe realignment).
+    // Per-track space policy for the video ring: evicts the prefix the save
+    // has already read while pinned, else full keyframe realignment.
     bool ensureRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size);
     void freeRingSpaceLocked(uint64_t bytesNeeded);
     void freeAudioRingSpaceLocked(uint64_t bytesNeeded);
-    // Audio ring space policy: waits on the save pin or evicts the physical
-    // prefix via freeAudioRingSpaceLocked.
+    // Releases the front packet's ring bytes; while a save holds the pin, only
+    // the prefix it has already read may be reclaimed. Returns false when the
+    // front is not yet consumed (the caller must wait for the save to read on).
+    bool releaseFrontRingBytes(RingFile& ring, uint64_t byteCount);
+    // Publishes `byteCount` ring bytes as consumed by the in-flight save and
+    // wakes any push blocked waiting for space. Called from the save thread.
+    void markRingBytesConsumed(RingFile& ring, uint64_t byteCount);
+    // Audio ring space policy: evicts the prefix the save has already read
+    // while pinned, else the physical insertion-order prefix.
     bool ensureAudioRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size);
     static int64_t diskAudioPacketEndPts100ns(const DiskAudioPacket& packet);
     // Caller must have secured space via the audio ring's ensureSpace; appends

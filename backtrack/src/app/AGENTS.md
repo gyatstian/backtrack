@@ -104,8 +104,12 @@ recording-stop drain handshake.
   - `refreshSystemAudioCapture` re-applies the sound-separation mutes on every
     2 s capture-loop poll, not only when the key list changes, so a replaced or
     restarted session and a mute the app cleared are caught before their audio
-    reaches a recording. When `applySessionMutesForExecutables` cannot establish
-    the exclusion (mute failure, unknown previous state, journal failure, failed
+    reaches a recording. The key list itself comes from the poll's caller and is
+    derived once from its settings snapshot (fixed for a pipeline run), so the
+    tick never rebuilds it; keep new settings reads out of that computation or
+    the list will drift from the mutes already applied.
+    When `applySessionMutesForExecutables` cannot establish the exclusion (mute
+    failure, unknown previous state, journal failure, failed
     enumeration) the poll stops system audio and keeps it stopped: recording
     audio the user asked to exclude is worse than a video-only clip. It logs one
     error per failure episode and resumes capture when the exclusion holds again.

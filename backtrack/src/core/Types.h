@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <memory_resource>
 #include <string>
 #include <vector>
 
@@ -315,7 +316,11 @@ struct WaveFormatBlob {
 struct AudioPacket {
     AudioTrack track = AudioTrack::System;
     uint32_t processId = 0;
-    std::vector<uint8_t> bytes;
+    // pmr so the WASAPI capture thread allocates payloads from a pool instead of
+    // the CRT heap; see ensureAudioPacketPool in audio/WasapiCapture.h. Bytes are
+    // still retained per packet by the replay buffer, so nothing recycles a live
+    // buffer - the pool only reclaims on destruction.
+    std::pmr::vector<uint8_t> bytes;
     uint32_t frameCount = 0;
     int64_t pts100ns = 0;
     std::shared_ptr<const WaveFormatBlob> format;

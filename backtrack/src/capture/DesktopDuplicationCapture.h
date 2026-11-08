@@ -161,6 +161,10 @@ private:
 
     ComPtr<ID3D11Texture2D> desktopCopy_;
     ComPtr<ID3D11ShaderResourceView> desktopCopySrv_;
+    // True when desktopCopy_ does not hold the current desktop content: a frame
+    // was copied straight into a slot because no cursor was drawn. A cursor that
+    // reappears on a later frame must refresh desktopCopy_ before compositing.
+    bool desktopCopyDirty_ = true;
     bool captureCursor_ = true;
 
     std::vector<uint8_t> cursorShapeBuffer_;

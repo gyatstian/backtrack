@@ -44,8 +44,9 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   every release to remove a physical prefix. video realigns to the next keyframe;
   disk audio keeps one insertion-ordered queue across tracks. age trimming stops
   at the first unexpired packet, even when later packets have expired. saves
-  split the pinned audio snapshot by track after reading. the save pin, deferred
-  close, and failover reasons stay in `ReplayBuffer`.
+  split the read audio snapshot by track after reading. the save pin, the
+  per-ring consumed cursor, deferred close, and failover reasons stay in
+  `ReplayBuffer`.
 - apart from normal time and byte trimming, only a backend or ring-directory
   switch drops buffered video. reconfiguring RAM video preserves compatible
   packets and immediately applies both bounds. on disk capacity is only a
@@ -100,16 +101,20 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   instead of copying a full payload per emitted interval. `saveTo` snapshots
   metadata under the same mutex, so no reader sees it unsynchronized. Keep both
   halves of that invariant together.
-- Ring protocol: a save takes a pin (`savePinsRefs_`), and while pinned, pushes
-  that need space wait on `ringSpace_` instead of byte-trimming, because
-  trimming could evict a packet an in-flight save has not read yet. The single
-  pin covers both rings: it is taken when either backend is on disk and
-  released once both the video and the audio bytes are consumed, before the
-  audio is written and before muxing. Any new space policy must preserve the
-  pin; the count is a counter rather than a bool so a second concurrent save
-  cannot break the protocol silently. Disk-audio trimming and the
-  empty-video audio clear both skip extent eviction while pinned, for the same
-  reason the video path does.
+- Ring protocol: a save takes a pin (`savePinsRefs_`) and reads through an
+  incremental cursor - each packet it consumes is published via
+  `RingFile::markSaveConsumed`, and ring eviction may reclaim only that
+  consumed prefix (`releaseConsumedPrefix`), so a save never loses unread bytes
+  and a push blocks on `ringSpace_` only when the unconsumed prefix alone cannot
+  free enough space (a save reads far faster than encode rate, so in practice
+  never). The single pin covers both rings: it is taken when either backend is
+  on disk and released once both the video and the audio bytes are consumed,
+  before the audio is written and before muxing. The count is a counter rather
+  than a bool so a second concurrent save cannot break the protocol silently;
+  concurrent saves only over-count the cursor, and every mark still corresponds
+  to a real read, so the front is never under-protected. Disk-audio trimming
+  and the empty-video audio clear both skip extent eviction while pinned, for
+  the same reason the video path does.
 - A ring read or write failure (typically a full disk, a vanished volume, or a
   media error) is not propagated as a save error. `failOverToRamLocked` discards
   the buffered video window and continues in memory for the rest of the session,
@@ -183,7 +188,10 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
 - a disk push copies each I/O chunk into operation-owned storage before waiting
   under `mutex_`; a completed disk read copies back to the save buffer. the
   completion-wait budget is `kRingIoTimeoutMs` per request, and UI counters are
-  mirrored to avoid waiting behind a disk push.
+  mirrored to avoid waiting behind a disk push. completed transfers recycle
+  their operation (duplicated handle, event, owned buffer) from a per-ring
+  pool; only the timeout/cancellation path detaches an operation for the drain
+  callback.
 - Lock order is `mutex_` then `storageFallbackMutex_`, never the reverse.
 
 ## Verification

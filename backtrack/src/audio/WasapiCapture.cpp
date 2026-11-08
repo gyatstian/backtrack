@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -710,6 +711,32 @@ bool isProcessAlive(DWORD processId) {
 
 } // namespace
 
+namespace {
+
+// Process-lifetime and intentionally never destroyed: AudioPacket payloads can
+// outlive static teardown (a replay buffer evicted at exit), and a destroyed
+// resource would free into a dead pool.
+std::pmr::synchronized_pool_resource& audioPacketPool() {
+    static std::pmr::synchronized_pool_resource* pool =
+        new std::pmr::synchronized_pool_resource();
+    return *pool;
+}
+
+} // namespace
+
+void ensureAudioPacketPool() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::pmr::set_default_resource(&audioPacketPool());
+        // Touch the block classes that typical shared-mode packet sizes land in
+        // (10 ms stereo float32 is 3840 bytes) so the first callbacks do not
+        // pay for chunk creation on the real-time thread.
+        for (const size_t packetBytes : {960u, 1920u, 3840u, 7680u}) {
+            std::pmr::vector<uint8_t> warmUp(packetBytes);
+        }
+    });
+}
+
 void WasapiCapture::emergencyRestoreSessionMutes() noexcept {
     try {
         // COM must be initialized on this thread for the whole store call, and
@@ -930,6 +957,10 @@ void WasapiCapture::stop() {
         wakeEvent_ = nullptr;
     }
     running_ = false;
+    // Hand back the pool's unused chunks: a replay window's worth of retained
+    // payloads would otherwise stay reserved for the process lifetime. Only
+    // unused blocks are freed, so packets still held downstream are safe.
+    audioPacketPool().release();
 }
 
 WaveFormatBlob WasapiCapture::format() const {

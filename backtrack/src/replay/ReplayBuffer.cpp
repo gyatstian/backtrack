@@ -149,10 +149,16 @@ bool writeTimelineAudio(
     // bypassing canonicalization), copying its raw bytes would append
     // wrong-rate samples and skew the timeline: drop it and let the PTS
     // gap-fill below cover the hole with silence.
-    const AudioFormatInfo streamFormat = parseAudioFormat(*(*formatPacket)->format);
-    auto packetFormatMatches = [&streamFormat](const AudioPacket& packet) {
+    const std::shared_ptr<const WaveFormatBlob> streamFormatBlob = (*formatPacket)->format;
+    const AudioFormatInfo streamFormat = parseAudioFormat(*streamFormatBlob);
+    auto packetFormatMatches = [streamFormatBlob, &streamFormat](const AudioPacket& packet) {
         if (!packet.format) {
             return false;
+        }
+        // Canonicalization shares one process-wide format blob, so pointer
+        // identity is the fast path; a distinct-but-equal blob is still kept.
+        if (packet.format == streamFormatBlob) {
+            return true;
         }
         const AudioFormatInfo packetFormat = parseAudioFormat(*packet.format);
         if (packetFormat == streamFormat) {
@@ -724,10 +730,17 @@ bool ReplayBuffer::saveTo(
         lastGopSeconds_ = (std::max<uint32_t>)(1, videoSettings.gopSeconds);
         saveGopSeconds = lastGopSeconds_;
         codecHeaderBytes = codecHeaderBytes_;
-        // While the pin holds, ring pushes that need space wait instead of
-        // trimming: trimming could evict packets this save has not read yet.
+        // While the pin holds, ring eviction may reclaim only the prefix the
+        // save has already read; reset each ring's read cursor so the first
+        // packet of this save is not mistaken for a consumed one.
         if (diskMode || diskAudioMode) {
             ++savePinsRefs_;
+            if (diskMode) {
+                videoRing_.resetSaveConsumed();
+            }
+            if (diskAudioMode) {
+                audioRing_.resetSaveConsumed();
+            }
         }
     }
     Logger::instance().info(L"replay",
@@ -846,9 +859,9 @@ bool ReplayBuffer::saveTo(
     const auto videoPath = tempDirectory / (videoSettings.codec == VideoCodec::H264 ? L"replay.h264" : L"replay.hevc");
 
     // Backend-agnostic payload reader for the cut snapshots below. A RAM
-    // snapshot owns its bytes; a disk snapshot pins ring extents, and the pin
-    // taken above guarantees they cannot be overwritten while consumed. Ring
-    // reads happen without holding mutex_. Both the parameter-set probe and
+    // snapshot owns its bytes; a disk snapshot reads ring extents, and the
+    // pin's consumed cursor guarantees a packet is not evicted before the
+    // save has read it. Ring reads happen without holding mutex_. Both the parameter-set probe and
     // the dump loop read through this one function, so the cut/patch/mux path
     // never branches on the backend.
     std::vector<uint8_t> ringScratch;
@@ -962,6 +975,14 @@ bool ReplayBuffer::saveTo(
         if (payload == nullptr) {
             break;
         }
+        if (!snapshot.ram) {
+            // The bytes are now staged in ringScratch, so the save has
+            // consumed them; publish that so a blocked push can reclaim the
+            // ring prefix instead of waiting for the whole dump to finish.
+            markRingBytesConsumed(
+                videoRing_,
+                static_cast<uint64_t>(snapshot.first.byteCount) + snapshot.second.byteCount);
+        }
         videoStream.write(
             reinterpret_cast<const char*>(payload->data()),
             static_cast<std::streamsize>(payload->size()));
@@ -1002,34 +1023,37 @@ bool ReplayBuffer::saveTo(
         return fail(detail);
     };
 
-    // Reassemble disk-backed audio the same way: the pin guarantees the
-    // referenced extents cannot be overwritten while they are consumed.
+    // Reassemble disk-backed audio the same way: the consumed cursor
+    // guarantees the referenced extents are not evicted before the save has
+    // read them.
     bool audioRingReadFailed = false;
     // The snapshot is empty in RAM mode; split disk packets by track only
     // after reading them in insertion order.
     for (const DiskAudioPacket& entry : diskAudio) {
         const uint32_t totalBytes = entry.first.byteCount + entry.second.byteCount;
-        ringScratch.resize(totalBytes);
+        auto packet = std::make_shared<AudioPacket>();
+        packet->track = entry.track;
+        packet->processId = entry.processId;
+        packet->frameCount = entry.frameCount;
+        packet->pts100ns = entry.pts100ns;
+        packet->format = entry.format;
+        // Read straight into the packet's bytes: the ring holds the packet
+        // bytes, and a scratch hop would double-copy the whole audio window.
+        packet->bytes.resize(totalBytes);
         if (entry.first.byteCount != 0 &&
-            !audioRing_.read(entry.first.offset, ringScratch.data(), entry.first.byteCount)) {
+            !audioRing_.read(entry.first.offset, packet->bytes.data(), entry.first.byteCount)) {
             audioRingReadFailed = true;
             break;
         }
         if (entry.second.byteCount != 0 &&
             !audioRing_.read(
                 entry.second.offset,
-                ringScratch.data() + entry.first.byteCount,
+                packet->bytes.data() + entry.first.byteCount,
                 entry.second.byteCount)) {
             audioRingReadFailed = true;
             break;
         }
-        auto packet = std::make_shared<AudioPacket>();
-        packet->track = entry.track;
-        packet->processId = entry.processId;
-        packet->bytes.assign(ringScratch.begin(), ringScratch.end());
-        packet->frameCount = entry.frameCount;
-        packet->pts100ns = entry.pts100ns;
-        packet->format = entry.format;
+        markRingBytesConsumed(audioRing_, totalBytes);
         auto& out = entry.track == AudioTrack::System ? systemAudio : microphoneAudio;
         out.push_back(std::move(packet));
     }
@@ -1287,17 +1311,24 @@ void ReplayBuffer::trimLocked() {
         // RAM byte cap, same realign as the disk ring: evict oldest until
         // under the cap, dropping the stranded P-frames before each keyframe
         // so the buffer stays decodable. Safe mid-save: RAM snapshots hold
-        // shared_ptrs, so no pin wait is needed.
+        // shared_ptrs, so no pin wait is needed. One forward keyframe scan per
+        // GOP keeps a VBR overshoot burst O(pops), not O(pops x buffer).
+        bool keyFramesRemain = true;
         while (ramVideoCapacityBytes_ > 0 && ramVideoBytes_ > ramVideoCapacityBytes_ && !video_.empty()) {
-            popVideoFront();
-            const auto nextKeyFrame = std::find_if(
-                video_.begin(), video_.end(), [](const auto& packet) { return packet->keyFrame; });
-            if (nextKeyFrame == video_.end()) {
+            const auto firstKeyFrame = keyFramesRemain
+                ? std::find_if(
+                      video_.begin(), video_.end(), [](const auto& packet) { return packet->keyFrame; })
+                : video_.end();
+            if (firstKeyFrame == video_.end()) {
+                keyFramesRemain = false;
+                popVideoFront();
                 continue;
             }
-            const auto stranded =
-                static_cast<size_t>(std::distance(video_.begin(), nextKeyFrame));
-            for (size_t index = 0; index < stranded; ++index) {
+            const auto stop = std::find_if(
+                std::next(firstKeyFrame), video_.end(), [](const auto& packet) { return packet->keyFrame; });
+            keyFramesRemain = stop != video_.end();
+            const size_t toPop = static_cast<size_t>(std::distance(video_.begin(), stop));
+            for (size_t index = 0; index < toPop; ++index) {
                 popVideoFront();
             }
         }
@@ -1453,30 +1484,55 @@ bool ReplayBuffer::appendRingLocked(const EncodedPacket& packet) {
 }
 
 void ReplayBuffer::freeRingSpaceLocked(uint64_t bytesNeeded) {
-    while (!diskVideo_.empty() && videoRing_.freeBytes() < bytesNeeded) {
+    // One forward keyframe scan per GOP instead of a fresh begin() scan per
+    // pop: mutex_ is held for the whole burst, so the deque iterators below
+    // are stable and the scan position advances with the pops. Each pop is
+    // save-aware: while a save is pinned, only the consumed prefix may go.
+    bool keyFramesRemain = true;
+    auto popFront = [&]() {
         const DiskVideoPacket& front = diskVideo_.front();
-        videoRing_.releaseBytes(front.first.byteCount + front.second.byteCount);
+        const uint64_t bytes =
+            static_cast<uint64_t>(front.first.byteCount) + front.second.byteCount;
+        if (!releaseFrontRingBytes(videoRing_, bytes)) {
+            return false;
+        }
         if (front.meta.keyFrame && diskVideoKeyFrames_ > 0) {
             --diskVideoKeyFrames_;
         }
         diskVideo_.pop_front();
-        // Evicting the head can strand non-keyframe descendants; realign to
-        // the next keyframe so the buffer stays independently decodable.
-        const auto firstBufferedKeyFrame = std::find_if(
-            diskVideo_.begin(), diskVideo_.end(), [](const DiskVideoPacket& packet) {
-                return packet.meta.keyFrame;
-            });
-        if (firstBufferedKeyFrame != diskVideo_.end()) {
-            const auto packetsBeforeKeyFrame =
-                static_cast<size_t>(std::distance(diskVideo_.begin(), firstBufferedKeyFrame));
-            for (size_t index = 0; index < packetsBeforeKeyFrame; ++index) {
-                const DiskVideoPacket& stale = diskVideo_.front();
-                videoRing_.releaseBytes(stale.first.byteCount + stale.second.byteCount);
-                if (stale.meta.keyFrame && diskVideoKeyFrames_ > 0) {
-                    --diskVideoKeyFrames_;
+        return true;
+    };
+    while (!diskVideo_.empty() && videoRing_.freeBytes() < bytesNeeded) {
+        bool poppedAll = true;
+        const auto firstKeyFrame = keyFramesRemain
+            ? std::find_if(diskVideo_.begin(), diskVideo_.end(), [](const DiskVideoPacket& packet) {
+                  return packet.meta.keyFrame;
+              })
+            : diskVideo_.end();
+        if (firstKeyFrame == diskVideo_.end()) {
+            // No keyframe anchors the buffer (undecodable); pop one packet and
+            // remember that further pops need no fresh scan.
+            keyFramesRemain = false;
+            poppedAll = popFront();
+        } else {
+            // Evicting the head can strand non-keyframe descendants; realign
+            // to the next keyframe so the buffer stays independently decodable.
+            const auto stop = std::find_if(
+                std::next(firstKeyFrame), diskVideo_.end(), [](const DiskVideoPacket& packet) {
+                    return packet.meta.keyFrame;
+                });
+            keyFramesRemain = stop != diskVideo_.end();
+            const size_t toPop = static_cast<size_t>(std::distance(diskVideo_.begin(), stop));
+            for (size_t index = 0; index < toPop; ++index) {
+                if (!popFront()) {
+                    poppedAll = false;
+                    break;
                 }
-                diskVideo_.pop_front();
             }
+        }
+        if (!poppedAll) {
+            // Front is not yet read by the in-flight save; wait for it.
+            break;
         }
     }
     // Byte-eviction changes the counts without going through trimLocked, and
@@ -1547,9 +1603,30 @@ bool ReplayBuffer::appendAudioRingLocked(const AudioPacket& packet) {
 void ReplayBuffer::freeAudioRingSpaceLocked(uint64_t bytesNeeded) {
     while (!diskAudio_.empty() && audioRing_.freeBytes() < bytesNeeded) {
         const DiskAudioPacket& front = diskAudio_.front();
-        audioRing_.releaseBytes(front.first.byteCount + front.second.byteCount);
+        const uint64_t bytes =
+            static_cast<uint64_t>(front.first.byteCount) + front.second.byteCount;
+        if (!releaseFrontRingBytes(audioRing_, bytes)) {
+            break;  // the in-flight save has not read this packet yet
+        }
         diskAudio_.pop_front();
     }
+}
+
+bool ReplayBuffer::releaseFrontRingBytes(RingFile& ring, uint64_t byteCount) {
+    if (savePinsRefs_) {
+        return ring.releaseConsumedPrefix(byteCount);
+    }
+    ring.releaseBytes(byteCount);
+    return true;
+}
+
+void ReplayBuffer::markRingBytesConsumed(RingFile& ring, uint64_t byteCount) {
+    if (byteCount == 0) {
+        return;
+    }
+    std::scoped_lock lock(mutex_);
+    ring.markSaveConsumed(byteCount);
+    ringSpace_.notify_all();
 }
 
 } // namespace backtrack

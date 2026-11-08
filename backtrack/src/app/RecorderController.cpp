@@ -393,7 +393,10 @@ bool RecorderController::updateSettings(AppSettings settings) {
         // polls the cursor mirror every second. Restarting the pipeline here
         // would split the replay timeline (and the active recording) on every
         // volume-drag tick, so store and publish instead of bouncing.
-        AppSettings currentBase = currentWithoutVoice;
+        // currentWithoutVoice and incomingNoReplay are dead past the two
+        // comparisons above, so the live-apply copies take them over instead of
+        // duplicating both executable lists once more.
+        AppSettings currentBase = std::move(currentWithoutVoice);
         currentBase.audioOutputVolumePercent = 0;
         currentBase.audioInputVolumePercent = 0;
         currentBase.audioInputAutoGainEnabled = false;
@@ -401,7 +404,7 @@ bool RecorderController::updateSettings(AppSettings settings) {
         currentBase.audioInputNoiseSuppressionEnabled = false;
 #endif
         currentBase.captureCursor = false;
-        AppSettings incomingBase = settings;
+        AppSettings incomingBase = std::move(incomingNoReplay);
         incomingBase.audioOutputVolumePercent = 0;
         incomingBase.audioInputVolumePercent = 0;
         incomingBase.audioInputAutoGainEnabled = false;
@@ -702,13 +705,21 @@ std::filesystem::path RecorderController::saveReplay() {
         // this thread waiting on pipelineGpuMutex_ during a recreate.
         forceVideoHeartbeat_ = true;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        // videoSpan100ns is O(buffered packets); sample it every ~10th poll
+        // (200 ms) so the preflight's transient work stays bounded. The abort
+        // checks below still re-read the live value.
+        int64_t span100ns = replay_.videoSpan100ns();
+        size_t pollCounter = 0;
         while (replay_.videoKeyFrameCount() == 0 ||
-               replay_.videoSpan100ns() < minReplayVideo100ns ||
+               span100ns < minReplayVideo100ns ||
                bufferedVideoStale()) {
             if (std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            if (++pollCounter % 10 == 0) {
+                span100ns = replay_.videoSpan100ns();
+            }
         }
         if (replay_.videoKeyFrameCount() == 0) {
             const std::wstring detail = L"no keyframe buffered yet";
@@ -1045,7 +1056,7 @@ bool RecorderController::ensurePipeline() {
     videoTimelineEndPts100ns_ = 0;
 
     if (snapshot.captureSystemAudio) {
-        refreshSystemAudioCapture(snapshot);
+        refreshSystemAudioCapture(snapshot, mutedSoundSeparationExecutableKeys(snapshot));
     }
     if (snapshot.captureMicrophone) {
         microphoneAgcResetPending_ = true;
@@ -1786,6 +1797,10 @@ void RecorderController::captureLoopImpl() {
     };
     const auto monitorPollInterval = std::chrono::milliseconds(100);
     const auto soundSeparationPollInterval = std::chrono::seconds(2);
+    // The poll's key list derives from captureSettings alone, which is fixed for
+    // this loop; computing it once keeps the 2 s tick from rebuilding it.
+    const std::vector<std::wstring> soundSeparationKeys =
+        mutedSoundSeparationExecutableKeys(captureSettings);
     const auto monitorSwitchStableInterval = std::chrono::milliseconds(300);
     const auto monitorSwitchCooldown = std::chrono::milliseconds(750);
     auto lastMonitorSwitch = SteadyClock::time_point::min();
@@ -2078,7 +2093,7 @@ void RecorderController::captureLoopImpl() {
         if (captureSettings.captureSystemAudio &&
             loopNow >= nextSoundSeparationPoll) {
             nextSoundSeparationPoll = loopNow + soundSeparationPollInterval;
-            refreshSystemAudioCapture(captureSettings);
+            refreshSystemAudioCapture(captureSettings, soundSeparationKeys);
         }
 
         if (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && loopNow >= nextMonitorPoll) {
@@ -2963,6 +2978,9 @@ void RecorderController::encodeLoopImpl() {
         publishVideoPacket(std::move(packet));
     };
 
+    // Hoisted out of the frame loop: encodeFrame clears it, so the previous
+    // frame's capacity is reused instead of freed and re-grown every frame.
+    std::vector<EncodedPacket> ready;
     while (!stopRequested_ || frameQueue_.size() > 0 ||
            durationUpdatePending_.load(std::memory_order_acquire)) {
         // Periodic health probe: averageEncodeMs is already measured per frame
@@ -3025,7 +3043,6 @@ void RecorderController::encodeLoopImpl() {
         // Vector form: one submit can complete several outputs while
         // reordering/lookahead drains, and the single-packet form strands the
         // tail. publishPacket skips empties, same as the old encoded gate.
-        std::vector<EncodedPacket> ready;
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
             if (encoder_) {
@@ -3136,7 +3153,7 @@ void RecorderController::writeAudioPacket(AudioPacket&& packet) {
     // declared with the old one, producing pitch-shifted audio and duration
     // skew. Unsupported formats cannot be converted and are dropped here
     // instead of corrupting downstream timelines.
-    if (!convertAudioPacketToCanonical(packet)) {
+    if (!convertAudioPacketToCanonical(packet, audioConvertScratch_)) {
         Logger::instance().warning(L"recorder",
             L"Audio packet dropped: unsupported capture format (track=" +
             std::wstring(packet.track == AudioTrack::System ? L"system" : L"microphone") + L")");
@@ -3203,12 +3220,12 @@ void RecorderController::audioLoopImpl() {
         [this](AudioPacket&& packet) { writeAudioPacket(std::move(packet)); });
 }
 
-void RecorderController::refreshSystemAudioCapture(const AppSettings& settings) {
+void RecorderController::refreshSystemAudioCapture(const AppSettings& settings,
+                                                   const std::vector<std::wstring>& mutedKeys) {
     if (!settings.captureSystemAudio) {
         return;
     }
 
-    const std::vector<std::wstring> mutedKeys = mutedSoundSeparationExecutableKeys(settings);
     std::scoped_lock lock(systemAudioCaptureMutex_);
 
     // Re-assert on every poll, including while capture is already running: a

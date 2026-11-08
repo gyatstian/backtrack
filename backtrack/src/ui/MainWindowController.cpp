@@ -35,6 +35,22 @@
 #include <utility>
 
 namespace backtrack {
+
+namespace {
+
+// Liveness probe for the stable-state auto record poll. A matched app was
+// readable with PROCESS_QUERY_LIMITED_INFORMATION during enumeration, so the
+// same probe works here without walking the desktop.
+bool isAutoRecordAppAlive(uint32_t processId) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (process) {
+        CloseHandle(process);
+    }
+    return process != nullptr;
+}
+
+} // namespace
+
 void MainWindow::handleHotkey(int id) {
     if (id == HotkeyService::kStartStopId) {
         ControllerAction action;
@@ -112,7 +128,7 @@ void MainWindow::handleLeagueKillDetected() {
     setStatus(L"Kill detected; press replay hotkey within 6 seconds to tag it");
 }
 
-std::optional<std::wstring> MainWindow::matchingAutoRecordAppName(
+std::optional<AudioSessionAppInfo> MainWindow::matchingAutoRecordApp(
     const AppSettings& applied, const std::vector<AudioSessionAppInfo>& openApps) {
     if (!applied.autoRecordEnabled || applied.autoRecordApps.empty()) {
         return std::nullopt;
@@ -124,8 +140,7 @@ std::optional<std::wstring> MainWindow::matchingAutoRecordAppName(
     }
     for (const auto& open : openApps) {
         if (keys.contains(normalizedPathKey(open.executablePath))) {
-            return open.name.empty() ? std::optional<std::wstring>(appNameFromPath(open.executablePath))
-                                     : std::optional<std::wstring>(open.name);
+            return open;
         }
     }
     return std::nullopt;
@@ -158,7 +173,7 @@ void MainWindow::stopRecordingForAutoRecord() {
 }
 
 void MainWindow::pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps) {
-    // Polling walks open app sessions on a 1s timer; a slow enumeration should
+    // Polling walks open app sessions on a 2s timer; a slow enumeration should
     // surface instead of silently delaying the UI thread.
     const ScopedLatencyWarn slowPoll(L"ui", L"Auto record poll exceeded budget",
         std::chrono::milliseconds(50));
@@ -168,10 +183,27 @@ void MainWindow::pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps
     }
 
     const AppSettings applied = controller_.settings();
-    const auto runningName = applied.autoRecordEnabled && !applied.autoRecordApps.empty()
-        ? matchingAutoRecordAppName(applied, openApps ? *openApps : WasapiCapture::enumerateOpenApps())
-        : std::nullopt;
-    const bool running = runningName.has_value();
+    std::optional<AudioSessionAppInfo> matchedApp;
+    if (autoRecordOwnsRecording_ && autoRecordAppRunning_ && autoRecordMatchedApp_.processId != 0 &&
+        applied.autoRecordEnabled && !applied.autoRecordApps.empty()) {
+        // Stable state: we own a recording of a known matched app, so only its
+        // liveness or its membership in the applied list can change. Confirm
+        // both cheaply; on any doubt fall back to the desktop walk so a list
+        // edit or another selected app resolves exactly as the full scan would.
+        if (isAutoRecordAppAlive(autoRecordMatchedApp_.processId) &&
+            matchingAutoRecordApp(applied, {autoRecordMatchedApp_})) {
+            matchedApp = autoRecordMatchedApp_;
+        } else {
+            matchedApp = matchingAutoRecordApp(applied, openApps ? *openApps : WasapiCapture::enumerateOpenApps());
+        }
+    } else if (applied.autoRecordEnabled && !applied.autoRecordApps.empty()) {
+        matchedApp = matchingAutoRecordApp(applied, openApps ? *openApps : WasapiCapture::enumerateOpenApps());
+    }
+    autoRecordMatchedApp_ = matchedApp ? *matchedApp : AudioSessionAppInfo{};
+    const bool running = matchedApp.has_value();
+    const std::wstring runningName = running
+        ? (matchedApp->name.empty() ? appNameFromPath(matchedApp->executablePath) : matchedApp->name)
+        : std::wstring();
     const bool previousRunning = std::exchange(autoRecordAppRunning_, running);
 
     if (previousRunning && !running) {
@@ -191,7 +223,7 @@ void MainWindow::pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps
     }
 
     if (running && !controller_.isRecording() && !autoRecordSuppressStart_) {
-        startRecordingForAutoRecord(runningName.value_or(L"selected app"));
+        startRecordingForAutoRecord(runningName.empty() ? L"selected app" : runningName);
         return;
     }
     if (!running && controller_.isRecording() && autoRecordOwnsRecording_) {

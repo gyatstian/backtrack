@@ -64,12 +64,6 @@ static std::wstring hdrStatusLine(const RecordingStats& stats) {
         return L"HDR: rejected (tone-mapping refused" + detail + L")";
     }
     if (stats.hdrActive) {
-        // Pinned single-mapping sessions self-report stability: flips stay 0
-        // and bridged counts the SDR surfaces normalized into the HDR mapping.
-        if (stats.hdrPinned) {
-            return L"HDR: active (tone-mapping, pinned" + detail +
-                L", bridged " + std::to_wstring(stats.hdrBridgedFrames) + L")";
-        }
         return L"HDR: active (tone-mapping" + detail + L")";
     }
     if (stats.hdrRejected) {

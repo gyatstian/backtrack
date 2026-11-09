@@ -21,7 +21,9 @@ untrusted values, and the enum name mappings that cross the file boundary.
   `%LOCALAPPDATA%\Backtrack\settings.ini` (`Application::run` constructs the
   store; `platform/localAppDataPath` owns the folder). There is no section
   syntax, no quoting, and no schema version field. `#` starts a comment, a line
-  without `=` is ignored, and a repeated key keeps the last value.
+  without `=` is ignored, and a repeated key keeps the last value. a leading
+  BOM is stripped from the first line; a line longer than 64 KiB is dropped
+  with one warning and does not affect the keys around it.
 - `load` reports `Missing`, `Failed`, or `Loaded` through its optional status
   argument. missing files and failed reads return sanitized defaults; a read
   error discards the entire partial input. an empty file is loaded successfully.
@@ -30,7 +32,12 @@ untrusted values, and the enum name mappings that cross the file boundary.
   rejects anything above `uint32_t`. `readBool` accepts `1/true/yes/on` and
   `0/false/no/off` in any case, and `library.viewMode` matches `gallery` /
   `list` in any case. Enum reads go through the `xxxFromName` functions, which
-  map an unrecognized name to a known value instead of failing the load.
+  fold the name once, compare lowercase spellings only, name their own default
+  value explicitly, and map an unrecognized name to that default instead of
+  failing the load.
+- The loader reads each executable list by index while the `.count` hint has
+  not run out or `<prefix>N.path` exists, capped at 128 entries: a file that
+  lost its count line keeps its apps instead of loading an empty list.
 - `sanitizeSettings` is the trust boundary. It runs on every load **and** on
   every save, so a hand-edited file is normalized on the next start and an
   out-of-range value can never reach disk. The `VideoSettings` ranges and the
@@ -50,6 +57,9 @@ untrusted values, and the enum name mappings that cross the file boundary.
   stem, replaces CR/LF in names with spaces, and replaces an empty
   `clipDirectory` with `defaultClipDirectory()`. a new setting needs a clamp
   here if it can be out of range.
+- `monitorIndex` is the one numeric setting left unclamped on purpose:
+  `platform/Win32Util.cpp:monitorFromIndex` warns and falls back to the first
+  monitor, so clamping it to 0 would silently move users off their monitor.
 - A non-`Custom` `resolutionMode` **overwrites** `video.width` and
   `video.height` with the preset size. The stored dimensions only matter in
   `Custom` mode, so a hand-edited size under a preset is discarded on load.
@@ -57,7 +67,7 @@ untrusted values, and the enum name mappings that cross the file boundary.
   unbound when that default matches `startStop`. a virtual key of 0 means
   unbound and is left alone.
 - `save` creates the settings directory when missing and publishes the complete
-  serialization through `clips/AtomicWrite.h`. the helper exclusively creates a
+  serialization through `platform/AtomicWrite.h`. the helper exclusively creates a
   fresh sibling, writes through its held handle, and replaces the destination
   entry by handle. it never truncates an existing staging file or writes through
   a linked destination; on failure it attempts to remove only its own staging
@@ -99,9 +109,10 @@ untrusted values, and the enum name mappings that cross the file boundary.
 
 `SettingsClipGuardTests` (CTest) links this folder's `SettingsStore.cpp` and
 covers the clamp ranges, resolution presets, enum fallbacks, app-list dedupe,
-and hotkey masking. `backtrack/tests/SettingsStoreTests.cpp` adds settings-only
-regressions, including linked destinations and staging collisions, but is not
-yet registered with CTest. symbolic link cases skip when link creation is
+and hotkey masking. `backtrack/tests/SettingsStoreTests.cpp` (CTest) adds
+settings-only regressions, including linked destinations, staging collisions,
+a UTF-8 BOM on the first key, an over-long dropped line, and an executable list
+without its `.count` hint. symbolic link cases skip when link creation is
 unavailable.
 
 The only `platform/Win32Util.h` symbols this folder uses are the `inline`

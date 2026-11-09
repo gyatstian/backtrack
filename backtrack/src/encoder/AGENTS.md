@@ -18,7 +18,9 @@ share.
 - `IEncoder` is the only encoder surface `RecorderController` touches; it never
   includes a backend header. Its header forward-declares `D3DDevice` (the
   backends include `capture/D3DDevice.h` in their own `.cpp`). Add virtuals with a default body rather than
-  forcing every backend and call site to change. `encodeFrame` has a
+  forcing every backend and call site to change; `resetInputResources()` is the
+  exception (pure virtual: no backend may inherit a silent `return true`).
+  `encodeFrame` has a
   drain-to-vector overload that appends every ready packet (default pops at
   most one through the single-packet form); the single-packet form returns
   false when no output is ready.

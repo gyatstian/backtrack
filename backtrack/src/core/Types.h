@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/TimeUnits.h"
+
 #include <Windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -16,7 +18,6 @@
 namespace backtrack {
 
 using Microsoft::WRL::ComPtr;
-using SteadyClock = std::chrono::steady_clock;
 
 enum class LogLevel {
     Trace,
@@ -46,7 +47,6 @@ enum class GpuVendor {
 enum class AudioTrack {
     System,
     Microphone,
-    SoundSeparation,
 };
 
 enum class ResolutionMode {
@@ -280,8 +280,12 @@ struct GpuFrame {
     uint64_t frameIndex = 0;
     int64_t pts100ns = 0;
     int64_t duration100ns = 0;
+    // The preceding encoder submission this frame has to close, valid only
+    // when hasPreviousFrame: a legitimate PTS can be zero, so no value works
+    // as an "absent" sentinel.
     int64_t previousFramePts100ns = 0;
     int64_t previousFrameDuration100ns = 0;
+    bool hasPreviousFrame = false;
     uint32_t width = 0;
     uint32_t height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
@@ -315,7 +319,6 @@ struct WaveFormatBlob {
 
 struct AudioPacket {
     AudioTrack track = AudioTrack::System;
-    uint32_t processId = 0;
     // pmr so the WASAPI capture thread allocates payloads from a pool instead of
     // the CRT heap; see ensureAudioPacketPool in audio/WasapiCapture.h. Bytes are
     // still retained per packet by the replay buffer, so nothing recycles a live
@@ -368,16 +371,12 @@ struct RecordingStats {
     // the monitor reports advanced color but no HDR frame was observed
     // (WGC/SDR interpretation of an HDR desktop). hdrFlipCount counts stable
     // hdr/format flips per pipeline run; hdrFormat is the last observed frame
-    // format (UNKNOWN across handoffs until a new frame lands). hdrPinned is
-    // the Desktop Duplication single-mapping pin (session interprets every
-    // frame as HDR, bridging SDR surfaces); hdrBridgedFrames counts those
-    // bridged surfaces per pipeline run. Output stays SDR either way.
+    // format (UNKNOWN across handoffs until a new frame lands). Output stays
+    // SDR either way.
     bool hdrActive = false;
     bool hdrRejected = false;
     uint64_t hdrFlipCount = 0;
     DXGI_FORMAT hdrFormat = DXGI_FORMAT_UNKNOWN;
-    bool hdrPinned = false;
-    uint64_t hdrBridgedFrames = 0;
     uint64_t capturedFrames = 0;
     uint64_t sourceFrames = 0;
     uint64_t sourceFramesPerSecond = 0;
@@ -412,11 +411,5 @@ struct RecordingStats {
     uint32_t encodeHeight = 0;
     EncoderStats encoder;
 };
-
-inline constexpr int64_t kHundredNanosecondsPerSecond = 10'000'000;
-
-inline int64_t secondsTo100ns(uint32_t seconds) {
-    return static_cast<int64_t>(seconds) * kHundredNanosecondsPerSecond;
-}
 
 } // namespace backtrack

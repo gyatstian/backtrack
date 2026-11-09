@@ -86,11 +86,9 @@ private:
     };
     // Metadata view of one buffered audio packet on disk. The payload lives in
     // the audio ring file; format/frameCount rebuild an AudioPacket on the
-    // save path, and processId survives so the RAM and disk backends publish
-    // identical packets.
+    // save path, so the RAM and disk backends publish identical packets.
     struct DiskAudioPacket {
         AudioTrack track = AudioTrack::System;
-        uint32_t processId = 0;
         int64_t pts100ns = 0;
         uint32_t frameCount = 0;
         std::shared_ptr<const WaveFormatBlob> format;

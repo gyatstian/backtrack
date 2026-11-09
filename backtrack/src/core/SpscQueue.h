@@ -3,12 +3,21 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <type_traits>
 #include <vector>
 
 namespace backtrack {
 
 template <typename T>
 class SpscQueue {
+    // clear() drains through tryPop, which assigns into a default-constructed
+    // T. Both requirements are documented here rather than discovered at the
+    // first instantiation that breaks.
+    static_assert(std::is_default_constructible_v<T>,
+        "SpscQueue::clear() drains into a default-constructed T");
+    static_assert(std::is_move_assignable_v<T> || std::is_copy_assignable_v<T>,
+        "SpscQueue hands items out by assigning into the caller's T");
+
 public:
     // The ring storage is fixed for the queue's lifetime at this capacity;
     // resetCapacity only ever lowers an atomic logical limit, so metadata

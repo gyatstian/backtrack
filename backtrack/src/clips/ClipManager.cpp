@@ -1,9 +1,9 @@
 #include "clips/ClipManager.h"
-#include "clips/AtomicWrite.h"
 #include "clips/ClipStorage.h"
 
 #include "core/LogContext.h"
 #include "core/Logger.h"
+#include "platform/AtomicWrite.h"
 
 #include <algorithm>
 #include <chrono>

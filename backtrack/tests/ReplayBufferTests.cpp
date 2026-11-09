@@ -1539,7 +1539,6 @@ void testDiskAudioRoundTripAcrossWrap() {
 AudioPacket makeMarkedAudio(AudioTrack track, int64_t seconds, uint8_t marker) {
     AudioPacket packet = makeAudio(seconds * kSecond100ns, 1);
     packet.track = track;
-    packet.processId = marker;
     for (size_t i = 0; i < packet.bytes.size(); ++i) {
         packet.bytes[i] = static_cast<uint8_t>(i * 31 + i / 251 + marker * 17);
     }

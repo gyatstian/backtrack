@@ -42,6 +42,12 @@ public:
     public:
         explicit ScopedTask(std::wstring label) { LogContext::begin(std::move(label)); }
         ~ScopedTask() { LogContext::end(); }
+        // The destructor ends the task, so a copy or a move would end it twice
+        // and pop an outer label.
+        ScopedTask(const ScopedTask&) = delete;
+        ScopedTask& operator=(const ScopedTask&) = delete;
+        ScopedTask(ScopedTask&&) = delete;
+        ScopedTask& operator=(ScopedTask&&) = delete;
     };
 
 private:

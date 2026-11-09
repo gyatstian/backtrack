@@ -255,6 +255,28 @@ void testDayHoldCoalescingIsCapped() {
         "default plan unexpectedly capped a day-long hold");
 }
 
+void testZeroPtsPreviousFrameUsesFlag() {
+    // A legitimate PTS of 0 still names a preceding sample: validity comes from
+    // hasPreviousFrame, never from the timestamp value.
+    VideoTimelineScheduler scheduler(kFrameDuration100ns);
+
+    const auto first = scheduler.plan(60, 0, 1, true, false, false);
+    expect(first.action == VideoTimelineAction::Submit, "first source frame at PTS 0 was not submitted");
+    expect(!first.hasPreviousFrame, "first source frame reported a preceding sample");
+    scheduler.acceptSubmission(first);
+
+    const auto second = scheduler.plan(61, kFrameDuration100ns, 1, true, false, false);
+    expect(second.action == VideoTimelineAction::Submit, "second source frame was coalesced");
+    expect(second.hasPreviousFrame, "a preceding sample at PTS 0 was reported as absent");
+    expect(second.previousFramePts100ns == 0, "the preceding sample at PTS 0 was not named");
+    expect(second.previousFrameDuration100ns == kFrameDuration100ns,
+        "the preceding sample at PTS 0 did not cover its timeline interval");
+
+    scheduler.reset();
+    const auto afterReset = scheduler.plan(62, 2 * kFrameDuration100ns, 1, true, false, false);
+    expect(!afterReset.hasPreviousFrame, "reset leaked the preceding-sample flag");
+}
+
 } // namespace
 
 int main() {
@@ -268,6 +290,7 @@ int main() {
         testCoalesceGapRecoveredByNextSubmit();
         testStallHoldPreferCoalesceOverSlideshow();
         testDayHoldCoalescingIsCapped();
+        testZeroPtsPreviousFrameUsesFlag();
         std::cout << "VideoTimelineScheduler tests passed\n";
         return 0;
     } catch (const std::exception& error) {

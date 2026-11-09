@@ -195,7 +195,7 @@ void testLongOutagePreservesGapDuration() {
     first.bytes.assign(48000 * 4, 0x80);
     expect(backtrack::paceAudioPacket(
                writer, nextPts, first,
-               (std::numeric_limits<int64_t>::max)(), L"test", L"timeline.wav", gapStats),
+               (std::numeric_limits<int64_t>::max)(), gapStats),
         "pacing the first marker failed");
 
     // 40 s of silence, then a resume marker at 40 s: the saved audio must span
@@ -207,7 +207,7 @@ void testLongOutagePreservesGapDuration() {
     resumed.bytes.assign(48000 * 4, 0x7f);
     expect(backtrack::paceAudioPacket(
                writer, nextPts, resumed,
-               (std::numeric_limits<int64_t>::max)(), L"test", L"timeline.wav", gapStats),
+               (std::numeric_limits<int64_t>::max)(), gapStats),
         "pacing the resumed marker failed");
     writer.close();
 

@@ -7,8 +7,9 @@ the lock-free queue used between threads, and the app version constant.
 
 ## Ownership
 
-- Owns: `core/Types.h`, `core/Clock.h`, `core/EncodingNames.h`, `core/Logger.*`,
-  `core/LogContext.h`, `core/LogTiming.h`, `core/SpscQueue.h`, `core/AppVersion.h`.
+- Owns: `core/Types.h`, `core/TimeUnits.h`, `core/Clock.h`, `core/EncodingNames.h`,
+  `core/Logger.*`, `core/LogContext.h`, `core/LogTiming.h`, `core/SpscQueue.h`,
+  `core/AppVersion.h`.
 - Does not own: any behavior that belongs to a domain. `Types.h` describes data,
   it does not act on it.
 
@@ -18,14 +19,12 @@ the lock-free queue used between threads, and the app version constant.
   `GpuOptimizationSettings`, `HotkeySettings`, `GameIntegrationSettings`,
   `AppSettings`) and the wire structs (`GpuFrame`, `EncodedPacket`,
   `AudioPacket`, `CaptureTarget`, plus the stats and capability structs).
-  `RecordingStats::hdrActive` / `hdrRejected` / `hdrFlipCount` / `hdrFormat` /
-  `hdrPinned` / `hdrBridgedFrames` are
+  `RecordingStats::hdrActive` / `hdrRejected` / `hdrFlipCount` / `hdrFormat` are
   diagnostics-only mirrors with
   no settings backing (HDR stays automatic): active means HDR frames are
   flowing, rejected means tone-mapping was refused or an HDR desktop is read as
   SDR, flip count tracks hdr/format flips per pipeline run, format is the last
-  observed frame format, pinned means the capture session locked the single
-  HDR mapping, bridged counts the SDR surfaces normalized into it. The Diagnostics page renders them as one `HDR:` line and `saveLog`
+  observed frame format. The Diagnostics page renders them as one `HDR:` line and `saveLog`
   appends the same chain to the saved copy.
 - Every settings struct has a defaulted `operator==`. The UI dirty check
   (`MainWindow::computeSettingsDirty`) compares whole structs, so a new
@@ -50,22 +49,31 @@ the lock-free queue used between threads, and the app version constant.
   `settings/SettingsStore.h`; a value that can be out of range also needs a
   clamp in `sanitizeSettings`. A field behind `BACKTRACK_HAS_NOISE_SUPPRESSION`
   is wrapped in that `#ifdef` at every site that touches it.
-- `kHundredNanosecondsPerSecond` and `secondsTo100ns` are the only conversion
-  helpers, plus `core/Clock.h`'s QPC/steady-clock converters (`qpcTo100ns`,
-  `qpcNow100ns`, `steadyNow100ns`, `steadyTimePoint100ns`,
-  `steadyPointFrom100ns`). Timestamps are signed 100 ns units and may legitimately be zero or
-  negative, so nothing in this folder may use a sentinel value; see
+- `kHundredNanosecondsPerSecond` and `secondsTo100ns` live in
+  `core/TimeUnits.h` (`<chrono>`/`<cstdint>` only), together with the
+  `SteadyClock` alias, so a timestamp-only header converts units without
+  including `core/Types.h`. `core/Clock.h` holds the QPC/steady-clock converters
+  (`qpcTo100ns`, `qpcNow100ns`, `steadyNow100ns`, `steadyTimePoint100ns`,
+  `steadyPointFrom100ns`) and includes TimeUnits.h, never Types.h. Nothing else
+  belongs in TimeUnits.h. Timestamps are signed 100 ns units and may legitimately
+  be zero or negative, so nothing in this folder may use a sentinel value; see
   `src/AGENTS.md` for the boundary rule.
 - `Logger` is a process singleton, safe from any thread. `initialize` once at
   startup, then `setEnabled` (logging defaults on; when off no line is written
-  anywhere); it renames any previous log to `<path>.old` and
-  clears the rate-limit, recent-line, and pending-group state. The minimum
-  level is fixed at `Trace` (most verbose) so no call site is ever filtered.
-  `writeHeader` logs
+  anywhere); it renames any previous log to `<path>.old` and clears the
+  rate-limit, recent-line, and pending-group state on every exit path. A
+  `initialize` that cannot create its directory leaves no stale state and an
+  empty `currentPath()`; one that cannot rename the previous log aside opens
+  `<path>.<pid>.log` instead of truncating a log it could not archive. The
+  minimum level is fixed at `Trace` (most verbose) so no call site is ever
+  filtered. `writeHeader` logs
   the project version, date, environment, and OS build once at startup (the per-line
   timestamp is `HH:mm:ss.SSS`); `writeFooter` logs a shutdown summary of
   error/warning/rate-limited counts. It keeps both a file and a 200-line
-  `recentLines` deque for the Diagnostics page.
+  `recentLines` deque for the Diagnostics page. `recentLines` reports the
+  deferred duplicate group's text without emitting it, so a Diagnostics poll
+  (~1/s) never ends the group or spends its rate-limit budget; flush,
+  `writeFooter`, and export stay the only emitters.
 - Consecutive-duplicate grouping runs before the rate limiter: back-to-back
   identical lines (same level, subsystem, and message) collapse into one `(Nx)`
   line, emitted when a different message arrives, on `flush`, or on export. The
@@ -81,7 +89,8 @@ the lock-free queue used between threads, and the app version constant.
   successfully. flush before export or a fatal exit.
 - Task correlation and breadcrumbs come from `core/LogContext.h` (header-only):
   `LogContext::ScopedTask` labels the calling thread's task, and `Logger` appends
-  `task=<label>` to every line from it. A per-thread 25-entry breadcrumb ring
+  `task=<label>` to every line from it. It is neither copyable nor movable: the
+  destructor ends the task, so a copy would pop an outer label. A per-thread 25-entry breadcrumb ring
   records silent state transitions (`LogContext::breadcrumb`); on ERROR the logger
   attaches the `trail=...` (relative-ms breadcrumbs) and a best-effort `stack=...`
   of return addresses (needs PDBs to symbolize). Task label, trail, and stack are
@@ -91,8 +100,10 @@ the lock-free queue used between threads, and the app version constant.
   through the same text-keyed rate limiter, so no per-callsite suppression state
   is needed.
 - `redactSecrets` masks values of known credential key names (`token=`, `password=`,
-  ...) on every written line, defensively - no call site logs secrets today. Paths
-  and window titles are NOT auto-redacted; instrumentation sites must avoid logging
+  ...) on every written line, defensively - no call site logs secrets today. A
+  line with no `=` returns before the lowercase copy and the per-key scans, since
+  no key can match it and this runs under the mutex capture and encode share.
+  Paths and window titles are NOT auto-redacted; instrumentation sites must avoid logging
   them (replay save lines log the output path, which embeds the foreground window
   title).
 - `SpscQueue<T>` is header-only and lock-free with exactly one producer and one
@@ -105,7 +116,9 @@ the lock-free queue used between threads, and the app version constant.
   any thread, including while a reset runs (the UI diagnostics timer reads
   `frameQueue_.size()` during a pipeline restart). `resetCapacity`/`clear` are
   still legal only when both ends are stopped; `clear` moves the consumer's
-  index, so it needs the consumer stopped too.
+  index, so it needs the consumer stopped too. `clear` and `tryPop` assign into a
+  default-constructed `T`, so `T` must be default-constructible and move- or
+  copy-assignable; `static_assert`s in the header state both.
 - `AppVersion.h`'s `kCurrentAppVersion` is the app's only version string;
   `MainWindow::startUpdateCheck` compares it against the latest GitHub release.
   The check is opt-out: `AppSettings::checkForUpdates` (default on) gates it in
@@ -125,7 +138,9 @@ the lock-free queue used between threads, and the app version constant.
 
 `SpscQueueTests` covers the queue; no suite covers `AppVersion.h` directly.
 `LoggerDiagnosticsTests` (CTest) covers logger rate limiting, pruning, stream
-failure, and diagnostics export. existing suites also link `Logger.cpp`.
+failure, diagnostics export, the archive fallback that keeps an unarchivable
+previous log, and that a `recentLines` poll does not end the pending group.
+existing suites also link `Logger.cpp`.
 
 ## Child DOX Index
 

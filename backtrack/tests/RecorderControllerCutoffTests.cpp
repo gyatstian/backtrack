@@ -150,6 +150,7 @@ public:
 
     bool initialize(backtrack::D3DDevice&, const backtrack::VideoSettings&) override { return true; }
     void requestKeyFrame() override {}
+    bool resetInputResources() override { return true; }
     bool encodeFrame(const backtrack::GpuFrame&, backtrack::EncodedPacket&) override { return false; }
     void drain(std::vector<backtrack::EncodedPacket>& packets) override { packets.clear(); }
     void shutdown() override {}

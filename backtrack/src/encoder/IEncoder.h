@@ -16,8 +16,9 @@ public:
     virtual void requestKeyFrame() = 0;
     // False means a cached registration, mapping, or input lease could not be
     // retired. In-flight inputs keep their storage and pool lease until the
-    // driver confirms completion.
-    virtual bool resetInputResources() { return true; }
+    // driver confirms completion. Pure virtual: a backend that pins inputs must
+    // say so, and a silent `return true` reads as safe retirement it never did.
+    virtual bool resetInputResources() = 0;
     // Single-packet form: true means `packet` holds one output, false means no
     // output was ready (never an error signal on its own).
     virtual bool encodeFrame(const GpuFrame& frame, EncodedPacket& packet) = 0;

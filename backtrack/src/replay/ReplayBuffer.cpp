@@ -180,9 +180,8 @@ bool writeTimelineAudio(
     }
 
     // Shared pacing core with the recording path (mux/AudioTimeline.h): gap
-    // fill capped at 10 s with resync past the cap, overlap trim, and the
-    // replay window end as the write bound.
-    const std::wstring fileName = path.filename().wstring();
+    // fill to the packet's true time, overlap trim, and the replay window end
+    // as the write bound.
     int64_t nextPts100ns = startPts100ns;
     AudioGapStats gapStats;
     for (const auto& packet : audio) {
@@ -192,7 +191,7 @@ bool writeTimelineAudio(
         if (!packetFormatMatches(*packet)) {
             continue;
         }
-        if (!paceAudioPacket(writer, nextPts100ns, *packet, endPts100ns, L"replay", fileName.c_str(), gapStats)) {
+        if (!paceAudioPacket(writer, nextPts100ns, *packet, endPts100ns, gapStats)) {
             return false;
         }
         if (nextPts100ns >= endPts100ns) {
@@ -1033,7 +1032,6 @@ bool ReplayBuffer::saveTo(
         const uint32_t totalBytes = entry.first.byteCount + entry.second.byteCount;
         auto packet = std::make_shared<AudioPacket>();
         packet->track = entry.track;
-        packet->processId = entry.processId;
         packet->frameCount = entry.frameCount;
         packet->pts100ns = entry.pts100ns;
         packet->format = entry.format;
@@ -1588,7 +1586,6 @@ bool ReplayBuffer::appendAudioRingLocked(const AudioPacket& packet) {
 
     DiskAudioPacket entry;
     entry.track = packet.track;
-    entry.processId = packet.processId;
     entry.pts100ns = packet.pts100ns;
     entry.frameCount = packet.frameCount;
     entry.format = packet.format;

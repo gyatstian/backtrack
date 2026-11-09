@@ -11,8 +11,6 @@ GPU scaler that converts frames to whatever the active encoder wants.
 - Owns: `ICaptureSource`, `WgcCaptureSource`, `DesktopDuplicationCapture`,
   `D3DDevice`, `D3D11FrameScaler`, `HdrStability.h`, `GpuTexturePool.h`,
   `GpuPoolBuilder.h`, `WgcCopyPool.h`.
-  `ICaptureSource` carries the HDR diagnostics defaults (`hdrPinned`,
-  `hdrBridgedFrames`); no source currently overrides them.
 - Does not own: encoder input format decisions (the encoder declares its
   preference through `IEncoder::preferredInputFormat`) or the frame queue, which
   belongs to `app`.

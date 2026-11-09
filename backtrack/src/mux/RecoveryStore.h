@@ -2,7 +2,6 @@
 
 #include "mux/MuxedInputs.h"
 
-#include <chrono>
 #include <filesystem>
 #include <ostream>
 #include <string>
@@ -78,9 +77,7 @@ std::filesystem::path recoverLatestFailedRecording(
     std::wstring& detail);
 // startup maintenance: attempts each recoverable session once and preserves
 // legacy sessions and ambiguous files, including old name reservations.
-void sweepOrphanedRecoveryData(
-    const std::filesystem::path& clipDirectory,
-    std::chrono::hours maxAge = std::chrono::hours(24));
+void sweepOrphanedRecoveryData(const std::filesystem::path& clipDirectory);
 
 } // namespace RecoveryStore
 } // namespace backtrack

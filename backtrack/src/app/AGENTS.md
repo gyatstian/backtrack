@@ -178,43 +178,35 @@ recording-stop drain handshake.
   is unavailable or fails, and `exclusiveRecovery` keeps its monitor-only DD
   path untouched. Once DD is live on an HDR monitor the session is sticky: a
   single ACCESS_LOST/INVALID_CALL retries DD once before the WGC fallback, so
-  one transient loss never flaps the backend. A DD session also pins one HDR
-  interpretation for its whole lifetime (capture owns the ratchet): SDR
-  surfaces bridge into the HDR mapping with no pool recreate and no GOP break,
-  so the capture loop's flip watch only ever fires on the one-time SDR->HDR
-  upgrade, never on the surface oscillation. The watch itself stays - a flip
-  still opens a new GOP (`requestKeyFrame` plus an `L"app"` log line) so a
-  genuine interpretation change never stretches into a running GOP - with flips
-  coalesced to one GOP restart per 2 s window and a >5-flips/min storm logging
-  one `L"app"` warning per minute window.
-- `RecordingStats::hdrActive` / `hdrRejected` / `hdrFlipCount` / `hdrFormat` /
-  `hdrPinned` / `hdrBridgedFrames`
+  one transient loss never flaps the backend. A flip in the arriving
+  interpretation opens a new GOP (`requestKeyFrame` plus an `L"app"` log line)
+  so a genuine change never stretches into a running GOP - with flips coalesced
+  to one GOP restart per 2 s window and a >5-flips/min storm logging one
+  `L"app"` warning per minute window.
+- `RecordingStats::hdrActive` / `hdrRejected` / `hdrFlipCount` / `hdrFormat`
   are lock-free mirrors for the
   Diagnostics page. `hdrMonitorActive_` caches the `monitorHasAdvancedColor`
   probe at source creation; `hdrActive_` follows the last acquired frame's
-  `GpuFrame::hdr`, `hdrFormat` its format, `hdrPinned_` the source pin and
-  `hdrBridgedFrames_` the source bridge count (both read through the
-  `ICaptureSource` defaults on WGC, so they stay false/0 there); `hdrFlipCount`
+  `GpuFrame::hdr`, `hdrFormat` its format; `hdrFlipCount`
   counts flips per pipeline run (reset at pipeline start, never on handoff, so
-  history survives, as does the bridged count). `stats()` ORs the scaler's sticky rejection - read inside
+  history survives). `stats()` ORs the scaler's sticky rejection - read inside
   the existing `try_to_lock` won-lock scope, race-free because the scaler is
   only touched under `pipelineGpuMutex_` - gated on live HDR input so a stale
   latch cannot paint SDR content as rejected, with the monitor-probe-no-frame
-  case covering WGC/SDR interpretation. `hdrActive_`/`hdrFormat`/`hdrPinned_`
+  case covering WGC/SDR interpretation. `hdrActive_`/`hdrFormat`
   reset on every video
   handoff (`resetVideoHandoff`, `switchCaptureTarget`); the outgoing frame is
   dropped before rebinding, so an HDR frame cannot leak into a WGC session.
   The monitor probe is creation-time
-  only; an OS HDR toggle mid-session on WGC stays invisible until the next
-  rebind (diagnostics-only known limit), while a DD session absorbs the toggle
-  by bridging (the one-time SDR->HDR upgrade still arrives via the per-frame
-  flag plus the resolution hook). The Diagnostics page splits `hdrRejected` for display -
+  only; an OS HDR toggle mid-session stays invisible to it until the next
+  rebind (diagnostics-only known limit), while a live DD session reports the
+  toggle through the per-frame flag plus the resolution hook. The Diagnostics
+  page splits `hdrRejected` for display -
   scaler refusal on live HDR input reads as rejected, monitor-probe-no-frame
   reads as SDR-on-HDR-monitor (WGC/DWM) - so the washout witness never looks
   like a driver refusal and `stats()` fields stay stable. The HDR line appends
-  backend + format + flip count (`hdrFlipCount`/`hdrFormat`), plus `pinned` and
-  the bridged count on a pinned session, so stability is
-  self-serve; no new setting, HDR stays automatic.
+  backend + format + flip count (`hdrFlipCount`/`hdrFormat`); no new setting,
+  HDR stays automatic.
 - `stats()` and `encoderCapabilities()` run on two threads at once - the UI
   thread (diagnostics timer, page refresh) and the controller worker thread
   `MainWindow` uses for blocking actions - and must never block on
@@ -255,7 +247,10 @@ recording-stop drain handshake.
   includes so `VideoTimelineSchedulerTests.cpp` still compiles standalone with
   `cl`. `advanceVideoCadence` deliberately collapses an interval only past a
   half-frame overshoot; do not "simplify" that slack away, it is what keeps
-  timer jitter from halving the effective frame rate.
+  timer jitter from halving the effective frame rate. A planned emission's
+  `previousFramePts100ns`/`previousFrameDuration100ns` are valid only when
+  `hasPreviousFrame` is set (propagated into `GpuFrame`): 0 is a legal PTS, so
+  the flag, never the value, decides whether the preceding sample is extended.
 - Unmatched video-duration extensions between encode submissions and the
   encoder outputs that consume them are tracked in `app/PendingDurationTracker.h`
   (`PendingDurationTracker`, cap 512). Bookkeeping stays bounded even when an

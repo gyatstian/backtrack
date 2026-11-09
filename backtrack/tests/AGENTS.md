@@ -55,8 +55,8 @@ build.
     a wrap and never above capacity, `clear()`, and `resetCapacity` including
     the zero-request clamp to 1.
   - `HdrStabilityTests` - `capture/HdrStability.h` alone, so the header must
-    stay free of project includes. The session-pin ratchet, the sRGB bridge
-    transfer, the rejection backoff schedule, and the HDR format predicate.
+    stay free of project includes. Desktop Duplication format negotiation, the
+    HDR format predicate, and the rejection cooldown.
   - `AudioConvertTests` - `audio/AudioConvert.cpp`, `core/Logger.cpp`:
     canonical conversion (passthrough, resample, mono duplication, 5.1 downmix,
     rejection of an unsupported format), the `applyMuteGain` primitive, and that
@@ -80,7 +80,9 @@ build.
     gate, and `listClips` root discovery.
   - `SettingsStoreTests` - `settings/SettingsStore.cpp`, `core/Logger.cpp`:
     hard/symbolic linked settings files, staging-shaped destinations, load
-    statuses, chunked parsing, failed-save retry, and app-name injection.
+    statuses, chunked parsing, failed-save retry, app-name injection, a
+    BOM-prefixed first key, an over-long line dropped, and app lists surviving a
+    missing or short `.count`.
   - `ClipManagerTests` - `clips/ClipManager.cpp`, `core/Logger.cpp`,
     `LIBS propsys`: linked sidecars, failed tag publication, a rename race, the
     supported clip roots, and scan cancellation.
@@ -99,7 +101,9 @@ build.
     root rules, game-root and nested recovery, and that recovery muxes an owned
     work copy so the original session survives.
   - `LoggerDiagnosticsTests` - `core/Logger.cpp`, `ui/DiagnosticsLog.cpp`:
-    rate limiting, pruning, stream failure, and diagnostics export.
+    rate limiting, pruning, stream failure, diagnostics export, an unarchivable
+    previous log left untruncated, and a `recentLines` poll reporting the pending
+    group without emitting it.
   - `PendingDurationTrackerTests` - `app/PendingDurationTracker.h` alone.
   - `RecorderControllerCutoffTests`, `RecorderControllerLeaseTests`,
     `RecorderControllerShutdownOrderingTests` - header-inline controller

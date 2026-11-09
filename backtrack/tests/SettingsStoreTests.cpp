@@ -358,6 +358,59 @@ void testAppNamesCannotInjectSettings() {
     expect(loaded == normalized, "app names injected or changed unrelated settings");
 }
 
+void testAppListsSurviveMissingCount() {
+    const auto path = testRoot() / L"applist-count" / L"settings.ini";
+    writeBytes(path,
+        "integrations.autoRecord.enabled=1\n"
+        // No count key: the entries still have to survive, or normalizeLoaded
+        // publishes an empty list and the user's apps are gone.
+        "integrations.autoRecord.0.name=Alpha\n"
+        "integrations.autoRecord.0.path=C:\\Apps\\alpha.exe\n"
+        "integrations.autoRecord.1.name=Beta\n"
+        "integrations.autoRecord.1.path=C:\\Apps\\beta.exe\n"
+        // A count shorter than the list must not hide the entries past it.
+        "audio.soundSeparation.count=1\n"
+        "audio.soundSeparation.0.name=Gamma\n"
+        "audio.soundSeparation.0.path=C:\\Apps\\gamma.exe\n"
+        "audio.soundSeparation.0.muted=0\n"
+        "audio.soundSeparation.1.name=Delta\n"
+        "audio.soundSeparation.1.path=C:\\Apps\\delta.exe\n");
+
+    SettingsStore::LoadStatus status;
+    const auto settings = SettingsStore(path).load(&status);
+    expect(status == SettingsStore::LoadStatus::Loaded, "the app-list fixture did not load");
+    expect(settings.autoRecordApps.size() == 2 &&
+           settings.autoRecordApps[1].executablePath.wstring() == L"C:\\Apps\\beta.exe",
+        "entries without a count key were dropped");
+    expect(settings.soundSeparationApps.size() == 2 &&
+           settings.soundSeparationApps[1].executablePath.wstring() == L"C:\\Apps\\delta.exe" &&
+           !settings.soundSeparationApps[0].muted,
+        "entries past the count hint were dropped");
+}
+
+void testBomAndOverlongLine() {
+    const auto bomPath = testRoot() / L"bom" / L"settings.ini";
+    writeBytes(bomPath, std::string("\xEF\xBB\xBF") + "video.fps=143\nreplay.seconds=333\n");
+    SettingsStore::LoadStatus status;
+    auto settings = SettingsStore(bomPath).load(&status);
+    expect(status == SettingsStore::LoadStatus::Loaded, "the BOM fixture did not load");
+    expect(settings.video.fps == 143,
+        "a UTF-8 BOM made the first key unreachable");
+
+    const auto longPath = testRoot() / L"overlong" / L"settings.ini";
+    // The oversized line is a complete assignment once trimmed, so parsing it
+    // would set replay.seconds; dropping it must not swallow the next key.
+    writeBytes(longPath,
+        "replay.seconds=333" + std::string(70 * 1024, ' ') + "\n" +
+        "video.fps=143\n");
+    settings = SettingsStore(longPath).load(&status);
+    expect(status == SettingsStore::LoadStatus::Loaded, "the over-long-line fixture did not load");
+    expect(settings.replay.seconds == AppSettings{}.replay.seconds,
+        "an over-long settings line was not dropped");
+    expect(settings.video.fps == 143,
+        "an over-long settings line swallowed the key after it");
+}
+
 } // namespace
 
 int main() {
@@ -372,6 +425,8 @@ int main() {
         testFailedSaveCanRetry();
         testReplayFallbackIsDistinctAndIdempotent();
         testAppNamesCannotInjectSettings();
+        testAppListsSurviveMissingCount();
+        testBomAndOverlongLine();
         std::filesystem::remove_all(testRoot());
         std::cout << "SettingsStoreTests passed\n";
         return 0;

@@ -119,6 +119,13 @@ std::wstring captureStackTrace() {
 // Paths and window titles are handled at the call sites, never auto-masked
 // here - mangling a legitimate path is worse than an unredacted warning.
 void redactSecrets(std::wstring& line) {
+    // Every written line passes through here while the mutex that capture and
+    // encode threads share is held. A line with no '=' cannot name a key below,
+    // so the lowercase copy and the per-key scans are skipped for the text that
+    // dominates the log.
+    if (line.find(L'=') == std::wstring::npos) {
+        return;
+    }
     static const wchar_t* const kKeys[] = {
         L"token", L"secret", L"password", L"passwd", L"authorization",
         L"api_key", L"apikey", L"api-key", L"access_token",
@@ -147,19 +154,28 @@ void redactSecrets(std::wstring& line) {
     }
 }
 
-void archivePreviousLog(const std::filesystem::path& logPath) {
+// Returns the path initialize() may truncate. When an existing log cannot be
+// renamed aside, truncating it would destroy the previous session's log, so the
+// new session opens a sidecar beside it instead.
+std::filesystem::path archivePreviousLog(const std::filesystem::path& logPath) {
     std::error_code error;
     if (!std::filesystem::exists(logPath, error) || error) {
-        return;
+        return logPath;
     }
 
     const std::filesystem::path archivedPath(logPath.wstring() + L".old");
     std::filesystem::remove(archivedPath, error);
     error = {};
     std::filesystem::rename(logPath, archivedPath, error);
-    if (error) {
-        OutputDebugStringW((L"Could not archive previous Backtrack log file: " + logPath.wstring() + L"\n").c_str());
+    if (!error) {
+        return logPath;
     }
+
+    const std::filesystem::path sidecar(
+        logPath.wstring() + L"." + std::to_wstring(GetCurrentProcessId()) + L".log");
+    OutputDebugStringW((L"Could not archive previous Backtrack log file: " + logPath.wstring() +
+        L", writing " + sidecar.wstring() + L"\n").c_str());
+    return sidecar;
 }
 
 } // namespace
@@ -174,26 +190,28 @@ void Logger::initialize(const std::filesystem::path& logPath) {
     if (stream_.is_open()) {
         stream_.close();
     }
-    if (!logPath.parent_path().empty()) {
-        std::error_code error;
-        std::filesystem::create_directories(logPath.parent_path(), error);
-        if (error) {
-            OutputDebugStringW((L"Could not create Backtrack log directory: " + logPath.parent_path().wstring() + L"\n").c_str());
-            return;
-        }
-    }
-    archivePreviousLog(logPath);
-    logPath_ = logPath;
-    stream_.open(logPath, std::ios::out | std::ios::binary | std::ios::trunc);
-    if (!stream_.is_open()) {
-        OutputDebugStringW((L"Could not open Backtrack log file: " + logPath.wstring() + L"\n").c_str());
-    }
+    // Reset before any early return: a failed initialize must not leave the
+    // previous session's rate-limit, recent-line, or pending-group state behind.
     rateStates_.clear();
     recentLines_.clear();
     pendingGroup_ = {};
     warnings_ = 0;
     errors_ = 0;
     rateLimitedLines_ = 0;
+    if (!logPath.parent_path().empty()) {
+        std::error_code error;
+        std::filesystem::create_directories(logPath.parent_path(), error);
+        if (error) {
+            OutputDebugStringW((L"Could not create Backtrack log directory: " + logPath.parent_path().wstring() + L"\n").c_str());
+            logPath_.clear();  // nothing was opened, so currentPath() must not name a file
+            return;
+        }
+    }
+    logPath_ = archivePreviousLog(logPath);
+    stream_.open(logPath_, std::ios::out | std::ios::binary | std::ios::trunc);
+    if (!stream_.is_open()) {
+        OutputDebugStringW((L"Could not open Backtrack log file: " + logPath_.wstring() + L"\n").c_str());
+    }
 }
 
 void Logger::setMinLevel(LogLevel level) {
@@ -360,6 +378,10 @@ void Logger::flushPendingGroupLocked(std::chrono::steady_clock::time_point now) 
         ++state.emitted;
     }
 
+    writeLine(formatGroupLine(group));
+}
+
+std::wstring Logger::formatGroupLine(const PendingGroup& group) const {
     std::wstringstream line;
     line << timestamp() << L" [" << levelName(group.level) << L"]";
     if (!group.subsystem.empty()) {
@@ -388,7 +410,7 @@ void Logger::flushPendingGroupLocked(std::chrono::steady_clock::time_point now) 
         line << L" (" << pairs << L")";
     }
     line << L"\n";
-    writeLine(line.str());
+    return line.str();
 }
 
 void Logger::writeHeader() {
@@ -446,17 +468,23 @@ std::filesystem::path Logger::currentPath() const {
 
 std::vector<std::wstring> Logger::recentLines(size_t maxLines) {
     std::scoped_lock lock(mutex_);
-    if (!enabled_) {
+    if (!enabled_ || maxLines == 0) {
         return {};
     }
-    // Flush the deferred duplicate group so the Diagnostics page shows the
-    // current tail, not a line held back for grouping.
-    flushPendingGroupLocked(std::chrono::steady_clock::now());
-    if (maxLines == 0 || recentLines_.empty()) {
-        return {};
+    // A diagnostics poll must not change what gets logged, so the deferred
+    // duplicate group is reported by formatting it here instead of emitting it:
+    // emitting would end the group and spend its rate-limit budget. Only
+    // flush/writeFooter/export emit.
+    size_t count = std::min(maxLines, recentLines_.size());
+    if (pendingGroup_.active) {
+        count = std::min(count, maxLines - 1);
     }
-    const size_t count = std::min(maxLines, recentLines_.size());
-    return {recentLines_.end() - static_cast<std::ptrdiff_t>(count), recentLines_.end()};
+    std::vector<std::wstring> lines(
+        recentLines_.end() - static_cast<std::ptrdiff_t>(count), recentLines_.end());
+    if (pendingGroup_.active) {
+        lines.push_back(formatGroupLine(pendingGroup_));
+    }
+    return lines;
 }
 
 std::wstring hresultToString(HRESULT hr) {

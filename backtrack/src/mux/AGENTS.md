@@ -74,6 +74,9 @@ recovery store that keeps a killed recording recoverable.
   `ClipStorage` roots and publishes to its original output root with an
   exclusively claimed name. startup attempts every recoverable session once;
   `RecorderController` serializes the sweep against saves and manual recovery.
+  the sweep has no age limit: sessions are never pruned by age, so a failed
+  recovery keeps its streams and `ensureFreeDiskSpace` is what protects later
+  saves.
 - recovery muxes from an exclusively created work directory, hard-linking or
   copying inputs so mixed audio cannot overwrite legacy content. original
   sessions and legacy ambiguous hidden reservations remain untouched. a completed

@@ -5,12 +5,13 @@
 Shared Win32 helpers used by several domains: monitor and DXGI adapter
 enumeration, hardware-encode adapter selection, foreground window and
 application queries, MMCSS thread profiles, high-resolution timing, app paths,
-Windows startup registration, microphone privacy cleanup, and the constants
-`app` and `ui` share.
+Windows startup registration, microphone privacy cleanup, the sibling-file
+publication helper, and the constants `app` and `ui` share.
 
 ## Ownership
 
-- Owns: everything in `platform/Win32Util.*`.
+- Owns: everything in `platform/Win32Util.*` and the publication helper in
+  `platform/AtomicWrite.h`.
 - Does not own: any pipeline behavior. This folder answers questions about the
   environment; it does not capture, encode, or record.
 
@@ -23,6 +24,12 @@ Windows startup registration, microphone privacy cleanup, and the constants
   own scoped wrapper because the profile name is chosen at the call site.
   String helpers that two modules must agree on byte-for-byte belong here too -
   see `normalizedPathKey`.
+- `platform/AtomicWrite.h`'s `atomicWriteSibling` is the generic durable-write
+  primitive both settings and the clip sidecars publish through; it lives here
+  because `settings`, a lower layer, must not include `clips`. it retains an
+  exclusive handle to its fresh staging file through publication and attempts
+  cleanup by that handle on failure. it does not reuse or remove preexisting
+  staging names.
 - Monitor index is a cross-module contract: `enumerateMonitors` returns entries in
   `EnumDisplayMonitors` order, `monitorFromIndex` indexes that same order, and
   `AppSettings::monitorIndex` stores it. Reordering the enumeration silently

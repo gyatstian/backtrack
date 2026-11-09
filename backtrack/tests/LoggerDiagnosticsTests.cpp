@@ -578,6 +578,53 @@ void testBreadcrumbTrailOnError() {
     expect(trailAttached, "error did not attach the breadcrumb trail");
 }
 
+void testUnarchivableLogIsNotTruncated() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    const auto source = dir.path / L"source.log";
+    writeFile(source, "previous session line");
+
+    // Read-only handle without FILE_SHARE_DELETE: the rename to .old fails, so
+    // initialize() must archive around the held file instead of truncating it.
+    FileHandle locked;
+    locked.value = CreateFileW(source.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    expect(locked.value != INVALID_HANDLE_VALUE, "could not lock the previous log");
+
+    logger.initialize(source);
+    expect(logger.currentPath() != source, "an unarchivable previous log was reopened for truncation");
+    expect(readFile(source) == "previous session line", "the previous session's log was destroyed");
+}
+
+void testRecentLinesDoesNotEmitPendingGroup() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    logger.initialize(dir.path / L"source.log");
+    for (int i = 0; i < 4; ++i) {
+        logger.info(L"test", L"poll marker");
+    }
+    // A diagnostics poll must report the deferred group without emitting it, so
+    // the group stays open and keeps accumulating.
+    auto lines = logger.recentLines(200);
+    expect(countLines(lines, L"poll marker (4x)") == 1,
+        "a diagnostics poll did not report the pending duplicate group");
+    expect(LoggerTestAccess::rateStateCount(logger) == 0,
+        "a diagnostics poll spent the pending group's rate-limit budget");
+    for (int i = 0; i < 3; ++i) {
+        logger.info(L"test", L"poll marker");
+    }
+    logger.info(L"test", L"after poll");
+    lines = logger.recentLines(200);
+    expect(countLines(lines, L"poll marker (7x)") == 1,
+        "a diagnostics poll closed the duplicate group early");
+    expect(countLines(lines, L"poll marker") == 1, "the pending group was reported twice");
+    expect(logger.flush(), "could not flush the grouped line");
+    const auto content = readFile(dir.path / L"source.log");
+    expect(content.find("poll marker (7x)") != std::string::npos &&
+        content.find("poll marker (4x)") == std::string::npos,
+        "the group was emitted by the poll instead of the flush");
+}
+
 } // namespace
 
 int main() {
@@ -600,6 +647,8 @@ int main() {
         testRedactsSecrets();
         testCorrelationTaskLabel();
         testBreadcrumbTrailOnError();
+        testUnarchivableLogIsNotTruncated();
+        testRecentLinesDoesNotEmitPendingGroup();
         std::cout << "LoggerDiagnosticsTests passed\n";
         return 0;
     } catch (const std::exception& error) {

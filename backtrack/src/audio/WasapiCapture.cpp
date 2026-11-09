@@ -7,7 +7,6 @@
 #include "platform/Win32Util.h"
 
 #include <audioclient.h>
-#include <audioclientactivationparams.h>
 #include <audiopolicy.h>
 #include <avrt.h>
 #include <mmdeviceapi.h>
@@ -54,8 +53,6 @@ const wchar_t* trackName(AudioTrack track) {
         return L"system audio";
     case AudioTrack::Microphone:
         return L"microphone";
-    case AudioTrack::SoundSeparation:
-        return L"sound separation";
     }
     return L"audio";
 }
@@ -278,138 +275,6 @@ std::wstring takeCoTaskMemString(LPWSTR value) {
     std::wstring text = value;
     CoTaskMemFree(value);
     return text;
-}
-
-class AudioActivationCompletionHandler final : public IActivateAudioInterfaceCompletionHandler {
-public:
-    explicit AudioActivationCompletionHandler(HANDLE event)
-        : event_(event) {
-    }
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** object) override {
-        if (!object) {
-            return E_POINTER;
-        }
-        *object = nullptr;
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
-            *object = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
-            AddRef();
-            return S_OK;
-        }
-        return E_NOINTERFACE;
-    }
-
-    ULONG STDMETHODCALLTYPE AddRef() override {
-        return ++refCount_;
-    }
-
-    ULONG STDMETHODCALLTYPE Release() override {
-        const ULONG count = --refCount_;
-        if (count == 0) {
-            delete this;
-        }
-        return count;
-    }
-
-    HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation* operation) override {
-        if (operation) {
-            Microsoft::WRL::ComPtr<IUnknown> activated;
-            HRESULT result = E_FAIL;
-            const HRESULT hr = operation->GetActivateResult(&result, &activated);
-            {
-                std::scoped_lock lock(mutex_);
-                activateResult_ = SUCCEEDED(hr) ? result : hr;
-                activated_ = activated;
-            }
-        }
-        if (event_) {
-            SetEvent(event_);
-        }
-        return S_OK;
-    }
-
-    HRESULT audioClient(IAudioClient** client) {
-        if (!client) {
-            return E_POINTER;
-        }
-        *client = nullptr;
-        std::scoped_lock lock(mutex_);
-        if (FAILED(activateResult_)) {
-            return activateResult_;
-        }
-        if (!activated_) {
-            return E_NOINTERFACE;
-        }
-        Microsoft::WRL::ComPtr<IAudioClient> audioClient;
-        const HRESULT hr = activated_.As(&audioClient);
-        if (SUCCEEDED(hr)) {
-            *client = audioClient.Detach();
-        }
-        return hr;
-    }
-
-private:
-    std::atomic<ULONG> refCount_{1};
-    HANDLE event_ = nullptr;
-    std::mutex mutex_;
-    HRESULT activateResult_ = E_FAIL;
-    Microsoft::WRL::ComPtr<IUnknown> activated_;
-};
-
-PROCESS_LOOPBACK_MODE nativeProcessLoopbackMode(ProcessLoopbackMode mode) {
-    return mode == ProcessLoopbackMode::ExcludeTargetProcessTree
-        ? PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
-        : PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
-}
-
-HRESULT activateProcessLoopbackAudioClient(DWORD processId, ProcessLoopbackMode mode, IAudioClient** audioClient) {
-    if (!audioClient) {
-        return E_POINTER;
-    }
-    *audioClient = nullptr;
-    if (processId == 0) {
-        return E_INVALIDARG;
-    }
-
-    HANDLE completed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!completed) {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-
-    AUDIOCLIENT_ACTIVATION_PARAMS activationParams{};
-    activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    activationParams.ProcessLoopbackParams.TargetProcessId = processId;
-    activationParams.ProcessLoopbackParams.ProcessLoopbackMode = nativeProcessLoopbackMode(mode);
-
-    PROPVARIANT variant;
-    PropVariantInit(&variant);
-    variant.vt = VT_BLOB;
-    variant.blob.cbSize = sizeof(activationParams);
-    variant.blob.pBlobData = reinterpret_cast<BYTE*>(&activationParams);
-
-    auto* rawHandler = new AudioActivationCompletionHandler(completed);
-    Microsoft::WRL::ComPtr<IActivateAudioInterfaceCompletionHandler> handler;
-    handler.Attach(rawHandler);
-    Microsoft::WRL::ComPtr<IActivateAudioInterfaceAsyncOperation> operation;
-    HRESULT hr = ActivateAudioInterfaceAsync(
-        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-        __uuidof(IAudioClient),
-        &variant,
-        handler.Get(),
-        &operation);
-
-    if (SUCCEEDED(hr)) {
-        const DWORD wait = WaitForSingleObject(completed, 10000);
-        if (wait == WAIT_OBJECT_0) {
-            hr = rawHandler->audioClient(audioClient);
-        } else {
-            hr = wait == WAIT_TIMEOUT ? HRESULT_FROM_WIN32(WAIT_TIMEOUT) : HRESULT_FROM_WIN32(GetLastError());
-            handler.Detach();
-        }
-    }
-
-    CloseHandle(completed);
-    return hr;
 }
 
 } // namespace
@@ -882,30 +747,6 @@ bool WasapiCapture::start(AudioTrack track, const std::wstring& deviceId, AudioP
     return start(std::move(options), std::move(callback));
 }
 
-bool WasapiCapture::startProcessLoopback(uint32_t processId, AudioPacketCallback callback) {
-    return startProcessLoopback(
-        AudioTrack::SoundSeparation,
-        processId,
-        ProcessLoopbackMode::IncludeTargetProcessTree,
-        std::move(callback));
-}
-
-bool WasapiCapture::startProcessLoopback(
-    AudioTrack track,
-    uint32_t processId,
-    ProcessLoopbackMode mode,
-    AudioPacketCallback callback) {
-    if (processId == 0) {
-        return false;
-    }
-    CaptureOptions options;
-    options.track = track;
-    options.processId = processId;
-    options.processLoopback = true;
-    options.processLoopbackMode = mode;
-    return start(std::move(options), std::move(callback));
-}
-
 bool WasapiCapture::start(CaptureOptions options, AudioPacketCallback callback) {
     if (running_) {
         return true;
@@ -971,9 +812,9 @@ WaveFormatBlob WasapiCapture::format() const {
 
 void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback callback, std::promise<bool> startedPromise) {
     const AudioTrack track = options.track;
-    setThreadDescriptionSafe(options.processLoopback
-        ? L"Backtrack WASAPI app loopback"
-        : (track == AudioTrack::System ? L"Backtrack WASAPI loopback" : L"Backtrack WASAPI microphone"));
+    setThreadDescriptionSafe(track == AudioTrack::System
+        ? L"Backtrack WASAPI loopback"
+        : L"Backtrack WASAPI microphone");
     const LogContext::ScopedTask taskContext(L"wasapi-" + std::wstring(trackName(track)));
 
     // Report activation success/failure to start() exactly once. On any failure
@@ -1036,71 +877,57 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
         ScopedDefaultEndpointNotification defaultNotification;
         uint64_t defaultGeneration = 0;
         Microsoft::WRL::ComPtr<IAudioClient> audioClient;
-        if (options.processLoopback) {
-            hr = activateProcessLoopbackAudioClient(options.processId, options.processLoopbackMode, &audioClient);
+        Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+        hr = options.createEnumerator
+            ? options.createEnumerator(enumerator.GetAddressOf())
+            : CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+        if (FAILED(hr) || !enumerator) {
+            if (reconnectCount == 0) {
+                Logger::instance().error(L"audio", L"CoCreateInstance(MMDeviceEnumerator) failed: " + hresultToString(hr));
+            }
+            if (!reconnectBackoff(false)) {
+                break;
+            }
+            continue;
+        }
+
+        Microsoft::WRL::ComPtr<IMMDevice> endpoint;
+        if (options.deviceId.empty()) {
+            hr = defaultNotification.start(enumerator.Get(), dataFlowFor(track), wakeEvent_);
             if (FAILED(hr)) {
                 if (reconnectCount == 0) {
-                    Logger::instance().warning(L"audio", L"Process loopback capture could not start for PID " +
-                                               std::to_wstring(options.processId) + L": " + hresultToString(hr));
+                    Logger::instance().error(L"audio", std::wstring(L"Default endpoint notification failed for ") + trackName(track) + L": " + hresultToString(hr));
                 }
                 if (!reconnectBackoff(false)) {
                     break;
                 }
                 continue;
             }
+            // Subscribe before resolving so changes during setup cannot be lost.
+            defaultGeneration = defaultNotification.generation();
+            hr = enumerator->GetDefaultAudioEndpoint(dataFlowFor(track), eConsole, &endpoint);
         } else {
-            Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
-            hr = options.createEnumerator
-                ? options.createEnumerator(enumerator.GetAddressOf())
-                : CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
-            if (FAILED(hr) || !enumerator) {
-                if (reconnectCount == 0) {
-                    Logger::instance().error(L"audio", L"CoCreateInstance(MMDeviceEnumerator) failed: " + hresultToString(hr));
-                }
-                if (!reconnectBackoff(false)) {
-                    break;
-                }
-                continue;
+            hr = enumerator->GetDevice(options.deviceId.c_str(), &endpoint);
+        }
+        if (FAILED(hr) || !endpoint) {
+            if (reconnectCount == 0) {
+                Logger::instance().error(L"audio", std::wstring(options.deviceId.empty() ? L"GetDefaultAudioEndpoint failed for " : L"Configured audio device was not found for ") + trackName(track) + L": " + hresultToString(hr));
             }
+            if (!reconnectBackoff(false)) {
+                break;
+            }
+            continue;
+        }
 
-            Microsoft::WRL::ComPtr<IMMDevice> endpoint;
-            if (options.deviceId.empty()) {
-                hr = defaultNotification.start(enumerator.Get(), dataFlowFor(track), wakeEvent_);
-                if (FAILED(hr)) {
-                    if (reconnectCount == 0) {
-                        Logger::instance().error(L"audio", std::wstring(L"Default endpoint notification failed for ") + trackName(track) + L": " + hresultToString(hr));
-                    }
-                    if (!reconnectBackoff(false)) {
-                        break;
-                    }
-                    continue;
-                }
-                // Subscribe before resolving so changes during setup cannot be lost.
-                defaultGeneration = defaultNotification.generation();
-                hr = enumerator->GetDefaultAudioEndpoint(dataFlowFor(track), eConsole, &endpoint);
-            } else {
-                hr = enumerator->GetDevice(options.deviceId.c_str(), &endpoint);
+        hr = endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &audioClient);
+        if (FAILED(hr)) {
+            if (reconnectCount == 0) {
+                Logger::instance().error(L"audio", L"IMMDevice::Activate(IAudioClient) failed: " + hresultToString(hr));
             }
-            if (FAILED(hr) || !endpoint) {
-                if (reconnectCount == 0) {
-                    Logger::instance().error(L"audio", std::wstring(options.deviceId.empty() ? L"GetDefaultAudioEndpoint failed for " : L"Configured audio device was not found for ") + trackName(track) + L": " + hresultToString(hr));
-                }
-                if (!reconnectBackoff(false)) {
-                    break;
-                }
-                continue;
+            if (!reconnectBackoff(false)) {
+                break;
             }
-
-            hr = endpoint->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &audioClient);
-            if (FAILED(hr)) {
-                if (reconnectCount == 0) {
-                    Logger::instance().error(L"audio", L"IMMDevice::Activate(IAudioClient) failed: " + hresultToString(hr));
-                }
-                if (!reconnectBackoff(false)) {
-                    break;
-                }
-                continue;
-            }
+            continue;
         }
 
         WAVEFORMATEX* rawMixFormat = nullptr;
@@ -1126,7 +953,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
 
         constexpr REFERENCE_TIME bufferDuration = 10'000'000;
         DWORD streamFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-        if (track == AudioTrack::System || options.processLoopback) {
+        if (track == AudioTrack::System) {
             streamFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
         }
 
@@ -1242,7 +1069,6 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
                 const size_t byteCount = static_cast<size_t>(framesAvailable) * mixFormat->nBlockAlign;
                 AudioPacket packet;
                 packet.track = track;
-                packet.processId = options.processId;
                 packet.frameCount = framesAvailable;
                 const int64_t packetDuration100ns = mixFormat->nSamplesPerSec > 0
                     ? static_cast<int64_t>(

@@ -3,9 +3,9 @@
 ## Purpose
 
 Audio in and out of the recorder: WASAPI system and microphone capture,
-per-process loopback for sound separation, conversion to one canonical ingest
-format, the mixed track handed to the muxer, and the optional RNNoise
-microphone denoiser.
+the per-session mutes that implement sound separation, conversion to one
+canonical ingest format, the mixed track handed to the muxer, and the optional
+RNNoise microphone denoiser.
 
 ## Ownership
 
@@ -67,8 +67,7 @@ microphone denoiser.
 - an empty endpoint ID follows the `eConsole` default for the track's render or
   capture flow. the worker subscribes before resolving and rebuilds on a
   matching default change, even if the previous client is healthy. registration
-  failures retry; explicit IDs stay pinned and retry if unavailable. process
-  loopback does not follow endpoint notifications.
+  failures retry; explicit IDs stay pinned and retry if unavailable.
 - endpoint notifications are registered and unregistered on the capture COM
   thread. callbacks only mark a generation and signal a duplicated event; they
   never access the capture object. a failed unregister retains the disabled
@@ -108,8 +107,6 @@ microphone denoiser.
   interface escapes to another thread or a later call. the emergency path
   re-enumerates on its own apartment scope and leaves an unreadable journal in
   place.
-- `ProcessLoopbackMode` (`IncludeTargetProcessTree` / `ExcludeTargetProcessTree`)
-  selects per-process capture with or without the target's child processes.
 - Microphone processing order on the audio writer thread: canonicalization,
   denoise (if enabled), AGC, then volume. The denoiser is microphone-only and
   requires the canonical format; system audio is never processed.

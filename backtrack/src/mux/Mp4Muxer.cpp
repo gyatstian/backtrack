@@ -797,16 +797,14 @@ void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPa
     }
 
     // Shared pacing core with the replay path (mux/AudioTimeline.h): gap fill
-    // capped at 10 s with resync past the cap, overlap trim, unbounded above
-    // (the recording has no video end yet). A write failure flags the
-    // recording so finalize() reports it instead of publishing truncated audio.
+    // to the packet's true time, overlap trim, unbounded above (the recording
+    // has no video end yet). A write failure flags the recording so finalize()
+    // reports it instead of publishing truncated audio.
     if (!paceAudioPacket(
             state.writer,
             state.nextPts100ns,
             packet,
             kNoAudioWindowEnd,
-            L"mux",
-            fileName,
             state.gapStats)) {
         noteAudioWriteFailedLocked(fileName);
     }

@@ -54,8 +54,11 @@ struct VideoTimelineEmission {
     uint32_t intervalCount = 1;
     int64_t pts100ns = 0;
     int64_t duration100ns = 0;
+    // previousFrame* are meaningful only when hasPreviousFrame is set; the
+    // preceding PTS can legitimately be 0, so it is never a sentinel.
     int64_t previousFramePts100ns = 0;
     int64_t previousFrameDuration100ns = 0;
+    bool hasPreviousFrame = false;
     int64_t coalescedFramePts100ns = 0;
     int64_t coalescedFrameDuration100ns = 0;
     uint64_t sourceFrameIndex = 0;
@@ -100,6 +103,7 @@ public:
         // duration across the full gap so replay never strobes frozen textures.
         emission.action = VideoTimelineAction::Submit;
         if (haveLastSubmittedFrame_) {
+            emission.hasPreviousFrame = true;
             emission.previousFramePts100ns = lastSubmittedPts100ns_;
             emission.previousFrameDuration100ns = std::min<int64_t>(
                 maxCoalescedDuration100ns,

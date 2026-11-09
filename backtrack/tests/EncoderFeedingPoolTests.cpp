@@ -42,6 +42,7 @@ struct FakeRetainingEncoder final : IEncoder {
 
     bool initialize(D3DDevice&, const VideoSettings&) override { return true; }
     void requestKeyFrame() override {}
+    bool resetInputResources() override { return true; }
     bool encodeFrame(const GpuFrame&, EncodedPacket&) override { return false; }
     void drain(std::vector<EncodedPacket>&) override {}
     void shutdown() override {}

@@ -8,8 +8,7 @@ delete, favorite, and tag operations the UI offers.
 ## Ownership
 
 - Owns: `ClipManager`, `ClipInfo`, `ClipStorage.h`'s shared storage-root rules,
-  `AtomicWrite.h`'s sibling-file publication helper, and the sidecar file
-  layout (favorite markers, tag files). settings also uses the publication helper.
+  and the sidecar file layout (favorite markers, tag files).
 - Does not own: writing new clips (`mux`), the directory choice
   (`AppSettings::clipDirectory`, `AppSettings::organizeClipsByGame`), or the UI's list and gallery views.
 
@@ -69,9 +68,6 @@ delete, favorite, and tag operations the UI offers.
   characters, drops empties, and replaces the whole tag entry through an
   exclusively created sibling. existing symlink and hardlink referents are not
   written through. there is no remove-tag path.
-- `atomicWriteSibling` retains an exclusive handle to its fresh staging file
-  through publication and attempts cleanup by that handle on failure. it does
-  not reuse or remove preexisting staging names.
 - the muxer stages each MP4 inside an owned session before publication. the
   output name is held by a hidden zero-byte reservation (`reserveClipOutput` in
   `clips/ClipStorage.h` and `removeEmptyOutputReservation` in

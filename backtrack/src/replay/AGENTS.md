@@ -160,11 +160,8 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   (`mux/AGENTS.md`): `writeTimelineAudio` opens the WAV and drops
   format-mismatched packets, then paces every packet through the shared
   `paceAudioPacket` core (`mux/AudioTimeline.h`) with the replay window
-  `[start, end]` as its bound. The 10 s silence cap is load-bearing here, not
-  cosmetic: a replay window runs up to an hour, so one unavailable loopback
-  device would otherwise be written out as tens of minutes of silence, and the
-  mux free-space preflight then demands hundreds of megabytes for a clip whose
-  real audio is a few megabytes.
+  `[start, end]` as its bound, so a packet past the window end is not written
+  and the clip's audio stops with the video.
 - each `saveTo` owns a freshly created session directory. a failed stream or
   mux write retains its files; `RecoveryStore` creates a manifest for a usable
   video prefix where possible and reports when manual recovery may be needed.

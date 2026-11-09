@@ -37,16 +37,12 @@ inline void mergeAudioGapStats(AudioGapStats& into, const AudioGapStats& other) 
 // kNoAudioWindowEnd. Returns false only on a write failure (typically disk
 // full); the caller maps that onto its own failure (fail the save vs flag the
 // recording). Zeroed writer timing means the writer was never opened, which
-// the caller owns, so it skips rather than fails here. logSubsystem and
-// fileName stay in the signature because both callers pass them; they are not
-// used here anymore.
+// the caller owns, so it skips rather than fails here.
 inline bool paceAudioPacket(
     WavWriter& writer,
     int64_t& nextPts100ns,
     const AudioPacket& packet,
     int64_t endPts100ns,
-    const wchar_t* /*logSubsystem*/,
-    const wchar_t* /*fileName*/,
     AudioGapStats& gapStats) {
     if (packet.frameCount == 0 || packet.bytes.empty()) {
         return true;

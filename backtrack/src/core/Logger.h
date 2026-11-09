@@ -94,6 +94,9 @@ private:
         size_t count = 0;
         bool active = false;
     };
+    // caller holds mutex_; the line a group would be written as, without
+    // emitting it and without touching the rate limiter.
+    std::wstring formatGroupLine(const PendingGroup& group) const;
     PendingGroup pendingGroup_;
     size_t warnings_ = 0;       // WARN events that passed minLevel
     size_t errors_ = 0;         // ERROR events that passed minLevel

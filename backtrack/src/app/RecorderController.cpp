@@ -867,8 +867,6 @@ RecordingStats RecorderController::stats() const {
     stats.hdrRejected = (stats.hdrActive && scalerHdrRejected) || (hdrMonitor && !stats.hdrActive);
     stats.hdrFlipCount = hdrFlipCount_.load(std::memory_order_relaxed);
     stats.hdrFormat = static_cast<DXGI_FORMAT>(hdrFormatCode_.load(std::memory_order_relaxed));
-    stats.hdrPinned = hdrPinned_.load(std::memory_order_relaxed);
-    stats.hdrBridgedFrames = hdrBridgedFrames_.load(std::memory_order_relaxed);
     stats.encoder.queueDepth = static_cast<uint32_t>(frameQueue_.size());
     detectVideoPipelineStall();
     detectSilentAudioInput();
@@ -1046,8 +1044,6 @@ bool RecorderController::ensurePipeline() {
     microphoneAudioQueueDrops_ = 0;
     hdrFlipCount_ = 0;
     hdrFormatCode_.store(static_cast<int>(DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
-    hdrPinned_ = false;
-    hdrBridgedFrames_ = 0;
     // Audio-liveness clocks start at pipeline start so a never-delivering
     // input shows a growing silence age instead of 0.
     systemAudioLastPacketAt100ns_.store(steadyNow100ns(), std::memory_order_relaxed);
@@ -1717,10 +1713,8 @@ void RecorderController::captureLoopImpl() {
     // Tracks the duplication surface HDR identity (GpuFrame::hdr + format). A
     // mid-session SDR->HDR upgrade flips them in place without a rebind; the next
     // accepted frame must open a new GOP so the tone-map switch never lands
-    // mid-GOP. Seeded from the first acquired frame after each rebind.
-    // Capture pins one interpretation per session, so at most the one-time
-    // upgrade arrives here; rapid flaps coalesce into one GOP restart per 2 s
-    // window, and a
+    // mid-GOP. Seeded from the first acquired frame after each rebind. Rapid
+    // flaps coalesce into one GOP restart per 2 s window, and a
     // >5-flips/min storm logs one warning per minute window.
     bool prevHdrSeen = false;
     bool prevHdr = false;
@@ -1920,6 +1914,7 @@ void RecorderController::captureLoopImpl() {
         frame.duration100ns = emission.duration100ns;
         frame.previousFramePts100ns = emission.previousFramePts100ns;
         frame.previousFrameDuration100ns = emission.previousFrameDuration100ns;
+        frame.hasPreviousFrame = emission.hasPreviousFrame;
         if (emission.requestKeyFrame) {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
             if (encoder_) {
@@ -2014,7 +2009,6 @@ void RecorderController::captureLoopImpl() {
         // the flip count stays cumulative per pipeline run for Diagnostics.
         hdrActive_.store(false, std::memory_order_relaxed);
         hdrFormatCode_.store(static_cast<int>(DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
-        hdrPinned_.store(false, std::memory_order_relaxed);
     };
 
     auto switchCaptureTarget = [&](const CaptureTarget& target,
@@ -2058,7 +2052,6 @@ void RecorderController::captureLoopImpl() {
             prevHdrSeen = false;
             hdrActive_.store(false, std::memory_order_relaxed);
             hdrFormatCode_.store(static_cast<int>(DXGI_FORMAT_UNKNOWN), std::memory_order_relaxed);
-            hdrPinned_.store(false, std::memory_order_relaxed);
             scaler_.reset();
             scaler_.setPoolSize(encoderFeedingPoolSizeFor(
                 activeFrameQueueLimit(gpuSettings),
@@ -2229,9 +2222,6 @@ void RecorderController::captureLoopImpl() {
             // one per frame.
             hdrActive_.store(frame.hdr, std::memory_order_relaxed);
             hdrFormatCode_.store(static_cast<int>(frame.format), std::memory_order_relaxed);
-            hdrPinned_.store(capture_ ? capture_->hdrPinned() : false, std::memory_order_relaxed);
-            hdrBridgedFrames_.store(
-                capture_ ? capture_->hdrBridgedFrames() : 0, std::memory_order_relaxed);
             if (!prevHdrSeen) {
                 prevHdr = frame.hdr;
                 prevHdrFormat = frame.format;
@@ -2262,8 +2252,8 @@ void RecorderController::captureLoopImpl() {
                         L"); coalescing keyframes to one per 2s window");
                 }
                 // Single GOP per transition: coalesce rapid flips within a 2 s
-                // window into the first flip's restart (capture pins one
-                // interpretation, so this is a guard, not the hot path).
+                // window into the first flip's restart so a surface oscillation
+                // does not restart GOPs back to back.
                 if (lastHdrFlipAt == SteadyClock::time_point::min() ||
                     flipNow - lastHdrFlipAt >= std::chrono::seconds(2)) {
                     lastHdrFlipAt = flipNow;
@@ -3002,7 +2992,10 @@ void RecorderController::encodeLoopImpl() {
     };
 
     auto extendVideoDuration = [&](int64_t pts100ns, int64_t duration100ns) {
-        if (pts100ns <= 0 || duration100ns <= 0) {
+        // No PTS test here: both callers already gate on an explicit validity
+        // flag, and 0 is a legal presentation time. Only a zero/negative
+        // duration leaves nothing to extend.
+        if (duration100ns <= 0) {
             return;
         }
         const size_t evicted = pendingDurations.extend(pts100ns, duration100ns);
@@ -3111,7 +3104,11 @@ void RecorderController::encodeLoopImpl() {
 
         recordingCutoff_.noteFrameSubmitted(frame.pts100ns);
 
-        extendVideoDuration(frame.previousFramePts100ns, frame.previousFrameDuration100ns);
+        // The preceding submission is present when the flag says so, not when
+        // its PTS happens to be nonzero: 0 is a legal presentation time.
+        if (frame.hasPreviousFrame) {
+            extendVideoDuration(frame.previousFramePts100ns, frame.previousFrameDuration100ns);
+        }
 
         // Vector form: one submit can complete several outputs while
         // reordering/lookahead drains, and the single-packet form strands the
@@ -3180,10 +3177,6 @@ void RecorderController::notifyRecordingCutoffAcked() {
 }
 
 void RecorderController::handleAudioPacket(AudioPacket&& packet) {
-    if (packet.track == AudioTrack::SoundSeparation) {
-        return;
-    }
-
     const AudioTrack track = packet.track;
     // Liveness: record arrival before the packet can be dropped by a full
     // queue - a starved queue must not read as a dead input. Also clears the

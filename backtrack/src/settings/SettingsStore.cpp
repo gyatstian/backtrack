@@ -1,9 +1,9 @@
 #include "settings/SettingsStore.h"
 
-#include "clips/AtomicWrite.h"
 #include "core/LogContext.h"
 #include "core/LogTiming.h"
 #include "core/Logger.h"
+#include "platform/AtomicWrite.h"
 #include "platform/Win32Util.h"
 
 #include <algorithm>
@@ -19,6 +19,22 @@
 namespace backtrack {
 
 namespace {
+
+// One case fold per parse: the persisted spellings are lowercase, so a
+// hand-edited "LOW-LATENCY" must not land on the fallback value.
+std::wstring foldName(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
+        return static_cast<wchar_t>(towlower(ch));
+    });
+    return value;
+}
+
+// Hard cap for a persisted app list, mirroring sanitizeSettings.
+constexpr uint32_t kMaxAppListEntries = 128;
+
+// The settings file is trusted no further than this: one corrupt line must not
+// buffer the whole file while it waits for a newline that never comes.
+constexpr size_t kMaxLineBytes = 64u * 1024;
 
 uint32_t readUInt(const std::map<std::wstring, std::wstring>& values, const std::wstring& key, uint32_t fallback) {
     const auto it = values.find(key);
@@ -45,10 +61,7 @@ bool readBool(const std::map<std::wstring, std::wstring>& values, const std::wst
     if (it == values.end()) {
         return fallback;
     }
-    auto value = it->second;
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(towlower(ch));
-    });
+    auto value = foldName(it->second);
     if (value == L"1" || value == L"true" || value == L"yes" || value == L"on") {
         return true;
     }
@@ -68,10 +81,7 @@ bool readLibraryGalleryView(const std::map<std::wstring, std::wstring>& values, 
     if (modeIt != values.end()) {
         // Case-insensitive like readBool, because the user's capitalization is
         // not a reason to drop a gallery view back to the default.
-        std::wstring mode = modeIt->second;
-        std::transform(mode.begin(), mode.end(), mode.begin(), [](wchar_t ch) {
-            return static_cast<wchar_t>(towlower(ch));
-        });
+        const std::wstring mode = foldName(modeIt->second);
         if (mode == L"gallery") {
             return true;
         }
@@ -112,7 +122,7 @@ void dedupeNamedExecutableApps(std::vector<App>& apps) {
         }
         seen.insert(key);
         kept.push_back(std::move(app));
-        if (kept.size() >= 128) {
+        if (kept.size() >= kMaxAppListEntries) {
             break;
         }
     }
@@ -218,9 +228,19 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
 
     std::map<std::wstring, std::wstring> values;
     std::string rawLine;
+    bool firstLine = true;
+    bool discardingLine = false;
     const auto parseLine = [&] {
         if (!rawLine.empty() && rawLine.back() == '\r') {
             rawLine.pop_back();
+        }
+        if (firstLine) {
+            firstLine = false;
+            // A UTF-8 BOM would otherwise join the first key and make that
+            // setting unreachable.
+            if (rawLine.starts_with("\xEF\xBB\xBF")) {
+                rawLine.erase(0, 3);
+            }
         }
         const std::wstring line = trimText(utf8ToWide(rawLine));
         if (line.empty() || line.front() == L'#') {
@@ -242,11 +262,22 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
             break;
         }
         for (DWORD index = 0; index < count; ++index) {
-            if (buffer[index] == '\n') {
-                parseLine();
+            const char ch = buffer[index];
+            if (ch == '\n') {
+                if (!discardingLine) {
+                    parseLine();
+                }
+                discardingLine = false;
                 rawLine.clear();
-            } else {
-                rawLine.push_back(buffer[index]);
+            } else if (!discardingLine) {
+                if (rawLine.size() >= kMaxLineBytes) {
+                    discardingLine = true;
+                    rawLine.clear();
+                    Logger::instance().warning(L"settings",
+                        L"settings line longer than 65536 bytes dropped");
+                } else {
+                    rawLine.push_back(ch);
+                }
             }
         }
     }
@@ -305,13 +336,18 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     settings.audioInputNoiseSuppressionEnabled = readBool(values, L"audio.inputNoiseSuppression", settings.audioInputNoiseSuppressionEnabled);
 #endif
     settings.soundSeparationEnabled = readBool(values, L"audio.soundSeparation.enabled", settings.soundSeparationEnabled);
-    const uint32_t soundSeparationCount = std::min<uint32_t>(
-        readUInt(values, L"audio.soundSeparation.count", 0),
-        128);
+    // count is only a hint: a hand-edited file can lose it while keeping the
+    // entries, and normalizeLoaded would then publish an empty list.
+    const uint32_t soundSeparationCount =
+        std::min<uint32_t>(readUInt(values, L"audio.soundSeparation.count", 0), kMaxAppListEntries);
     settings.soundSeparationApps.clear();
     settings.soundSeparationApps.reserve(soundSeparationCount);
-    for (uint32_t index = 0; index < soundSeparationCount; ++index) {
+    for (uint32_t index = 0; index < kMaxAppListEntries; ++index) {
         const std::wstring prefix = L"audio.soundSeparation." + std::to_wstring(index) + L".";
+        const bool hasPath = values.contains(prefix + L"path");
+        if (index >= soundSeparationCount && !hasPath) {
+            break;
+        }
         AppSettings::SoundSeparationApp app;
         app.name = readString(values, prefix + L"name", {});
         app.executablePath = readString(values, prefix + L"path", {});
@@ -319,13 +355,16 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
         settings.soundSeparationApps.push_back(std::move(app));
     }
     settings.autoRecordEnabled = readBool(values, L"integrations.autoRecord.enabled", settings.autoRecordEnabled);
-    const uint32_t autoRecordCount = std::min<uint32_t>(
-        readUInt(values, L"integrations.autoRecord.count", 0),
-        128);
+    const uint32_t autoRecordCount =
+        std::min<uint32_t>(readUInt(values, L"integrations.autoRecord.count", 0), kMaxAppListEntries);
     settings.autoRecordApps.clear();
     settings.autoRecordApps.reserve(autoRecordCount);
-    for (uint32_t index = 0; index < autoRecordCount; ++index) {
+    for (uint32_t index = 0; index < kMaxAppListEntries; ++index) {
         const std::wstring prefix = L"integrations.autoRecord." + std::to_wstring(index) + L".";
+        const bool hasPath = values.contains(prefix + L"path");
+        if (index >= autoRecordCount && !hasPath) {
+            break;
+        }
         AppSettings::AutoRecordApp app;
         app.name = readString(values, prefix + L"name", {});
         app.executablePath = readString(values, prefix + L"path", {});
@@ -358,10 +397,10 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     settings.gameIntegrations.voiceCommand = voiceCommandModeFromName(
         readString(values, L"integrations.voiceCommand", voiceCommandModeName(settings.gameIntegrations.voiceCommand)));
     {
-        const std::wstring raw = readString(
+        const std::wstring raw = foldName(readString(
             values,
             L"integrations.discordRichPresence",
-            discordRichPresenceModeName(settings.gameIntegrations.discordRichPresence));
+            discordRichPresenceModeName(settings.gameIntegrations.discordRichPresence)));
         // Legacy bool values from older settings files: 1/true -> Always, 0/false -> Off.
         if (raw == L"1" || raw == L"true") {
             settings.gameIntegrations.discordRichPresence =
@@ -559,10 +598,14 @@ AppSettings sanitizeSettings(AppSettings settings) {
 }
 
 VideoCodec codecFromName(const std::wstring& value) {
-    if (value == L"hevc" || value == L"HEVC" || value == L"h265" || value == L"H265") {
+    const std::wstring name = foldName(value);
+    if (name == L"hevc" || name == L"h265") {
         return VideoCodec::Hevc;
     }
-    return VideoCodec::H264;
+    if (name == L"h264") {
+        return VideoCodec::H264;
+    }
+    return VideoCodec::H264; // fallback for unknown names
 }
 
 const wchar_t* resolutionModeName(ResolutionMode mode) {
@@ -586,71 +629,80 @@ const wchar_t* resolutionModeName(ResolutionMode mode) {
 }
 
 ResolutionMode resolutionModeFromName(const std::wstring& value) {
-    if (value == L"240p" || value == L"240P") {
+    const std::wstring name = foldName(value);
+    if (name == L"240p") {
         return ResolutionMode::P240;
     }
-    if (value == L"480p" || value == L"480P") {
+    if (name == L"480p") {
         return ResolutionMode::P480;
     }
-    if (value == L"720p" || value == L"720P") {
+    if (name == L"720p") {
         return ResolutionMode::P720;
     }
-    if (value == L"1080p" || value == L"1080P") {
-        return ResolutionMode::P1080;
-    }
-    if (value == L"2k" || value == L"2K" || value == L"1440p" || value == L"1440P") {
+    if (name == L"2k" || name == L"1440p") {
         return ResolutionMode::P2K;
     }
-    if (value == L"4k" || value == L"4K" || value == L"2160p" || value == L"2160P") {
+    if (name == L"4k" || name == L"2160p") {
         return ResolutionMode::P4K;
     }
-    if (value == L"custom" || value == L"CUSTOM") {
+    if (name == L"custom") {
         return ResolutionMode::Custom;
     }
     // Legacy "native" mode was removed. Preserve the persisted width/height by
     // migrating to Custom (which keeps the explicit size) rather than a preset.
-    if (value == L"native" || value == L"NATIVE") {
+    if (name == L"native") {
         return ResolutionMode::Custom;
     }
-    return ResolutionMode::P1080;
+    if (name == L"1080p") {
+        return ResolutionMode::P1080;
+    }
+    return ResolutionMode::P1080; // fallback for unknown names
 }
 
 EncoderPreset encoderPresetFromName(const std::wstring& value) {
-    if (value == L"p1" || value == L"P1") {
+    const std::wstring name = foldName(value);
+    if (name == L"p1") {
         return EncoderPreset::P1;
     }
-    if (value == L"p2" || value == L"P2") {
+    if (name == L"p2") {
         return EncoderPreset::P2;
     }
-    if (value == L"p3" || value == L"P3") {
+    if (name == L"p3") {
         return EncoderPreset::P3;
     }
-    if (value == L"p5" || value == L"P5") {
+    if (name == L"p4") {
+        return EncoderPreset::P4;
+    }
+    if (name == L"p5") {
         return EncoderPreset::P5;
     }
-    if (value == L"p6" || value == L"P6") {
+    if (name == L"p6") {
         return EncoderPreset::P6;
     }
-    if (value == L"p7" || value == L"P7") {
+    if (name == L"p7") {
         return EncoderPreset::P7;
     }
-    return EncoderPreset::P4;
+    return EncoderPreset::P4; // fallback for unknown names
 }
 
 EncoderMode encoderModeFromName(const std::wstring& value) {
-    if (value == L"low-latency" || value == L"LOW_LATENCY") {
+    const std::wstring name = foldName(value);
+    if (name == L"low-latency" || name == L"low_latency") {
         return EncoderMode::LowLatency;
     }
-    if (value == L"ultra-low-latency" || value == L"ULTRA_LOW_LATENCY") {
+    if (name == L"ultra-low-latency" || name == L"ultra_low_latency") {
         return EncoderMode::UltraLowLatency;
     }
-    if (value == L"lossless" || value == L"LOSSLESS") {
+    if (name == L"lossless") {
         return EncoderMode::Lossless;
     }
-    if (value == L"ultra-high-quality" || value == L"ULTRA_HIGH_QUALITY") {
+    if (name == L"ultra-high-quality" || name == L"ultra_high_quality") {
         return EncoderMode::UltraHighQuality;
     }
-    return EncoderMode::HighQuality;
+    if (name == L"high-quality") {
+        return EncoderMode::HighQuality;
+    }
+    return EncoderMode::HighQuality; // fallback for unknown names
 }
 
 const wchar_t* encoderProfileName(EncoderProfile profile) {
@@ -666,13 +718,17 @@ const wchar_t* encoderProfileName(EncoderProfile profile) {
 }
 
 EncoderProfile encoderProfileFromName(const std::wstring& value) {
-    if (value == L"balanced" || value == L"BALANCED") {
+    const std::wstring name = foldName(value);
+    if (name == L"balanced") {
         return EncoderProfile::Balanced;
     }
-    if (value == L"custom" || value == L"CUSTOM") {
+    if (name == L"custom") {
         return EncoderProfile::Custom;
     }
-    return EncoderProfile::LowestGpu;
+    if (name == L"lowest-gpu") {
+        return EncoderProfile::LowestGpu;
+    }
+    return EncoderProfile::LowestGpu; // fallback for unknown names
 }
 
 const wchar_t* encoderMultipassName(EncoderMultipass multipass) {
@@ -688,13 +744,17 @@ const wchar_t* encoderMultipassName(EncoderMultipass multipass) {
 }
 
 EncoderMultipass encoderMultipassFromName(const std::wstring& value) {
-    if (value == L"quarter-resolution" || value == L"quarter" || value == L"QUARTER") {
+    const std::wstring name = foldName(value);
+    if (name == L"quarter-resolution" || name == L"quarter") {
         return EncoderMultipass::QuarterResolution;
     }
-    if (value == L"full-resolution" || value == L"full" || value == L"FULL") {
+    if (name == L"full-resolution" || name == L"full") {
         return EncoderMultipass::FullResolution;
     }
-    return EncoderMultipass::Disabled;
+    if (name == L"disabled") {
+        return EncoderMultipass::Disabled;
+    }
+    return EncoderMultipass::Disabled; // fallback for unknown names
 }
 
 const wchar_t* gpuAdaptiveModeName(GpuAdaptiveMode mode) {
@@ -710,13 +770,17 @@ const wchar_t* gpuAdaptiveModeName(GpuAdaptiveMode mode) {
 }
 
 GpuAdaptiveMode gpuAdaptiveModeFromName(const std::wstring& value) {
-    if (value == L"disabled" || value == L"DISABLED" || value == L"off") {
+    const std::wstring name = foldName(value);
+    if (name == L"disabled" || name == L"off") {
         return GpuAdaptiveMode::Disabled;
     }
-    if (value == L"aggressive" || value == L"AGGRESSIVE") {
+    if (name == L"aggressive") {
         return GpuAdaptiveMode::Aggressive;
     }
-    return GpuAdaptiveMode::Conservative;
+    if (name == L"conservative") {
+        return GpuAdaptiveMode::Conservative;
+    }
+    return GpuAdaptiveMode::Conservative; // fallback for unknown names
 }
 
 const wchar_t* captureBackendName(CaptureBackend backend) {
@@ -730,12 +794,16 @@ const wchar_t* captureBackendName(CaptureBackend backend) {
 }
 
 CaptureBackend captureBackendFromName(const std::wstring& value) {
-    if (value == L"desktop-duplication" || value == L"dda" || value == L"dxgi") {
+    const std::wstring name = foldName(value);
+    if (name == L"desktop-duplication" || name == L"dda" || name == L"dxgi") {
         return CaptureBackend::DesktopDuplication;
+    }
+    if (name == L"wgc") {
+        return CaptureBackend::WindowsGraphicsCapture;
     }
     // Legacy "game-capture" values fall back to WGC; the injected game-capture
     // DLL no longer exists in the codebase.
-    return CaptureBackend::WindowsGraphicsCapture;
+    return CaptureBackend::WindowsGraphicsCapture; // fallback for unknown names
 }
 
 const wchar_t* voiceCommandModeName(GameIntegrationSettings::VoiceCommandMode mode) {
@@ -751,13 +819,17 @@ const wchar_t* voiceCommandModeName(GameIntegrationSettings::VoiceCommandMode mo
 }
 
 GameIntegrationSettings::VoiceCommandMode voiceCommandModeFromName(const std::wstring& value) {
-    if (value == L"clip-that") {
+    const std::wstring name = foldName(value);
+    if (name == L"clip-that") {
         return GameIntegrationSettings::VoiceCommandMode::ClipThat;
     }
-    if (value == L"record-video") {
+    if (name == L"record-video") {
         return GameIntegrationSettings::VoiceCommandMode::RecordVideo;
     }
-    return GameIntegrationSettings::VoiceCommandMode::Disabled;
+    if (name == L"disabled") {
+        return GameIntegrationSettings::VoiceCommandMode::Disabled;
+    }
+    return GameIntegrationSettings::VoiceCommandMode::Disabled; // fallback for unknown names
 }
 
 const wchar_t* discordRichPresenceModeName(GameIntegrationSettings::DiscordRichPresenceMode mode) {
@@ -773,13 +845,17 @@ const wchar_t* discordRichPresenceModeName(GameIntegrationSettings::DiscordRichP
 }
 
 GameIntegrationSettings::DiscordRichPresenceMode discordRichPresenceModeFromName(const std::wstring& value) {
-    if (value == L"always") {
+    const std::wstring name = foldName(value);
+    if (name == L"always") {
         return GameIntegrationSettings::DiscordRichPresenceMode::Always;
     }
-    if (value == L"fullscreen-only") {
+    if (name == L"fullscreen-only") {
         return GameIntegrationSettings::DiscordRichPresenceMode::FullscreenOnly;
     }
-    return GameIntegrationSettings::DiscordRichPresenceMode::Off;
+    if (name == L"off") {
+        return GameIntegrationSettings::DiscordRichPresenceMode::Off;
+    }
+    return GameIntegrationSettings::DiscordRichPresenceMode::Off; // fallback for unknown names
 }
 
 } // namespace backtrack

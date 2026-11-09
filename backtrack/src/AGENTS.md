@@ -19,8 +19,8 @@ every child shares.
 - Everything is in `namespace backtrack`.
 - Timestamps crossing a module boundary are 100 ns units: `pts100ns`,
   `dts100ns`, `duration100ns`. Convert from `std::chrono` with
-  `kHundredNanosecondsPerSecond` (core/Types.h). Milliseconds exist only inside
-  a Win32 timeout call.
+  `kHundredNanosecondsPerSecond` (core/TimeUnits.h). Milliseconds exist only
+  inside a Win32 timeout call.
 - PTS is the authoritative timeline anchor. Both encoders emit `dts100ns` on
   every packet, always paired with an explicit `hasDts` flag, and DTS equals
   PTS when nothing reorders. Zero and negative timestamps are legal values and

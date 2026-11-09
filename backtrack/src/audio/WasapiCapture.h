@@ -24,11 +24,6 @@ using AudioPacketCallback = std::function<void(AudioPacket&&)>;
 // each) in its constructor. wWinMain calls this before constructing Application.
 void ensureAudioPacketPool();
 
-enum class ProcessLoopbackMode {
-    IncludeTargetProcessTree,
-    ExcludeTargetProcessTree,
-};
-
 class WasapiCapture {
 public:
     WasapiCapture() = default;
@@ -55,8 +50,6 @@ public:
     static void emergencyRestoreSessionMutes() noexcept;
 
     bool start(AudioTrack track, const std::wstring& deviceId, AudioPacketCallback callback);
-    bool startProcessLoopback(uint32_t processId, AudioPacketCallback callback);
-    bool startProcessLoopback(AudioTrack track, uint32_t processId, ProcessLoopbackMode mode, AudioPacketCallback callback);
     void stop();
     bool running() const { return running_.load(); }
     WaveFormatBlob format() const;
@@ -67,9 +60,6 @@ private:
     struct CaptureOptions {
         AudioTrack track = AudioTrack::System;
         std::wstring deviceId;
-        uint32_t processId = 0;
-        bool processLoopback = false;
-        ProcessLoopbackMode processLoopbackMode = ProcessLoopbackMode::IncludeTargetProcessTree;
         std::function<HRESULT(IMMDeviceEnumerator**)> createEnumerator;
     };
 

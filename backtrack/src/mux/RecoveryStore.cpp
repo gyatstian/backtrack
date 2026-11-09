@@ -860,7 +860,7 @@ std::filesystem::path recoverLatestFailedRecording(
     return recoverManifest(*selected, detail);
 }
 
-void sweepOrphanedRecoveryData(const std::filesystem::path& clipDirectory, std::chrono::hours /*maxAge*/) {
+void sweepOrphanedRecoveryData(const std::filesystem::path& clipDirectory) {
     for (const auto& located : findManifests(clipDirectory)) {
         std::wstring detail;
         if (recoverManifest(located, detail).empty()) {

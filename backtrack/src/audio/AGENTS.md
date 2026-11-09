@@ -55,6 +55,9 @@ microphone denoiser.
   `AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR`) on the first packet, on
   `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, or once drift passes
   `kAudioTimestampResyncThreshold100ns` (50 ms).
+  Gradual clock drift (discontinuity=no) is corrected smoothly over ~1s via a
+  per-packet PTS adjustment of ≤0.5ms, avoiding hard timeline jumps. Only
+  `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` triggers a hard resync.
 - The capture thread never gives up on a lost client. Activation, `GetMixFormat`,
   `Initialize`, `GetBuffer` and `ReleaseBuffer` failures - including
   `AUDCLNT_E_DEVICE_INVALIDATED` on an unplugged or swapped endpoint - clear

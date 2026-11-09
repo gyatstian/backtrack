@@ -35,6 +35,7 @@ constexpr PROPERTYKEY kPkeyDeviceFriendlyName = {
     {0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}},
     14};
 constexpr int64_t kAudioTimestampResyncThreshold100ns = kHundredNanosecondsPerSecond / 20;
+constexpr int64_t kMaxDriftCorrectionPerPacket100ns = kHundredNanosecondsPerSecond / 2000; // 0.5ms
 
 WaveFormatBlob copyWaveFormat(WAVEFORMATEX* format) {
     WaveFormatBlob blob;
@@ -1205,6 +1206,7 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
             : 0;
 
         int64_t nextPacketPts100ns = -1;
+        int64_t driftCorrection100ns = 0;
         bool sessionLost = false;
         // Underrun probe: a packet arrival gap past 50 ms is a device stall or
         // CPU starvation, not normal device cadence.
@@ -1256,22 +1258,41 @@ void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback ca
                 const bool hasTimeline = nextPacketPts100ns >= 0;
                 const bool discontinuity = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
                 const int64_t drift100ns = hasTimeline ? capturedPts100ns - nextPacketPts100ns : 0;
-                const bool resyncTimeline =
-                    !hasTimeline ||
-                    discontinuity ||
-                    drift100ns < -kAudioTimestampResyncThreshold100ns ||
-                    drift100ns > kAudioTimestampResyncThreshold100ns;
-                if (resyncTimeline && hasTimeline) {
-                    // Mid-stream resync only (the first-packet !hasTimeline
-                    // case is expected, not a gap). Rate-limited by the logger.
-                    Logger::instance().warning(L"audio",
-                        L"WASAPI capture timeline resynced for " + std::wstring(trackName(track)) +
-                        L" (drift_ms=" +
-                        std::to_wstring(drift100ns / (kHundredNanosecondsPerSecond / 1000)) +
-                        L" discontinuity=" + (discontinuity ? L"yes" : L"no") +
-                        L"); audio gap expected");
+                const bool driftExceedsThreshold =
+                    hasTimeline &&
+                    !discontinuity &&
+                    (drift100ns < -kAudioTimestampResyncThreshold100ns ||
+                     drift100ns > kAudioTimestampResyncThreshold100ns);
+                if (discontinuity || !hasTimeline) {
+                    // Hard resync: a real device change, or the first packet.
+                    driftCorrection100ns = 0;
+                    packet.pts100ns = capturedPts100ns;
+                    if (discontinuity && hasTimeline) {
+                        Logger::instance().warning(L"audio",
+                            L"WASAPI capture timeline resynced for " + std::wstring(trackName(track)) +
+                            L" (drift_ms=" +
+                            std::to_wstring(drift100ns / (kHundredNanosecondsPerSecond / 1000)) +
+                            L" discontinuity=yes" +
+                            L"); audio gap expected");
+                    }
+                } else {
+                    // Gradual clock drift is spread over subsequent packets
+                    // instead of a hard jump. Only start a new correction when
+                    // none is pending, or the still-measured offset would be
+                    // accumulated again on every packet.
+                    if (driftExceedsThreshold && driftCorrection100ns == 0) {
+                        driftCorrection100ns += drift100ns;
+                        Logger::instance().info(L"audio",
+                            L"WASAPI capture drift correction for " + std::wstring(trackName(track)) +
+                            L" (drift_ms=" +
+                            std::to_wstring(drift100ns / (kHundredNanosecondsPerSecond / 1000)) +
+                            L" cumulative)");
+                    }
+                    const int64_t thisCorrection = std::clamp(driftCorrection100ns,
+                        -kMaxDriftCorrectionPerPacket100ns, kMaxDriftCorrectionPerPacket100ns);
+                    driftCorrection100ns -= thisCorrection;
+                    packet.pts100ns = nextPacketPts100ns + thisCorrection;
                 }
-                packet.pts100ns = resyncTimeline ? capturedPts100ns : nextPacketPts100ns;
                 nextPacketPts100ns = packet.pts100ns + packetDuration100ns;
 
                 if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data) {

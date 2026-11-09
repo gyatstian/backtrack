@@ -102,6 +102,7 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
                                      L", replay=" + (settings.replay.enabled ? L"enabled" : L"disabled") +
                                      L", resolution=" + std::to_wstring(settings.video.width) + L"x" +
                                      std::to_wstring(settings.video.height) + L"@" + std::to_wstring(settings.video.fps));
+    Logger::instance().info(L"app", std::wstring(L"Replay capture: ") + (settings.replay.enabled ? L"enabled" : L"disabled"));
     if (settingsStatus != SettingsStore::LoadStatus::Failed) {
         updateWindowsStartupRegistration(settings.startWithWindowsMinimized);
     }

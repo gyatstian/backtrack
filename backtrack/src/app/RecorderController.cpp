@@ -1697,6 +1697,15 @@ void RecorderController::captureLoopImpl() {
     // Never thrash WGC CreateForWindow for exclusive cover (zero frames).
     // Transitions are session.toX(); partial resets write session fields directly.
     CaptureSession session;
+    // Cumulative across soft-stall episodes (persists past per-episode resets
+    // so a repeatedly-wedging source eventually escalates to full recreate).
+    int cumulativeSoftStallRecreates = 0;
+    SteadyClock::time_point cumulativeSoftStallWindowStart = SteadyClock::time_point::min();
+    SteadyClock::time_point cumulativeSoftStallEscalatedAt = SteadyClock::time_point::min();
+    // Pipeline start time for startup-timeout diagnostics and time-to-first-frame.
+    const auto pipelineStartedAt = std::chrono::steady_clock::now();
+    bool startupStallWarned = false;
+
     // Tracks capture_->cursorOnlyFrames() from the last delivered frame. A DXGI
     // frame whose counter did not advance carries a real desktop present (proof of
     // composited/capturable content); a cursor-only stale frame advances it.
@@ -1770,7 +1779,7 @@ void RecorderController::captureLoopImpl() {
         if (session.toHolding()) {
             LogContext::breadcrumb(L"exclusive fullscreen hold");
             forceVideoHeartbeat_ = true; // one IDR of freeze; no periodic slideshow
-            Logger::instance().warning(L"recorder",
+            Logger::instance().info(L"recorder",
                 std::wstring(L"Exclusive fullscreen hold: ") +
                     (reason ? reason : L"desktop APIs blind") +
                     (lastFrame.texture ? L". Holding last frame." : L". Waiting for capture."));
@@ -2207,7 +2216,8 @@ void RecorderController::captureLoopImpl() {
         if (acquired) {
             lastSourceFrameAt = std::chrono::steady_clock::now();
             // Frames are flowing again: any soft-stall episode is over and the
-            // escalation budget re-arms.
+            // escalation budget re-arms (per-episode counter only).
+            // cumulativeSoftStallRecreates persists across episodes.
             session.softStallBeganAt = SteadyClock::time_point::min();
             session.softStallRecreates = 0;
             session.deadTargetFailures = 0;
@@ -2372,6 +2382,11 @@ void RecorderController::captureLoopImpl() {
                 if (!emitClockStarted) {
                     nextEmit = std::chrono::steady_clock::now();
                     emitClockStarted = true;
+                    Logger::instance().info(L"recorder",
+                        L"First captured frame after startup (" +
+                        std::to_wstring(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - pipelineStartedAt).count()) +
+                        L"ms)");
                 } else {
                     // Track A: re-phase the emit grid to the frame's real DWM present
                     // time. The free-running grid otherwise beats against the (jittery,
@@ -2403,6 +2418,13 @@ void RecorderController::captureLoopImpl() {
                     }
                 }
             }
+        }
+
+        // Startup-timeout diagnostic: warn if no frame within 5s.
+        if (!emitClockStarted && !startupStallWarned &&
+            std::chrono::steady_clock::now() - pipelineStartedAt > std::chrono::seconds(5)) {
+            startupStallWarned = true;
+            Logger::instance().warning(L"recorder", L"No capture frame within 5s of startup; GPU/capture init may be stalled");
         }
 
         // Health probes run lock-free. Every pointer read here is only ever
@@ -2507,7 +2529,7 @@ void RecorderController::captureLoopImpl() {
             // ---- Capture session state machine (exclusive-aware) ----
             constexpr auto kWaitStableMs = std::chrono::milliseconds(1200);
             constexpr auto kRebindCooldownMs = std::chrono::milliseconds(2500);
-            constexpr auto kHoldDesktopProbeMs = std::chrono::milliseconds(2000);
+            constexpr auto kHoldDesktopProbeMs = std::chrono::milliseconds(5000);
             // WGC legitimately remains quiet for unchanged borderless content.
             // Require a sustained stall before treating a full-monitor window
             // as exclusive and entering recovery hold.
@@ -2529,6 +2551,12 @@ void RecorderController::captureLoopImpl() {
             // the recreate cadence (3 s + 10 s cooldown) so an idle stretch stops
             // recreating after the first attempt.
             constexpr auto kSoftStallCursorIdleMs = std::chrono::milliseconds(10000);
+            // Cumulative soft-stall escalation: if a repeatedly-wedging source
+            // hits this many recreates within the window, escalate to full
+            // pipeline recreate (rebuilds D3D device + DWM session).
+            constexpr int kCumulativeSoftStallThreshold = 10;
+            constexpr auto kCumulativeSoftStallWindow = std::chrono::minutes(5);
+            constexpr auto kCumulativeSoftStallEscalationCooldown = std::chrono::minutes(2);
 
             // Instant DXGI death after exclusive rebind → hard hold (no loop).
             if (exclusiveCoverActive &&
@@ -2739,14 +2767,20 @@ void RecorderController::captureLoopImpl() {
                         session.state = CaptureSessionState::Rebind;
                     }
                 } else if (nowLoop - session.lastRebindAt >= kHoldDesktopProbeMs) {
-                    // Full-monitor borderless still satisfies exclusive-cover geometry.
-                    // Probe Desktop Duplication once more; repeated identical
-                    // attempts would not make desktop capture recover.
-                    session.exclusiveBlind = false;
-                    session.exclusiveDxgiAttempts = 0;
-                    session.rebindAttempts = 0;
-                    session.recoveryProbe = true;
-                    session.state = CaptureSessionState::Rebind;
+                    // Cheap probe: check whether the exclusive condition truly
+                    // changed before re-initializing DD. If the same window
+                    // still covers the monitor, stay in Holding.
+                    if (exclusiveCoverActive && session.exclusiveWindow &&
+                        GetForegroundWindow() == session.exclusiveWindow) {
+                        // Still exclusive; skip re-init.
+                    } else {
+                        // Cover changed or window no longer covers monitor.
+                        session.exclusiveBlind = false;
+                        session.exclusiveDxgiAttempts = 0;
+                        session.rebindAttempts = 0;
+                        session.recoveryProbe = true;
+                        session.state = CaptureSessionState::Rebind;
+                    }
                 }
             }
 
@@ -2783,22 +2817,61 @@ void RecorderController::captureLoopImpl() {
                         ++session.softStallRecreates;
                         session.lastSoftStallAt = nowLoop;
                         session.softStallBeganAt = nowLoop;
+
+                        // Cumulative tracking across episodes.
+                        const bool windowExpired = cumulativeSoftStallWindowStart != SteadyClock::time_point::min() &&
+                            nowLoop - cumulativeSoftStallWindowStart > kCumulativeSoftStallWindow &&
+                            cumulativeSoftStallRecreates < kCumulativeSoftStallThreshold;
+                        if (windowExpired) {
+                            cumulativeSoftStallRecreates = 0;
+                            cumulativeSoftStallWindowStart = SteadyClock::time_point::min();
+                        }
+                        ++cumulativeSoftStallRecreates;
+                        if (cumulativeSoftStallWindowStart == SteadyClock::time_point::min()) {
+                            cumulativeSoftStallWindowStart = nowLoop;
+                        }
+
                         CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
                             ? captureTargetForSettings(captureSettings)
                             : activeCaptureTarget_;
                         target.window = nullptr;
-                        Logger::instance().warning(L"recorder",
-                            L"No frames for " +
-                            std::to_wstring(
-                                std::chrono::duration_cast<std::chrono::milliseconds>(nowLoop - lastSourceFrameAt).count()) +
-                            L"ms without device loss; recreating capture source (attempt " +
-                            std::to_wstring(session.softStallRecreates) + L"/" +
-                            std::to_wstring(kMaxSoftStallRecreates) + L")");
-                        // switchCaptureTarget discards queued frames and arms
-                        // a keyframe on the next live frame.
-                        if (switchCaptureTarget(target, L"frozen source recovery")) {
-                            lastSourceFrameAt = nowLoop;
-                            prevCursorOnlyFrames = 0;
+
+                        const bool escalate = cumulativeSoftStallRecreates >= kCumulativeSoftStallThreshold &&
+                            nowLoop - cumulativeSoftStallWindowStart <= kCumulativeSoftStallWindow &&
+                            (cumulativeSoftStallEscalatedAt == SteadyClock::time_point::min() ||
+                             nowLoop - cumulativeSoftStallEscalatedAt >= kCumulativeSoftStallEscalationCooldown);
+
+                        if (escalate) {
+                            Logger::instance().info(L"recorder",
+                                L"Soft-stall escalation: " +
+                                std::to_wstring(cumulativeSoftStallRecreates) +
+                                L" recreates in " +
+                                std::to_wstring(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    nowLoop - cumulativeSoftStallWindowStart).count()) +
+                                L"ms; full pipeline recreate");
+                            if (recreateGpuPipeline(target, L"soft-stall escalation",
+                                    pipelineAdapterForTarget(target))) {
+                                cumulativeSoftStallRecreates = 0;
+                                cumulativeSoftStallWindowStart = SteadyClock::time_point::min();
+                                cumulativeSoftStallEscalatedAt = nowLoop;
+                                lastSourceFrameAt = nowLoop;
+                                prevCursorOnlyFrames = 0;
+                            }
+                        } else {
+                            Logger::instance().warning(L"recorder",
+                                L"No frames for " +
+                                std::to_wstring(
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(nowLoop - lastSourceFrameAt).count()) +
+                                L"ms without device loss; recreating capture source (attempt " +
+                                std::to_wstring(session.softStallRecreates) + L"/" +
+                                std::to_wstring(kMaxSoftStallRecreates) +
+                                L", cumulative=" + std::to_wstring(cumulativeSoftStallRecreates) + L")");
+                            // switchCaptureTarget discards queued frames and arms
+                            // a keyframe on the next live frame.
+                            if (switchCaptureTarget(target, L"frozen source recovery")) {
+                                lastSourceFrameAt = nowLoop;
+                                prevCursorOnlyFrames = 0;
+                            }
                         }
                     }
                 }

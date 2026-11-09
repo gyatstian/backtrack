@@ -274,6 +274,24 @@ recording-stop drain handshake.
 
 ## Work Guidance
 
+- Cumulative soft-stall escalation (RecorderController.cpp, capture-loop
+  locals): `cumulativeSoftStallRecreates` persists across per-episode
+  `softStallRecreates` resets. When the cumulative count reaches
+  `kCumulativeSoftStallThreshold` (10) within `kCumulativeSoftStallWindow`
+  (5 min), the next soft-stall recreates the full GPU pipeline instead of
+  just the capture source. A cooldown prevents re-escalation within 2 min.
+  Counters reset when the window expires without reaching threshold.
+
+- Exclusive hold probe: `kHoldDesktopProbeMs` is 5000 ms (not 2000). Before
+  re-initializing Desktop Duplication from the Holding state, a cheap check
+  tests whether the same exclusive window still covers the monitor; if so,
+  the re-init is skipped until the next probe tick. The enterExclusiveHold
+  log is INFO, not WARN (expected under exclusive fullscreen).
+
+- Startup time-to-first-frame: logged at INFO with the ms delta from
+  capture loop start when the first acquired frame enables `emitClockStarted`.
+  A WARN fires if no frame arrives within 5 s of loop start.
+
 - Prefer fixing a decision at its source (the scheduler, the encoder
   capabilities, the capture source) over branching on it in the loops.
 - When adding a pipeline stage, define where it sits in the queue chain and

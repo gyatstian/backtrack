@@ -90,7 +90,8 @@ conditions change.
 
 `ClipManagerTests` (CTest) covers linked sidecars and staging collisions, failed
 tag publication, a destination created between rename precheck and move, normal
-rename, supported clip roots, and scan cancellation. symbolic link cases skip
+rename, nonfatal failures of either sidecar move, mixed-case clip and staging
+names, supported clip roots, and scan cancellation. symbolic link cases skip
 when link creation is unavailable. `StorageLayoutTests` (CTest) covers the
 shared root rules, and `SettingsClipGuardTests` covers the listing rules.
 legacy clip names matching `.publish[.n].mp4` directly in `.backtrack_tmp` are

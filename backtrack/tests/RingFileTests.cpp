@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -69,6 +70,7 @@ struct FakeState {
     std::atomic<unsigned> resultCalls{0};
     std::atomic<unsigned> cancellations{0};
     DWORD completionError = ERROR_SUCCESS;
+    std::optional<DWORD> completedBytes;
     DWORD immediateError = ERROR_SUCCESS;
     bool signalOnSubmit = false;
 };
@@ -106,7 +108,7 @@ struct FakeIo {
             SetLastError(state->completionError);
             return FALSE;
         }
-        *moved = state->size;
+        *moved = state->completedBytes.value_or(state->size);
         return TRUE;
     }
 
@@ -199,6 +201,33 @@ void testCompletedAndImmediateErrors() {
     expect(!ring.writeWrapped(output.data(), 4, first, second, L"ring") && GetLastError() == ERROR_WRITE_FAULT,
            "failed ring accepted another write");
     ring.closeNow();
+}
+
+void testCompletedTransferFaults() {
+    TestRoot root;
+    for (const bool write : {false, true}) {
+        for (const DWORD moved : {0u, 5u, 4u}) {
+            RingFile ring;
+            expect(ring.open(root.path, L"ring.bin", 16), "open failed");
+            auto state = std::make_shared<FakeState>();
+            state->signalOnSubmit = true;
+            state->completedBytes = moved;
+            state->completionError = moved == 4 ? ERROR_CRC : ERROR_SUCCESS;
+            FakeIo io{state, std::make_shared<int>(1)};
+            std::array<uint8_t, 4> bytes{1, 2, 3, 4};
+            RingExtent first{7, 8}, second{9, 10};
+            const bool ok = write
+                ? RingFileTestAccess::write(ring, bytes.data(), 4, first, second, io, 100)
+                : RingFileTestAccess::read(ring, 0, bytes.data(), 4, io, 100);
+            expect(!ok && GetLastError() == (write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT),
+                   "completed transfer did not report the direction-specific fault");
+            expect(state->cancellations.load() == 0, "completed transfer was cancelled");
+            expect(bytes == std::array<uint8_t, 4>{1, 2, 3, 4}, "failed transfer changed caller bytes");
+            expect(ring.liveBytes() == 0 && first.offset == 7 && first.byteCount == 8 &&
+                   second.offset == 9 && second.byteCount == 10, "failed transfer published extents");
+            ring.closeNow();
+        }
+    }
 }
 
 void testPartialRead() {
@@ -336,6 +365,7 @@ int main() {
     try {
         testWrapAndRoundTrip();
         testCompletedAndImmediateErrors();
+        testCompletedTransferFaults();
         testPartialRead();
         testPendingWriteSurvivesStopAndCannotOverwrite();
         testRealPendingRead();

@@ -1,4 +1,5 @@
 #include "capture/HdrStability.h"
+#include "platform/Win32Util.h"
 
 #include <iostream>
 #include <stdexcept>
@@ -134,6 +135,23 @@ void testSurfaceFormats() {
     expect(!isHdrCaptureFormat(DXGI_FORMAT_R10G10B10A2_UNORM), "R10 was assumed to be PQ");
 }
 
+void testAdvancedColorSpaces() {
+    expect(backtrack::isAdvancedColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020),
+        "PQ output was not advanced color");
+    expect(backtrack::isAdvancedColorSpace(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709),
+        "scRGB output was not advanced color");
+    for (const auto colorSpace : {
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+            DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709,
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020,
+            DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
+            DXGI_COLOR_SPACE_RESERVED,
+            DXGI_COLOR_SPACE_CUSTOM}) {
+        expect(!backtrack::isAdvancedColorSpace(colorSpace),
+            "SDR or an unrecognized output was assumed to be advanced color");
+    }
+}
+
 void testBackoffSchedule() {
     expect(hdrRejectionCooldown(0).count() == 5, "first retry did not wait 5 s");
     expect(hdrRejectionCooldown(1).count() == 5, "retry after one rejection did not wait 5 s");
@@ -150,6 +168,7 @@ int main() {
         testLegacyFallback();
         testTransientAndFatalFailures();
         testSurfaceFormats();
+        testAdvancedColorSpaces();
         testBackoffSchedule();
     } catch (const std::exception& e) {
         std::cerr << "HdrStabilityTests FAILED: " << e.what() << "\n";

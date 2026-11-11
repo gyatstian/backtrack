@@ -34,28 +34,28 @@ size_t annexBStartCodeSize(const std::vector<uint8_t>& bytes, size_t offset) {
     return 0;
 }
 
+uint8_t nalUnitType(VideoCodec codec, const uint8_t* header) {
+    return codec == VideoCodec::H264 ? (*header & kH264NalTypeMask) : ((header[0] >> 1) & 0x3f);
+}
+
+uint64_t parameterSetMask(VideoCodec codec) {
+    return codec == VideoCodec::H264
+        ? (uint64_t{1} << kH264NalSps) | (uint64_t{1} << kH264NalPps)
+        : (uint64_t{1} << kHevcVps) | (uint64_t{1} << kHevcSps) | (uint64_t{1} << kHevcPps);
+}
+
 bool nalUnitIsKeyFrame(VideoCodec codec, const uint8_t* header) {
-    if (codec == VideoCodec::H264) {
-        return (*header & kH264NalTypeMask) == kH264NalIdrSlice;
-    }
-    const uint8_t nalType = (header[0] >> 1) & 0x3f;
-    return nalType >= kHevcFirstBla && nalType <= kHevcLastIdr;
+    const uint8_t type = nalUnitType(codec, header);
+    return codec == VideoCodec::H264 ? type == kH264NalIdrSlice
+        : type >= kHevcFirstBla && type <= kHevcLastIdr;
 }
 
 bool nalUnitIsCra(VideoCodec codec, const uint8_t* header) {
-    if (codec != VideoCodec::Hevc) {
-        return false;
-    }
-    return ((header[0] >> 1) & 0x3f) == kHevcCra;
+    return codec == VideoCodec::Hevc && nalUnitType(codec, header) == kHevcCra;
 }
 
 bool nalUnitIsParameterSet(VideoCodec codec, const uint8_t* header) {
-    if (codec == VideoCodec::H264) {
-        const uint8_t type = *header & kH264NalTypeMask;
-        return type == kH264NalSps || type == kH264NalPps;
-    }
-    const uint8_t nalType = (header[0] >> 1) & 0x3f;
-    return nalType == kHevcVps || nalType == kHevcSps || nalType == kHevcPps;
+    return (parameterSetMask(codec) & (uint64_t{1} << nalUnitType(codec, header))) != 0;
 }
 
 // Walks every NAL unit and invokes the predicate with a pointer to the NAL
@@ -93,23 +93,12 @@ bool bitstreamContainsCraFrame(VideoCodec codec, const std::vector<uint8_t>& byt
 }
 
 bool bitstreamContainsParameterSets(VideoCodec codec, const std::vector<uint8_t>& bytes) {
-    bool sawSps = false;
-    bool sawPps = false;
-    bool sawVps = false;
-    scanNalUnits(codec, bytes, [&](const uint8_t* header) {
-        if (codec == VideoCodec::H264) {
-            const uint8_t type = *header & kH264NalTypeMask;
-            sawSps |= type == kH264NalSps;
-            sawPps |= type == kH264NalPps;
-        } else {
-            const uint8_t nalType = (header[0] >> 1) & 0x3f;
-            sawVps |= nalType == kHevcVps;
-            sawSps |= nalType == kHevcSps;
-            sawPps |= nalType == kHevcPps;
-        }
-        return false;
+    const uint64_t required = parameterSetMask(codec);
+    uint64_t seen = 0;
+    return scanNalUnits(codec, bytes, [&](const uint8_t* header) {
+        seen |= uint64_t{1} << nalUnitType(codec, header);
+        return (seen & required) == required;
     });
-    return codec == VideoCodec::H264 ? (sawSps && sawPps) : (sawVps && sawSps && sawPps);
 }
 
 bool extractParameterSets(

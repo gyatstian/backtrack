@@ -252,9 +252,7 @@ if (BACKTRACK_NOISE_SUPPRESSION)
         LIBS rnnoise)
 endif()
 
-# --- Header-only suites ---
-# Each of these drives header-inline production logic; the only linked source is
-# the logger some of those headers call.
+# --- Controller and capture helper suites ---
 
 add_backtrack_test(PendingDurationTrackerTests
     SOURCES backtrack/tests/PendingDurationTrackerTests.cpp)
@@ -263,7 +261,11 @@ add_backtrack_test(RecorderControllerLeaseTests
     SOURCES backtrack/tests/RecorderControllerLeaseTests.cpp)
 
 add_backtrack_test(RecorderControllerShutdownOrderingTests
-    SOURCES backtrack/tests/RecorderControllerShutdownOrderingTests.cpp)
+    SOURCES
+        backtrack/tests/RecorderControllerShutdownOrderingTests.cpp
+        backtrack/src/app/AudioWriter.cpp
+        backtrack/src/audio/AudioConvert.cpp
+        backtrack/src/core/Logger.cpp)
 
 add_backtrack_test(RecorderControllerCutoffTests
     SOURCES backtrack/tests/RecorderControllerCutoffTests.cpp)

@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-#include <Windows.h>
 namespace backtrack {
 
 class ReplayBuffer {
@@ -105,7 +104,10 @@ private:
         Disk,
     };
 
+    static VideoPacketMeta videoMetaOf(const EncodedPacket& packet);
     void trimLocked();
+    // Caller holds mutex_; serialized against saves like clear().
+    void clearBuffersLocked();
     void clearBufferedVideoLocked();
     // Refreshes the lock-free mirrors the UI-thread counters read. Called
     // everywhere the buffered packet or keyframe counts change.
@@ -148,7 +150,6 @@ private:
     // Audio ring space policy: evicts the prefix the save has already read
     // while pinned, else the physical insertion-order prefix.
     bool ensureAudioRingSpaceLocked(std::unique_lock<std::mutex>& lock, uint32_t size);
-    static int64_t diskAudioPacketEndPts100ns(const DiskAudioPacket& packet);
     // Caller must have secured space via the audio ring's ensureSpace; appends
     // the packet payload to the audio ring and records its extents. False on
     // any write failure - the caller must then stop trusting the ring contents.

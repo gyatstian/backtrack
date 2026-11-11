@@ -36,6 +36,23 @@
 #include <utility>
 
 namespace backtrack {
+namespace {
+bool readCheckControl(HWND control, bool fallback) {
+    return control ? SendMessageW(control, BM_GETCHECK, 0, 0) == BST_CHECKED : fallback;
+}
+
+template <typename Row>
+void releaseRowIcons(std::vector<Row>& rows) {
+    for (auto& row : rows) {
+        if (row.icon) {
+            DestroyIcon(row.icon);
+            row.icon = nullptr;
+        }
+    }
+    rows.clear();
+}
+}
+
 void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (bitrateEdit_) {
         target.video.bitrateKbps = readUIntControl(bitrateEdit_, target.video.bitrateKbps);
@@ -76,31 +93,21 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (heightEdit_ && !monitorEntrySelected) {
         target.video.height = readUIntControl(heightEdit_, target.video.height);
     }
-    if (multiMonitorSupportCheck_) {
-        target.multiMonitorSupport = SendMessageW(multiMonitorSupportCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (followFocusedMonitorCheck_) {
-        target.followFocusedMonitor = SendMessageW(followFocusedMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.multiMonitorSupport = readCheckControl(multiMonitorSupportCheck_, target.multiMonitorSupport);
+    target.followFocusedMonitor = readCheckControl(followFocusedMonitorCheck_, target.followFocusedMonitor);
     if (followMouseMonitorCheck_) {
         target.followMouseMonitor = target.multiMonitorSupport && target.followFocusedMonitor &&
-            SendMessageW(followMouseMonitorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            readCheckControl(followMouseMonitorCheck_, target.followMouseMonitor);
     }
-    if (captureCursorCheck_) {
-        target.captureCursor = SendMessageW(captureCursorCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.captureCursor = readCheckControl(captureCursorCheck_, target.captureCursor);
     if (codecCombo_) {
         int codec = static_cast<int>(target.video.codec);
         if (readEnumCombo(codecCombo_, kVideoCodecComboEntries, codec)) {
             target.video.codec = static_cast<VideoCodec>(codec);
         }
     }
-    if (systemAudioCheck_) {
-        target.captureSystemAudio = SendMessageW(systemAudioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (microphoneCheck_) {
-        target.captureMicrophone = SendMessageW(microphoneCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.captureSystemAudio = readCheckControl(systemAudioCheck_, target.captureSystemAudio);
+    target.captureMicrophone = readCheckControl(microphoneCheck_, target.captureMicrophone);
     if (outputDeviceCombo_) {
         target.audioOutputDeviceId = selectedDeviceId(outputDeviceCombo_, outputDevices_);
     }
@@ -113,27 +120,14 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (inputVolumeEdit_) {
         target.audioInputVolumePercent = readUIntControl(inputVolumeEdit_, target.audioInputVolumePercent);
     }
-    if (inputAutoGainCheck_) {
-        target.audioInputAutoGainEnabled = SendMessageW(inputAutoGainCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.audioInputAutoGainEnabled = readCheckControl(inputAutoGainCheck_, target.audioInputAutoGainEnabled);
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-    if (inputNoiseSuppressionCheck_) {
-        target.audioInputNoiseSuppressionEnabled = SendMessageW(inputNoiseSuppressionCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.audioInputNoiseSuppressionEnabled = readCheckControl(inputNoiseSuppressionCheck_, target.audioInputNoiseSuppressionEnabled);
 #endif
-    if (startWithWindowsCheck_) {
-        target.startWithWindowsMinimized = SendMessageW(startWithWindowsCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (pruneStaleMicrophoneConsentEntriesCheck_) {
-        target.pruneStaleMicrophoneConsentEntries =
-            SendMessageW(pruneStaleMicrophoneConsentEntriesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (exitToTrayCheck_) {
-        target.exitToTray = SendMessageW(exitToTrayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (checkForUpdatesCheck_) {
-        target.checkForUpdates = SendMessageW(checkForUpdatesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.startWithWindowsMinimized = readCheckControl(startWithWindowsCheck_, target.startWithWindowsMinimized);
+    target.pruneStaleMicrophoneConsentEntries = readCheckControl(pruneStaleMicrophoneConsentEntriesCheck_, target.pruneStaleMicrophoneConsentEntries);
+    target.exitToTray = readCheckControl(exitToTrayCheck_, target.exitToTray);
+    target.checkForUpdates = readCheckControl(checkForUpdatesCheck_, target.checkForUpdates);
     if (notificationSoundVolumeEdit_) {
         target.notificationSoundVolumePercent =
             readUIntControl(notificationSoundVolumeEdit_, target.notificationSoundVolumePercent);
@@ -159,39 +153,25 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
             target.video.encoderProfile = static_cast<EncoderProfile>(profile);
         }
     }
-    if (encoderLookaheadCheck_) {
-        target.video.encoderLookahead = SendMessageW(encoderLookaheadCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.video.encoderLookahead = readCheckControl(encoderLookaheadCheck_, target.video.encoderLookahead);
     if (encoderLookaheadDepthEdit_) {
         target.video.encoderLookaheadDepth = readUIntControl(encoderLookaheadDepthEdit_, target.video.encoderLookaheadDepth);
     }
-    if (encoderSpatialAQCheck_) {
-        target.video.encoderSpatialAQ = SendMessageW(encoderSpatialAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.video.encoderSpatialAQ = readCheckControl(encoderSpatialAQCheck_, target.video.encoderSpatialAQ);
     if (encoderAQStrengthEdit_) {
         target.video.encoderAQStrength = readUIntControl(encoderAQStrengthEdit_, target.video.encoderAQStrength);
     }
-    if (encoderTemporalAQCheck_) {
-        target.video.encoderTemporalAQ = SendMessageW(encoderTemporalAQCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.video.encoderTemporalAQ = readCheckControl(encoderTemporalAQCheck_, target.video.encoderTemporalAQ);
     if (encoderMultipassCombo_) {
         int multipass = static_cast<int>(target.video.encoderMultipass);
         if (readEnumCombo(encoderMultipassCombo_, kEncoderMultipassComboEntries, multipass)) {
             target.video.encoderMultipass = static_cast<EncoderMultipass>(multipass);
         }
     }
-    if (encoderBFramesCheck_) {
-        target.video.encoderBFrames = SendMessageW(encoderBFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (encoderAdaptiveBFramesCheck_) {
-        target.video.encoderAdaptiveBFrames = SendMessageW(encoderAdaptiveBFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (encoderAdaptiveIFramesCheck_) {
-        target.video.encoderAdaptiveIFrames = SendMessageW(encoderAdaptiveIFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (encoderZeroReorderDelayCheck_) {
-        target.video.encoderZeroReorderDelay = SendMessageW(encoderZeroReorderDelayCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.video.encoderBFrames = readCheckControl(encoderBFramesCheck_, target.video.encoderBFrames);
+    target.video.encoderAdaptiveBFrames = readCheckControl(encoderAdaptiveBFramesCheck_, target.video.encoderAdaptiveBFrames);
+    target.video.encoderAdaptiveIFrames = readCheckControl(encoderAdaptiveIFramesCheck_, target.video.encoderAdaptiveIFrames);
+    target.video.encoderZeroReorderDelay = readCheckControl(encoderZeroReorderDelayCheck_, target.video.encoderZeroReorderDelay);
     if (encoderGopSecondsEdit_) {
         target.video.gopSeconds = readUIntControl(encoderGopSecondsEdit_, target.video.gopSeconds);
     }
@@ -207,46 +187,26 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (gpuFrameQueueLimitEdit_) {
         target.gpu.frameQueueLimit = readUIntControl(gpuFrameQueueLimitEdit_, target.gpu.frameQueueLimit);
     }
-    if (idleFrameCoalescingCheck_) {
-        target.gpu.allowIdleFrameSkipping =
-            SendMessageW(idleFrameCoalescingCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.gpu.allowIdleFrameSkipping = readCheckControl(idleFrameCoalescingCheck_, target.gpu.allowIdleFrameSkipping);
     if (captureMethodCombo_) {
         int backend = static_cast<int>(target.preferredCaptureBackend);
         if (readEnumCombo(captureMethodCombo_, kCaptureBackendComboEntries, backend)) {
             target.preferredCaptureBackend = static_cast<CaptureBackend>(backend);
         }
     }
-    if (stableMultimonitorFramesCheck_) {
-        target.gpu.stableMultimonitorFrames =
-            SendMessageW(stableMultimonitorFramesCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (replayEnabledCheck_) {
-        target.replay.enabled = SendMessageW(replayEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.gpu.stableMultimonitorFrames = readCheckControl(stableMultimonitorFramesCheck_, target.gpu.stableMultimonitorFrames);
+    target.replay.enabled = readCheckControl(replayEnabledCheck_, target.replay.enabled);
     if (replaySecondsEdit_) {
         target.replay.seconds = readUIntControl(replaySecondsEdit_, target.replay.seconds);
     }
-    if (replayDiskBackedCheck_) {
-        target.replay.diskBackedVideo =
-            SendMessageW(replayDiskBackedCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (replayDiskBackedAudioCheck_) {
-        target.replay.diskBackedAudio =
-            SendMessageW(replayDiskBackedAudioCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.replay.diskBackedVideo = readCheckControl(replayDiskBackedCheck_, target.replay.diskBackedVideo);
+    target.replay.diskBackedAudio = readCheckControl(replayDiskBackedAudioCheck_, target.replay.diskBackedAudio);
     if (replayRingDirEdit_) {
         // Stored raw; ensureFoldersExist validates and creates on the save path.
         target.replayRingDirectory = trimText(readText(replayRingDirEdit_));
     }
-    if (leagueKillReminderCheck_) {
-        target.gameIntegrations.leagueOfLegendsKillReminder =
-            SendMessageW(leagueKillReminderCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
-    if (autoRecordEnabledCheck_) {
-        target.autoRecordEnabled =
-            SendMessageW(autoRecordEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.gameIntegrations.leagueOfLegendsKillReminder = readCheckControl(leagueKillReminderCheck_, target.gameIntegrations.leagueOfLegendsKillReminder);
+    target.autoRecordEnabled = readCheckControl(autoRecordEnabledCheck_, target.autoRecordEnabled);
     if (voiceCommandCombo_) {
         int voiceCommand = static_cast<int>(target.gameIntegrations.voiceCommand);
         if (readEnumCombo(voiceCommandCombo_, kVoiceCommandComboEntries, voiceCommand)) {
@@ -267,9 +227,7 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
             target.gameIntegrations.discordRichPresenceResetTimerOnSwitch = (selected == 0);
         }
     }
-    if (soundSeparationEnabledCheck_) {
-        target.soundSeparationEnabled = SendMessageW(soundSeparationEnabledCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.soundSeparationEnabled = readCheckControl(soundSeparationEnabledCheck_, target.soundSeparationEnabled);
     if (recordHotkey_) {
         target.hotkeys.startStopModifiers = recordHotkeyModifiers_;
         target.hotkeys.startStopVirtualKey = recordHotkeyVirtualKey_;
@@ -284,10 +242,7 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
         // defaultClipDirectory() on save. Validated by ensureFoldersExist.
         target.clipDirectory = trimText(readText(clipFolderEdit_));
     }
-    if (organizeClipsByGameCheck_) {
-        target.organizeClipsByGame =
-            SendMessageW(organizeClipsByGameCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
-    }
+    target.organizeClipsByGame = readCheckControl(organizeClipsByGameCheck_, target.organizeClipsByGame);
     target.libraryGalleryView = libraryViewMode_ == LibraryViewMode::Gallery;
 }
 
@@ -957,13 +912,7 @@ void MainWindow::destroySoundSeparationRows() {
 }
 
 void MainWindow::releaseSoundSeparationRowIcons() {
-    for (auto& row : soundSeparationRows_) {
-        if (row.icon) {
-            DestroyIcon(row.icon);
-            row.icon = nullptr;
-        }
-    }
-    soundSeparationRows_.clear();
+    releaseRowIcons(soundSeparationRows_);
 }
 
 void MainWindow::toggleSoundSeparationApp(size_t index) {
@@ -1036,13 +985,7 @@ void MainWindow::destroyAutoRecordRows() {
 }
 
 void MainWindow::releaseAutoRecordRowIcons() {
-    for (auto& row : autoRecordRows_) {
-        if (row.icon) {
-            DestroyIcon(row.icon);
-            row.icon = nullptr;
-        }
-    }
-    autoRecordRows_.clear();
+    releaseRowIcons(autoRecordRows_);
 }
 
 void MainWindow::removeAutoRecordApp(size_t index) {

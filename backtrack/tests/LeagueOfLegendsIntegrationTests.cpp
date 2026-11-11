@@ -79,6 +79,23 @@ std::optional<std::string> offlineHttpGetBody(
 
 namespace {
 
+void testNumericFields() {
+    constexpr std::string_view object = "{\"EventID\" \t: \r\n -12, \"EventTime\": \t1.25e+2}";
+    expect(backtrack::jsonIntField(object, "EventID") == -12, "integer field whitespace or sign changed");
+    expect(backtrack::jsonDoubleField(object, "EventTime") == 125.0, "double field whitespace or exponent changed");
+    expect(backtrack::jsonIntField("{\"EventID\":0}", "EventID") == 0, "zero integer was lost");
+    expect(!backtrack::jsonIntField(object, "missing"), "missing integer was accepted");
+    expect(!backtrack::jsonDoubleField(object, "missing"), "missing double was accepted");
+    expect(!backtrack::jsonIntField("{\"EventID\"}", "EventID"), "integer without a colon was accepted");
+    expect(!backtrack::jsonDoubleField("{\"EventTime\"}", "EventTime"), "double without a colon was accepted");
+    expect(!backtrack::jsonIntField("\"EventID\": \t", "EventID"), "empty integer was accepted");
+    expect(!backtrack::jsonDoubleField("\"EventTime\": \t", "EventTime"), "empty double was accepted");
+    expect(!backtrack::jsonIntField("{\"EventID\":-}", "EventID"), "bare minus was accepted");
+    expect(!backtrack::jsonIntField("{\"EventID\":9223372036854775808}", "EventID"), "integer overflow was accepted");
+    expect(!backtrack::jsonDoubleField("{\"EventTime\":1e+}", "EventTime"), "incomplete exponent was accepted");
+    expect(!backtrack::jsonDoubleField("{\"EventTime\":1e9999}", "EventTime"), "nonfinite double was accepted");
+}
+
 void testFeedResets() {
     backtrack::LeagueOfLegendsIntegration integration([] {
         std::scoped_lock lock(feed.mutex);
@@ -112,6 +129,7 @@ void testFeedResets() {
 
 int main() {
     try {
+        testNumericFields();
         testFeedResets();
         std::cout << "LeagueOfLegendsIntegrationTests passed\n";
         return 0;

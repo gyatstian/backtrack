@@ -384,8 +384,106 @@ void testAppListsSurviveMissingCount() {
         "entries without a count key were dropped");
     expect(settings.soundSeparationApps.size() == 2 &&
            settings.soundSeparationApps[1].executablePath.wstring() == L"C:\\Apps\\delta.exe" &&
-           !settings.soundSeparationApps[0].muted,
-        "entries past the count hint were dropped");
+           !settings.soundSeparationApps[0].muted && settings.soundSeparationApps[1].muted,
+        "entries past the count hint or the default muted flag were lost");
+    const SettingsStore store(path);
+    expect(store.normalizeLoaded(settings, status) && store.load() == settings,
+        "normalization lost app-list entries or muted flags");
+}
+
+void testAppListCountBoundsAndGaps() {
+    const auto path = testRoot() / L"applist-bounds" / L"settings.ini";
+    const SettingsStore store(path);
+    for (const std::string hint : {"", "0", "1", "4294967295", "invalid"}) {
+        std::string text;
+        for (const std::string key : {"audio.soundSeparation", "integrations.autoRecord"}) {
+            if (!hint.empty()) text += key + ".count=" + hint + "\n";
+            for (unsigned index = 0; index < 130; ++index) {
+                text += key + "." + std::to_string(index) + ".path=C:\\Apps\\app" +
+                    std::to_string(index) + ".exe\n";
+            }
+        }
+        writeBytes(path, text);
+        const auto loaded = store.load();
+        expect(loaded.soundSeparationApps.size() == 128 && loaded.autoRecordApps.size() == 128,
+            "an app-list count hint changed the 128-entry cap");
+        expect(loaded.soundSeparationApps.back().muted &&
+               loaded.autoRecordApps.back().executablePath == L"C:\\Apps\\app127.exe",
+            "app-list loading changed entry order or the muted default");
+    }
+
+    const std::string entries =
+        "audio.soundSeparation.1.path=C:\\Apps\\sound.exe\n"
+        "audio.soundSeparation.1.muted=invalid\n"
+        "integrations.autoRecord.1.path=C:\\Apps\\record.exe\n";
+    writeBytes(path, entries);
+    auto loaded = store.load();
+    expect(loaded.soundSeparationApps.empty() && loaded.autoRecordApps.empty(),
+        "a missing path beyond the count hint did not stop either app list");
+    writeBytes(path, "audio.soundSeparation.count=2\nintegrations.autoRecord.count=2\n" + entries);
+    loaded = store.load();
+    expect(loaded.soundSeparationApps.size() == 1 && loaded.soundSeparationApps[0].muted &&
+           loaded.autoRecordApps.size() == 1, "a gap inside the count hint hid later entries");
+}
+
+void testResolutionPersistence() {
+    using backtrack::ResolutionMode;
+    const struct {
+        ResolutionMode mode;
+        const char* name;
+        uint32_t width;
+        uint32_t height;
+    } cases[] = {
+        {ResolutionMode::P240, "240p", 426, 240},
+        {ResolutionMode::P480, "480p", 854, 480},
+        {ResolutionMode::P720, "720p", 1280, 720},
+        {ResolutionMode::P1080, "1080p", 1920, 1080},
+        {ResolutionMode::P2K, "2k", 2560, 1440},
+        {ResolutionMode::P4K, "4k", 3840, 2160},
+        {ResolutionMode::Custom, "custom", 1000, 800},
+    };
+    const auto path = testRoot() / L"resolution" / L"settings.ini";
+    const SettingsStore store(path);
+    for (const auto& entry : cases) {
+        AppSettings settings;
+        settings.video.resolutionMode = entry.mode;
+        settings.video.width = 1000;
+        settings.video.height = 800;
+        expect(store.save(settings), "could not save a resolution preset");
+        const auto bytes = readBytes(path);
+        expect(std::string(bytes.begin(), bytes.end()).find(
+            std::string("video.resolutionMode=") + entry.name + "\n") != std::string::npos,
+            "persisted resolution spelling changed");
+        const auto loaded = store.load();
+        expect(loaded.video.resolutionMode == entry.mode && loaded.video.width == entry.width &&
+               loaded.video.height == entry.height, "resolution preset did not round trip");
+    }
+    for (const auto& entry : cases) {
+        writeBytes(path, std::string("video.resolutionMode=") + entry.name +
+            "\nvideo.width=1000\nvideo.height=800\n");
+        const auto loaded = store.load();
+        expect(loaded.video.resolutionMode == entry.mode && loaded.video.width == entry.width &&
+               loaded.video.height == entry.height, "persisted resolution name changed its size");
+    }
+    const struct {
+        const char* name;
+        ResolutionMode mode;
+        uint32_t width;
+        uint32_t height;
+    } aliases[] = {
+        {"1440P", ResolutionMode::P2K, 2560, 1440},
+        {"2160p", ResolutionMode::P4K, 3840, 2160},
+        {"NaTiVe", ResolutionMode::Custom, 1000, 800},
+        {"CuStOm", ResolutionMode::Custom, 1000, 800},
+        {"unknown", ResolutionMode::P1080, 1920, 1080},
+    };
+    for (const auto& entry : aliases) {
+        writeBytes(path, std::string("video.resolutionMode=") + entry.name +
+            "\nvideo.width=1000\nvideo.height=800\n");
+        const auto loaded = store.load();
+        expect(loaded.video.resolutionMode == entry.mode && loaded.video.width == entry.width &&
+               loaded.video.height == entry.height, "legacy or unknown resolution fallback changed");
+    }
 }
 
 void testBomAndOverlongLine() {
@@ -427,6 +525,8 @@ int main() {
         testAppNamesCannotInjectSettings();
         testAppListsSurviveMissingCount();
         testBomAndOverlongLine();
+        testAppListCountBoundsAndGaps();
+        testResolutionPersistence();
         std::filesystem::remove_all(testRoot());
         std::cout << "SettingsStoreTests passed\n";
         return 0;

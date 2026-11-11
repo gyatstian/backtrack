@@ -21,6 +21,12 @@ struct HotkeyServiceTestAccess {
     static bool matches(const HotkeyService& service, uint32_t key, uint32_t modifiers, uint32_t hotkey) {
         return service.matchesHotkey(service.currentHookModifiers(), key, modifiers, hotkey);
     }
+    static void bindStartStop(HotkeyService& service, HWND window, uint32_t modifiers, uint32_t key) {
+        service.window_ = window;
+        service.settings_.startStopModifiers = modifiers;
+        service.settings_.startStopVirtualKey = key;
+        service.settings_.saveReplayVirtualKey = 0;
+    }
     static void markPressed(HotkeyService& service) {
         service.settings_.startStopVirtualKey = VK_F9;
         service.settings_.saveReplayVirtualKey = VK_F10;
@@ -161,6 +167,36 @@ void testNormalMatchingAndInjectedKeyUp() {
     expect(HotkeyServiceTestAccess::modifiers(service) == 0, "unregister did not clear both sides");
 }
 
+void testModifierKeysNeverFire() {
+    const HWND window = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0,
+        HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    expect(window != nullptr, "could not create hotkey message window");
+    bool fired = false;
+    for (const auto& modifier : kModifiers) {
+        for (const DWORD key : {modifier.genericKey, modifier.leftKey, modifier.rightKey}) {
+            HotkeyService service;
+            HotkeyServiceTestAccess::bindStartStop(service, window, modifier.mask, key);
+            auto event = modifierEvent(modifier, key != modifier.rightKey, key == modifier.genericKey, false);
+            send(service, event, true, modifier.mask == MOD_ALT);
+            fired |= HotkeyServiceTestAccess::startStopPressed(service);
+        }
+    }
+    MSG message{};
+    fired |= PeekMessageW(&message, window, WM_HOTKEY, WM_HOTKEY, PM_REMOVE) != FALSE;
+    DestroyWindow(window);
+    expect(!fired, "a modifier key fired a hotkey");
+}
+
+void testUnboundRegistration() {
+    HotkeyService service;
+    backtrack::HotkeySettings settings;
+    settings.startStopVirtualKey = 0;
+    settings.saveReplayVirtualKey = 0;
+    expect(service.registerHotkeys(nullptr, settings), "unbound hotkeys failed registration");
+    expect(service.lastErrorMessage().empty(), "unbound hotkeys acquired a registration error");
+    service.unregisterHotkeys(nullptr);
+}
+
 void testGenericShiftWithoutScanCode() {
     HotkeyService service;
     auto unknownShift = modifierEvent(kModifiers[2], true, true, true);
@@ -181,6 +217,8 @@ int main() {
         testOverlappingSides();
         testNormalMatchingAndInjectedKeyUp();
         testGenericShiftWithoutScanCode();
+        testModifierKeysNeverFire();
+        testUnboundRegistration();
     } catch (const std::exception& e) {
         std::cerr << "HotkeyServiceTests FAILED: " << e.what() << "\n";
         return 1;

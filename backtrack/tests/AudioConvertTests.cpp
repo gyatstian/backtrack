@@ -340,6 +340,73 @@ void testInvalidFormatsAreRejected() {
         "empty packet with a valid format was rejected");
 }
 
+void testExtensibleSizeAndTagGuards() {
+    const auto full = extensibleFormat(3, 48000, 32, kFloatSubFormat);
+    for (size_t size = 0; size < sizeof(WAVEFORMATEXTENSIBLE); ++size) {
+        auto truncated = std::make_shared<WaveFormatBlob>(*full);
+        truncated->bytes.resize(size);
+        expect(backtrack::parseAudioFormat(*truncated).encoding == AudioSampleEncoding::Unsupported,
+            "truncated extensible header was interpreted as PCM or float");
+        AudioPacket packet;
+        packet.format = truncated;
+        packet.frameCount = 7;
+        packet.pts100ns = 12345;
+        packet.bytes.assign(12, 0x7f);
+        const auto originalBytes = packet.bytes;
+        expect(!backtrack::convertAudioPacketToCanonical(packet), "truncated extensible header was converted");
+        expect(packet.bytes == originalBytes && packet.format == truncated &&
+               packet.frameCount == 7 && packet.pts100ns == 12345,
+            "rejected extensible header modified the packet");
+    }
+
+    auto unknown = std::make_shared<WaveFormatBlob>(*full);
+    auto* format = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(unknown->bytes.data());
+    format->SubFormat.Data4[7] ^= 1;
+    expect(backtrack::parseAudioFormat(*unknown).encoding == AudioSampleEncoding::Unsupported,
+        "non-wave subformat GUID was accepted");
+    format->SubFormat = kFloatSubFormat;
+    format->Format.wFormatTag = WAVE_FORMAT_ADPCM;
+    expect(backtrack::parseAudioFormat(*unknown).encoding == AudioSampleEncoding::Unsupported,
+        "extensible-sized non-extensible header used its subformat");
+
+    format->Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    format->Format.cbSize = 0;
+    expect(backtrack::parseAudioFormat(*unknown).encoding == AudioSampleEncoding::Float,
+        "complete extensible blob must retain the existing size/tag-only guard");
+}
+
+void testChannelMaskGuards() {
+    struct MaskCase {
+        uint16_t tag;
+        uint32_t mask;
+        bool usesLfe;
+    };
+    const MaskCase cases[] = {
+        {WAVE_FORMAT_EXTENSIBLE, 0xB, true}, // FL FR LFE rather than the default FL FR FC.
+        {WAVE_FORMAT_EXTENSIBLE, 0, false},
+        {WAVE_FORMAT_EXTENSIBLE, 0x3, false},
+        {WAVE_FORMAT_IEEE_FLOAT, 0xB, false},
+    };
+    for (const auto& test : cases) {
+        auto blob = std::make_shared<WaveFormatBlob>(*extensibleFormat(3, 48000, 32, kFloatSubFormat));
+        auto* format = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(blob->bytes.data());
+        format->Format.wFormatTag = test.tag;
+        format->dwChannelMask = test.mask;
+        AudioPacket packet;
+        packet.format = blob;
+        const float samples[] = {0.25f, -0.5f, 1.0f};
+        packet.bytes.resize(sizeof(samples));
+        std::memcpy(packet.bytes.data(), samples, sizeof(samples));
+        expect(backtrack::convertAudioPacketToCanonical(packet), "channel-mask guard conversion failed");
+        constexpr float centerGain = 0.70710678f;
+        const float left = test.usesLfe ? samples[0] : (samples[0] + centerGain) / (1.0f + centerGain);
+        const float right = test.usesLfe ? samples[1] : (samples[1] + centerGain) / (1.0f + centerGain);
+        expect(std::fabs(sampleAt(packet, 0, 0) - left) < 1e-6f &&
+               std::fabs(sampleAt(packet, 0, 1) - right) < 1e-6f,
+            "channel-mask size/tag/popcount fallback changed");
+    }
+}
+
 void testLargestRepresentableStride() {
     AudioPacket packet;
     packet.format = pcmFormat(32767, 48000, 16);
@@ -462,6 +529,8 @@ int main() {
         testMonoPcm16ResampleAndDuplication();
         testFormatChangeMidStreamIsTransparent();
         testInvalidFormatsAreRejected();
+        testExtensibleSizeAndTagGuards();
+        testChannelMaskGuards();
         testLargestRepresentableStride();
         testUnsupportedFormatDropped();
         testSilenceStaysSilent();

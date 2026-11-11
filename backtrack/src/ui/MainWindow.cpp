@@ -110,63 +110,26 @@ MainWindow::~MainWindow() {
     stopThumbnailWorker();
     stopControllerWorker();
     releaseClipThumbnailCache();
-    if (backgroundBrush_) {
-        DeleteObject(backgroundBrush_);
-    }
-    if (headingFont_) {
-        DeleteObject(headingFont_);
-    }
-    if (controlBrush_) {
-        DeleteObject(controlBrush_);
-    }
-    if (editBrush_) {
-        DeleteObject(editBrush_);
-    }
-    if (selectionBrush_) {
-        DeleteObject(selectionBrush_);
-    }
-    if (favoriteBrush_) {
-        DeleteObject(favoriteBrush_);
-    }
-    if (outlinePen_) {
-        DeleteObject(outlinePen_);
-    }
-    if (selectedOutlinePen_) {
-        DeleteObject(selectedOutlinePen_);
-    }
-    if (tabActiveBrush_) {
-        DeleteObject(tabActiveBrush_);
-    }
-    if (buttonHoverBrush_) {
-        DeleteObject(buttonHoverBrush_);
-    }
-    if (buttonPressedBrush_) {
-        DeleteObject(buttonPressedBrush_);
-    }
-    if (saveButtonBrush_) {
-        DeleteObject(saveButtonBrush_);
-    }
-    if (tabActiveOutlinePen_) {
-        DeleteObject(tabActiveOutlinePen_);
-    }
-    if (muteIconPenMuted_) {
-        DeleteObject(muteIconPenMuted_);
-    }
-    if (muteIconPenNormal_) {
-        DeleteObject(muteIconPenNormal_);
-    }
-    if (muteIconPenDisabled_) {
-        DeleteObject(muteIconPenDisabled_);
-    }
-    if (muteIconBrushMuted_) {
-        DeleteObject(muteIconBrushMuted_);
-    }
-    if (muteIconBrushNormal_) {
-        DeleteObject(muteIconBrushNormal_);
-    }
-    if (muteIconBrushDisabled_) {
-        DeleteObject(muteIconBrushDisabled_);
-    }
+    // DeleteObject on null is a no-op.
+    DeleteObject(backgroundBrush_);
+    DeleteObject(headingFont_);
+    DeleteObject(controlBrush_);
+    DeleteObject(editBrush_);
+    DeleteObject(selectionBrush_);
+    DeleteObject(favoriteBrush_);
+    DeleteObject(outlinePen_);
+    DeleteObject(selectedOutlinePen_);
+    DeleteObject(tabActiveBrush_);
+    DeleteObject(buttonHoverBrush_);
+    DeleteObject(buttonPressedBrush_);
+    DeleteObject(saveButtonBrush_);
+    DeleteObject(tabActiveOutlinePen_);
+    DeleteObject(muteIconPenMuted_);
+    DeleteObject(muteIconPenNormal_);
+    DeleteObject(muteIconPenDisabled_);
+    DeleteObject(muteIconBrushMuted_);
+    DeleteObject(muteIconBrushNormal_);
+    DeleteObject(muteIconBrushDisabled_);
 }
 
 bool MainWindow::create(HINSTANCE instance, int showCommand, bool startMinimized) {

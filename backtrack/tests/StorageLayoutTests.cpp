@@ -1,3 +1,4 @@
+#include "audio/AudioConvert.h"
 #include "clips/ClipManager.h"
 #include "clips/ClipStorage.h"
 #include "mux/Mp4Muxer.h"
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,6 +23,7 @@ namespace backtrack {
 
 static bool failMux = false;
 static unsigned muxCalls = 0;
+static bool muxHadAudio = false;
 static std::vector<std::filesystem::path> muxOutputs;
 
 bool removeEmptyOutputReservation(const std::filesystem::path& path) {
@@ -35,6 +38,7 @@ bool removeEmptyOutputReservation(const std::filesystem::path& path) {
 bool Mp4Muxer::muxToMp4(const MuxedInputs& inputs, const std::filesystem::path& output,
                         std::wstring*, unsigned, DWORD*) {
     ++muxCalls;
+    muxHadAudio = !inputs.systemAudioPath.empty() || !inputs.microphoneAudioPath.empty();
     muxOutputs.push_back(output);
     if (failMux) return false;
     if (!inputs.systemAudioPath.empty()) {
@@ -336,6 +340,64 @@ void testEscapingManifestIsPreserved() {
            "invalid recovery data was not preserved");
 }
 
+void testClearAndDisableRingLifecycle() {
+    TestRoot root;
+    for (const bool disable : {false, true}) {
+        const auto directory = root.path / (disable ? L"disable" : L"clear");
+        const auto ring = directory / L".backtrack_ring";
+        writeFile(ring / L"replay_video.bin", "user video");
+        writeFile(ring / L"replay_audio.bin", "user audio");
+        {
+            ReplayBuffer buffer;
+            ReplaySettings settings;
+            buffer.configure(settings, directory, 8ull * 1024 * 1024, 1024ull * 1024);
+            expect(buffer.storageFallbackReason().empty(), "could not open alternate rings");
+            EncodedPacket packet;
+            packet.bytes = {0, 0, 0, 1, 0x65};
+            packet.keyFrame = true;
+            packet.duration100ns = 333333;
+            buffer.pushVideo(packet);
+            for (const auto track : {AudioTrack::System, AudioTrack::Microphone}) {
+                AudioPacket audio;
+                audio.track = track;
+                audio.format = std::make_shared<WaveFormatBlob>(canonicalAudioFormat());
+                audio.frameCount = 1;
+                audio.bytes.assign(8, 0);
+                buffer.pushAudio(std::move(audio));
+            }
+            expect(buffer.videoPacketCount() == 1 && buffer.videoKeyFrameCount() == 1,
+                   "initial counters were not published");
+            if (disable) {
+                settings.enabled = false;
+                buffer.configure(settings, directory, 8ull * 1024 * 1024, 1024ull * 1024);
+                buffer.pushVideo(packet);
+            } else {
+                buffer.clear();
+            }
+            expect(buffer.videoPacketCount() == 0 && buffer.videoKeyFrameCount() == 0 &&
+                   buffer.videoSpan100ns() == 0, "clear or disable left buffered video counters");
+            expect(std::filesystem::exists(ring / L"replay_video_1.bin") == !disable &&
+                   std::filesystem::exists(ring / L"replay_audio_1.bin") == !disable,
+                   "clear closed rings or disable retained them");
+            if (disable) {
+                settings.enabled = true;
+                buffer.configure(settings, directory, 8ull * 1024 * 1024, 1024ull * 1024);
+            }
+            buffer.pushVideo(std::move(packet));
+            expect(buffer.videoPacketCount() == 1 && buffer.videoKeyFrameCount() == 1,
+                   "buffer did not resume after clear or re-enable");
+            muxHadAudio = true;
+            expect(buffer.saveTo(directory / L"resumed.mp4", VideoSettings{}),
+                   "resumed ring could not save");
+            expect(!muxHadAudio, "resumed save included audio from before clear or disable");
+        }
+        expect(readFile(ring / L"replay_video.bin") == "user video" &&
+               readFile(ring / L"replay_audio.bin") == "user audio", "lifecycle changed ring collisions");
+        expect(!std::filesystem::exists(ring / L"replay_video_1.bin") &&
+               !std::filesystem::exists(ring / L"replay_audio_1.bin"), "owned rings survived destruction");
+    }
+}
+
 void testRingCollisionIsPreserved() {
     TestRoot root;
     const auto ring = root.path / L".backtrack_ring";
@@ -373,6 +435,7 @@ int main() {
         testManualRecoverySelectsNewestAcrossRoots();
         testEscapingManifestIsPreserved();
         testRingCollisionIsPreserved();
+        testClearAndDisableRingLifecycle();
         std::cout << "StorageLayout tests passed\n";
         return 0;
     } catch (const std::exception& error) {

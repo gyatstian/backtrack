@@ -21,6 +21,29 @@ struct MainWindowAccessibilityTestAccess {
     }
     static bool shortcut(MainWindow& window, MSG& message) { return window.handleShortcut(message); }
     static void stopWorker(MainWindow& window) { window.stopControllerWorker(); }
+    static void category(MainWindow& window, size_t index) {
+        window.switchSettingsCategory(static_cast<MainWindow::SettingsCategory>(index));
+    }
+    static const std::vector<HWND>& categories(const MainWindow& window) { return window.settingsCategoryButtons_; }
+    static HWND save(const MainWindow& window) { return window.saveSettingsButton_; }
+    static HWND voice(const MainWindow& window) { return window.voiceCommandCombo_; }
+    static bool move(MainWindow& window, HWND control, int x, int y, int width, int height) {
+        return window.movePlacedControl(control, x, y, width, height);
+    }
+    static void scrollOffset(MainWindow& window, int offset) { window.pageScrollY_ = offset; }
+    static bool layout(MainWindow& window) { return window.layoutCurrentPage(); }
+    static void invalidate(MainWindow& window, size_t index) {
+        window.invalidatePageCache(static_cast<MainWindow::Page>(index));
+    }
+    static std::wstring help(const MainWindow& window, HWND control) {
+        const auto found = window.statusHelpTexts_.find(control);
+        return found != window.statusHelpTexts_.end() ? found->second : L"";
+    }
+    static void dirty(MainWindow& window, bool value) {
+        window.settingsDirty_ = value;
+        window.updateTabChrome();
+    }
+    static HWND settingsTab(const MainWindow& window) { return window.tabButtons_[2]; }
 };
 
 } // namespace backtrack
@@ -107,6 +130,93 @@ void checkPage(MainWindow& window, size_t index, HWND hiddenHost, const Keyboard
     }
 }
 
+std::wstring text(HWND control) {
+    wchar_t buffer[256]{};
+    GetWindowTextW(control, buffer, static_cast<int>(std::size(buffer)));
+    return buffer;
+}
+
+void checkPlacedLayout(MainWindow& window) {
+    const HWND host = MainWindowAccessibilityTestAccess::host(window, 3);
+    const HWND control = GetDlgItem(host, ui_ids::kDiagnosticLogLabelId);
+    expect(control != nullptr, "missing diagnostics layout fixture");
+    const HWND logging = GetDlgItem(host, ui_ids::kLoggingEnabledCheckId);
+    expect(SendMessageW(logging, BM_GETCHECK, 0, 0) == BST_CHECKED,
+           "diagnostics checkbox lost its initial state");
+    expect(!MainWindowAccessibilityTestAccess::move(window, nullptr, 0, 0, 100, 50),
+           "null placement reported a change");
+    MainWindowAccessibilityTestAccess::scrollOffset(window, 7);
+    ShowWindow(control, SW_HIDE);
+    expect(MainWindowAccessibilityTestAccess::move(window, control, 20, 30, 100, 50),
+           "new placement did not report a change");
+    expect(IsWindowVisible(control), "moving a hidden control did not show it");
+    RECT rect{};
+    GetWindowRect(control, &rect);
+    MapWindowPoints(nullptr, host, reinterpret_cast<POINT*>(&rect), 2);
+    expect(rect.left == 20 && rect.top == 23 && rect.right == 120 && rect.bottom == 73,
+           "placed layout did not apply the scroll offset");
+    ShowWindow(control, SW_HIDE);
+    expect(!MainWindowAccessibilityTestAccess::move(window, control, 20, 30, 100, 50),
+           "memoized placement reported a change");
+    expect(IsWindowVisible(control), "memoized placement did not show a hidden control");
+    MainWindowAccessibilityTestAccess::layout(window);
+    expect(!MainWindowAccessibilityTestAccess::layout(window), "unchanged diagnostics layout reported a change");
+}
+
+void checkSettingsBodyAndChrome(MainWindow& window) {
+    MainWindowAccessibilityTestAccess::showPage(window, 2);
+    const HWND host = MainWindowAccessibilityTestAccess::host(window, 2);
+    const HWND save = MainWindowAccessibilityTestAccess::save(window);
+    const auto categories = MainWindowAccessibilityTestAccess::categories(window);
+    MainWindowAccessibilityTestAccess::category(window, 4);
+    const HWND voice = MainWindowAccessibilityTestAccess::voice(window);
+    expect(voice && IsWindow(voice), "voice control was not built");
+    MainWindowAccessibilityTestAccess::category(window, 3);
+    expect(!MainWindowAccessibilityTestAccess::voice(window), "category teardown retained the voice pointer");
+    expect(MainWindowAccessibilityTestAccess::save(window) == save && IsWindow(save) &&
+           MainWindowAccessibilityTestAccess::categories(window) == categories,
+           "category teardown replaced persistent settings controls");
+    for (HWND button : categories) {
+        expect(IsWindow(button), "category teardown destroyed a category button");
+    }
+    const HWND combo = GetDlgItem(host, ui_ids::kOutputDeviceComboId);
+    HWND label = nullptr;
+    for (HWND child = GetWindow(host, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        if (text(child) == L"Output device") {
+            label = child;
+            break;
+        }
+    }
+    expect(label && (GetWindowLongPtrW(label, GWL_STYLE) & SS_NOTIFY), "row label lost hover notifications");
+    expect(!MainWindowAccessibilityTestAccess::help(window, combo).empty() &&
+           MainWindowAccessibilityTestAccess::help(window, label) == MainWindowAccessibilityTestAccess::help(window, combo),
+           "row label and control no longer share help");
+    const HWND checkbox = GetDlgItem(host, ui_ids::kSystemAudioCheckId);
+    const auto style = GetWindowLongPtrW(checkbox, GWL_STYLE);
+    expect((style & BS_TYPEMASK) == BS_AUTOCHECKBOX && (style & WS_TABSTOP), "checkbox styles changed");
+    expect(SendMessageW(checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED,
+           "audio checkbox lost its initial state");
+    MainWindowAccessibilityTestAccess::dirty(window, true);
+    expect(text(MainWindowAccessibilityTestAccess::settingsTab(window)) == L"Settings*", "dirty tab lost its marker");
+    MainWindowAccessibilityTestAccess::dirty(window, false);
+    expect(text(MainWindowAccessibilityTestAccess::settingsTab(window)) == L"Settings", "clean tab retained its marker");
+}
+
+void checkCacheInvalidation(MainWindow& window) {
+    const HWND diagnostics = MainWindowAccessibilityTestAccess::host(window, 3);
+    MainWindowAccessibilityTestAccess::invalidate(window, 3);
+    expect(MainWindowAccessibilityTestAccess::host(window, 3) == diagnostics && IsWindow(diagnostics),
+           "hidden cache invalidation replaced its host");
+    expect(!GetDlgItem(diagnostics, ui_ids::kSaveLogButtonId), "hidden cache retained controls");
+    MainWindowAccessibilityTestAccess::showPage(window, 3);
+    MainWindowAccessibilityTestAccess::invalidate(window, 3);
+    expect(MainWindowAccessibilityTestAccess::host(window, 3) == diagnostics && IsWindow(diagnostics),
+           "current cache invalidation replaced its host");
+    expect(!GetDlgItem(diagnostics, ui_ids::kSaveLogButtonId), "current cache retained controls");
+    MainWindowAccessibilityTestAccess::showPage(window, 3);
+    expect(GetDlgItem(diagnostics, ui_ids::kSaveLogButtonId) != nullptr, "invalidated page did not rebuild");
+}
+
 void testPageNavigation() {
     const HRESULT com = OleInitialize(nullptr);
     expect(SUCCEEDED(com), "OleInitialize failed");
@@ -154,6 +264,9 @@ void testPageNavigation() {
     checkPage(window, 2, hiddenHost, keyboard);
     checkPage(window, 1, hiddenHost, keyboard);
     checkPage(window, 3, MainWindowAccessibilityTestAccess::host(window, 0), keyboard);
+    checkPlacedLayout(window);
+    checkSettingsBodyAndChrome(window);
+    checkCacheInvalidation(window);
 }
 
 } // namespace

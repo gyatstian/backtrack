@@ -12,7 +12,8 @@ RNNoise microphone denoiser.
 - Owns: `WasapiCapture`, `SessionMuteStore`, `AudioConvert`, `AudioMix`, `WavReader`,
   `RnnoiseDenoiser`.
 - Does not own: WAV or MP4 writing (`mux/WavWriter.h`, `mux/Mp4Muxer.h`), or
-  the microphone AGC, which is implemented inside `app/RecorderController.cpp`.
+  the microphone AGC and writer packet helpers (`app/AudioWriter.h/.cpp`, owned
+  by `app/AGENTS.md`).
 
 ## Local Contracts
 
@@ -100,11 +101,16 @@ RNNoise microphone denoiser.
   restores and unreachable journal obligations stay journaled and are retried; a
   later apply merges them with its own mutes instead of overwriting them. a
   fully restored journal is deleted, including after a complete startup sweep.
+- ordinary orphan restoration seeds claimed sessions from surviving live mutes.
+  emergency restoration deliberately starts with an empty claim set and does no
+  process-liveness pruning; keep its try-lock and exception containment.
 - COM ownership: the store holds no COM interface. `WasapiCapture` initializes
   the apartment for the whole store call, and the store invokes every callback
   and releases every candidate before returning, so enumeration, callback
   invocation, and interface release all happen on one initialized apartment. no
-  interface escapes to another thread or a later call. the emergency path
+  interface escapes to another thread or a later call. device and app enumeration
+  likewise keep COM initialized in the caller until every returned endpoint
+  interface is released. the emergency path
   re-enumerates on its own apartment scope and leaves an unreadable journal in
   place.
 - Microphone processing order on the audio writer thread: canonicalization,
@@ -166,7 +172,8 @@ RNNoise microphone denoiser.
 ## Verification
 
 - `AudioConvertTests` (CTest) covers format parsing, supported and unsupported
-  encodings and widths, invalid strides, padded-frame repacking, resampling with
+  encodings and widths, truncated extensible headers, subformat/tag and channel-mask
+  guards, invalid strides, padded-frame repacking, resampling with
   mono duplication, a mid-stream format change, and the 5.1 fold-down.
 - `SessionMuteStoreTests` (CTest) covers the journal codec round trip and
   malformed-line skipping, journaling the intent before the session is touched,
@@ -176,7 +183,9 @@ RNNoise microphone denoiser.
   unknown `GetMute` state left untouched, a failed restore retried until it
   succeeds, a partial startup sweep followed by an unrelated apply/clear (the
   orphan is preserved, then retired once its process is gone), a complete sweep
-  retiring the journal (including the empty-write-cache case), and callbacks
+  retiring the journal (including the empty-write-cache case), surviving live claims,
+  one-to-one orphan pairing across endpoints, emergency empty claims and retained
+  obligations, emergency enumeration/callback exceptions, and callbacks
   never invoked after the enumeration that produced them returned. Needs no COM
   or WASAPI: sessions enter as `SessionMuteCandidate` values with recording
   lambdas.
@@ -193,7 +202,8 @@ RNNoise microphone denoiser.
 - `WasapiDefaultDeviceTests` (CTest) drives the capture worker with fake
   endpoints: default-device switches, a pinned explicit device, switch during
   resolution and inside a packet callback, default loss and recovery, and
-  registration/stop races. real endpoint switching still needs a listening
+  registration/stop races, repeated failures at every setup retry site, and stop
+  during setup backoff. real endpoint switching still needs a listening
   check.
 - The mixed track and sound separation are verified by building and listening.
 

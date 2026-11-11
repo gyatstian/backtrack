@@ -37,7 +37,8 @@ untrusted values, and the enum name mappings that cross the file boundary.
   failing the load.
 - The loader reads each executable list by index while the `.count` hint has
   not run out or `<prefix>N.path` exists, capped at 128 entries: a file that
-  lost its count line keeps its apps instead of loading an empty list.
+  lost its count line keeps its apps instead of loading an empty list. a missing
+  or malformed sound-separation `muted` value defaults to true.
 - `sanitizeSettings` is the trust boundary. It runs on every load **and** on
   every save, so a hand-edited file is normalized on the next start and an
   out-of-range value can never reach disk. The `VideoSettings` ranges and the
@@ -60,9 +61,12 @@ untrusted values, and the enum name mappings that cross the file boundary.
 - `monitorIndex` is the one numeric setting left unclamped on purpose:
   `platform/Win32Util.cpp:monitorFromIndex` warns and falls back to the first
   monitor, so clamping it to 0 would silently move users off their monitor.
-- A non-`Custom` `resolutionMode` **overwrites** `video.width` and
-  `video.height` with the preset size. The stored dimensions only matter in
-  `Custom` mode, so a hand-edited size under a preset is discarded on load.
+- a known preset `resolutionMode` **overwrites** `video.width` and
+  `video.height` with the preset size; `Custom` keeps explicit dimensions.
+  a hand-edited size under a preset is discarded on load.
+  `kResolutionPresets` owns preset sizes and persisted names; legacy `1440p`,
+  `2160p`, and `native` spellings remain readable. an unknown enum keeps explicit
+  dimensions but serializes as `1080p`; an unknown name loads as the 1080p preset.
 - an invalid or duplicate `saveReplay` chord falls back to its default, or is
   unbound when that default matches `startStop`. a virtual key of 0 means
   unbound and is left alone.
@@ -112,8 +116,9 @@ covers the clamp ranges, resolution presets, enum fallbacks, app-list dedupe,
 and hotkey masking. `backtrack/tests/SettingsStoreTests.cpp` (CTest) adds
 settings-only regressions, including linked destinations, staging collisions,
 a UTF-8 BOM on the first key, an over-long dropped line, and an executable list
-without its `.count` hint. symbolic link cases skip when link creation is
-unavailable.
+without its `.count` hint. it also covers app-list count bounds and gaps,
+default-muted normalization, and every persisted resolution preset and legacy
+alias. symbolic link cases skip when link creation is unavailable.
 
 The only `platform/Win32Util.h` symbols this folder uses are the `inline`
 `trimText` and `normalizedPathKey`, plus `defaultClipDirectory()`, which the

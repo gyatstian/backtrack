@@ -24,6 +24,7 @@ void testUnavailableStub() {
     backtrack::VideoSettings settings;
 
     expect(!encoder.encoderAvailable(), "the stub started available");
+    expect(encoder.inputRetentionBudget() == 0, "the stub retained input surfaces");
     expect(!encoder.initialize(device, settings), "the stub initialized successfully");
     const auto caps = encoder.capabilities();
     expect(!caps.available && caps.backendName == L"NVENC", "the stub reported an available backend");

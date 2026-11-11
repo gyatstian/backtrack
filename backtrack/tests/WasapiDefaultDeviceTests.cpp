@@ -71,6 +71,8 @@ private:
     std::atomic<ULONG> refs_{1};
 };
 
+enum class SetupFailure { None, Enumerator, Registration, Endpoint, Activation, MixFormat, Initialize, Service, Start };
+
 struct FakeState {
     std::mutex mutex;
     std::condition_variable changed;
@@ -95,6 +97,18 @@ struct FakeState {
     bool pollBlocked = false;
     bool releasePoll = false;
     bool wrongLookup = false;
+    SetupFailure failure = SetupFailure::None;
+    int failuresLeft = 0;
+    int failuresObserved = 0;
+
+    bool fail(SetupFailure stage) {
+        std::scoped_lock lock(mutex);
+        if (failure != stage || failuresLeft == 0) return false;
+        --failuresLeft;
+        ++failuresObserved;
+        changed.notify_all();
+        return true;
+    }
 
     template <typename Predicate>
     bool wait(Predicate predicate) {
@@ -160,12 +174,15 @@ public:
     FakeAudioClient(std::shared_ptr<FakeState> state, std::wstring id)
         : state_(std::move(state)), id_(std::move(id)) {}
 
-    HRESULT STDMETHODCALLTYPE Initialize(AUDCLNT_SHAREMODE, DWORD, REFERENCE_TIME, REFERENCE_TIME, const WAVEFORMATEX*, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Initialize(AUDCLNT_SHAREMODE, DWORD, REFERENCE_TIME, REFERENCE_TIME, const WAVEFORMATEX*, LPCGUID) override {
+        return state_->fail(SetupFailure::Initialize) ? E_FAIL : S_OK;
+    }
     HRESULT STDMETHODCALLTYPE GetBufferSize(UINT32*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetStreamLatency(REFERENCE_TIME*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetCurrentPadding(UINT32*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE IsFormatSupported(AUDCLNT_SHAREMODE, const WAVEFORMATEX*, WAVEFORMATEX**) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetMixFormat(WAVEFORMATEX** format) override {
+        if (state_->fail(SetupFailure::MixFormat)) return E_FAIL;
         *format = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
         if (!*format) return E_OUTOFMEMORY;
         **format = {};
@@ -179,6 +196,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE GetDevicePeriod(REFERENCE_TIME*, REFERENCE_TIME*) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE Start() override {
+        if (state_->fail(SetupFailure::Start)) return E_FAIL;
         std::scoped_lock lock(state_->mutex);
         state_->starts.push_back(id_);
         state_->changed.notify_all();
@@ -193,6 +211,7 @@ public:
     HRESULT STDMETHODCALLTYPE Reset() override { return S_OK; }
     HRESULT STDMETHODCALLTYPE SetEventHandle(HANDLE) override { return S_OK; }
     HRESULT STDMETHODCALLTYPE GetService(REFIID iid, void** object) override {
+        if (state_->fail(SetupFailure::Service)) return E_FAIL;
         if (iid != __uuidof(IAudioCaptureClient)) return E_NOINTERFACE;
         *object = static_cast<IAudioCaptureClient*>(new FakeCaptureClient(state_, id_));
         return S_OK;
@@ -208,6 +227,7 @@ public:
         : state_(std::move(state)), id_(std::move(id)) {}
 
     HRESULT STDMETHODCALLTYPE Activate(REFIID iid, DWORD, PROPVARIANT*, void** object) override {
+        if (state_->fail(SetupFailure::Activation)) return E_FAIL;
         if (iid != __uuidof(IAudioClient)) return E_NOINTERFACE;
         *object = static_cast<IAudioClient*>(new FakeAudioClient(state_, id_));
         return S_OK;
@@ -226,6 +246,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE EnumAudioEndpoints(EDataFlow, DWORD, IMMDeviceCollection**) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE GetDefaultAudioEndpoint(EDataFlow flow, ERole role, IMMDevice** endpoint) override {
+        if (state_->fail(SetupFailure::Endpoint)) return E_FAIL;
         std::wstring id;
         ComPtr<IMMNotificationClient> retained;
         {
@@ -252,6 +273,7 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE RegisterEndpointNotificationCallback(IMMNotificationClient* client) override {
+        if (state_->fail(SetupFailure::Registration)) return E_FAIL;
         std::scoped_lock lock(state_->mutex);
         ++state_->registerCalls;
         APTTYPE apartment;
@@ -285,6 +307,7 @@ private:
 bool startCapture(WasapiCapture& capture, const std::shared_ptr<FakeState>& state, AudioTrack track, const std::wstring& id) {
     return WasapiCaptureTestAccess::start(capture, track, id,
         [state](IMMDeviceEnumerator** enumerator) -> HRESULT {
+            if (state->fail(SetupFailure::Enumerator)) return E_FAIL;
             *enumerator = new FakeEnumerator(state);
             return S_OK;
         },
@@ -412,6 +435,37 @@ void testRegistrationFailureRetries() {
     expect(state->registerCalls >= 2 && state->unregisterCalls == 1, "registration retry leaked or skipped cleanup");
 }
 
+void testSetupFailuresRetryUntilRecovered() {
+    for (const auto stage : {SetupFailure::Enumerator, SetupFailure::Registration, SetupFailure::Endpoint,
+             SetupFailure::Activation, SetupFailure::MixFormat, SetupFailure::Initialize,
+             SetupFailure::Service, SetupFailure::Start}) {
+        auto state = std::make_shared<FakeState>();
+        state->failure = stage;
+        state->failuresLeft = 2;
+        WasapiCapture capture;
+        expect(!startCapture(capture, state, AudioTrack::System, L""), "setup failure must report a failed first attempt");
+        expect(state->wait([](const auto& s) { return hasPacket(s, 'A'); }), "repeated setup failure did not recover");
+        capture.stop();
+        std::scoped_lock lock(state->mutex);
+        expect(state->failuresObserved == 2 && state->failuresLeft == 0, "setup failures were not both retried");
+        expect(state->starts == std::vector<std::wstring>{L"A"} && state->stops == std::vector<std::wstring>{L"A"},
+            "setup retries must start and stop only the successful client");
+        expect(state->listener == nullptr, "setup retries left a notification registered");
+    }
+}
+
+void testStopDuringSetupBackoff() {
+    auto state = std::make_shared<FakeState>();
+    state->failure = SetupFailure::Enumerator;
+    state->failuresLeft = 100;
+    WasapiCapture capture;
+    expect(!startCapture(capture, state, AudioTrack::System, L""), "failed enumerator must fail the first attempt");
+    capture.stop();
+    std::scoped_lock lock(state->mutex);
+    expect(!capture.running() && state->starts.empty() && state->listener == nullptr,
+        "stop during setup backoff must not start a client or retain a notification");
+}
+
 void testStopDrainsPendingPacket() {
     auto state = std::make_shared<FakeState>();
     WasapiCapture capture;
@@ -502,6 +556,8 @@ int main() {
         testSwitchDuringPacketCallback();
         testDefaultLossAndRecovery();
         testRegistrationFailureRetries();
+        testSetupFailuresRetryUntilRecovered();
+        testStopDuringSetupBackoff();
         testStopDrainsPendingPacket();
         testCallbacksAcrossStop();
         testUnregisterFailureKeepsCallbackSafe();

@@ -15,6 +15,12 @@ bool foregroundWindowIsFullscreen() { return false; }
 void setThreadDescriptionSafe(const wchar_t*) {}
 
 struct DiscordRichPresenceTestAccess {
+    static void runStoppedWorker(DiscordRichPresence& presence, HANDLE pipe) {
+        presence.pipe_ = pipe;
+        presence.stopRequested_ = true;
+        presence.workerLoop();
+    }
+
     static void startDrain(DiscordRichPresence& presence, HANDLE pipe) {
         presence.pipe_ = pipe;
         presence.stopRequested_ = false;
@@ -175,6 +181,33 @@ void testStopJoinsPartialFrame() {
     expect(joined, "stop did not join the partial-frame reader");
 }
 
+void testStoppedWorkerClearsActivity() {
+    PipePair pipe;
+    backtrack::DiscordRichPresence presence;
+    HANDLE client = nullptr;
+    expect(DuplicateHandle(GetCurrentProcess(), pipe.client, GetCurrentProcess(), &client,
+        0, FALSE, DUPLICATE_SAME_ACCESS), "could not duplicate exit-clear pipe");
+    const auto start = std::chrono::steady_clock::now();
+    backtrack::DiscordRichPresenceTestAccess::runStoppedWorker(presence, client);
+    expect(std::chrono::steady_clock::now() - start < 1500ms, "exit clear exceeded its shutdown budget");
+
+    DWORD available = 0;
+    expect(PeekNamedPipe(pipe.server, nullptr, 0, nullptr, &available, nullptr) && available >= 8,
+        "stopped worker did not send an exit clear");
+    uint32_t header[2]{};
+    DWORD read = 0;
+    expect(ReadFile(pipe.server, header, sizeof(header), &read, nullptr) && read == sizeof(header),
+        "exit clear header was not readable");
+    expect(header[0] == backtrack::kOpcodeFrame && header[1] == available - sizeof(header),
+        "exit clear framing changed");
+    std::string payload(header[1], '\0');
+    expect(ReadFile(pipe.server, payload.data(), header[1], &read, nullptr) && read == header[1],
+        "exit clear payload was not readable");
+    const std::string prefix = "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" +
+        std::to_string(GetCurrentProcessId()) + ",\"activity\":null},\"nonce\":\"backtrack-";
+    expect(payload.starts_with(prefix) && payload.ends_with("\"}"), "exit clear payload changed");
+}
+
 void testCompletionOwnsPendingStorage() {
     auto operation = std::make_shared<backtrack::PipeOperation>();
     operation->overlapped.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -210,6 +243,7 @@ int main() {
         testPendingReadAndWrite();
         testPartialFrame();
         testStopJoinsPartialFrame();
+        testStoppedWorkerClearsActivity();
         testCompletionOwnsPendingStorage();
         std::cout << "DiscordRichPresenceTests passed\n";
         return 0;

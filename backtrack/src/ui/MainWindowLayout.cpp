@@ -33,6 +33,44 @@
 #include <utility>
 
 namespace backtrack {
+namespace {
+void updatePageScrollBar(HWND host, int viewportHeight, int contentHeight, int scrollY) {
+    SCROLLINFO scroll{};
+    scroll.cbSize = sizeof(scroll);
+    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    scroll.nMin = 0;
+    scroll.nMax = std::max(0, contentHeight - 1);
+    scroll.nPage = static_cast<UINT>(viewportHeight);
+    scroll.nPos = scrollY;
+    SetScrollInfo(host, SB_VERT, &scroll, TRUE);
+    ShowScrollBar(host, SB_VERT, contentHeight > viewportHeight);
+}
+}
+
+MainWindow::LayoutItem* MainWindow::layoutItemFor(HWND control) {
+    const auto found = std::find_if(layoutItems_.begin(), layoutItems_.end(),
+        [control](const LayoutItem& item) { return item.control == control; });
+    return found != layoutItems_.end() ? &*found : nullptr;
+}
+
+bool MainWindow::movePlacedControl(HWND control, int x, int y, int width, int height) {
+    if (!control) {
+        return false;
+    }
+    if (LayoutItem* cached = layoutItemFor(control)) {
+        const RECT placed{x, y - pageScrollY_, x + width, y - pageScrollY_ + height};
+        if (cached->placedValid && EqualRect(&cached->placed, &placed)) {
+            showWindowIfHidden(control);
+            return false;
+        }
+        cached->placed = placed;
+        cached->placedValid = true;
+    }
+    const bool moved = moveWindowIfChanged(control, x, y - pageScrollY_, width, height);
+    const bool shown = showWindowIfHidden(control);
+    return moved || shown;
+}
+
 void MainWindow::detachPageControl(HWND control) {
     if (!control) {
         return;
@@ -164,35 +202,8 @@ bool MainWindow::layoutCurrentPage() {
             sectionPanels_.clear();
             changed = true;
         }
-        auto findLayoutItem = [&](HWND control) -> LayoutItem* {
-            for (auto& item : layoutItems_) {
-                if (item.control == control) {
-                    return &item;
-                }
-            }
-            return nullptr;
-        };
         auto move = [&](HWND control, int x, int y, int width, int height) {
-            if (control) {
-                // Join the placed-cache protocol the generic path uses, so a
-                // later generic layout does not mistake gallery geometry for
-                // already-applied state (or vice versa).
-                if (LayoutItem* cached = findLayoutItem(control)) {
-                    const RECT placed{x, y - pageScrollY_, x + width, y - pageScrollY_ + height};
-                    if (cached->placedValid &&
-                        cached->placed.left == placed.left &&
-                        cached->placed.top == placed.top &&
-                        cached->placed.right == placed.right &&
-                        cached->placed.bottom == placed.bottom) {
-                        showWindowIfHidden(control);
-                        return;
-                    }
-                    cached->placed = placed;
-                    cached->placedValid = true;
-                }
-                changed = moveWindowIfChanged(control, x, y - pageScrollY_, width, height) || changed;
-                changed = showWindowIfHidden(control) || changed;
-            }
+            changed = movePlacedControl(control, x, y, width, height) || changed;
         };
         auto movePageControl = [&](size_t index, int x, int y, int width, int height) {
             if (index < pageControls_.size()) {
@@ -224,15 +235,7 @@ bool MainWindow::layoutCurrentPage() {
         listChanged = setListItemHeightIfChanged(clipList_, clipListItemHeight_, galleryItemHeight);
         move(clipList_, kLayoutPadding, listTop, listWidth, listHeight);
 
-        SCROLLINFO scroll{};
-        scroll.cbSize = sizeof(scroll);
-        scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-        scroll.nMin = 0;
-        scroll.nMax = std::max(0, pageContentHeight_ - 1);
-        scroll.nPage = static_cast<UINT>(viewportHeight);
-        scroll.nPos = pageScrollY_;
-        SetScrollInfo(pageHost_, SB_VERT, &scroll, TRUE);
-        ShowScrollBar(pageHost_, SB_VERT, pageContentHeight_ > viewportHeight);
+        updatePageScrollBar(pageHost_, viewportHeight, pageContentHeight_, pageScrollY_);
         if (listChanged) {
             InvalidateRect(clipList_, nullptr, FALSE);
         }
@@ -271,32 +274,8 @@ bool MainWindow::layoutCurrentPage() {
         pageScrollY_ = std::clamp(pageScrollY_, 0, maxScroll);
 
         bool changed = false;
-        auto findLayoutItem = [&](HWND control) -> LayoutItem* {
-            for (auto& item : layoutItems_) {
-                if (item.control == control) {
-                    return &item;
-                }
-            }
-            return nullptr;
-        };
         auto move = [&](HWND control, int x, int y, int width, int height) {
-            if (control) {
-                if (LayoutItem* cached = findLayoutItem(control)) {
-                    const RECT placed{x, y - pageScrollY_, x + width, y - pageScrollY_ + height};
-                    if (cached->placedValid &&
-                        cached->placed.left == placed.left &&
-                        cached->placed.top == placed.top &&
-                        cached->placed.right == placed.right &&
-                        cached->placed.bottom == placed.bottom) {
-                        showWindowIfHidden(control);
-                        return;
-                    }
-                    cached->placed = placed;
-                    cached->placedValid = true;
-                }
-                changed = moveWindowIfChanged(control, x, y - pageScrollY_, width, height) || changed;
-                changed = showWindowIfHidden(control) || changed;
-            }
+            changed = movePlacedControl(control, x, y, width, height) || changed;
         };
 
         // Headings in build order map to the three columns.
@@ -336,15 +315,7 @@ bool MainWindow::layoutCurrentPage() {
                 editBottom + kPanelPadding});
         }
 
-        SCROLLINFO scroll{};
-        scroll.cbSize = sizeof(scroll);
-        scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-        scroll.nMin = 0;
-        scroll.nMax = std::max(0, pageContentHeight_ - 1);
-        scroll.nPage = static_cast<UINT>(viewportHeight);
-        scroll.nPos = pageScrollY_;
-        SetScrollInfo(pageHost_, SB_VERT, &scroll, TRUE);
-        ShowScrollBar(pageHost_, SB_VERT, pageContentHeight_ > viewportHeight);
+        updatePageScrollBar(pageHost_, viewportHeight, pageContentHeight_, pageScrollY_);
 
         if (changed) {
             InvalidateRect(pageHost_, nullptr, FALSE);
@@ -445,18 +416,11 @@ bool MainWindow::layoutCurrentPage() {
         // Tabs are registered in layoutItems_ like any other control (they are
         // merely excluded from content scaling), so reuse their placed cache
         // instead of pushing an unconditional move on every layout tick.
-        auto placedCacheFor = [this](HWND control) -> LayoutItem* {
-            const auto found = std::find_if(
-                layoutItems_.begin(),
-                layoutItems_.end(),
-                [control](const LayoutItem& item) { return item.control == control; });
-            return found != layoutItems_.end() ? &*found : nullptr;
-        };
         int x = kLayoutPadding;
         for (HWND button : settingsCategoryButtons_) {
             if (button) {
                 RECT rect{x, kLayoutPadding, x + tabWidth, kLayoutPadding + kSettingsCategoryTabHeight};
-                placements.push_back(Placement{button, rect, kSettingsCategoryTabHeight, placedCacheFor(button)});
+                placements.push_back(Placement{button, rect, kSettingsCategoryTabHeight, layoutItemFor(button)});
                 contentBottom = std::max(contentBottom, static_cast<int>(rect.bottom));
             }
             x += tabWidth + kSettingsCategoryTabGap;
@@ -593,15 +557,7 @@ bool MainWindow::layoutCurrentPage() {
     const int maxScroll = std::max(0, pageContentHeight_ - viewportHeight);
     pageScrollY_ = std::clamp(pageScrollY_, 0, maxScroll);
 
-    SCROLLINFO scroll{};
-    scroll.cbSize = sizeof(scroll);
-    scroll.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    scroll.nMin = 0;
-    scroll.nMax = std::max(0, pageContentHeight_ - 1);
-    scroll.nPage = static_cast<UINT>(viewportHeight);
-    scroll.nPos = pageScrollY_;
-    SetScrollInfo(pageHost_, SB_VERT, &scroll, TRUE);
-    ShowScrollBar(pageHost_, SB_VERT, pageContentHeight_ > viewportHeight);
+    updatePageScrollBar(pageHost_, viewportHeight, pageContentHeight_, pageScrollY_);
 
     // Collect the moves that actually change a control's rect (comparing
     // against the last-applied rect instead of querying GetWindowRect per

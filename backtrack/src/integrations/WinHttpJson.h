@@ -178,7 +178,7 @@ inline std::optional<std::wstring> parseJsonStringAt(std::string_view json, size
     return std::nullopt;
 }
 
-inline std::optional<std::wstring> jsonStringField(std::string_view object, std::string_view field) {
+inline std::optional<size_t> jsonValuePos(std::string_view object, std::string_view field) {
     const std::string pattern = "\"" + std::string(field) + "\"";
     size_t pos = object.find(pattern);
     if (pos == std::string_view::npos) {
@@ -188,8 +188,29 @@ inline std::optional<std::wstring> jsonStringField(std::string_view object, std:
     if (pos == std::string_view::npos) {
         return std::nullopt;
     }
-    pos = skipJsonWhitespace(object, pos + 1);
-    return parseJsonStringAt(object, pos);
+    return skipJsonWhitespace(object, pos + 1);
+}
+
+inline std::optional<std::wstring> jsonStringField(std::string_view object, std::string_view field) {
+    const auto pos = jsonValuePos(object, field);
+    return pos ? parseJsonStringAt(object, *pos) : std::nullopt;
+}
+
+inline void ignoreServerCertificate(HINTERNET request) {
+    // local game client only: its endpoint serves a self-signed cert.
+    DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+    WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+}
+
+inline std::optional<DWORD> httpResponseStatus(HINTERNET request) {
+    DWORD statusCode = 0;
+    DWORD statusCodeSize = sizeof(statusCode);
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX)) {
+        return std::nullopt;
+    }
+    return statusCode;
 }
 
 struct AsyncHttpRequestState {
@@ -249,9 +270,7 @@ inline std::optional<std::string> httpGetBody(
     owner.release();
 
     if (ignoreCert && session.secure) {
-        DWORD securityFlags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-            SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-        WinHttpSetOption(request.value, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+        ignoreServerCertificate(request.value);
     }
 
     auto cancelled = [&] {
@@ -279,11 +298,9 @@ inline std::optional<std::string> httpGetBody(
         return std::nullopt;
     }
 
-    DWORD statusCode = 0;
-    DWORD statusCodeSize = sizeof(statusCode);
-    if (!WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX) || statusCode != 200) {
-        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status=" + std::to_wstring(statusCode));
+    const auto statusCode = httpResponseStatus(request.value);
+    if (statusCode != 200) {
+        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status=" + std::to_wstring(statusCode.value_or(0)));
         return std::nullopt;
     }
 
@@ -325,13 +342,7 @@ inline std::optional<std::string> httpGetBody(
     }
 
     if (ignoreCert) {
-        // Local game client only: its endpoint serves a self-signed cert.
-        DWORD securityFlags =
-            SECURITY_FLAG_IGNORE_UNKNOWN_CA |
-            SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
-            SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
-            SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-        WinHttpSetOption(request.value, WINHTTP_OPTION_SECURITY_FLAGS, &securityFlags, sizeof(securityFlags));
+        ignoreServerCertificate(request.value);
     }
 
     if (!WinHttpSendRequest(
@@ -344,17 +355,9 @@ inline std::optional<std::string> httpGetBody(
         return std::nullopt;
     }
 
-    DWORD statusCode = 0;
-    DWORD statusCodeSize = sizeof(statusCode);
-    if (!WinHttpQueryHeaders(
-            request.value,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            WINHTTP_HEADER_NAME_BY_INDEX,
-            &statusCode,
-            &statusCodeSize,
-            WINHTTP_NO_HEADER_INDEX) ||
-        statusCode != 200) {
-        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status=" + std::to_wstring(statusCode));
+    const auto statusCode = httpResponseStatus(request.value);
+    if (statusCode != 200) {
+        Logger::instance().debug(logSubsystem, L"HTTP GET unexpected status=" + std::to_wstring(statusCode.value_or(0)));
         return std::nullopt;
     }
 

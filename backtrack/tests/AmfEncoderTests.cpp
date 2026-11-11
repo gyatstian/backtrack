@@ -28,11 +28,17 @@ struct AmfEncoderTestAccess {
     }
 
     static void updateCaps(AmfEncoder& owner) { owner.impl_->updateCapabilities(L"fake"); }
-    static bool configure(AmfEncoder& owner) {
+    static bool configure(AmfEncoder& owner, const EncoderEffectiveSettings& effective) {
         auto& impl = *owner.impl_;
-        const auto effective = effectiveSettingsFor(impl.settings);
         return impl.isHevc() ? impl.configureHevc(effective) : impl.configureAvc(effective);
     }
+    static bool configure(AmfEncoder& owner) {
+        return configure(owner, effectiveSettingsFor(owner.impl_->settings));
+    }
+    static void updateDetail(AmfEncoder& owner, const EncoderEffectiveSettings& requested) {
+        owner.impl_->updateActiveDetail(requested);
+    }
+    static bool createComponent(AmfEncoder& owner) { return owner.impl_->createComponent(); }
     static bool switchFormat(AmfEncoder& owner) {
         return owner.impl_->switchInputFormat(amf::AMF_SURFACE_BGRA);
     }
@@ -215,10 +221,14 @@ struct FakeContext : PropertyStorage<amf::AMFContext> {
 struct FakeFactory : amf::AMFFactory {
     FakeComponent* next = nullptr;
     int creates = 0;
+    AMF_RESULT createResult = AMF_OK;
+    std::wstring lastComponentId;
     AMF_RESULT AMF_STD_CALL CreateContext(amf::AMFContext**) override { return AMF_NOT_IMPLEMENTED; }
-    AMF_RESULT AMF_STD_CALL CreateComponent(amf::AMFContext*, const wchar_t*, amf::AMFComponent** component) override {
+    AMF_RESULT AMF_STD_CALL CreateComponent(amf::AMFContext*, const wchar_t* id, amf::AMFComponent** component) override {
         ++creates;
-        if (!next) return AMF_FAIL;
+        lastComponentId = id;
+        if (createResult != AMF_OK) return createResult;
+        if (!next) return AMF_OK;
         next->Acquire();
         *component = next;
         return AMF_OK;
@@ -338,6 +348,85 @@ void testLookaheadReportsOnlyConfiguredFeatures() {
                 expect(AmfEncoderTestAccess::delay(encoder) == 0 && AmfEncoderTestAccess::inFlightCap(encoder) == 16,
                     "the requested lookahead leaked into timing or the retention budget");
             }
+        }
+    }
+}
+
+void testEffectiveSettingsDoNotOverwriteRequests() {
+    for (const auto codec : {VideoCodec::H264, VideoCodec::Hevc}) {
+        for (const bool supported : {false, true}) {
+            FakeComponent component;
+            FakeContext context;
+            FakeFactory factory;
+            AmfEncoder encoder;
+            auto settings = requestedSettings(codec);
+            settings.encoderPreset = EncoderPreset::P7;
+            settings.encoderSpatialAQ = true;
+            settings.encoderAQStrength = 12;
+            settings.encoderTemporalAQ = true;
+            settings.encoderMultipass = EncoderMultipass::FullResolution;
+            settings.encoderReferenceFrames = 4;
+            auto requested = effectiveSettingsFor(settings);
+            setCaps(component, supported, true);
+            component.caps.seed(codec == VideoCodec::H264 ? AMF_VIDEO_ENCODER_CAP_MAX_REFERENCE_FRAMES
+                : AMF_VIDEO_ENCODER_HEVC_CAP_MAX_REFERENCE_FRAMES,
+                amf::AMFVariant(static_cast<amf_int64>(supported ? 4 : 1)));
+            AmfEncoderTestAccess::attach(encoder, &component, &context, &factory, settings);
+            AmfEncoderTestAccess::updateCaps(encoder);
+            expect(AmfEncoderTestAccess::configure(encoder, requested), "effective-settings configuration failed");
+            expect(requested.lookahead && requested.lookaheadDepth == 24 && requested.temporalAQ &&
+                   requested.multipass == EncoderMultipass::FullResolution && requested.adaptiveBFrames &&
+                   requested.adaptiveIFrames && requested.bFrames && !requested.zeroReorderDelay &&
+                   requested.referenceFrames == 4,
+                "publishing AMF effective settings overwrote the request");
+            const auto effective = encoder.capabilities().effective;
+            const bool bFrames = codec == VideoCodec::H264 && supported;
+            expect(!effective.lookahead && effective.lookaheadDepth == 0 && !effective.temporalAQ &&
+                   effective.multipass == EncoderMultipass::Disabled && !effective.adaptiveBFrames &&
+                   !effective.adaptiveIFrames && effective.bFrames == bFrames &&
+                   effective.zeroReorderDelay == !bFrames && effective.referenceFrames == (supported ? 4u : 1u),
+                "AMF effective settings did not mask unsupported features or retain established timing");
+            expect(effective.profile == requested.profile && effective.preset == requested.preset &&
+                   effective.mode == requested.mode && effective.spatialAQ && effective.aqStrength == 12,
+                "AMF publishing changed an unrelated effective setting");
+            AmfEncoderTestAccess::updateDetail(encoder, requested);
+            const std::wstring detail = std::wstring(L"AMF ") + (codec == VideoCodec::H264 ? L"AVC" : L"HEVC") +
+                L" Direct3D 11 session active; lookahead is unsupported by the AMF backend" +
+                (bFrames ? L"" : L"; B-frames are unavailable");
+            const auto lines = Logger::instance().recentLines(1);
+            expect(encoder.capabilities().detail == detail && !lines.empty() &&
+                   lines.back().find(detail) != std::wstring::npos && lines.back().find(L"WARN") != std::wstring::npos,
+                "the AMF warning was emitted before the complete ordered detail was assembled");
+        }
+    }
+}
+
+void testComponentCreationFailureDetailsAndCallerLogging() {
+    for (const auto codec : {VideoCodec::H264, VideoCodec::Hevc}) {
+        for (const auto result : {AMF_NOT_SUPPORTED, AMF_OK}) {
+            FakeComponent oldComponent;
+            FakeContext context;
+            FakeFactory factory;
+            AmfEncoder encoder;
+            factory.createResult = result;
+            AmfEncoderTestAccess::attach(encoder, nullptr, &context, &factory, requestedSettings(codec));
+            const std::wstring detail = std::wstring(L"AMFFactory::CreateComponent(") +
+                (codec == VideoCodec::H264 ? L"AVC" : L"HEVC") + L") failed: " +
+                (result == AMF_OK ? L"AMF_OK" : L"AMF_NOT_SUPPORTED");
+            Logger::instance().info(L"encoder-test", L"before component creation");
+            const auto before = Logger::instance().recentLines(200);
+            expect(!AmfEncoderTestAccess::createComponent(encoder) && encoder.capabilities().detail == detail,
+                "component creation lost the codec-specific status detail or accepted a null component");
+            expect(Logger::instance().recentLines(200) == before,
+                "the component helper logged instead of leaving logging to its caller");
+            AmfEncoderTestAccess::attach(encoder, &oldComponent, &context, &factory, requestedSettings(codec));
+            expect(!AmfEncoderTestAccess::switchFormat(encoder), "the failed component replacement succeeded");
+            const auto lines = Logger::instance().recentLines(1);
+            expect(factory.creates == 2 && factory.lastComponentId ==
+                   (codec == VideoCodec::H264 ? AMFVideoEncoderVCE_AVC : AMFVideoEncoder_HEVC) &&
+                   encoder.capabilities().detail == detail && !lines.empty() &&
+                   lines.back().find(detail) != std::wstring::npos && lines.back().find(L"ERROR") != std::wstring::npos,
+                "the format-switch caller changed component selection, failure detail, or error logging");
         }
     }
 }
@@ -536,6 +625,8 @@ int main() {
     try {
         testTerminalOutputFailureDuringSwitch();
         testLookaheadReportsOnlyConfiguredFeatures();
+        testEffectiveSettingsDoNotOverwriteRequests();
+        testComponentCreationFailureDetailsAndCallerLogging();
         testPreAnalysisRejectionAndReadback();
         testBFramePatternControlsEffectiveTiming();
         testSuccessfulSwitchResetsTiming();

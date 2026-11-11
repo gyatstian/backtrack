@@ -64,8 +64,6 @@ public:
     uint32_t height() const override { return height_; }
     uint64_t cursorOnlyFrames() const override { return cursorOnlyFrames_; }
     uint64_t resolutionChangeCount() const override { return resolutionChanges_; }
-    uint64_t hdrChangeCount() const { return hdrChangeCount_; }
-    bool hdrActive() const { return !pool_.empty() && isHdrCaptureFormat(format_); }
     void setCursorCaptureEnabled(bool enabled) override { captureCursor_ = enabled; }
 
 private:
@@ -147,7 +145,6 @@ private:
     DXGI_FORMAT format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
     bool hdrPollState_ = false;
     bool legacyDuplication_ = false;
-    uint64_t hdrChangeCount_ = 0;
     uint64_t resolutionChanges_ = 0;
     std::chrono::steady_clock::time_point lastHdrPollAt_{};
     bool deviceLost_ = false;

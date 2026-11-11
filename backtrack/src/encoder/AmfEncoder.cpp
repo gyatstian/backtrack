@@ -544,6 +544,20 @@ struct AmfEncoder::Impl {
                (settings.width % 2) == 0 && (settings.height % 2) == 0;
     }
 
+    void publishEffective(EncoderEffectiveSettings effective) {
+        // report unconfigured features off rather than echoing the request.
+        effective.temporalAQ = false;
+        effective.multipass = EncoderMultipass::Disabled;
+        effective.adaptiveBFrames = false;
+        effective.adaptiveIFrames = false;
+        if (!caps.multipleReferenceFrames) {
+            effective.referenceFrames = 1;
+        }
+        effective.lookahead = false;
+        effective.lookaheadDepth = 0;
+        caps.effective = effective;
+    }
+
     bool configureAvc(const EncoderEffectiveSettings& effective) {
         const int64_t bitrate = static_cast<int64_t>(settings.bitrateKbps) * 1000;
         const uint32_t idrPeriod = std::max<uint32_t>(1, settings.fps * settings.gopSeconds);
@@ -612,20 +626,10 @@ struct AmfEncoder::Impl {
             return false;
         }
 
-        caps.effective = effective;
-        caps.effective.bFrames = bFrameDelayFrames != 0;
-        caps.effective.zeroReorderDelay = bFrameDelayFrames == 0;
-        // This backend does not configure the features below; report them as
-        // off instead of echoing requested-but-ignored settings.
-        caps.effective.temporalAQ = false;
-        caps.effective.multipass = EncoderMultipass::Disabled;
-        caps.effective.adaptiveBFrames = false;
-        caps.effective.adaptiveIFrames = false;
-        if (!caps.multipleReferenceFrames) {
-            caps.effective.referenceFrames = 1;
-        }
-        caps.effective.lookahead = false;
-        caps.effective.lookaheadDepth = 0;
+        auto applied = effective;
+        applied.bFrames = bFrameDelayFrames != 0;
+        applied.zeroReorderDelay = bFrameDelayFrames == 0;
+        publishEffective(applied);
         return true;
     }
 
@@ -688,20 +692,10 @@ struct AmfEncoder::Impl {
         }
         bFrameDelayFrames = 0;
 
-        caps.effective = effective;
-        caps.effective.bFrames = false; // AMF HEVC has no B-frame pattern control here.
-        caps.effective.zeroReorderDelay = true;
-        // This backend does not configure the features below; report them as
-        // off instead of echoing requested-but-ignored settings.
-        caps.effective.temporalAQ = false;
-        caps.effective.multipass = EncoderMultipass::Disabled;
-        caps.effective.adaptiveBFrames = false;
-        caps.effective.adaptiveIFrames = false;
-        if (!caps.multipleReferenceFrames) {
-            caps.effective.referenceFrames = 1;
-        }
-        caps.effective.lookahead = false;
-        caps.effective.lookaheadDepth = 0;
+        auto applied = effective;
+        applied.bFrames = false; // AMF HEVC has no B-frame pattern control here.
+        applied.zeroReorderDelay = true;
+        publishEffective(applied);
         return true;
     }
 
@@ -711,24 +705,29 @@ struct AmfEncoder::Impl {
         if (requested.lookahead) {
             caps.detail += L"; lookahead is unsupported by the AMF backend";
         }
-        if (requested.bFrames && !requested.zeroReorderDelay && !caps.effective.bFrames) {
+        const bool bFramesDropped = requested.bFrames && !requested.zeroReorderDelay && !caps.effective.bFrames;
+        if (bFramesDropped) {
             caps.detail += L"; B-frames are unavailable";
         }
-        if (requested.lookahead || (requested.bFrames && !requested.zeroReorderDelay && !caps.effective.bFrames)) {
+        if (requested.lookahead || bFramesDropped) {
             Logger::instance().warning(L"encoder", caps.detail);
         }
     }
 
-    bool initializeEncoder(ID3D11Device* device, const std::wstring& adapterName) {
-        if (!loadFactory() || !openContext(device)) {
-            return false;
-        }
-
+    bool createComponent() {
         const wchar_t* componentId = isHevc() ? AMFVideoEncoder_HEVC : AMFVideoEncoderVCE_AVC;
         AMF_RESULT result = factory->CreateComponent(context, componentId, &encoder);
         if (result != AMF_OK || !encoder) {
             caps.detail = std::wstring(L"AMFFactory::CreateComponent(") +
                           (isHevc() ? L"HEVC" : L"AVC") + L") failed: " + amfResultName(result);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool initializeEncoder(ID3D11Device* device, const std::wstring& adapterName) {
+        if (!loadFactory() || !openContext(device) || !createComponent()) {
             return false;
         }
 
@@ -852,11 +851,7 @@ struct AmfEncoder::Impl {
         encoder = nullptr;
 
         inputSurfaceFormat = format;
-        const wchar_t* componentId = isHevc() ? AMFVideoEncoder_HEVC : AMFVideoEncoderVCE_AVC;
-        AMF_RESULT result = factory->CreateComponent(context, componentId, &encoder);
-        if (result != AMF_OK || !encoder) {
-            caps.detail = std::wstring(L"AMFFactory::CreateComponent(") +
-                          (isHevc() ? L"HEVC" : L"AVC") + L") failed: " + amfResultName(result);
+        if (!createComponent()) {
             Logger::instance().error(L"encoder", caps.detail);
             return false;
         }
@@ -1022,11 +1017,6 @@ struct AmfEncoder::Impl {
             // on any AMF_OK response, so a driver looping on unusable buffers
             // trips the idle bound above instead of resetting it forever.
             lastProgress = SteadyClock::now();
-
-            if (!waitForAll) {
-                // Drain everything currently ready, then return.
-                continue;
-            }
         }
         return true;
     }

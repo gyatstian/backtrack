@@ -61,9 +61,10 @@ application has focus, including while a game does.
 
 ## Verification
 
-`HotkeyServiceTests` (CTest) exercises modifier tracking and matching without a
-window. manually check hotkeys
-with a modifier held during registration, overlapping sides, and injected keys.
+`HotkeyServiceTests` (CTest) exercises modifier tracking, matching,
+modifier-only suppression through a message-only window, and unbound
+registration. manually check hotkeys with a modifier held during registration,
+overlapping sides, and injected keys.
 check that each hotkey fires while a different application is focused, that a
 game holding the combination still reaches Backtrack through the hook fallback,
 and that holding the key fires once.

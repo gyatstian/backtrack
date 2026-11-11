@@ -191,6 +191,48 @@ bool SessionMuteStore::restoreMuteLocked(const AppliedMute& mute, const SessionM
     return session.setMute && session.setMute(mute.record.previousMute);
 }
 
+std::unordered_set<std::wstring> SessionMuteStore::claimedSessionsLocked() const {
+    std::unordered_set<std::wstring> claimed;
+    for (const auto& mute : mutes_) {
+        claimed.insert(sessionKey(mute.endpointId, mute.instanceId));
+    }
+    return claimed;
+}
+
+uint32_t SessionMuteStore::restoreOrphanRecordsLocked(
+    const std::vector<SessionMuteCandidate>& sessions,
+    const std::function<bool(uint32_t)>& isProcessAlive,
+    std::unordered_set<std::wstring>& claimed) {
+    uint32_t restored = 0;
+    for (auto it = orphans_.begin(); it != orphans_.end();) {
+        const SessionMuteCandidate* session = findSessionForRecord(sessions, *it, claimed);
+        if (!session) {
+            if (isProcessAlive && !isProcessAlive(it->processId)) {
+                it = orphans_.erase(it);
+            } else {
+                ++it;
+            }
+            continue;
+        }
+        if (!session->muteStateKnown) {
+            ++it;
+            continue;
+        }
+        if (!session->muted) {
+            it = orphans_.erase(it);
+            continue;
+        }
+        if (!session->setMute || !session->setMute(it->previousMute)) {
+            ++it;
+            continue;
+        }
+        claimed.insert(sessionKey(session->endpointId, session->instanceId));
+        ++restored;
+        it = orphans_.erase(it);
+    }
+    return restored;
+}
+
 SessionMuteApplyResult SessionMuteStore::apply(const std::vector<std::wstring>& wantedKeys,
                                                SessionEnumerator enumerateSessions,
                                                std::function<bool(uint32_t)> isProcessAlive) {
@@ -222,10 +264,7 @@ SessionMuteApplyResult SessionMuteStore::apply(const std::vector<std::wstring>& 
     // still muted and still wanted becomes a live mute instead of being
     // restored and re-muted, so the state the user actually had is the one kept
     // for later.
-    std::unordered_set<std::wstring> claimed;
-    for (const auto& mute : mutes_) {
-        claimed.insert(sessionKey(mute.endpointId, mute.instanceId));
-    }
+    auto claimed = claimedSessionsLocked();
     for (auto it = orphans_.begin(); it != orphans_.end();) {
         const SessionMuteCandidate* session = findSessionForRecord(sessions, *it, claimed);
         if (!session) {
@@ -387,36 +426,8 @@ SessionMuteRestoreResult SessionMuteStore::clear(SessionEnumerator enumerateSess
         }
     }
 
-    std::unordered_set<std::wstring> claimed;
-    for (const auto& mute : mutes_) {
-        claimed.insert(sessionKey(mute.endpointId, mute.instanceId));
-    }
-    for (auto it = orphans_.begin(); it != orphans_.end();) {
-        const SessionMuteCandidate* session = findSessionForRecord(sessions, *it, claimed);
-        if (!session) {
-            if (isProcessAlive && !isProcessAlive(it->processId)) {
-                it = orphans_.erase(it);
-            } else {
-                ++it;
-            }
-            continue;
-        }
-        if (!session->muteStateKnown) {
-            ++it;
-            continue;
-        }
-        if (!session->muted) {
-            it = orphans_.erase(it);
-            continue;
-        }
-        if (!session->setMute || !session->setMute(it->previousMute)) {
-            ++it;
-            continue;
-        }
-        claimed.insert(sessionKey(session->endpointId, session->instanceId));
-        ++result.restored;
-        it = orphans_.erase(it);
-    }
+    auto claimed = claimedSessionsLocked();
+    result.restored += restoreOrphanRecordsLocked(sessions, isProcessAlive, claimed);
 
     result.unresolved = mutes_.size() + orphans_.size();
     if (!journalReadable) {
@@ -448,40 +459,8 @@ std::optional<SessionMuteSweepResult> SessionMuteStore::sweepOrphans(
     }
 
     SessionMuteSweepResult result;
-    std::unordered_set<std::wstring> claimed;
-    for (const auto& mute : mutes_) {
-        claimed.insert(sessionKey(mute.endpointId, mute.instanceId));
-    }
-    for (auto it = orphans_.begin(); it != orphans_.end();) {
-        const SessionMuteCandidate* session = findSessionForRecord(sessions, *it, claimed);
-        if (!session) {
-            if (isProcessAlive && !isProcessAlive(it->processId)) {
-                // The process is gone, so its sessions and their mutes are too.
-                it = orphans_.erase(it);
-            } else {
-                ++it;
-            }
-            continue;
-        }
-        // Only touch sessions still muted: if the user already unmuted the app
-        // after the crash, respect that instead of re-applying the journaled
-        // state blindly.
-        if (!session->muteStateKnown) {
-            ++it;
-            continue;
-        }
-        if (!session->muted) {
-            it = orphans_.erase(it);
-            continue;
-        }
-        if (!session->setMute || !session->setMute(it->previousMute)) {
-            ++it;
-            continue;
-        }
-        claimed.insert(sessionKey(session->endpointId, session->instanceId));
-        ++result.restored;
-        it = orphans_.erase(it);
-    }
+    auto claimed = claimedSessionsLocked();
+    result.restored = restoreOrphanRecordsLocked(sessions, isProcessAlive, claimed);
 
     // Consumed only after a sweep actually ran: the enumeration failure above
     // returns early, and entries the loop could not reach are rewritten, not
@@ -520,28 +499,9 @@ void SessionMuteStore::emergencyRestore(SessionEnumerator enumerateSessions) noe
                 ++it;
             }
         }
+        // Preserve crash-path pairing: no live claims and no process-liveness pruning.
         std::unordered_set<std::wstring> claimed;
-        for (auto it = orphans_.begin(); it != orphans_.end();) {
-            const SessionMuteCandidate* session = findSessionForRecord(sessions, *it, claimed);
-            if (!session) {
-                ++it;
-                continue;
-            }
-            if (!session->muteStateKnown) {
-                ++it;
-                continue;
-            }
-            if (!session->muted) {
-                it = orphans_.erase(it);
-                continue;
-            }
-            if (!session->setMute || !session->setMute(it->previousMute)) {
-                ++it;
-                continue;
-            }
-            claimed.insert(sessionKey(session->endpointId, session->instanceId));
-            it = orphans_.erase(it);
-        }
+        restoreOrphanRecordsLocked(sessions, {}, claimed);
 
         // Retire what was restored so the next launch does not restore it a
         // second time. A failed write leaves the old journal, which is

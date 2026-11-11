@@ -26,6 +26,19 @@ struct MainWindowSettingsTestAccess {
         window.setLibraryViewMode(enabled ? MainWindow::LibraryViewMode::Gallery : MainWindow::LibraryViewMode::List);
     }
     static bool commitDraft(MainWindow& window) { return window.commitSettings(window.settings_); }
+    static void read(MainWindow& window, AppSettings& target) { window.readVisibleSettingsInto(target); }
+    static void monitorControls(MainWindow& window, HWND multi, HWND focused, HWND mouse) {
+        window.multiMonitorSupportCheck_ = multi;
+        window.followFocusedMonitorCheck_ = focused;
+        window.followMouseMonitorCheck_ = mouse;
+    }
+    static void bindVoice(MainWindow& window, HWND control) {
+        window.voiceCommandCombo_ = control;
+        window.pageControls_.push_back(control);
+    }
+    static HWND voice(const MainWindow& window) { return window.voiceCommandCombo_; }
+    static void clearControls(MainWindow& window) { window.clearPageControls(); }
+    static void rebind(MainWindow& window) { window.rebindPageControlPointers(); }
     static void switchPages(MainWindow& window) {
         window.clearSettingsDirty();
         window.switchPage(MainWindow::Page::Settings);
@@ -238,6 +251,76 @@ void testImmediatePreferencesPreserveDraftsAndSavedValues() {
            "later independent commit lost published settings");
 }
 
+void testMissingCheckboxesPreserveSettings() {
+    const auto directory = testRoot() / L"missing_controls";
+    SettingsStore store(directory / L"settings.ini");
+    const auto initial = fixture(directory);
+    RecorderController controller;
+    MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Missing);
+    auto target = initial;
+    bool* fields[] = {
+        &target.multiMonitorSupport, &target.followFocusedMonitor, &target.followMouseMonitor,
+        &target.captureCursor, &target.captureSystemAudio, &target.captureMicrophone,
+        &target.audioInputAutoGainEnabled,
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+        &target.audioInputNoiseSuppressionEnabled,
+#endif
+        &target.startWithWindowsMinimized, &target.pruneStaleMicrophoneConsentEntries,
+        &target.exitToTray, &target.checkForUpdates,
+        &target.video.encoderLookahead, &target.video.encoderSpatialAQ, &target.video.encoderTemporalAQ,
+        &target.video.encoderBFrames, &target.video.encoderAdaptiveBFrames,
+        &target.video.encoderAdaptiveIFrames, &target.video.encoderZeroReorderDelay,
+        &target.gpu.allowIdleFrameSkipping, &target.gpu.stableMultimonitorFrames,
+        &target.replay.enabled, &target.replay.diskBackedVideo, &target.replay.diskBackedAudio,
+        &target.gameIntegrations.leagueOfLegendsKillReminder, &target.autoRecordEnabled,
+        &target.soundSeparationEnabled, &target.organizeClipsByGame,
+    };
+    for (bool value : {true, false}) {
+        for (bool* field : fields) {
+            *field = value;
+        }
+        const auto before = target;
+        MainWindowSettingsTestAccess::read(window, target);
+        expect(target == before, "absent checkbox changed its fallback setting");
+    }
+}
+
+struct Checkbox {
+    HWND handle = CreateWindowExW(0, L"BUTTON", L"", WS_POPUP | BS_AUTOCHECKBOX,
+        0, 0, 100, 24, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Checkbox() { expect(handle != nullptr, "could not create checkbox fixture"); }
+    ~Checkbox() { if (IsWindow(handle)) DestroyWindow(handle); }
+    void check(bool value) const { SendMessageW(handle, BM_SETCHECK, value ? BST_CHECKED : BST_UNCHECKED, 0); }
+};
+
+void testFollowMouseGateAndPageReset() {
+    const auto directory = testRoot() / L"monitor_controls";
+    SettingsStore store(directory / L"settings.ini");
+    const auto initial = fixture(directory);
+    RecorderController controller;
+    Checkbox multi, focused, mouse;
+    MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Missing);
+    MainWindowSettingsTestAccess::monitorControls(window, multi.handle, focused.handle, mouse.handle);
+    for (int bits = 0; bits < 8; ++bits) {
+        multi.check((bits & 1) != 0);
+        focused.check((bits & 2) != 0);
+        mouse.check((bits & 4) != 0);
+        auto target = initial;
+        MainWindowSettingsTestAccess::read(window, target);
+        expect(target.multiMonitorSupport == ((bits & 1) != 0) &&
+               target.followFocusedMonitor == ((bits & 2) != 0) &&
+               target.followMouseMonitor == (bits == 7), "follow-mouse gate or checkbox read changed");
+    }
+    MainWindowSettingsTestAccess::bindVoice(window, mouse.handle);
+    MainWindowSettingsTestAccess::clearControls(window);
+    expect(MainWindowSettingsTestAccess::voice(window) == nullptr, "page teardown retained the voice control");
+    expect(!IsWindow(mouse.handle), "page teardown did not destroy its control");
+    MainWindowSettingsTestAccess::bindVoice(window, focused.handle);
+    MainWindowSettingsTestAccess::rebind(window);
+    expect(MainWindowSettingsTestAccess::voice(window) == nullptr, "empty-host rebind retained the voice control");
+    MainWindowSettingsTestAccess::clearControls(window);
+}
+
 void testAutoRecordUsesAppliedSettings() {
     const auto directory = testRoot() / L"auto_record";
     SettingsStore store(directory / L"settings.ini");
@@ -273,6 +356,8 @@ int main() {
         testFailedStartupReadNeverOverwritesFile();
         testImmediatePreferencesPreserveDraftsAndSavedValues();
         testAutoRecordUsesAppliedSettings();
+        testMissingCheckboxesPreserveSettings();
+        testFollowMouseGateAndPageReset();
         std::filesystem::remove_all(testRoot());
         std::cout << "MainWindowSettingsTests passed\n";
         return 0;

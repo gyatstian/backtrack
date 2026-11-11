@@ -72,15 +72,12 @@ BlockLevels measureBlockLevels(const AudioPacket& packet, const AudioFormatInfo&
     // resolution over long blocks; the sum itself never allocates.
     uint64_t sampleCount = 0;
     double sumOfSquares = 0.0;
-    float peak = 0.0f;
     const uint8_t* data = packet.bytes.data();
     const size_t byteCount = packet.bytes.size();
     for (size_t offset = 0; offset + bytesPerSample <= byteCount; offset += bytesPerSample) {
         // Single decode path (8/16/24/32 + float32) owned by AudioConvert;
         // no hand-rolled integer magic here.
         const float value = decodeInterleavedSample(data + offset, format);
-        const float magnitude = std::fabs(value);
-        peak = std::max(peak, magnitude);
         sumOfSquares += static_cast<double>(value) * value;
         ++sampleCount;
     }
@@ -89,7 +86,6 @@ BlockLevels measureBlockLevels(const AudioPacket& packet, const AudioFormatInfo&
     }
     const double rms = std::sqrt(sumOfSquares / static_cast<double>(sampleCount));
     levels.rmsDb = rms > 0.0 ? static_cast<float>(20.0 * std::log10(rms)) : kAgcFloorDb;
-    levels.peakDb = peak > 0.0f ? 20.0f * std::log10(peak) : kAgcFloorDb;
     return levels;
 }
 

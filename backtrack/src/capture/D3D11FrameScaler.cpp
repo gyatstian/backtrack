@@ -66,13 +66,16 @@ bool D3D11FrameScaler::scale(
     // Same-size, same-format frames skip the video processor entirely. This
     // fast path never consumed the retry budget, so it runs before the slow
     // path instead of inside its loop.
-    if (input.width == outputWidth && input.height == outputHeight &&
-        input.format == outputFormat) {
+    const auto copyOrAlias = [&]() {
         if (!forceOutputTexture) {
             output = input;
             return true;
         }
         return tryFastCopy(device, input, outputWidth, outputHeight, outputFormat, output);
+    };
+    if (input.width == outputWidth && input.height == outputHeight &&
+        input.format == outputFormat) {
+        return copyOrAlias();
     }
 
     // Slow path: one VP attempt, then at most one SDR retry (HDR rejection)
@@ -95,11 +98,7 @@ bool D3D11FrameScaler::scale(
         // The downgrade can make a same-size BGRA frame copyable directly.
         if (input.width == outputWidth && input.height == outputHeight &&
             input.format == outputFormat) {
-            if (!forceOutputTexture) {
-                output = input;
-                return true;
-            }
-            return tryFastCopy(device, input, outputWidth, outputHeight, outputFormat, output);
+            return copyOrAlias();
         }
         outcome = tryVpBlt(
             device, input, outputWidth, outputHeight, outputFormat, output,
@@ -351,8 +350,7 @@ void D3D11FrameScaler::applyVideoProcessorState(const VpState& state) {
             inputColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
         }
     }
-    // Legacy path programs no input color space, so nothing tone-maps there:
-    // report no HDR mapping so hdrMappingActive() stays truthful.
+    // the legacy path applies no HDR input space, so it cannot reject one.
     appliedHdrInputSpace_ =
         state.colorSpace1Path &&
         inputColorSpace != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
@@ -441,10 +439,6 @@ void D3D11FrameScaler::reset() {
 
 bool D3D11FrameScaler::hdrInputRejected() const {
     return hdrInputRejected_;
-}
-
-bool D3D11FrameScaler::hdrMappingActive() const {
-    return appliedHdrInputSpace_;
 }
 
 uint64_t D3D11FrameScaler::poolGeneration() const {

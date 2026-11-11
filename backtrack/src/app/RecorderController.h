@@ -396,7 +396,6 @@ private:
     mutable std::atomic<bool> systemAudioSilenceWarned_{false};
     mutable std::atomic<bool> microphoneAudioSilenceWarned_{false};
     std::atomic<int64_t> lastEncodedVideoPts100ns_{0};
-    std::atomic<int64_t> videoTimelineEndPts100ns_{0};
     // Pipeline-stall watchdog (diagnostics only). Tracks the newest encoded
     // video PTS so stats() can warn when a capture/encode pipeline that should
     // be running stops advancing (frozen GPU/NVENC). mutable/inline so the

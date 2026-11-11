@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace backtrack {
@@ -162,6 +163,10 @@ private:
     // session is already unmuted, or SetMute succeeded. False keeps the record
     // for the next attempt. `session` must not be null.
     static bool restoreMuteLocked(const AppliedMute& mute, const SessionMuteCandidate& session);
+    std::unordered_set<std::wstring> claimedSessionsLocked() const;
+    uint32_t restoreOrphanRecordsLocked(const std::vector<SessionMuteCandidate>& sessions,
+                                       const std::function<bool(uint32_t)>& isProcessAlive,
+                                       std::unordered_set<std::wstring>& claimed);
 
     std::filesystem::path journalPath_;
     std::mutex mutex_;

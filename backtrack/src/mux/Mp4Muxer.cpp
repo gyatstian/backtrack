@@ -145,12 +145,12 @@ bool configureVideoStream(IMFSinkWriter* writer, const MuxedInputs& inputs, DWOR
 
     hr = writer->AddStream(mediaType.Get(), &streamIndex);
     if (FAILED(hr)) {
-        Logger::instance().error(L"mux", L"Native MP4 mux could not add video stream: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not add video stream: " + formatHresult(hr));
         return false;
     }
     hr = writer->SetInputMediaType(streamIndex, mediaType.Get(), nullptr);
     if (FAILED(hr)) {
-        Logger::instance().error(L"mux", L"Native MP4 mux could not set video input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not set video input type: " + formatHresult(hr));
         return false;
     }
     return true;
@@ -172,7 +172,7 @@ bool configureAudioStream(IMFSinkWriter* writer, const WavInfo& wav, DWORD& stre
 
     hr = writer->AddStream(outputType.Get(), &streamIndex);
     if (FAILED(hr)) {
-        Logger::instance().error(L"mux", L"Native MP4 mux could not add audio stream: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not add audio stream: " + formatHresult(hr));
         return false;
     }
 
@@ -206,13 +206,13 @@ bool configureAudioStream(IMFSinkWriter* writer, const WavInfo& wav, DWORD& stre
     }
 
     if (FAILED(hr)) {
-        Logger::instance().error(L"mux", L"Native MP4 mux could not create audio input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not create audio input type: " + formatHresult(hr));
         return false;
     }
 
     hr = writer->SetInputMediaType(streamIndex, inputType.Get(), nullptr);
     if (FAILED(hr)) {
-        Logger::instance().error(L"mux", L"Native MP4 mux could not set audio input type: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+        Logger::instance().error(L"mux", L"Native MP4 mux could not set audio input type: " + formatHresult(hr));
         return false;
     }
     return true;
@@ -318,7 +318,7 @@ bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInpu
 
         hr = writer->WriteSample(streamIndex, sample.Get());
         if (FAILED(hr)) {
-            Logger::instance().error(L"mux", L"Native MP4 mux could not write video sample: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+            Logger::instance().error(L"mux", L"Native MP4 mux could not write video sample: " + formatHresult(hr));
             return false;
         }
     }
@@ -376,7 +376,7 @@ bool writeAudioSamples(
 
         hr = writer->WriteSample(streamIndex, sample.Get());
         if (FAILED(hr)) {
-            Logger::instance().error(L"mux", L"Native MP4 mux could not write audio sample: 0x" + std::to_wstring(static_cast<uint32_t>(hr)));
+            Logger::instance().error(L"mux", L"Native MP4 mux could not write audio sample: " + formatHresult(hr));
             return false;
         }
         framesWritten += framesThisChunk;

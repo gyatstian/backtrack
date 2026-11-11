@@ -116,11 +116,7 @@ void MainWindow::releaseClipThumbnailCache() {
 
 void MainWindow::loadClipThumbnails() {
     clearClipThumbnails();
-    if (page_ != Page::Library || libraryViewMode_ != LibraryViewMode::Gallery) {
-        releaseClipThumbnailCache();
-        return;
-    }
-    if (clips_.empty()) {
+    if (page_ != Page::Library || libraryViewMode_ != LibraryViewMode::Gallery || clips_.empty()) {
         releaseClipThumbnailCache();
         return;
     }
@@ -393,9 +389,6 @@ size_t MainWindow::clipIndexAtPoint(POINT point) const {
     }
 
     const int row = LOWORD(hit);
-    if (row < 0) {
-        return static_cast<size_t>(-1);
-    }
     if (libraryViewMode_ != LibraryViewMode::Gallery) {
         return clipIndexFromListItem(static_cast<UINT>(row));
     }
@@ -709,8 +702,7 @@ void MainWindow::populateClipListRows() {
     SendMessageW(clipList_, LB_INITSTORAGE, static_cast<WPARAM>(rowCount), 0);
 
     if (libraryViewMode_ == LibraryViewMode::Gallery) {
-        const size_t rows = (clips_.size() + kGalleryClipColumns - 1) / kGalleryClipColumns;
-        for (size_t row = 0; row < rows; ++row) {
+        for (size_t row = 0; row < rowCount; ++row) {
             const auto index = SendMessageW(clipList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L""));
             if (index != LB_ERR) {
                 SendMessageW(clipList_, LB_SETITEMDATA, static_cast<WPARAM>(index), static_cast<LPARAM>(row));

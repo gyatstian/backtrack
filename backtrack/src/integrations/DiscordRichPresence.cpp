@@ -215,6 +215,12 @@ void DiscordRichPresence::workerLoop() {
     // An exception leaving a std::thread entry point calls std::terminate, so an
     // internal fault here may only cost Rich Presence, never the app.
     static std::atomic<uint64_t> faultCount{0};
+    auto clearActivity = [this](bool exitClear) {
+        std::ostringstream payload;
+        payload << "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" << GetCurrentProcessId()
+                << ",\"activity\":null},\"nonce\":\"" << nonceString() << "\"}";
+        return sendFrame(kOpcodeFrame, payload.str(), exitClear);
+    };
 
     try {
         std::string lastGameName;
@@ -291,10 +297,7 @@ void DiscordRichPresence::workerLoop() {
                     }
                 } else if (activityShown) {
                     // Foreground left fullscreen; clear the displayed activity.
-                    std::ostringstream payload;
-                    payload << "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" << GetCurrentProcessId()
-                            << ",\"activity\":null},\"nonce\":\"" << nonceString() << "\"}";
-                    if (!sendFrame(kOpcodeFrame, payload.str())) {
+                    if (!clearActivity(false)) {
                         Logger::instance().warning(L"discord", L"Discord activity clear failed");
                         disconnect();
                         nextReconnect = SteadyClock::now() + kReconnectInterval;
@@ -324,10 +327,7 @@ void DiscordRichPresence::workerLoop() {
     // an unresponsive peer must not hold shutdown while clearing presence.
     if (pipe_) {
         try {
-            std::ostringstream payload;
-            payload << "{\"cmd\":\"SET_ACTIVITY\",\"args\":{\"pid\":" << GetCurrentProcessId()
-                    << ",\"activity\":null},\"nonce\":\"" << nonceString() << "\"}";
-            sendFrame(kOpcodeFrame, payload.str(), true);
+            clearActivity(true);
         } catch (const std::exception& error) {
             Logger::instance().warning(L"discord",
                 L"Discord activity clear failed before exit: " + utf8ToWide(error.what()));

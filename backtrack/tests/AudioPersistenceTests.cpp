@@ -14,6 +14,7 @@
 #include <Windows.h>
 #include <mmreg.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -225,6 +226,59 @@ void testLongOutagePreservesGapDuration() {
     std::filesystem::remove_all(testOutputDir(), error);
 }
 
+void testSilenceFramesStayAlignedAcrossChunks() {
+    const auto dir = testOutputDir() / L"silence";
+    std::filesystem::create_directories(dir);
+    const auto path = dir / L"three-channel.wav";
+    auto format = pcm16Stereo();
+    auto* wave = reinterpret_cast<WAVEFORMATEX*>(format.bytes.data());
+    wave->nChannels = 3;
+    wave->nBlockAlign = 6;
+    wave->nAvgBytesPerSec = wave->nSamplesPerSec * wave->nBlockAlign;
+
+    WavWriter writer;
+    expect(!writer.writeSilenceFrames(1), "silence was accepted before open");
+    expect(writer.open(path, format), "could not open the silence fixture");
+    expect(writer.writeSilenceFrames(0) && writer.dataBytes() == 0,
+        "zero silence frames changed the stream");
+    constexpr uint64_t frames = 21847;
+    expect(writer.writeSilenceFrames(frames) && writer.writeSilenceFrames(1),
+        "frame-aligned silence failed across chunk boundaries");
+    expect(writer.dataBytes() == (frames + 1) * 6, "silence lost a partial chunk");
+    writer.close();
+
+    backtrack::WavInfo info;
+    expect(backtrack::parseWav(path, info) && info.blockAlign == 6 && info.dataBytes == (frames + 1) * 6,
+        "silence extent or format did not round trip");
+    {
+        std::ifstream stream(path, std::ios::binary);
+        stream.seekg(static_cast<std::streamoff>(info.dataOffset));
+        std::vector<uint8_t> payload(static_cast<size_t>(info.dataBytes), 0xff);
+        stream.read(reinterpret_cast<char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+        expect(stream && std::all_of(payload.begin(), payload.end(), [](uint8_t byte) { return byte == 0; }),
+            "silence payload was not entirely zero");
+    }
+    std::filesystem::remove_all(dir);
+}
+
+void testWavWriterCanReopenItsOwnPath() {
+    const auto dir = testOutputDir() / L"reopen";
+    std::filesystem::create_directories(dir);
+    const auto path = dir / L"reopened.wav";
+    WavWriter writer;
+    expect(writer.open(path, pcm16Stereo()) && writer.writeSilenceFrames(5),
+        "could not prepare the reopen fixture");
+    expect(writer.open(writer.path(), pcm16Stereo()), "reopening the writer's own path failed");
+    expect(writer.path() == path && writer.dataBytes() == 0 && writer.blockAlign() == 4 &&
+           writer.samplesPerSec() == 48000, "reopening did not reset the WAV state");
+    expect(writer.writeSilenceFrames(1), "could not write the reopened WAV");
+    writer.close();
+    backtrack::WavInfo info;
+    expect(backtrack::parseWav(path, info) && info.dataBytes == 4,
+        "reopened WAV retained the previous payload or header extent");
+    std::filesystem::remove_all(dir);
+}
+
 // --- markers beyond the RIFF boundary ---
 
 void testWritesPastRiffBoundaryAreKept() {
@@ -264,6 +318,8 @@ int main() {
         testValidWavMixes();
         testLongOutagePreservesGapDuration();
         testWritesPastRiffBoundaryAreKept();
+        testSilenceFramesStayAlignedAcrossChunks();
+        testWavWriterCanReopenItsOwnPath();
         std::cout << "AudioPersistence tests passed\n";
         return 0;
     } catch (const std::exception& error) {

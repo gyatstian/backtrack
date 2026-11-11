@@ -60,16 +60,11 @@ bool isNewEvent(int64_t eventId, double eventTime, int64_t lastEventId, double l
 }
 
 std::optional<int64_t> jsonIntField(std::string_view object, std::string_view field) {
-    const std::string pattern = "\"" + std::string(field) + "\"";
-    size_t pos = object.find(pattern);
-    if (pos == std::string_view::npos) {
+    const auto valuePos = jsonValuePos(object, field);
+    if (!valuePos) {
         return std::nullopt;
     }
-    pos = object.find(':', pos + pattern.size());
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-    pos = skipJsonWhitespace(object, pos + 1);
+    size_t pos = *valuePos;
     const size_t start = pos;
     if (pos < object.size() && object[pos] == '-') {
         ++pos;
@@ -93,16 +88,11 @@ std::optional<int64_t> jsonIntField(std::string_view object, std::string_view fi
 }
 
 std::optional<double> jsonDoubleField(std::string_view object, std::string_view field) {
-    const std::string pattern = "\"" + std::string(field) + "\"";
-    size_t pos = object.find(pattern);
-    if (pos == std::string_view::npos) {
+    const auto valuePos = jsonValuePos(object, field);
+    if (!valuePos) {
         return std::nullopt;
     }
-    pos = object.find(':', pos + pattern.size());
-    if (pos == std::string_view::npos) {
-        return std::nullopt;
-    }
-    pos = skipJsonWhitespace(object, pos + 1);
+    size_t pos = *valuePos;
     const size_t start = pos;
     while (pos < object.size()) {
         const char ch = object[pos];

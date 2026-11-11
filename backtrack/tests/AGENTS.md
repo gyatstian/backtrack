@@ -54,22 +54,22 @@ build.
     on a full queue without disturbing the head, `size()` hand-computed across
     a wrap and never above capacity, `clear()`, and `resetCapacity` including
     the zero-request clamp to 1.
-  - `HdrStabilityTests` - `capture/HdrStability.h` alone, so the header must
-    stay free of project includes. Desktop Duplication format negotiation, the
-    HDR format predicate, and the rejection cooldown.
+  - `HdrStabilityTests` - header-inline helpers in `capture/HdrStability.h`
+    and `platform/Win32Util.h`: format negotiation, HDR/advanced-color
+    predicates, and rejection cooldown.
   - `AudioConvertTests` - `audio/AudioConvert.cpp`, `core/Logger.cpp`:
-    canonical conversion (passthrough, resample, mono duplication, 5.1 downmix,
-    rejection of an unsupported format), the `applyMuteGain` primitive, and that
-    a mid-stream format change still leaves every packet on one uniform format.
+    canonical conversion, extensible-format and channel-mask guards,
+    `applyMuteGain`, and uniform packets across mid-stream format changes.
   - `SessionMuteStoreTests` - `audio/SessionMuteStore.cpp`, `core/Logger.cpp`.
     The journal codec, write-after-every-mute with atomic publish, stale
-    pruning, the orphan sweep, and the try_lock-only crash path.
+    pruning, one-to-one live/orphan claims, and retryable crash-path restore.
   - `ReplayBufferTests` - `replay/ReplayBuffer.cpp`, `mux/RecoveryStore.cpp`,
     `audio/AudioConvert.cpp`, `audio/WavReader.cpp`, `mux/WavWriter.cpp`,
     `encoder/BitstreamUtils.cpp`, `core/Logger.cpp`. Both backends, trimming and
     wrap reassembly, the `RecoveryStore` manifest rules, the audio gap fill
     keeping the real outage duration, the unpatched-WAV fallback, the bitstream
-    classifiers, and the mux- and ring-read-failure save paths. `Mp4Muxer.cpp`
+    classifiers (parameter-set completeness and truncated/trailing input),
+    and the mux- and ring-read-failure save paths. `Mp4Muxer.cpp`
     stays out (see the stub rule below).
   - `RingFileTests` - `replay/RingFile.h` plus `core/Logger.cpp`: wrap and
     partial reads, immediate and completed errors, a real pending pipe read, and
@@ -89,7 +89,8 @@ build.
   - `AudioPersistenceTests` - `audio/AudioMix.cpp`, `audio/WavReader.cpp`,
     `mux/WavWriter.cpp`, `core/Logger.cpp`: the mix source policy (read-denied
     and locked WAVs fail, absent or empty tracks stay video-only), the full-gap
-    fill, and writes past the 4 GiB RIFF boundary.
+    fill, frame-aligned silence, same-path reopen, and writes past the 4 GiB
+    RIFF boundary.
   - `Mp4MuxerTests` - `mux/Mp4Muxer.cpp`, `mux/RecoveryStore.cpp`,
     `mux/WavReader.cpp`, `mux/WavWriter.cpp`, `audio/WavReader.cpp`,
     `audio/AudioConvert.cpp`, `audio/AudioMix.cpp`, `core/Logger.cpp`,
@@ -99,38 +100,45 @@ build.
   - `StorageLayoutTests` - the `ReplayBufferTests` source set plus
     `clips/ClipManager.cpp`, `LIBS propsys`: reservation collisions, the shared
     root rules, game-root and nested recovery, and that recovery muxes an owned
-    work copy so the original session survives.
+    work copy so the original session survives; clear/disable/re-enable ring
+    lifecycle and stale-audio removal.
   - `LoggerDiagnosticsTests` - `core/Logger.cpp`, `ui/DiagnosticsLog.cpp`:
     rate limiting, pruning, stream failure, diagnostics export, an unarchivable
     previous log left untruncated, and a `recentLines` poll reporting the pending
     group without emitting it.
   - `PendingDurationTrackerTests` - `app/PendingDurationTracker.h` alone.
-  - `RecorderControllerCutoffTests`, `RecorderControllerLeaseTests`,
-    `RecorderControllerShutdownOrderingTests` - header-inline controller
-    helpers only (`RecordingCutoffTracker.h`, `CaptureFrameHandoff.h`,
-    `AudioDrain.h`, `pipelineEncoderFaulted`, `EncoderFaultBackoff`,
-    `encoderBehindBudget`), no
-    controller sources.
+  - `RecorderControllerCutoffTests`, `RecorderControllerLeaseTests` -
+    header-inline controller helpers only (`RecordingCutoffTracker.h`,
+    `CaptureFrameHandoff.h`, `pipelineEncoderFaulted`, `EncoderFaultBackoff`,
+    `encoderBehindBudget`), no controller sources.
+  - `RecorderControllerShutdownOrderingTests` - `app/AudioWriter.cpp`,
+    `audio/AudioConvert.cpp`, `core/Logger.cpp` plus `app/AudioDrain.h`:
+    late system/microphone packets and queue draining before writer exit,
+    block RMS floors, and microphone AGC gain continuity and packet metadata.
   - `DesktopDuplicationRotationTests` - `capture/DesktopDuplicationCapture.h`'s
     header-inline rotation helpers and cursor carry, no D3D device.
   - `WgcCopyPoolTests` - `capture/WgcCopyPool.h`, `core/Logger.cpp`,
     `LIBS d3d11`: fallback resize on a WARP device.
   - `D3D11FrameScalerTests` - `capture/D3D11FrameScaler.cpp`,
-    `core/Logger.cpp`, `LIBS d3d11`: the copied-input fallback and NV12 failure
-    handling on WARP plus a fake video device.
+    `core/Logger.cpp`, `LIBS d3d11`: same-size alias/copy ownership and pixels,
+    copied-input fallback, and NV12 failure handling on WARP plus a fake video
+    device.
   - `EncoderFeedingPoolTests` - `capture/GpuTexturePool.h` with a fake
     deep-lookahead encoder, `core/Logger.cpp`.
   - `WasapiDefaultDeviceTests` - `audio/WasapiCapture.cpp`,
     `audio/SessionMuteStore.cpp`, `core/Logger.cpp`,
     `LIBS avrt mmdevapi ole32 propsys user32 uuid windowsapp`: default-device
     switches with a fake enumerator, a pinned explicit device, switches during
-    resolution and inside the packet callback, and registration/stop races.
+    resolution and inside the packet callback, setup retries/backoff stop,
+    and registration/stop races.
   - `DiscordRichPresenceTests` and `LeagueOfLegendsIntegrationTests` - each
     includes its worker `.cpp` directly (to replace the pipe or the HTTP GET), so
     it must not be linked again; `core/Logger.cpp` plus `winhttp` for LoL.
+    Includes Discord shutdown activity clearing and LoL numeric-field parsing.
   - `WinHttpJsonTests` - `integrations/WinHttpJson.h` (header-only),
     `core/Logger.cpp`, `LIBS winhttp ws2_32`: response cap, total deadline that
-    progress does not reset, cancellation, and callback buffer ownership.
+    progress does not reset, cancellation, callback buffer ownership, JSON
+    field lookup, certificate-option guards, and failed status queries.
   - `NvencStubTests` - `encoder/NvencEncoder.cpp`, `core/Logger.cpp`,
     `DEFINES BACKTRACK_HAS_NVENC=0`: the unavailable-backend stub.
   - `NvencLifecycleTests` - includes `NvencEncoder.cpp` itself, plus
@@ -154,6 +162,9 @@ build.
     library. Page navigation and shortcuts, the library scan and thumbnail
     worker, controller-action busy feedback, settings draft/commit/auto-record,
     and the update check against a loopback HTTP server (`LIBS ws2_32`).
+    `MainWindowLibraryTests` also covers settings rebuild notification filtering,
+    edited values and dirty-state marking, bitmap aspect ratio/pixels, cache
+    replacement, and retaining the cache/source on scaling failure.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` and
   `StorageLayoutTests` define `Mp4Muxer::muxToMp4` and

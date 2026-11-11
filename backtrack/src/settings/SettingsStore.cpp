@@ -129,34 +129,30 @@ void dedupeNamedExecutableApps(std::vector<App>& apps) {
     apps = std::move(kept);
 }
 
+struct ResolutionPreset {
+    ResolutionMode mode;
+    const wchar_t* name;
+    uint32_t width;
+    uint32_t height;
+};
+
+constexpr ResolutionPreset kResolutionPresets[] = {
+    {ResolutionMode::P240, L"240p", 426, 240},
+    {ResolutionMode::P480, L"480p", 854, 480},
+    {ResolutionMode::P720, L"720p", 1280, 720},
+    {ResolutionMode::P1080, L"1080p", 1920, 1080},
+    {ResolutionMode::P2K, L"2k", 2560, 1440},
+    {ResolutionMode::P4K, L"4k", 3840, 2160},
+    {ResolutionMode::Custom, L"custom", 0, 0},
+};
+
 bool resolutionPresetSize(ResolutionMode mode, uint32_t& width, uint32_t& height) {
-    switch (mode) {
-    case ResolutionMode::P240:
-        width = 426;
-        height = 240;
-        return true;
-    case ResolutionMode::P480:
-        width = 854;
-        height = 480;
-        return true;
-    case ResolutionMode::P720:
-        width = 1280;
-        height = 720;
-        return true;
-    case ResolutionMode::P1080:
-        width = 1920;
-        height = 1080;
-        return true;
-    case ResolutionMode::P2K:
-        width = 2560;
-        height = 1440;
-        return true;
-    case ResolutionMode::P4K:
-        width = 3840;
-        height = 2160;
-        return true;
-    case ResolutionMode::Custom:
-        break;
+    for (const auto& preset : kResolutionPresets) {
+        if (preset.mode == mode && mode != ResolutionMode::Custom) {
+            width = preset.width;
+            height = preset.height;
+            return true;
+        }
     }
     return false;
 }
@@ -336,40 +332,35 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     settings.audioInputNoiseSuppressionEnabled = readBool(values, L"audio.inputNoiseSuppression", settings.audioInputNoiseSuppressionEnabled);
 #endif
     settings.soundSeparationEnabled = readBool(values, L"audio.soundSeparation.enabled", settings.soundSeparationEnabled);
-    // count is only a hint: a hand-edited file can lose it while keeping the
-    // entries, and normalizeLoaded would then publish an empty list.
-    const uint32_t soundSeparationCount =
-        std::min<uint32_t>(readUInt(values, L"audio.soundSeparation.count", 0), kMaxAppListEntries);
-    settings.soundSeparationApps.clear();
-    settings.soundSeparationApps.reserve(soundSeparationCount);
-    for (uint32_t index = 0; index < kMaxAppListEntries; ++index) {
-        const std::wstring prefix = L"audio.soundSeparation." + std::to_wstring(index) + L".";
-        const bool hasPath = values.contains(prefix + L"path");
-        if (index >= soundSeparationCount && !hasPath) {
-            break;
+    const auto readAppList = [&values](const std::wstring& listKey, auto& apps, auto loadEntry) {
+        // count is only a hint: normalizeLoaded must not erase entries without it.
+        const uint32_t count = std::min<uint32_t>(
+            readUInt(values, listKey + L".count", 0), kMaxAppListEntries);
+        apps.clear();
+        apps.reserve(count);
+        for (uint32_t index = 0; index < kMaxAppListEntries; ++index) {
+            const std::wstring prefix = listKey + L"." + std::to_wstring(index) + L".";
+            const bool hasPath = values.contains(prefix + L"path");
+            if (index >= count && !hasPath) {
+                break;
+            }
+            apps.push_back(loadEntry(prefix));
         }
-        AppSettings::SoundSeparationApp app;
-        app.name = readString(values, prefix + L"name", {});
-        app.executablePath = readString(values, prefix + L"path", {});
-        app.muted = readBool(values, prefix + L"muted", true);
-        settings.soundSeparationApps.push_back(std::move(app));
-    }
+    };
+    readAppList(L"audio.soundSeparation", settings.soundSeparationApps,
+        [&values](const std::wstring& prefix) {
+            return AppSettings::SoundSeparationApp{
+                readString(values, prefix + L"name", {}),
+                readString(values, prefix + L"path", {}),
+                readBool(values, prefix + L"muted", true)};
+        });
     settings.autoRecordEnabled = readBool(values, L"integrations.autoRecord.enabled", settings.autoRecordEnabled);
-    const uint32_t autoRecordCount =
-        std::min<uint32_t>(readUInt(values, L"integrations.autoRecord.count", 0), kMaxAppListEntries);
-    settings.autoRecordApps.clear();
-    settings.autoRecordApps.reserve(autoRecordCount);
-    for (uint32_t index = 0; index < kMaxAppListEntries; ++index) {
-        const std::wstring prefix = L"integrations.autoRecord." + std::to_wstring(index) + L".";
-        const bool hasPath = values.contains(prefix + L"path");
-        if (index >= autoRecordCount && !hasPath) {
-            break;
-        }
-        AppSettings::AutoRecordApp app;
-        app.name = readString(values, prefix + L"name", {});
-        app.executablePath = readString(values, prefix + L"path", {});
-        settings.autoRecordApps.push_back(std::move(app));
-    }
+    readAppList(L"integrations.autoRecord", settings.autoRecordApps,
+        [&values](const std::wstring& prefix) {
+            return AppSettings::AutoRecordApp{
+                readString(values, prefix + L"name", {}),
+                readString(values, prefix + L"path", {})};
+        });
     settings.startWithWindowsMinimized = readBool(values, L"general.startWithWindowsMinimized", settings.startWithWindowsMinimized);
     settings.pruneStaleMicrophoneConsentEntries =
         readBool(values, L"general.pruneStaleMicrophoneConsentEntries", settings.pruneStaleMicrophoneConsentEntries);
@@ -609,21 +600,10 @@ VideoCodec codecFromName(const std::wstring& value) {
 }
 
 const wchar_t* resolutionModeName(ResolutionMode mode) {
-    switch (mode) {
-    case ResolutionMode::P240:
-        return L"240p";
-    case ResolutionMode::P480:
-        return L"480p";
-    case ResolutionMode::P720:
-        return L"720p";
-    case ResolutionMode::P1080:
-        return L"1080p";
-    case ResolutionMode::P2K:
-        return L"2k";
-    case ResolutionMode::P4K:
-        return L"4k";
-    case ResolutionMode::Custom:
-        return L"custom";
+    for (const auto& preset : kResolutionPresets) {
+        if (preset.mode == mode) {
+            return preset.name;
+        }
     }
     return L"1080p";
 }

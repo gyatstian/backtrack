@@ -1151,6 +1151,16 @@ void testBitstreamClassifiersMatchIdrOnly() {
                VideoCodec::H264, annexBNalUnit(longStart, 0x61)),
         "an H.264 plain I slice was accepted as a cut point");
 
+    for (uint8_t type = 0; type < 64; ++type) {
+        for (const auto& start : {shortStart, longStart}) {
+            const auto nal = annexBNalUnit(start, static_cast<uint8_t>(type << 1));
+            expect(backtrack::bitstreamContainsKeyFrame(VideoCodec::Hevc, nal) == (type >= 16 && type <= 20),
+                "HEVC cut classification disagreed with the closed-GOP BLA/IDR range");
+            expect(backtrack::bitstreamContainsCraFrame(VideoCodec::Hevc, nal) == (type == 21),
+                "HEVC CRA classification accepted another NAL type");
+        }
+    }
+
     // Both ends of the HEVC BLA..IDR range, plus CRA just past it.
     expect(backtrack::bitstreamContainsKeyFrame(
                VideoCodec::Hevc, annexBNalUnit(longStart, 0x20)),
@@ -1186,6 +1196,98 @@ void testBitstreamClassifiersMatchIdrOnly() {
         "an H.264 IDR header with no start code was accepted as a cut point");
     expect(!backtrack::bitstreamContainsCraFrame(VideoCodec::Hevc, noStartCode),
         "a byte sequence with no start code was reported as a CRA");
+}
+
+void testParameterSetClassifiersRequireEveryCodecHeader() {
+    for (const auto codec : {VideoCodec::H264, VideoCodec::Hevc}) {
+        const std::vector<uint8_t> headers = codec == VideoCodec::H264
+            ? std::vector<uint8_t>{0x67, 0x68} : std::vector<uint8_t>{0x40, 0x42, 0x44};
+        const std::vector<uint8_t> irrelevant = codec == VideoCodec::H264
+            ? std::vector<uint8_t>{0x61, 0x66, 0x69, 0x7f}
+            : std::vector<uint8_t>{0x02, 0x0e, 0x10, 0x2a, 0x7e};
+        for (const auto& start : {std::vector<uint8_t>{0, 0, 1}, std::vector<uint8_t>{0, 0, 0, 1}}) {
+            const unsigned complete = (1u << headers.size()) - 1;
+            for (unsigned subset = 0; subset <= complete; ++subset) {
+                std::vector<uint8_t> bytes;
+                std::vector<uint8_t> expected;
+                for (const uint8_t header : irrelevant) {
+                    const auto nal = annexBNalUnit(start, header);
+                    bytes.insert(bytes.end(), nal.begin(), nal.end());
+                }
+                for (size_t i = 0; i < headers.size(); ++i) {
+                    if ((subset & (1u << i)) == 0) {
+                        continue;
+                    }
+                    auto nal = annexBNalUnit(start, headers[i]);
+                    nal.insert(nal.end(), {0xab, 0xcd, 0x80});
+                    // duplicate sets cannot substitute for a missing type.
+                    for (int repeat = 0; repeat < 2; ++repeat) {
+                        bytes.insert(bytes.end(), nal.begin(), nal.end());
+                        expected.insert(expected.end(), nal.begin(), nal.end());
+                        const auto filler = annexBNalUnit(
+                            start.size() == 3 ? std::vector<uint8_t>{0, 0, 0, 1} : std::vector<uint8_t>{0, 0, 1},
+                            irrelevant.back());
+                        bytes.insert(bytes.end(), filler.begin(), filler.end());
+                    }
+                }
+                expect(backtrack::bitstreamContainsParameterSets(codec, bytes) == (subset == complete),
+                    "parameter-set completeness did not match the codec's required types");
+                expect(!backtrack::bitstreamContainsKeyFrame(codec, bytes),
+                    "parameter sets or irrelevant NALs became a cut point");
+                expect(backtrack::bitstreamContainsCraFrame(codec, bytes) == (codec == VideoCodec::Hevc),
+                    "an interleaved CRA was lost or invented");
+                std::vector<uint8_t> extracted{0xff};
+                expect(backtrack::extractParameterSets(codec, bytes, extracted) == (subset != 0),
+                    "extraction incorrectly required a complete parameter-set group");
+                expect(extracted == expected, "extraction changed parameter sets or retained irrelevant NALs");
+            }
+        }
+    }
+}
+
+void testBitstreamClassifiersHandleTruncatedAndTrailingInput() {
+    const std::vector<std::vector<uint8_t>> truncated{
+        {}, {0}, {0, 0}, {0, 0, 0}, {0, 0, 1}, {0, 0, 0, 1},
+        {0x65, 0x2a, 0x67, 0x68, 0x40, 0x42, 0x44, 0, 0}};
+    for (const auto codec : {VideoCodec::H264, VideoCodec::Hevc}) {
+        for (const auto& bytes : truncated) {
+            expect(!backtrack::bitstreamContainsKeyFrame(codec, bytes) &&
+                   !backtrack::bitstreamContainsCraFrame(codec, bytes) &&
+                   !backtrack::bitstreamContainsParameterSets(codec, bytes),
+                "truncated or unframed input was classified as a NAL");
+            std::vector<uint8_t> extracted{0xff};
+            expect(!backtrack::extractParameterSets(codec, bytes, extracted) && extracted.empty(),
+                "empty extraction retained bytes from truncated or previous input");
+        }
+        for (const auto& start : {std::vector<uint8_t>{0, 0, 1}, std::vector<uint8_t>{0, 0, 0, 1}}) {
+            const uint8_t idr = codec == VideoCodec::H264 ? 0x65 : 0x28;
+            auto bytes = annexBNalUnit(start, idr);
+            bytes.insert(bytes.end(), start.begin(), start.end());
+            expect(backtrack::bitstreamContainsKeyFrame(codec, bytes),
+                "a trailing empty start code hid an IDR");
+            expect(!backtrack::bitstreamContainsCraFrame(codec, bytes), "an IDR became a CRA");
+
+            const std::vector<uint8_t> headers = codec == VideoCodec::H264
+                ? std::vector<uint8_t>{0x67, 0x68} : std::vector<uint8_t>{0x40, 0x42, 0x44};
+            bytes.clear();
+            for (const auto header : headers) {
+                const auto nal = annexBNalUnit(start, header);
+                bytes.insert(bytes.end(), nal.begin(), nal.end());
+            }
+            // header-only NALs are recognized; this scanner does not parse payloads.
+            expect(backtrack::bitstreamContainsParameterSets(codec, bytes),
+                "header-only parameter sets were not recognized");
+            std::vector<uint8_t> extracted;
+            auto trailing = bytes;
+            trailing.insert(trailing.end(), start.begin(), start.end());
+            expect(backtrack::bitstreamContainsParameterSets(codec, trailing) &&
+                   backtrack::extractParameterSets(codec, trailing, extracted) && extracted == bytes,
+                "a trailing empty start code changed complete parameter sets");
+            bytes.insert(bytes.end(), {0, 0});
+            expect(backtrack::extractParameterSets(codec, bytes, extracted) && extracted == bytes,
+                "a trailing partial start code truncated the last parameter set");
+        }
+    }
 }
 
 // The extractor ends a NAL where the next start code begins, and a start code
@@ -2474,6 +2576,8 @@ int main() {
         testDiskBackendPreservesDecodeTimestamps();
         testParameterSetsArePrependedOnBothBackends();
         testBitstreamClassifiersMatchIdrOnly();
+        testParameterSetClassifiersRequireEveryCodecHeader();
+        testBitstreamClassifiersHandleTruncatedAndTrailingInput();
         testExtractParameterSetsCopiesTrailingNalWhole();
         testDiskBackendSavesAudio();
         testDiskAudioRoundTrip();

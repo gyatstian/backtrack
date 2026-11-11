@@ -39,7 +39,6 @@ private:
 
 struct BlockLevels {
     float rmsDb = -90.0f;
-    float peakDb = -90.0f;
 };
 
 BlockLevels measureBlockLevels(const AudioPacket& packet, const AudioFormatInfo& format);

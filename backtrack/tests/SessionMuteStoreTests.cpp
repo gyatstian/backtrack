@@ -686,6 +686,154 @@ void testEmergencyRestoreSkipsWhenLocked() {
     expect(!std::filesystem::exists(journal), "a complete emergency restore retires the journal");
 }
 
+void testSurvivingLiveClaimsAndEmergencyPairing() {
+    for (int path = 0; path < 4; ++path) {
+        const auto journal = testDir("live-claims") / L"audio-session-mutes.txt";
+        {
+            std::ofstream stream(journal, std::ios::binary);
+            stream << "111\t0\tc:\\apps\\game.exe\n111\t1\tc:\\apps\\game.exe\n";
+        }
+        SessionMuteStore store(journal);
+        std::vector<bool> calls;
+        std::vector<FakeSession> sessions(1);
+        sessions[0].pid = 111;
+        sessions[0].key = L"c:\\apps\\game.exe";
+        sessions[0].instance = L"{session-a}";
+        sessions[0].muted = true;
+        sessions[0].calls = &calls;
+        const auto adopted = store.apply({sessions[0].key}, enumeratorFor(sessions), alwaysAlive);
+        expect(adopted.muted == 1 && adopted.unresolved == 1 && calls.empty(),
+            "setup must adopt one record and leave the other orphan unclaimed");
+        sessions[0].failSetMute = true;
+
+        if (path == 0) {
+            const auto result = store.apply({sessions[0].key}, enumeratorFor(sessions), alwaysAlive);
+            expect(result.muted == 1 && result.unresolved == 1 && calls.empty(),
+                "apply must seed claims from its live mutes");
+        } else if (path == 1) {
+            const auto result = store.clear(enumeratorFor(sessions), alwaysAlive);
+            expect(result.restored == 0 && result.unresolved == 2 && calls == std::vector<bool>{false},
+                "clear must not pair an orphan with a surviving failed live restore");
+        } else if (path == 2) {
+            const auto result = store.sweepOrphans(enumeratorFor(sessions), alwaysAlive);
+            expect(result && result->restored == 0 && result->unmatched == 1 && calls.empty(),
+                "sweep must seed claims from surviving live mutes");
+        } else {
+            store.emergencyRestore(enumeratorFor(sessions));
+            expect(calls == (std::vector<bool>{false, true}),
+                "emergency pairing must start empty even when a live restore failed");
+        }
+        const auto records = readJournal(journal);
+        expect(records.size() == 2 && !records[0].previousMute && records[1].previousMute,
+            "unresolved live and orphan records must retain their own previous states");
+    }
+}
+
+void testClearAndEmergencyPairOrphansOneToOne() {
+    for (bool emergency : {false, true}) {
+        const auto journal = testDir("orphan-pairing") / L"audio-session-mutes.txt";
+        {
+            std::ofstream stream(journal, std::ios::binary);
+            stream << "111\t0\tc:\\apps\\game.exe\n111\t1\tc:\\apps\\game.exe\n"
+                   << "222\t0\tc:\\apps\\gone.exe\n";
+        }
+        SessionMuteStore store(journal);
+        std::vector<bool> callsA;
+        std::vector<bool> callsB;
+        std::vector<FakeSession> sessions(2);
+        for (auto& session : sessions) {
+            session.pid = 111;
+            session.key = L"c:\\apps\\game.exe";
+            session.instance = L"{same-instance}";
+            session.muted = true;
+        }
+        sessions[1].endpoint = L"{endpoint-1}";
+        sessions[0].calls = &callsA;
+        sessions[1].calls = &callsB;
+        if (emergency) {
+            store.emergencyRestore(enumeratorFor(sessions));
+        } else {
+            const auto result = store.clear(enumeratorFor(sessions), alwaysAlive);
+            expect(result.restored == 2 && result.unresolved == 1, "clear must count both orphan restores");
+        }
+        expect(callsA == std::vector<bool>{false} && callsB == std::vector<bool>{true},
+            "orphan claims must distinguish endpoints and restore each record's own state");
+        const auto remaining = readJournal(journal);
+        expect(remaining.size() == 1 && remaining[0].processId == 222,
+            "an unreachable orphan must survive, including on the crash path without liveness pruning");
+    }
+}
+
+void testEmergencyPreservesUnverifiedOrphans() {
+    const auto journal = testDir("emergency-unverified") / L"audio-session-mutes.txt";
+    {
+        std::ofstream stream(journal, std::ios::binary);
+        stream << "111\t0\tc:\\apps\\unknown.exe\n222\t1\tc:\\apps\\unmuted.exe\n"
+               << "333\t0\tc:\\apps\\failed.exe\n444\t0\tc:\\apps\\missing-callback.exe\n";
+    }
+    SessionMuteStore store(journal);
+    std::vector<bool> calls;
+    std::vector<FakeSession> sessions(3);
+    sessions[0].pid = 111;
+    sessions[0].key = L"c:\\apps\\unknown.exe";
+    sessions[0].muteStateKnown = false;
+    sessions[1].pid = 222;
+    sessions[1].key = L"c:\\apps\\unmuted.exe";
+    sessions[2].pid = 333;
+    sessions[2].key = L"c:\\apps\\failed.exe";
+    sessions[2].muted = true;
+    sessions[2].failSetMute = true;
+    for (auto& session : sessions) {
+        session.instance = session.key;
+        session.calls = &calls;
+    }
+    auto enumerate = enumeratorFor(sessions);
+    store.emergencyRestore([&](std::vector<SessionMuteCandidate>& out) {
+        enumerate(out);
+        out.push_back({444, L"c:\\apps\\missing-callback.exe", L"endpoint", L"instance", true, true, {}});
+        return true;
+    });
+    expect(calls == std::vector<bool>{false}, "only the known still-muted orphan with a callback is attempted");
+    const auto remaining = readJournal(journal);
+    expect(remaining.size() == 3 && remaining[0].processId == 111 &&
+           remaining[1].processId == 333 && remaining[2].processId == 444,
+        "unknown state, failed restore and missing callback must stay journaled; user-unmuted must retire");
+}
+
+void testEmergencyContainsFailuresAndCanRetry() {
+    const auto journal = testDir("emergency-exceptions") / L"audio-session-mutes.txt";
+    {
+        std::ofstream stream(journal, std::ios::binary);
+        stream << "111\t0\tc:\\apps\\game.exe\n";
+    }
+    SessionMuteStore store(journal);
+    const auto before = readFile(journal);
+    store.emergencyRestore([](std::vector<SessionMuteCandidate>&) { return false; });
+    expect(readFile(journal) == before, "failed emergency enumeration must leave the journal unchanged");
+    store.emergencyRestore([](std::vector<SessionMuteCandidate>&) -> bool {
+        throw std::runtime_error("enumeration failure");
+    });
+    expect(readFile(journal) == before, "throwing emergency enumeration must leave the journal unchanged");
+
+    std::vector<FakeSession> sessions(1);
+    sessions[0].pid = 111;
+    sessions[0].key = L"c:\\apps\\game.exe";
+    sessions[0].instance = L"{session-a}";
+    sessions[0].muted = true;
+    sessions[0].beforeSetMute = [] { throw std::runtime_error("restore failure"); };
+    store.emergencyRestore(enumeratorFor(sessions));
+    expect(readFile(journal) == before && sessions[0].muted,
+        "throwing emergency restore must preserve its obligation");
+    {
+        auto held = store.tryAcquire();
+        expect(held.owns_lock(), "an emergency exception must release the store lock");
+    }
+    sessions[0].beforeSetMute = {};
+    store.emergencyRestore(enumeratorFor(sessions));
+    expect(!sessions[0].muted && !std::filesystem::exists(journal),
+        "emergency restore must remain retryable after exceptions");
+}
+
 void testCallbacksNeverOutliveTheirEnumeration() {
     // Production candidates hold ISimpleAudioVolume proxies. Invoking one from
     // an older enumeration would run it outside the apartment that created it;
@@ -735,6 +883,10 @@ int main() {
         testApplyEnumerationFailureLeavesEverything();
         testApplyAdoptsOrphanForWantedSession();
         testEmergencyRestoreSkipsWhenLocked();
+        testSurvivingLiveClaimsAndEmergencyPairing();
+        testClearAndEmergencyPairOrphansOneToOne();
+        testEmergencyPreservesUnverifiedOrphans();
+        testEmergencyContainsFailuresAndCanRetry();
         testCallbacksNeverOutliveTheirEnumeration();
         std::cout << "SessionMuteStore tests passed\n";
         return 0;

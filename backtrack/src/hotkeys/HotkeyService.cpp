@@ -56,29 +56,25 @@ std::wstring keyboardHookFailureMessage(DWORD error) {
     return message;
 }
 
-bool isControlVirtualKey(uint32_t virtualKey) {
-    return virtualKey == VK_CONTROL || virtualKey == VK_LCONTROL || virtualKey == VK_RCONTROL;
-}
-
-bool isAltVirtualKey(uint32_t virtualKey) {
-    return virtualKey == VK_MENU || virtualKey == VK_LMENU || virtualKey == VK_RMENU;
-}
-
-bool isShiftVirtualKey(uint32_t virtualKey) {
-    return virtualKey == VK_SHIFT || virtualKey == VK_LSHIFT || virtualKey == VK_RSHIFT;
-}
-
 bool isModifierVirtualKey(uint32_t virtualKey) {
-    return isControlVirtualKey(virtualKey) || isAltVirtualKey(virtualKey) || isShiftVirtualKey(virtualKey);
+    switch (virtualKey) {
+    case VK_CONTROL:
+    case VK_LCONTROL:
+    case VK_RCONTROL:
+    case VK_MENU:
+    case VK_LMENU:
+    case VK_RMENU:
+    case VK_SHIFT:
+    case VK_LSHIFT:
+    case VK_RSHIFT:
+        return true;
+    default:
+        return false;
+    }
 }
 
 bool isKeyDownNow(int virtualKey) {
     return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
-}
-
-uint32_t supportedHookModifiers(uint32_t modifiers) {
-    // Single source is sanitizeSettings' mask; a second expression here drifts.
-    return supportedHotkeyModifiers(modifiers);
 }
 
 } // namespace
@@ -123,52 +119,43 @@ bool HotkeyService::registerHotkeys(HWND window, const HotkeySettings& settings)
         }
     }
 
+    auto registerOne = [window](int id, uint32_t modifiers, uint32_t virtualKey, DWORD& error) {
+        if (virtualKey == 0) {
+            return true;
+        }
+        if (!RegisterHotKey(window, id, modifiers | MOD_NOREPEAT, virtualKey)) {
+            error = GetLastError();
+            return false;
+        }
+        return true;
+    };
+    auto appendError = [this](const std::wstring& message) {
+        if (!lastErrorMessage_.empty()) {
+            lastErrorMessage_ += L"; ";
+        }
+        lastErrorMessage_ += message;
+    };
     DWORD startStopError = ERROR_SUCCESS;
-    const BOOL startStop = settings.startStopVirtualKey == 0
-        ? TRUE
-        : RegisterHotKey(
-              window,
-              kStartStopId,
-              settings.startStopModifiers | MOD_NOREPEAT,
-              settings.startStopVirtualKey);
-    if (!startStop) {
-        startStopError = GetLastError();
-    }
-
+    const bool startStop = registerOne(kStartStopId, settings.startStopModifiers, settings.startStopVirtualKey, startStopError);
     DWORD saveReplayError = ERROR_SUCCESS;
-    const BOOL saveReplay = settings.saveReplayVirtualKey == 0
-        ? TRUE
-        : RegisterHotKey(
-              window,
-              kSaveReplayId,
-              settings.saveReplayModifiers | MOD_NOREPEAT,
-              settings.saveReplayVirtualKey);
-    if (!saveReplay) {
-        saveReplayError = GetLastError();
-    }
+    const bool saveReplay = registerOne(kSaveReplayId, settings.saveReplayModifiers, settings.saveReplayVirtualKey, saveReplayError);
 
     if (!startStop) {
         const std::wstring message = hotkeyFailureMessage(L"start/stop", settings.startStopModifiers, settings.startStopVirtualKey, startStopError);
         Logger::instance().warning(L"hotkeys", hookOk ? message + L"; fullscreen hook remains active" : message);
         if (!hookOk) {
-            lastErrorMessage_ = message;
+            appendError(message);
         }
     }
     if (!saveReplay) {
         const std::wstring message = hotkeyFailureMessage(L"save replay", settings.saveReplayModifiers, settings.saveReplayVirtualKey, saveReplayError);
         Logger::instance().warning(L"hotkeys", hookOk ? message + L"; fullscreen hook remains active" : message);
         if (!hookOk) {
-            if (!lastErrorMessage_.empty()) {
-                lastErrorMessage_ += L"; ";
-            }
-            lastErrorMessage_ += message;
+            appendError(message);
         }
     }
     if ((!startStop || !saveReplay) && !hookOk) {
-        if (!lastErrorMessage_.empty()) {
-            lastErrorMessage_ += L"; ";
-        }
-        lastErrorMessage_ += keyboardHookFailureMessage(hookError);
+        appendError(keyboardHookFailureMessage(hookError));
         unregisterHotkeys(window);
         return false;
     }
@@ -310,7 +297,7 @@ uint32_t HotkeyService::currentHookModifiers() const {
 bool HotkeyService::matchesHotkey(uint32_t modifiers, uint32_t virtualKey, uint32_t hotkeyModifiers, uint32_t hotkeyVirtualKey) const {
     return hotkeyVirtualKey != 0 &&
            virtualKey == hotkeyVirtualKey &&
-           modifiers == supportedHookModifiers(hotkeyModifiers);
+           modifiers == supportedHotkeyModifiers(hotkeyModifiers);
 }
 
 bool HotkeyService::postHookHotkey(int id) {

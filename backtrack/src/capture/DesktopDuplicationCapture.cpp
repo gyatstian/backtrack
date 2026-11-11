@@ -127,7 +127,6 @@ void DesktopDuplicationCapture::markLost(const wchar_t* reason, HRESULT hr) {
     deviceLost_ = true;
     duplication_.Reset();
     rotation_ = DXGI_MODE_ROTATION_UNSPECIFIED;
-    frameHeld_ = false;
     // Device/output loss: the carried pointer state no longer describes a live
     // output, so a later rebuild must not composite it.
     cursorVisible_ = false;
@@ -171,9 +170,7 @@ bool DesktopDuplicationCapture::queryAdvancedColor() {
     if (colorProbe_) {
         DXGI_OUTPUT_DESC1 desc1{};
         if (SUCCEEDED(colorProbe_->GetDesc1(&desc1))) {
-            // Same predicate as monitorHasAdvancedColor: PQ or scRGB.
-            return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-                desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+            return isAdvancedColorSpace(desc1.ColorSpace);
         }
         return hdrPollState_; // transient failure: hold the last state, never flap.
     }
@@ -186,7 +183,6 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     frameIndex_ = 0;
     cursorOnlyFrames_ = 0;
     resolutionChanges_ = 0;
-    hdrChangeCount_ = 0;
     hdrPollState_ = false;
     legacyDuplication_ = false;
     format_ = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -253,8 +249,6 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
         Logger::instance().error(L"capture", L"IDXGIOutput::GetDesc failed: " + hresultToString(hr));
         return false;
     }
-    width_ = static_cast<uint32_t>(outputDesc.DesktopCoordinates.right - outputDesc.DesktopCoordinates.left);
-    height_ = static_cast<uint32_t>(outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top);
     // Cache the output for cheap per-frame HDR polling (GetDesc1 needs no
     // factory walk). Failure is non-fatal: queries fall back to
     // monitorHasAdvancedColor.
@@ -297,7 +291,6 @@ bool DesktopDuplicationCapture::initialize(D3DDevice& device, const AppSettings&
     // dimensions, so normalize width_/height_ to the texture dimensions the
     // acquired surface will actually have. Pool, frame size, and cursor math
     // then all use the captured orientation.
-    rotation_ = DXGI_MODE_ROTATION_UNSPECIFIED;
     DXGI_OUTDUPL_DESC duplDesc{};
     // IDXGIOutputDuplication::GetDesc returns void, not HRESULT.
     duplication_->GetDesc(&duplDesc);
@@ -390,8 +383,6 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
     const bool sizeChanged = acquiredDesc.Width != width_ || acquiredDesc.Height != height_;
     const bool formatChanged = hadPool && arrivedFormat != format_;
     if (!hadPool || sizeChanged || formatChanged) {
-        const bool hdrChanged = formatChanged &&
-            isHdrCaptureFormat(arrivedFormat) != isHdrCaptureFormat(format_);
         width_ = acquiredDesc.Width;
         height_ = acquiredDesc.Height;
         format_ = arrivedFormat;
@@ -407,9 +398,6 @@ bool DesktopDuplicationCapture::acquireNextFrame(GpuFrame& frame, uint32_t timeo
         }
         if (hadPool) {
             ++resolutionChanges_;
-            if (hdrChanged) {
-                ++hdrChangeCount_;
-            }
         }
     }
 
@@ -509,7 +497,6 @@ void DesktopDuplicationCapture::shutdown() {
     }
     duplication_.Reset();
     haveContent_ = false;
-    frameHeld_ = false;
     deviceLost_ = true;
     hdrPollState_ = false;
     legacyDuplication_ = false;
@@ -745,22 +732,13 @@ bool DesktopDuplicationCapture::buildCursorTexture() {
                 bgra[static_cast<size_t>(y) * outWidth + x] = pixel;
             }
         }
-    } else if (cursorShapeInfo_.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+    } else if (cursorShapeInfo_.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR ||
+        cursorShapeInfo_.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
+        // masked alpha 0 replaces desktop RGB; 0xFF XORs it in the shader.
         bgra.resize(static_cast<size_t>(outWidth) * outHeight);
         for (uint32_t y = 0; y < outHeight; ++y) {
             const uint32_t* row = reinterpret_cast<const uint32_t*>(src + static_cast<size_t>(y) * srcPitch);
             std::memcpy(&bgra[static_cast<size_t>(y) * outWidth], row, static_cast<size_t>(outWidth) * 4);
-        }
-    } else if (cursorShapeInfo_.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR) {
-        // Alpha 0 replaces desktop RGB; alpha 0xFF XORs it. Both paths run in
-        // the compositor because fixed-function blending cannot express XOR.
-        bgra.resize(static_cast<size_t>(outWidth) * outHeight);
-        for (uint32_t y = 0; y < outHeight; ++y) {
-            const uint32_t* row = reinterpret_cast<const uint32_t*>(src + static_cast<size_t>(y) * srcPitch);
-            for (uint32_t x = 0; x < outWidth; ++x) {
-                const uint32_t texel = row[x];
-                bgra[static_cast<size_t>(y) * outWidth + x] = texel;
-            }
         }
     } else {
         Logger::instance().warning(L"capture", L"Unknown cursor shape type; skipping composite");

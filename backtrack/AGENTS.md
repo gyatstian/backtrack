@@ -86,11 +86,7 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release
 ```
 
-The generator is `"Visual Studio 17 2022"` because Build Tools 2022 (17.14) is
-the installed toolchain; `cmake` lives inside that install and is not on
-`PATH`. The app target also needs the `C++ ATL for latest v143 build tools`
-component (`<sapi.h>` pulls in `atlbase.h`); without it only the app fails, the
-test targets still build.
+Toolchain paths and ATL requirements are in the root `AGENTS.md`.
 
 34 suites build unconditionally. `NvencLifecycleTests` and `AmfEncoderTests`
 are added when the NVENC and AMF headers are found (both are vendored), and

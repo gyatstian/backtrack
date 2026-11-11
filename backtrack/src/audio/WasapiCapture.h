@@ -52,7 +52,6 @@ public:
     bool start(AudioTrack track, const std::wstring& deviceId, AudioPacketCallback callback);
     void stop();
     bool running() const { return running_.load(); }
-    WaveFormatBlob format() const;
 
 private:
     friend struct WasapiCaptureTestAccess;

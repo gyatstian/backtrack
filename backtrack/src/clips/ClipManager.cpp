@@ -46,21 +46,21 @@ uint64_t readMediaDuration(const std::filesystem::path& path) {
     return duration;
 }
 
-bool hasMp4Extension(const std::filesystem::path& path) {
-    std::wstring extension = path.extension().wstring();
-    std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t ch) {
+std::wstring lowercased(std::wstring value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
         return static_cast<wchar_t>(towlower(ch));
     });
-    return extension == L".mp4";
+    return value;
+}
+
+bool hasMp4Extension(const std::filesystem::path& path) {
+    return lowercased(path.extension().wstring()) == L".mp4";
 }
 
 // shortcut: legacy clips matching the staging suffix in .backtrack_tmp remain unlisted; revisit with ownership metadata.
 bool isLegacyStagedMp4(const std::filesystem::path& path) {
-    std::wstring parent = path.parent_path().filename().wstring();
-    std::wstring stem = path.stem().wstring();
-    const auto lower = [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); };
-    std::transform(parent.begin(), parent.end(), parent.begin(), lower);
-    std::transform(stem.begin(), stem.end(), stem.begin(), lower);
+    const auto parent = lowercased(path.parent_path().filename().wstring());
+    const auto stem = lowercased(path.stem().wstring());
     if (parent != L".backtrack_tmp") {
         return false;
     }
@@ -136,10 +136,7 @@ std::wstring normalizedPathText(const std::filesystem::path& path) {
     while (!value.empty() && value.back() == L'\\') {
         value.pop_back();
     }
-    std::transform(value.begin(), value.end(), value.begin(), [](wchar_t ch) {
-        return static_cast<wchar_t>(towlower(ch));
-    });
-    return value;
+    return lowercased(std::move(value));
 }
 
 bool isPathInsideDirectory(const std::filesystem::path& path, const std::filesystem::path& directory) {
@@ -348,23 +345,19 @@ bool ClipManager::renameClipImpl(const std::filesystem::path& path, const std::w
         return false;
     }
 
-    const auto oldMarker = favoriteMarker(path);
-    std::error_code markerError;
-    if (std::filesystem::exists(oldMarker, markerError) && !markerError) {
-        std::filesystem::rename(oldMarker, favoriteMarker(target), error);
-        if (error) {
-            Logger::instance().warning(L"clips", L"Could not rename favorite marker for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+    const auto moveSidecar = [&path](const std::filesystem::path& from,
+                                      const std::filesystem::path& to, const wchar_t* what) {
+        std::error_code sidecarError;
+        if (std::filesystem::exists(from, sidecarError) && !sidecarError) {
+            std::filesystem::rename(from, to, sidecarError);
+            if (sidecarError) {
+                Logger::instance().warning(L"clips", L"Could not rename " + std::wstring(what) +
+                    L" for clip: " + path.wstring() + L" (" + utf8ToWide(sidecarError.message()) + L")");
+            }
         }
-    }
-    error = {};
-    const auto oldTags = tagFile(path);
-    std::error_code tagsError;
-    if (std::filesystem::exists(oldTags, tagsError) && !tagsError) {
-        std::filesystem::rename(oldTags, tagFile(target), error);
-        if (error) {
-            Logger::instance().warning(L"clips", L"Could not rename tag file for clip: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-        }
-    }
+    };
+    moveSidecar(favoriteMarker(path), favoriteMarker(target), L"favorite marker");
+    moveSidecar(tagFile(path), tagFile(target), L"tag file");
     return true;
 }
 

@@ -163,7 +163,11 @@ share.
   ignore header insertion and leave a cut undecodable: both backends cache the
   parameter sets from the first packet that carries them and prepend them to any
   keyframe that lacks them. Both encoders emit Annex B start codes, which is the
-  only framing `BitstreamUtils` scans.
+  only framing `BitstreamUtils` scans. parameter-set completeness requires
+  SPS/PPS for H.264 and VPS/SPS/PPS for HEVC; duplicates and other NAL types do
+  not satisfy a missing set. NAL-type masks must cover all 64 HEVC types.
+  classification reads the first available NAL header byte, not the payload;
+  extraction also returns partial parameter-set groups and preserves their bytes.
 
 ## Work Guidance
 
@@ -185,15 +189,20 @@ out-of-order retirement, repeated input, rejection, reset, lock/unmap failure,
 shutdown retention, and the early non-blocking lock statuses (an incomplete
 `LOCK_BUSY`/`OUT_OF_MEMORY` lock keeps the encoder available and still
 publishes once the picture completes, while a permanently stuck lock escalates
-after the deadline without latching the mapping fault). `NvencStubTests` (CTest)
-covers the `BACKTRACK_HAS_NVENC=0` stub.
+after the deadline without latching the mapping fault). drop-path regressions
+cover counters, keyframe rearm, ready tails, unchanged diagnostics, and mapping
+retirement; retention-budget cases cover pipeline delay and the buffer-count cap.
+`NvencStubTests` (CTest) covers the `BACKTRACK_HAS_NVENC=0` stub and zero retention.
 `AmfEncoderTests` (CTest, needs the AMF headers) exercises AMF configuration,
 lookahead feature reporting, pre-analysis readback, B-frame timing, and
-format-switch failures with fake components and no GPU.
+format-switch failures with fake components and no GPU. requested/effective
+separation, complete warning details, component selection, null-component failure,
+and caller-owned error logging have focused regressions.
 `ReplayBufferTests` covers the `BitstreamUtils` classifiers against hand-built
-Annex B NALs, including that `extractParameterSets` copies a NAL running to
-the final byte of the buffer whole (its end scan needs a start code to stop at,
-so a short copy here is a cached PPS stripped of its trailing bits). Build with
+Annex B NALs: the HEVC closed-GOP range and CRA rejection, every complete/missing
+parameter-set combination for each codec, duplicate/irrelevant NALs, short/long
+and mixed start codes, truncated/trailing input, and byte-exact extraction through
+the final byte of the buffer. Build with
 the SDK headers present and absent to exercise both sides of the compile guards,
 then confirm the Diagnostics page reports the expected backend and effective
 settings.

@@ -4,7 +4,7 @@
 
 #include <Windows.h>
 #include <avrt.h>
-#include <dxgi.h>
+#include <dxgi1_6.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -93,6 +93,10 @@ std::vector<MonitorEnumEntry> enumerateMonitors();
 // systems or when the output cannot be resolved, so callers treat SDR as the
 // safe default.
 bool monitorHasAdvancedColor(HMONITOR monitor);
+inline bool isAdvancedColorSpace(DXGI_COLOR_SPACE_TYPE colorSpace) {
+    return colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+        colorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+}
 HMONITOR focusedMonitorOrFallback(uint32_t fallbackIndex);
 HMONITOR cursorMonitorOrFallback(uint32_t fallbackIndex);
 // Returns DXGI output index on the given adapter for HMONITOR, or UINT32_MAX if none.

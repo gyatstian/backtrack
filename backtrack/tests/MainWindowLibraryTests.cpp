@@ -1,9 +1,11 @@
 #include "ui/MainWindow.h"
+#include "ui/UiHelpers.h"
 #include "ui/UiIds.h"
 
 #include <Windows.h>
 #include <objbase.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -18,6 +20,8 @@ namespace backtrack {
 
 struct MainWindowLibraryTestAccess {
     static HWND window(const MainWindow& window) { return window.window_; }
+    static HWND pageHost(const MainWindow& window) { return window.pageHost_; }
+    static bool settingsDirty(const MainWindow& window) { return window.settingsDirty_; }
     static size_t page(const MainWindow& window) { return static_cast<size_t>(window.page_); }
     static void showPage(MainWindow& window, size_t index) {
         window.switchPage(static_cast<MainWindow::Page>(index));
@@ -299,6 +303,114 @@ void testThumbnailCompletionsStayBounded() {
            "thumbnail slots no longer cover the clip snapshot");
 }
 
+void testSettingsRebuildNotifications() {
+    Fixture fixture;
+    auto& window = *fixture.window;
+    MainWindowLibraryTestAccess::showPage(window, 2);
+    const HWND root = MainWindowLibraryTestAccess::window(window);
+    const struct {
+        int category;
+        int id;
+        int notification;
+        const wchar_t* on;
+        const wchar_t* off;
+        int dependent;
+    } cases[] = {
+        {2, kResolutionModeComboId, CBN_SELCHANGE, L"Custom size", L"1080p", kWidthEditId},
+        {4, kDiscordRichPresenceComboId, CBN_SELCHANGE, L"Always", L"Never", kDiscordPresenceTimerComboId},
+        {1, kMultiMonitorSupportCheckId, BN_CLICKED, nullptr, nullptr, kFollowFocusedMonitorCheckId},
+        {2, kEncoderProfileComboId, CBN_SELCHANGE, L"Custom", L"Balanced", kEncoderPresetComboId},
+        {1, kReplayDiskBackedCheckId, BN_CLICKED, nullptr, nullptr, kReplayRingDirEditId},
+        {1, kReplayDiskBackedAudioCheckId, BN_CLICKED, nullptr, nullptr, kReplayRingDirEditId},
+    };
+    for (const auto& test : cases) {
+        SendMessageW(root, WM_COMMAND, MAKEWPARAM(kSettingsCategoryButtonBaseId + test.category, BN_CLICKED), 0);
+        const HWND host = MainWindowLibraryTestAccess::pageHost(window);
+        for (bool enabled : {false, true, false}) {
+            const HWND control = GetDlgItem(host, test.id);
+            expect(control != nullptr, "rebuild trigger control is missing");
+            if (test.notification == CBN_SELCHANGE) {
+                const LRESULT index = SendMessageW(control, CB_FINDSTRINGEXACT, static_cast<WPARAM>(-1),
+                    reinterpret_cast<LPARAM>(enabled ? test.on : test.off));
+                expect(index != CB_ERR, "rebuild trigger combo entry is missing");
+                SendMessageW(control, CB_SETCURSEL, static_cast<WPARAM>(index), 0);
+            } else {
+                SendMessageW(control, BM_SETCHECK, enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+            }
+            if (enabled) {
+                SendMessageW(root, WM_COMMAND, MAKEWPARAM(test.id, EN_KILLFOCUS), reinterpret_cast<LPARAM>(control));
+                expect(!GetDlgItem(host, test.dependent), "unrelated notification rebuilt the category");
+            }
+            SendMessageW(root, WM_COMMAND, MAKEWPARAM(test.id, test.notification), reinterpret_cast<LPARAM>(control));
+            expect((GetDlgItem(host, test.dependent) != nullptr) == enabled,
+                   "rebuild notification did not preserve the edited value and update dependent controls");
+            if (enabled) {
+                expect(MainWindowLibraryTestAccess::settingsDirty(window), "rebuild notification did not mark settings dirty");
+            }
+        }
+    }
+}
+
+struct BitmapSurface {
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ oldBitmap = nullptr;
+    uint32_t* pixels = nullptr;
+
+    BitmapSurface(int width, int height) {
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        pixels = static_cast<uint32_t*>(bits);
+        if (dc && bitmap) oldBitmap = SelectObject(dc, bitmap);
+    }
+    ~BitmapSurface() {
+        if (oldBitmap) SelectObject(dc, oldBitmap);
+        if (bitmap) DeleteObject(bitmap);
+        if (dc) DeleteDC(dc);
+    }
+};
+
+void testBitmapScalingReplacesOnlyOnSuccess() {
+    BitmapSurface source(4, 2);
+    BitmapSurface target(8, 8);
+    expect(source.oldBitmap && target.oldBitmap && source.pixels && target.pixels, "could not create bitmap surfaces");
+    std::fill_n(source.pixels, 8, 0x00336699u);
+    SelectObject(source.dc, source.oldBitmap);
+    struct Cache {
+        HBITMAP bitmap = nullptr;
+        ~Cache() { if (bitmap) DeleteObject(bitmap); }
+    } cache;
+    int width = 0;
+    int height = 0;
+    drawBitmapFitCached(target.dc, source.bitmap, cache.bitmap, width, height, RECT{0, 0, 8, 8});
+    expect(cache.bitmap && width == 8 && height == 4, "bitmap scaling did not preserve aspect ratio");
+    GdiFlush();
+    expect((target.pixels[4 * 8 + 4] & 0x00ffffffu) == 0x00336699u, "scaled bitmap changed the source color");
+
+    const HBITMAP previous = cache.bitmap;
+    drawBitmapFitCached(target.dc, source.bitmap, cache.bitmap, width, height, RECT{0, 0, 4, 4});
+    BITMAP info{};
+    expect(cache.bitmap != previous && width == 4 && height == 2, "successful scaling did not replace the cached bitmap");
+    expect(GetObjectW(previous, sizeof(info), &info) == 0, "successful replacement leaked the previous bitmap");
+
+    // a bitmap already selected in another DC cannot be selected by the scaler.
+    SelectObject(source.dc, source.bitmap);
+    const HBITMAP retained = cache.bitmap;
+    drawBitmapFitCached(target.dc, source.bitmap, cache.bitmap, width, height, RECT{0, 0, 6, 6});
+    expect(cache.bitmap == retained && width == 4 && height == 2, "failed scaling replaced the existing cache");
+    expect(GetObjectW(cache.bitmap, sizeof(info), &info) == sizeof(info), "failed scaling deleted the existing cache");
+    expect(GetObjectW(source.bitmap, sizeof(info), &info) == sizeof(info) && info.bmWidth == 4 && info.bmHeight == 2,
+           "failed scaling destroyed or changed the original bitmap");
+    expect(GetCurrentObject(source.dc, OBJ_BITMAP) == source.bitmap, "scaling changed the source DC's selected bitmap");
+}
+
 } // namespace
 
 int main() {
@@ -310,6 +422,8 @@ int main() {
         testStaleScanResultRejected();
         testViewSwitchKeepsSnapshotAndSelection();
         testThumbnailCompletionsStayBounded();
+        testSettingsRebuildNotifications();
+        testBitmapScalingReplacesOnlyOnSuccess();
         std::cout << "MainWindowLibraryTests passed\n";
         return 0;
     } catch (const std::exception& error) {

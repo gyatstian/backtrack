@@ -268,28 +268,24 @@ struct WgcCaptureSource::Impl {
         // Wait for the next frame. When a high-res cadence timer is available,
         // wait on both it and frameEvent so sub-15ms timeouts are honored even if
         // the global timer period was not raised. Timer expiry == cadence timeout.
+        DWORD wait = WAIT_FAILED;
+        bool haveWait = false;
         if (cadenceTimer && timeoutMs > 0) {
             LARGE_INTEGER due;
             // Negative = relative, in 100ns units.
             due.QuadPart = -static_cast<int64_t>(timeoutMs) * 10'000LL;
             if (SetWaitableTimer(cadenceTimer, &due, 0, nullptr, nullptr, FALSE)) {
                 const HANDLE handles[2] = {frameEvent, cadenceTimer};
-                const DWORD wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                wait = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+                haveWait = true; // WAIT_FAILED must not trigger a second wait.
                 CancelWaitableTimer(cadenceTimer);
-                if (wait != WAIT_OBJECT_0) {
-                    return false;
-                }
-            } else {
-                const DWORD wait = WaitForSingleObject(frameEvent, timeoutMs);
-                if (wait != WAIT_OBJECT_0) {
-                    return false;
-                }
             }
-        } else {
-            const DWORD wait = WaitForSingleObject(frameEvent, timeoutMs);
-            if (wait != WAIT_OBJECT_0) {
-                return false;
-            }
+        }
+        if (!haveWait) {
+            wait = WaitForSingleObject(frameEvent, timeoutMs);
+        }
+        if (wait != WAIT_OBJECT_0) {
+            return false;
         }
 
         try {

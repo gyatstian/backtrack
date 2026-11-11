@@ -14,7 +14,6 @@
 #include <chrono>
 #include <deque>
 #include <mutex>
-#include <numeric>
 #include <thread>
 #include <unordered_map>
 
@@ -261,7 +260,6 @@ struct NvencEncoder::Impl {
     uint32_t consecutiveEncodeFailures = 0;
     uint32_t consecutiveNeedMoreInput = 0;
     uint32_t consecutiveOutputBufferStarvation = 0;
-    uint32_t consecutiveLockFailures = 0;
     // Terminal fault: stop submitting into a session that cannot produce
     // output. `inputMappingFaulted` is the narrower subset where the driver's
     // input bindings are in an unknown state (a failed unmap/unregister/EOS),
@@ -555,9 +553,7 @@ struct NvencEncoder::Impl {
     }
 
     uint32_t desiredBitstreamBufferCount() const {
-        const uint32_t bFrameDelay = caps.effective.bFrames ? 2 : 0;
-        const uint32_t lookaheadDelay = caps.effective.lookahead ? caps.effective.lookaheadDepth : 0;
-        return std::clamp<uint32_t>(lookaheadDelay + bFrameDelay + 4, 4, 40);
+        return std::clamp<uint32_t>(reorderDelayFrames() + 4, 4, 40);
     }
 
     RegisteredResource* registeredResourceFor(ID3D11Texture2D* texture, NV_ENC_BUFFER_FORMAT bufferFormat) {
@@ -828,7 +824,6 @@ struct NvencEncoder::Impl {
                         nvStatusName(status) + L")");
                 }
                 if (status != NV_ENC_SUCCESS) {
-                    ++consecutiveLockFailures;
                     ++encoderStats.droppedFrames;
                     return failEncoder(L"NVENC output lock failed: " + nvStatusName(status));
                 }
@@ -842,7 +837,6 @@ struct NvencEncoder::Impl {
                 if (readyOutputCount > 0) {
                     --readyOutputCount;
                 }
-                consecutiveLockFailures = 0;
                 idleDeadline = SteadyClock::now() + kBitstreamLockTimeout;
             }
             // B-frame output reorders: the output that just locked carries the
@@ -864,7 +858,7 @@ struct NvencEncoder::Impl {
                 return failEncoder(L"NVENC output did not identify a submitted input");
             }
             if (pending.locked) {
-                if (matched && !matched->finalized) {
+                if (!matched->finalized) {
                     EncodedPacket packet;
                     const bool finalized = finalizePacket(
                         settings.codec, pending.lockedData, pending.lockedSize,
@@ -883,7 +877,7 @@ struct NvencEncoder::Impl {
                 }
                 pending.locked = false;
             }
-            if (matched && matched->mapped) {
+            if (matched->mapped) {
                 const NVENCSTATUS status = api.nvEncUnmapInputResource(session, matched->mapped);
                 if (status != NV_ENC_SUCCESS) {
                     return failEncoder(L"nvEncUnmapInputResource failed: " + nvStatusName(status));
@@ -943,37 +937,34 @@ struct NvencEncoder::Impl {
         const auto start = std::chrono::steady_clock::now();
         ID3D11Texture2D* texture = frame.texture.Get();
 
+        // frame loss must restart the reference chain without stranding harvested output.
+        auto dropFrame = [&](const wchar_t* reason) {
+            forceKeyFrame = true;
+            ++encoderStats.droppedFrames;
+            if (reason) {
+                Logger::instance().warning(L"encoder", reason);
+            }
+            return popReadyPacket(packet);
+        };
+
         // A texture stays mapped until the output carrying its timestamp is
         // harvested. Submitting the same zero-copy lastFrame again while it is
         // still mapped would touch a texture the encoder owns; drop the repeat.
         // After unmap the producer may reuse it, so only mapped entries block.
         for (const auto& pending : pendingOutputs) {
             if (pending.mapped != nullptr && pending.inputTexture == texture) {
-                forceKeyFrame = true;
-                ++encoderStats.droppedFrames;
-                Logger::instance().warning(L"encoder", L"NVENC frame dropped: input texture still mapped; keyframe re-armed");
-                return popReadyPacket(packet);
+                return dropFrame(L"NVENC frame dropped: input texture still mapped; keyframe re-armed");
             }
         }
         for (const auto& retained : retainedMappings) {
             if (retained.inputTexture == texture) {
-                forceKeyFrame = true;
-                ++encoderStats.droppedFrames;
-                Logger::instance().warning(L"encoder", L"NVENC frame dropped: retained input mapping; keyframe re-armed");
-                return popReadyPacket(packet);
+                return dropFrame(L"NVENC frame dropped: retained input mapping; keyframe re-armed");
             }
         }
 
         RegisteredResource* entry = registeredResourceFor(texture, expectedBufferFormat);
         if (!entry) {
-            // Frame lost before reaching the encoder: restart the next GOP so
-            // the stream never continues from a broken reference chain.
-            forceKeyFrame = true;
-            ++encoderStats.droppedFrames;
-            Logger::instance().warning(L"encoder", L"NVENC frame dropped: no registered input resource; keyframe re-armed");
-            // Pop rather than returning false: a ready tail from earlier
-            // harvests must not strand behind this drop.
-            return popReadyPacket(packet);
+            return dropFrame(L"NVENC frame dropped: no registered input resource; keyframe re-armed");
         }
 
         NV_ENC_OUTPUT_PTR bitstream = acquireBitstreamBuffer();
@@ -993,9 +984,7 @@ struct NvencEncoder::Impl {
             bitstream = acquireBitstreamBuffer();
         }
         if (!bitstream) {
-            forceKeyFrame = true;
-            ++encoderStats.droppedFrames;
-            return popReadyPacket(packet);
+            return dropFrame(nullptr);
         }
 
         NV_ENC_MAP_INPUT_RESOURCE map{};
@@ -1164,7 +1153,6 @@ struct NvencEncoder::Impl {
         consecutiveNeedMoreInput = 0;
         consecutiveEncodeFailures = 0;
         consecutiveOutputBufferStarvation = 0;
-        consecutiveLockFailures = 0;
         return true;
     }
 

@@ -1,7 +1,37 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <winhttp.h>
+
+namespace {
+
+bool failStatusQuery = false;
+DWORD certificateFlags = 0;
+
+BOOL WINAPI testQueryHeaders(HINTERNET request, DWORD level, LPCWSTR name,
+    LPVOID buffer, LPDWORD size, LPDWORD index) {
+    if (failStatusQuery) {
+        *static_cast<DWORD*>(buffer) = 503;
+        SetLastError(ERROR_WINHTTP_HEADER_NOT_FOUND);
+        return FALSE;
+    }
+    return WinHttpQueryHeaders(request, level, name, buffer, size, index);
+}
+
+BOOL WINAPI testSetOption(HINTERNET request, DWORD option, LPVOID buffer, DWORD size) {
+    if (option == WINHTTP_OPTION_SECURITY_FLAGS && size == sizeof(DWORD)) {
+        certificateFlags = *static_cast<DWORD*>(buffer);
+    }
+    return WinHttpSetOption(request, option, buffer, size);
+}
+
+} // namespace
+
+#define WinHttpQueryHeaders testQueryHeaders
+#define WinHttpSetOption testSetOption
 #include "integrations/WinHttpJson.h"
+#undef WinHttpSetOption
+#undef WinHttpQueryHeaders
 
 #include <algorithm>
 #include <atomic>
@@ -149,6 +179,45 @@ backtrack::CancellableHttpSession makeSession(INTERNET_PORT port, const std::ato
     return {handles, stop, deadline, false};
 }
 
+void testJsonFieldPositions() {
+    constexpr std::string_view object = "{\"name\" \t: \r\n\t\"A\\u0042\", \"count\": 0}";
+    const auto pos = backtrack::jsonValuePos(object, "name");
+    expect(pos && object[*pos] == '"', "field value did not skip JSON whitespace");
+    expect(backtrack::jsonStringField(object, "name") == L"AB", "string decoding changed");
+    expect(!backtrack::jsonValuePos(object, "missing"), "missing field acquired a value position");
+    expect(!backtrack::jsonValuePos("{\"name\"}", "name"), "field without a colon acquired a position");
+    expect(backtrack::jsonValuePos("\"name\": \t", "name") == 9, "empty value position changed");
+    expect(!backtrack::jsonStringField("\"name\": \t", "name"), "empty string value was accepted");
+    expect(!backtrack::jsonStringField(object, "count"), "numeric field was accepted as a string");
+}
+
+void testCertificateFlagsAndInsecureGuard() {
+    backtrack::ignoreServerCertificate(nullptr);
+    expect(certificateFlags == (SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+        SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE),
+        "certificate exception flags changed");
+    certificateFlags = 0;
+    HttpServer server("hello", 0ms);
+    auto session = makeSession(server.port(), nullptr, 3s);
+    auto body = backtrack::httpGetBody(session, session.handles->connection.value, L"/", nullptr, true, L"test");
+    expect(body && *body == "hello", "insecure request with ignoreCert failed");
+    expect(certificateFlags == 0, "insecure async request set certificate exceptions");
+}
+
+void testFailedStatusQueryLogsZero() {
+    HttpServer server("hello", 0ms);
+    auto session = makeSession(server.port(), nullptr, 3s);
+    failStatusQuery = true;
+    const auto status = backtrack::httpResponseStatus(nullptr);
+    auto body = backtrack::httpGetBody(session, session.handles->connection.value, L"/", nullptr, false, L"test");
+    failStatusQuery = false;
+    expect(!status && !body, "failed status query was accepted");
+    const auto lines = backtrack::Logger::instance().recentLines(200);
+    expect(std::any_of(lines.begin(), lines.end(), [](const auto& line) {
+        return line.find(L"HTTP GET unexpected status=0") != std::wstring::npos;
+    }), "failed status query did not log status=0");
+}
+
 void testSuccessfulResponse() {
     HttpServer server("hello", 10ms);
     auto session = makeSession(server.port(), nullptr, 3s);
@@ -221,6 +290,9 @@ void testClosingCallbackOwnsBuffers() {
 int main() {
     try {
         Winsock winsock;
+        testJsonFieldPositions();
+        testCertificateFlagsAndInsecureGuard();
+        testFailedStatusQueryLogsZero();
         testSuccessfulResponse();
         testResponseCap();
         testProgressDoesNotResetDeadline();

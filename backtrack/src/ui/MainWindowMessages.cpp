@@ -305,31 +305,24 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
     case WM_COMMAND: {
         const int controlId = static_cast<int>(LOWORD(wParam));
         const int notification = static_cast<int>(HIWORD(wParam));
-        if (controlId == kResolutionModeComboId && notification == CBN_SELCHANGE) {
-            stashVisibleSettings();
-            rebuildSettingsCategoryBody();
-            markSettingsDirty();
-            return 0;
-        }
-        if (controlId == kDiscordRichPresenceComboId && notification == CBN_SELCHANGE) {
-            // The elapsed-timer row only exists while presence is on; the
-            // rebuild reveals or removes it exactly like multi-monitor does.
-            stashVisibleSettings();
-            rebuildSettingsCategoryBody();
-            markSettingsDirty();
-            return 0;
-        }
-        if (controlId == kMultiMonitorSupportCheckId && notification == BN_CLICKED) {
-            stashVisibleSettings();
-            rebuildSettingsCategoryBody();
-            markSettingsDirty();
-            return 0;
-        }
-        if (controlId == kEncoderProfileComboId && notification == CBN_SELCHANGE) {
-            stashVisibleSettings();
-            rebuildSettingsCategoryBody();
-            markSettingsDirty();
-            return 0;
+        static constexpr struct {
+            int id;
+            int notification;
+        } kRebuildTriggers[] = {
+            {kResolutionModeComboId, CBN_SELCHANGE},
+            {kDiscordRichPresenceComboId, CBN_SELCHANGE},
+            {kMultiMonitorSupportCheckId, BN_CLICKED},
+            {kEncoderProfileComboId, CBN_SELCHANGE},
+            {kReplayDiskBackedCheckId, BN_CLICKED},
+            {kReplayDiskBackedAudioCheckId, BN_CLICKED},
+        };
+        for (const auto& trigger : kRebuildTriggers) {
+            if (controlId == trigger.id && notification == trigger.notification) {
+                stashVisibleSettings();
+                rebuildSettingsCategoryBody();
+                markSettingsDirty();
+                return 0;
+            }
         }
         if (controlId == kSoundSeparationAppComboId && notification == CBN_SELCHANGE) {
             addSelectedSoundSeparationApp();
@@ -349,14 +342,6 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         if (isSoundSeparationRemoveButtonId(controlId) && notification == BN_CLICKED) {
             removeSoundSeparationApp(soundSeparationIndexFromButtonId(controlId, kSoundSeparationRemoveButtonBaseId));
-            return 0;
-        }
-        if ((controlId == kReplayDiskBackedCheckId || controlId == kReplayDiskBackedAudioCheckId) && notification == BN_CLICKED) {
-            // The ring-folder row only exists while the toggle is on; the
-            // rebuild reveals or removes it exactly like multi-monitor does.
-            stashVisibleSettings();
-            rebuildSettingsCategoryBody();
-            markSettingsDirty();
             return 0;
         }
         if (isSettingsControlId(controlId) &&
@@ -522,8 +507,6 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         thumbnailUpdatePosted_ = false;
         updateThumbnailWorkingSet();
         return 0;
-    case WM_NOTIFY:
-        break;
     case WM_DPICHANGED: {
         if (lParam) {
             const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
@@ -640,11 +623,6 @@ LRESULT MainWindow::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
                 staticColor = kMuteIconColor;
             }
             SetTextColor(reinterpret_cast<HDC>(wParam), staticColor);
-        }
-        if (reinterpret_cast<HWND>(lParam) == status_) {
-            SetBkMode(reinterpret_cast<HDC>(wParam), OPAQUE);
-            SetBkColor(reinterpret_cast<HDC>(wParam), kPanel);
-            return reinterpret_cast<LRESULT>(controlBrush_);
         }
         SetBkMode(reinterpret_cast<HDC>(wParam), OPAQUE);
         SetBkColor(reinterpret_cast<HDC>(wParam), kPanel);

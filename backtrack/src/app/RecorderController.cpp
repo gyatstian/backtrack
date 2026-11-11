@@ -161,16 +161,6 @@ std::filesystem::path replayRingDirectoryFor(const AppSettings& settings) {
     return settings.replayRingDirectory.empty() ? settings.clipDirectory : settings.replayRingDirectory;
 }
 
-CaptureBackend selectedBackendForSettings(const AppSettings& settings) {
-    return settings.preferredCaptureBackend;
-}
-
-VideoSettings activeVideoSettingsFor(const AppSettings& settings) {
-    // sanitizeSettings already clamps width/height even 16-7680/4320; no second
-    // clamp here so the sanitizer stays the sole authority.
-    return settings.video;
-}
-
 std::vector<std::wstring> mutedSoundSeparationExecutableKeys(const AppSettings& settings) {
     std::vector<std::wstring> keys;
     if (!settings.soundSeparationEnabled || !settings.captureSystemAudio) {
@@ -190,16 +180,13 @@ std::vector<std::wstring> mutedSoundSeparationExecutableKeys(const AppSettings& 
     return keys;
 }
 
-bool hasMutedSoundSeparationApps(const AppSettings& settings) {
-    if (!settings.soundSeparationEnabled) {
-        return false;
+void restoreSessionMutes(const wchar_t* context) {
+    const SessionMuteRestoreResult restore = WasapiCapture::clearSessionMutes();
+    if (restore.unresolved > 0 || restore.journalFailed) {
+        Logger::instance().warning(L"recorder",
+            L"Sound separation could not restore " + std::to_wstring(restore.unresolved) +
+            L" audio session(s); the journal keeps them " + context);
     }
-    return std::any_of(
-        settings.soundSeparationApps.begin(),
-        settings.soundSeparationApps.end(),
-        [](const AppSettings::SoundSeparationApp& app) {
-            return app.muted && !app.executablePath.empty();
-        });
 }
 
 } // namespace
@@ -231,12 +218,7 @@ RecorderController::~RecorderController() {
     // restored on every destruction path, including ones where stopPipeline
     // early-outs (pipeline never reached running state after mutes were
     // applied). No-op when nothing is muted.
-    const SessionMuteRestoreResult muteRestore = WasapiCapture::clearSessionMutes();
-    if (muteRestore.unresolved > 0 || muteRestore.journalFailed) {
-        Logger::instance().warning(L"recorder",
-            L"Sound separation could not restore " + std::to_wstring(muteRestore.unresolved) +
-            L" audio session(s); the journal keeps them for the next launch");
-    }
+    restoreSessionMutes(L"for the next launch");
     if (frameEvent_) {
         CloseHandle(frameEvent_);
         frameEvent_ = nullptr;
@@ -396,22 +378,19 @@ bool RecorderController::updateSettings(AppSettings settings) {
         // currentWithoutVoice and incomingNoReplay are dead past the two
         // comparisons above, so the live-apply copies take them over instead of
         // duplicating both executable lists once more.
+        const auto clearLiveApplied = [](AppSettings& base) {
+            base.audioOutputVolumePercent = 0;
+            base.audioInputVolumePercent = 0;
+            base.audioInputAutoGainEnabled = false;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+            base.audioInputNoiseSuppressionEnabled = false;
+#endif
+            base.captureCursor = false;
+        };
         AppSettings currentBase = std::move(currentWithoutVoice);
-        currentBase.audioOutputVolumePercent = 0;
-        currentBase.audioInputVolumePercent = 0;
-        currentBase.audioInputAutoGainEnabled = false;
-#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-        currentBase.audioInputNoiseSuppressionEnabled = false;
-#endif
-        currentBase.captureCursor = false;
+        clearLiveApplied(currentBase);
         AppSettings incomingBase = std::move(incomingNoReplay);
-        incomingBase.audioOutputVolumePercent = 0;
-        incomingBase.audioInputVolumePercent = 0;
-        incomingBase.audioInputAutoGainEnabled = false;
-#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-        incomingBase.audioInputNoiseSuppressionEnabled = false;
-#endif
-        incomingBase.captureCursor = false;
+        clearLiveApplied(incomingBase);
         // startReplayPipeline means nothing actually changed (voice branch fell
         // through): let it reach ensurePipeline below instead of returning here.
         if (!startReplayPipeline && currentBase == incomingBase) {
@@ -546,7 +525,6 @@ bool RecorderController::startRecording() {
         return false;
     }
     lastEncodedVideoPts100ns_ = 0;
-    videoTimelineEndPts100ns_ = 0;
     waitingForRecordingKeyFrame_ = true;
     recording_ = true;
     // Request the IDR via forceVideoHeartbeat_, consumed by the capture thread
@@ -849,13 +827,13 @@ RecordingStats RecorderController::stats() const {
         // hold this lock while WGC waits for outstanding frame leases, so never
         // block UI for it either: the snapshot pointer is the only handoff.
         std::unique_lock gpuLock(pipelineGpuMutex_, std::try_to_lock);
-        if (gpuLock.owns_lock() && encoder_) {
-            lastEncoderStats_.store(std::make_shared<const EncoderStats>(encoder_->stats()));
-        }
-        // The scaler is only touched under pipelineGpuMutex_ (both scale()
-        // sites and every reset()), so this won-lock read of its sticky HDR
-        // rejection is race-free and still never blocks the UI thread.
         if (gpuLock.owns_lock()) {
+            if (encoder_) {
+                lastEncoderStats_.store(std::make_shared<const EncoderStats>(encoder_->stats()));
+            }
+            // The scaler is only touched under pipelineGpuMutex_ (both scale()
+            // sites and every reset()), so this won-lock read of its sticky HDR
+            // rejection is race-free and still never blocks the UI thread.
             scalerHdrRejected = scaler_.hdrInputRejected();
         }
         stats.encoder = *lastEncoderStats_.load();
@@ -1049,7 +1027,6 @@ bool RecorderController::ensurePipeline() {
     systemAudioLastPacketAt100ns_.store(steadyNow100ns(), std::memory_order_relaxed);
     microphoneAudioLastPacketAt100ns_.store(steadyNow100ns(), std::memory_order_relaxed);
     lastEncodedVideoPts100ns_ = 0;
-    videoTimelineEndPts100ns_ = 0;
 
     if (snapshot.captureSystemAudio) {
         refreshSystemAudioCapture(snapshot, mutedSoundSeparationExecutableKeys(snapshot));
@@ -1130,12 +1107,7 @@ void RecorderController::stopPipeline() {
         audioThread_.join();
         Logger::instance().info(L"recorder", L"Audio writer stopped");
     }
-    const SessionMuteRestoreResult muteRestore = WasapiCapture::clearSessionMutes();
-    if (muteRestore.unresolved > 0 || muteRestore.journalFailed) {
-        Logger::instance().warning(L"recorder",
-            L"Sound separation could not restore " + std::to_wstring(muteRestore.unresolved) +
-            L" audio session(s); the journal keeps them for the next launch");
-    }
+    restoreSessionMutes(L"for the next launch");
     {
         std::scoped_lock lock(systemAudioCaptureMutex_);
         systemAudioMutedExecutableKeys_.clear();
@@ -1328,7 +1300,8 @@ bool RecorderController::recreateGpuPipeline(
     captureHeight_ = sourceHeight;
 
     AppSettings snapshot = settings();
-    const VideoSettings videoSettings = activeVideoSettingsFor(snapshot);
+    // sanitizeSettings owns the even width/height limits; no second clamp here.
+    const VideoSettings videoSettings = snapshot.video;
     const GpuOptimizationSettings gpuSettings = snapshot.gpu;
     {
         std::scoped_lock stateLock(stateMutex_);
@@ -1404,7 +1377,7 @@ bool RecorderController::createCaptureSource(
     const CaptureTarget& target,
     bool exclusiveRecovery) {
     AppSettings snapshot = settings();
-    const CaptureBackend selectedBackend = selectedBackendForSettings(snapshot);
+    const CaptureBackend selectedBackend = snapshot.preferredCaptureBackend;
     // Sticky-HDR input: what was live before this (re)bind. Read before the
     // reset below overwrites it; a DD session on an HDR monitor retries DD
     // before falling back to WGC so one ACCESS_LOST never flaps the backend.
@@ -1662,11 +1635,12 @@ void RecorderController::captureLoopImpl() {
     AppSettings captureSettings = settings();
     VideoSettings videoSettings;
     GpuOptimizationSettings gpuSettings;
-    {
+    const auto reloadActiveSettings = [&]() {
         std::scoped_lock stateLock(stateMutex_);
         videoSettings = activeVideoSettings_;
         gpuSettings = activeGpuSettings_;
-    }
+    };
+    reloadActiveSettings();
     GpuFrame& lastFrame = captureLastFrame_;
     GpuFrame& frame = captureAcquiredFrame_;
     auto nextEmit = std::chrono::steady_clock::now();
@@ -1739,12 +1713,13 @@ void RecorderController::captureLoopImpl() {
     // once per stats interval so a settings toggle applies without a rebind.
     bool appliedCursorPreference = captureSettings.captureCursor;
     DXGI_FORMAT encoderInputFormat;
-    {
+    const auto reloadEncoderInputFormat = [&]() {
         std::scoped_lock gpuLock(pipelineGpuMutex_);
         encoderInputFormat = encoder_
             ? encoder_->preferredInputFormat()
             : DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
+    };
+    reloadEncoderInputFormat();
     const auto fps = std::max<uint32_t>(1, videoSettings.fps);
     const auto frameInterval = std::chrono::nanoseconds(1'000'000'000 / fps);
     const int64_t nominalFrameDuration100ns = kHundredNanosecondsPerSecond / fps;
@@ -2024,17 +1999,8 @@ void RecorderController::captureLoopImpl() {
             resetVideoHandoff();
             prevResolutionChanges = capture_ ? capture_->resolutionChangeCount() : 0;
             pendingWgcResizeDrain = false;
-            {
-                std::scoped_lock stateLock(stateMutex_);
-                videoSettings = activeVideoSettings_;
-                gpuSettings = activeGpuSettings_;
-            }
-            {
-                std::scoped_lock gpuLock(pipelineGpuMutex_);
-                encoderInputFormat = encoder_
-                    ? encoder_->preferredInputFormat()
-                    : DXGI_FORMAT_B8G8R8A8_UNORM;
-            }
+            reloadActiveSettings();
+            reloadEncoderInputFormat();
             return true;
         }
         // The outgoing source cannot close until the queue and encoder release it.
@@ -2457,20 +2423,11 @@ void RecorderController::captureLoopImpl() {
                 // The drain above may have published the broken pipeline's tail;
                 // only packets from the rebuilt pipeline reset the backoff.
                 encoderFaultPtsBaseline = lastEncodedVideoPts100ns_.load(std::memory_order_acquire);
-                {
-                    std::scoped_lock stateLock(stateMutex_);
-                    videoSettings = activeVideoSettings_;
-                    gpuSettings = activeGpuSettings_;
-                }
+                reloadActiveSettings();
                 resetVideoHandoff();
                 prevResolutionChanges = capture_ ? capture_->resolutionChangeCount() : 0;
                 pendingWgcResizeDrain = false;
-                {
-                    std::scoped_lock gpuLock(pipelineGpuMutex_);
-                    encoderInputFormat = encoder_
-                        ? encoder_->preferredInputFormat()
-                        : DXGI_FORMAT_B8G8R8A8_UNORM;
-                }
+                reloadEncoderInputFormat();
                 if (recording_) {
                     waitingForRecordingKeyFrame_ = true;
                     forceVideoHeartbeat_ = true;
@@ -3015,7 +2972,6 @@ void RecorderController::encodeLoopImpl() {
         if (recordingExtended || replayExtended) {
             pendingDurations.erase(pts100ns);
         }
-        videoTimelineEndPts100ns_.store(pts100ns + duration100ns, std::memory_order_release);
     };
 
     auto consumeDurationUpdate = [&]() {
@@ -3143,11 +3099,7 @@ void RecorderController::publishVideoPacket(EncodedPacket packet) {
         return;
     }
     const int64_t pts100ns = packet.pts100ns;
-    const int64_t duration100ns = packet.duration100ns;
     lastEncodedVideoPts100ns_.store(pts100ns, std::memory_order_release);
-    videoTimelineEndPts100ns_.store(
-        pts100ns + std::max<int64_t>(duration100ns, 0),
-        std::memory_order_release);
 
     // The PTS gate keeps delayed pre-stop output (the reorder tail) in the
     // recording and keeps post-stop frames out of it once a stop is pending;
@@ -3342,12 +3294,7 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings,
     systemAudio_.stop();
 
     if (mutedKeys.empty()) {
-        const SessionMuteRestoreResult restore = WasapiCapture::clearSessionMutes();
-        if (restore.unresolved > 0 || restore.journalFailed) {
-            Logger::instance().warning(L"recorder",
-                L"Sound separation could not restore " + std::to_wstring(restore.unresolved) +
-                L" audio session(s); the journal keeps them for the next attempt");
-        }
+        restoreSessionMutes(L"for the next attempt");
     } else {
         Logger::instance().info(L"recorder",
             L"Sound separation muting " + std::to_wstring(mutes.muted) +
@@ -3363,12 +3310,7 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings,
 
     if (!started) {
         Logger::instance().warning(L"recorder", L"System audio capture did not start");
-        const SessionMuteRestoreResult restore = WasapiCapture::clearSessionMutes();
-        if (restore.unresolved > 0 || restore.journalFailed) {
-            Logger::instance().warning(L"recorder",
-                L"Sound separation could not restore " + std::to_wstring(restore.unresolved) +
-                L" audio session(s); the journal keeps them for the next launch");
-        }
+        restoreSessionMutes(L"for the next launch");
         systemAudioMutedExecutableKeys_.clear();
     }
 }

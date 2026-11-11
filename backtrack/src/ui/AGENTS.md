@@ -99,9 +99,11 @@ icon.
   because Library scan and thumbnail callbacks can arrive after a tab switch.
   Leaving Library cancels the scan and releases its thumbnail cache; the clip
   snapshot and selection stay, and returning rebuilds from them and starts a
-  scan. Any code
-  that builds controls must also null and rebind its member pointers in
-  `rebindPageControlPointers`; a stale pointer makes `readVisibleSettingsInto`
+  scan. `resetPageCache` clears cached state without replacing its host. any code
+  that builds controls must also add its member pointers to
+  `resetPageControlMembers` and rebind them in `rebindPageControlPointers`;
+  settings-body teardown keeps its own subset so category buttons and Save
+  Settings survive. a stale pointer makes `readVisibleSettingsInto`
   read a dead HWND and silently flip that setting back.
 - Settings dirty tracking compares `AppSettings` structs through
   `computeSettingsDirty`, which is why every settings struct in `core/Types.h`
@@ -121,7 +123,9 @@ icon.
 - Layout is proportional, not DPI-based. `addControl` records a design rect,
   and `layoutCurrentPage` scales x and width from it to the available column
   width with `MulDiv`; heights and fonts are never scaled. `WM_DPICHANGED` only
-  adopts the suggested window rect and relayouts.
+  adopts the suggested window rect and relayouts. Gallery and Diagnostics share
+  `movePlacedControl`: a placed-cache hit returns false even if it unhides the
+  control; showing the control must not be short-circuited by a successful move.
 - Diagnostics bypasses the generic two-column layout: a dedicated branch in
   `layoutCurrentPage` places its three sections (Runtime, Encoder, Recent Log)
   side by side at equal width. Each body is a read-only multiline `EDIT` that
@@ -182,8 +186,10 @@ icon.
 - There is no UI framework and no layout engine. Adding a settings control means
   an id in `UiIds.h`, that same id in `isSettingsControlId` (`UiHelpers.cpp`) or
   it never marks the page dirty, an `addControl` call that records its design
-  rect, a read in `readVisibleSettingsInto`, and a reset plus rebind in
-  `rebindPageControlPointers` if it gets a member pointer.
+  rect, a read in `readVisibleSettingsInto`, and a reset plus rebind if it gets a
+  member pointer (see the page-lifetime contract above). use `addCheckbox` for
+  checkbox creation, `addRowLabel` / `addRowHelp` for labeled settings rows;
+  keep geometry in the builder.
 - Enum combo boxes share one `{value, label}` table in `UiHelpers.h` between
   the page builder (`fillEnumCombo`) and the reader (`readEnumCombo`); extend
   the table when the enum grows, never raw-cast a combo index.
@@ -226,6 +232,10 @@ icon.
   the Gallery layout branch clears them on entry, so a previous page's cards
   can never paint behind the Library. `rebuildSettingsCategoryBody` restores
   focus to the rebuilt counterpart of the focused control.
+- bitmap scaling in `UiHelpers.cpp` leaves the source bitmap owned by its caller.
+  `downscaleBitmapToFit` returns the original on failure and deletes it only
+  after successfully creating a replacement; selection or blit failure must
+  not consume the original.
 - `loadClipThumbnails` and `updateThumbnailWorkingSet` bound thumbnail work and
   retention to the visible Gallery rows plus one overscan row, capped by
   `kMaxLibraryThumbnails` (48). The worker queue is replaced on every working-set
@@ -243,16 +253,18 @@ icon.
 ## Verification
 
 `LoggerDiagnosticsTests.cpp` covers log export without a window.
-`MainWindowSettingsTests.cpp` covers settings publication, preferences and
-applied auto record. `MainWindowNotificationTests.cpp` covers busy feedback
+`MainWindowSettingsTests.cpp` covers settings publication, preferences,
+applied auto record, absent-checkbox fallbacks, the follow-mouse gate and
+page-control reset. `MainWindowNotificationTests.cpp` covers busy feedback
 while loading or playback is blocked. `MainWindowUpdateCheckTests.cpp` covers
 loopback success, slow progress, stop and destruction.
-`MainWindowAccessibilityTests.cpp` exercises dialog-key traversal in a visible
-window and needs an interactive desktop. `MainWindowLibraryTests.cpp` covers a
-blocked scan with a responsive window and page change, stale scan rejection,
+`MainWindowAccessibilityTests.cpp` exercises dialog-key traversal, settings-body
+lifetime, shared row help, tab chrome, placed-layout memoization and page-cache
+invalidation in a visible window; it needs an interactive desktop.
+`MainWindowLibraryTests.cpp` covers a blocked scan with a responsive window and page change, stale scan rejection,
 view switches keeping the snapshot/selection without a rescan, and the
-thumbnail working-set budget; these suites still need CTest
-registration. build, then exercise the affected page manually: settings
+thumbnail working-set budget. these suites are registered with CTest.
+build, then exercise the affected page manually: settings
 round-trip through a restart, hotkeys from another application, tray
 restore/exit, library rename and delete, and Diagnostics.
 

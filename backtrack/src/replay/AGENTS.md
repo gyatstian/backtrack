@@ -127,9 +127,12 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   publishes the same field; reasons are kept per track so one backend's report
   cannot hide or clear the other's. Keep the setting itself untouched: the
   checkbox stays ticked, so the report is the only evidence the backend changed.
-- `clearBufferedVideoLocked` must not reset `ringWriteOffset_`, which keeps the
-  write head at least a full buffer ahead of offset 0. It does not make `clear()`
-  safe during a pin: zeroing `ringLiveBytes_` makes the whole ring look free, so
+- `clear()` and disabled `configure` share `clearBuffersLocked`, which requires
+  an already-held `mutex_` and serialization against saves. clearing keeps the
+  rings open; disabling closes them after clearing.
+- `clearBufferedVideoLocked` must not reset the `RingFile` write cursor, which
+  keeps the write head at least a full buffer ahead of offset 0. It does not make
+  `clear()` safe during a pin: clearing live-byte accounting makes the whole ring look free, so
   a push could wrap onto pinned bytes. Clearing mid-pin is therefore only
   allowed when the ring is being abandoned, which is what makes
   `failOverToRamLocked` the one exception: it can run from the encode thread
@@ -137,8 +140,8 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   backend to RAM, so no push writes the ring again and the pinned extents keep
   their bytes until the deferred close. Every other caller runs on the
   controller worker, which serializes against `saveReplay`. Any new caller must
-  preserve one of those two properties. Only `openRingLocked` and
-  `closeRingNowLocked` reset the cursor.
+  preserve one of those two properties. only `RingFile::open` and
+  `RingFile::closeNow` reset the cursor.
 - pending ring transfers wait at most `kRingIoTimeoutMs` per request. on timeout
   or wait failure they request cancellation and return a ring fault; cancellation
   does not guarantee completion. a thread-pool wait retains the operation's
@@ -194,7 +197,8 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
 ## Verification
 
 - `StorageLayoutTests` (CTest) covers game roots, tags, nested recovery, and
-  ring collisions, with recovery preserving the original session content.
+  ring collisions, clear/disable ring lifetime and resumed saves, with recovery
+  preserving the original session content.
 - `ReplayBufferTests` (CTest) covers the real buffer with `Mp4Muxer` entry
   points stubbed inside the test source. It covers trimming, wrap-around
   reassembly, byte-identical parity between the two backends,
@@ -219,7 +223,8 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   way: they exist because the save path's read-failure handling is silent data
   loss if it regresses, and no public path can provoke the fault.
 - `RingFileTests` (CTest) exercises wrap and partial reads, immediate and
-  completed errors, a real pending pipe read, and injected delayed completion
+  completed errors, zero/oversized completion counts in both directions,
+  a real pending pipe read, and injected delayed completion
   after close. a full disk or stalled removable drive remains a manual
   end-to-end check of disk-to-RAM failover.
 

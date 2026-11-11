@@ -17,7 +17,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -208,7 +207,8 @@ bool writeTimelineAudio(
     return true;
 }
 
-int64_t audioPacketEndPts100ns(const AudioPacket& packet) {
+template <typename Packet>
+int64_t audioPacketEndPts100ns(const Packet& packet) {
     if (!packet.format || packet.frameCount == 0 || packet.format->bytes.size() < sizeof(WAVEFORMATEX)) {
         return packet.pts100ns;
     }
@@ -324,15 +324,7 @@ void ReplayBuffer::configure(const ReplaySettings& settings,
         audioCapacityBytes != 0 ? audioCapacityBytes : defaultRamAudioCapBytes(settings.seconds);
 
     if (!settings_.enabled) {
-        video_.clear();
-        systemAudio_.clear();
-        microphoneAudio_.clear();
-        ramVideoBytes_ = 0;
-        ramAudioBytes_ = 0;
-        clearBufferedVideoLocked();
-        clearBufferedAudioLocked();
-        lastSaveEndPts100ns_ = 0;
-        codecHeaderBytes_.clear();
+        clearBuffersLocked();
         closeRingLocked();
         closeAudioRingLocked();
         videoBackend_ = VideoBackend::Ram;
@@ -568,15 +560,12 @@ void ReplayBuffer::pushVideo(EncodedPacket packet) {
             L"being buffered in memory for the rest of this session. See the log for details.");
     }
 
-    if (packet.keyFrame) {
-        ++videoKeyFrames_;
-    }
     // A packet larger than the whole RAM cap can never fit, same as the ring.
     if (ramVideoCapacityBytes_ > 0 && packet.bytes.size() > ramVideoCapacityBytes_) {
-        if (packet.keyFrame && videoKeyFrames_ > 0) {
-            --videoKeyFrames_;
-        }
         return;
+    }
+    if (packet.keyFrame) {
+        ++videoKeyFrames_;
     }
     ramVideoBytes_ += packet.bytes.size();
     video_.push_back(std::make_shared<EncodedPacket>(std::move(packet)));
@@ -709,11 +698,7 @@ bool ReplayBuffer::saveTo(
             for (const auto& packet : video_) {
                 SnapshottedVideo snapshot;
                 snapshot.ram = packet;
-                snapshot.meta.pts100ns = packet->pts100ns;
-                snapshot.meta.dts100ns = packet->dts100ns;
-                snapshot.meta.hasDts = packet->hasDts;
-                snapshot.meta.duration100ns = packet->duration100ns;
-                snapshot.meta.keyFrame = packet->keyFrame;
+                snapshot.meta = videoMetaOf(*packet);
                 videoBytes += packet->bytes.size();
                 video.push_back(std::move(snapshot));
             }
@@ -817,10 +802,6 @@ bool ReplayBuffer::saveTo(
                 }
             }
         }
-    } else {
-        firstKeyFrame = std::find_if(video.begin(), video.end(), [](const SnapshottedVideo& snapshot) {
-            return snapshot.meta.keyFrame;
-        });
     }
 
     if (firstKeyFrame == video.end()) {
@@ -909,12 +890,13 @@ bool ReplayBuffer::saveTo(
     // anyway, duplicating them in the first sample.
     const bool firstSampleHasHeaders =
         firstPayload != nullptr && bitstreamContainsParameterSets(videoSettings.codec, *firstPayload);
-    if (!firstSampleHasHeaders && !ringReadFailed && codecHeaderBytes.empty()) {
+    const bool mayPrependHeaders = !firstSampleHasHeaders && !ringReadFailed;
+    if (mayPrependHeaders && codecHeaderBytes.empty()) {
         Logger::instance().warning(L"replay",
             L"Replay starts at a keyframe without codec headers and no cached headers are available");
     }
     const uint64_t headersToWrite =
-        !firstSampleHasHeaders && !ringReadFailed && !codecHeaderBytes.empty() ? codecHeaderBytes.size() : 0;
+        mayPrependHeaders && !codecHeaderBytes.empty() ? codecHeaderBytes.size() : 0;
 
     // Fail fast on a full disk before writing hundreds of megabytes of
     // elementary streams: the estimate covers the cut video, the buffered
@@ -1100,30 +1082,27 @@ bool ReplayBuffer::saveTo(
     std::filesystem::path systemPath;
     std::filesystem::path microphonePath;
 
-    if (!systemAudio.empty()) {
-        systemPath = tempDirectory / L"replay_system.wav";
-        if (!writeTimelineAudio(systemWriter, systemAudio, systemPath, replayStartPts, replayEndPts)) {
-            // A failed WAV write (typically disk full) must fail the save;
-            // muxing would publish a silently truncated audio track.
-            return preserveFailure(L"could not write the temporary replay audio stream " + systemPath.wstring() +
+    auto writeTrack = [&](WavWriter& writer, const auto& packets, const wchar_t* fileName,
+                          const wchar_t* track, std::filesystem::path& outPath) {
+        if (packets.empty()) {
+            return true;
+        }
+        outPath = tempDirectory / fileName;
+        if (!writeTimelineAudio(writer, packets, outPath, replayStartPts, replayEndPts)) {
+            // Muxing after a failed WAV write would publish truncated audio.
+            return preserveFailure(L"could not write the temporary replay audio stream " + outPath.wstring() +
                         L" (disk full?)");
         }
-        if (systemWriter.dataBytes() == 0) {
-            systemPath.clear();
-            Logger::instance().warning(L"replay", L"Replay system audio stream had no samples on the saved timeline");
+        if (writer.dataBytes() == 0) {
+            outPath.clear();
+            Logger::instance().warning(L"replay",
+                std::wstring(L"Replay ") + track + L" audio stream had no samples on the saved timeline");
         }
-    }
-
-    if (!microphoneAudio.empty()) {
-        microphonePath = tempDirectory / L"replay_microphone.wav";
-        if (!writeTimelineAudio(microphoneWriter, microphoneAudio, microphonePath, replayStartPts, replayEndPts)) {
-            return preserveFailure(L"could not write the temporary replay audio stream " + microphonePath.wstring() +
-                        L" (disk full?)");
-        }
-        if (microphoneWriter.dataBytes() == 0) {
-            microphonePath.clear();
-            Logger::instance().warning(L"replay", L"Replay microphone audio stream had no samples on the saved timeline");
-        }
+        return true;
+    };
+    if (!writeTrack(systemWriter, systemAudio, L"replay_system.wav", L"system", systemPath) ||
+        !writeTrack(microphoneWriter, microphoneAudio, L"replay_microphone.wav", L"microphone", microphonePath)) {
+        return false;
     }
 
     inputs.systemAudioPath = systemPath;
@@ -1152,6 +1131,10 @@ bool ReplayBuffer::saveTo(
 
 void ReplayBuffer::clear() {
     std::scoped_lock lock(mutex_);
+    clearBuffersLocked();
+}
+
+void ReplayBuffer::clearBuffersLocked() {
     video_.clear();
     systemAudio_.clear();
     microphoneAudio_.clear();
@@ -1188,13 +1171,7 @@ int64_t ReplayBuffer::videoSpan100ns() const {
     } else {
         metas.reserve(video_.size());
         for (const auto& packet : video_) {
-            VideoPacketMeta meta;
-            meta.pts100ns = packet->pts100ns;
-            meta.dts100ns = packet->dts100ns;
-            meta.duration100ns = packet->duration100ns;
-            meta.hasDts = packet->hasDts;
-            meta.keyFrame = packet->keyFrame;
-            metas.push_back(meta);
+            metas.push_back(videoMetaOf(*packet));
         }
     }
     if (metas.empty()) {
@@ -1220,17 +1197,8 @@ int64_t ReplayBuffer::newestVideoPts100ns() const {
     return video_.empty() ? 0 : video_.back()->pts100ns;
 }
 
-int64_t ReplayBuffer::diskAudioPacketEndPts100ns(const DiskAudioPacket& packet) {
-    if (!packet.format || packet.frameCount == 0 || packet.format->bytes.size() < sizeof(WAVEFORMATEX)) {
-        return packet.pts100ns;
-    }
-    const auto* format = reinterpret_cast<const WAVEFORMATEX*>(packet.format->bytes.data());
-    if (format->nSamplesPerSec == 0) {
-        return packet.pts100ns;
-    }
-    return packet.pts100ns +
-           static_cast<int64_t>((static_cast<int64_t>(packet.frameCount) * kHundredNanosecondsPerSecond) /
-                                format->nSamplesPerSec);
+ReplayBuffer::VideoPacketMeta ReplayBuffer::videoMetaOf(const EncodedPacket& packet) {
+    return {packet.pts100ns, packet.dts100ns, packet.duration100ns, packet.hasDts, packet.keyFrame};
 }
 
 void ReplayBuffer::trimLocked() {
@@ -1333,9 +1301,7 @@ void ReplayBuffer::trimLocked() {
     }
 
     // One audio trim for both backends and both bounds below: RAM packets
-    // subtract their RAM bytes, disk packets release their ring bytes. The
-    // end-time function differs because the disk metadata is not an
-    // AudioPacket.
+    // subtract their RAM bytes, disk packets release their ring bytes.
     const int64_t newestAudioReferencePts = videoBackend_ == VideoBackend::Disk
         ? (diskVideo_.empty() ? 0 : diskVideo_.back().meta.pts100ns)
         : (video_.empty() ? 0 : video_.back()->pts100ns);
@@ -1354,7 +1320,7 @@ void ReplayBuffer::trimLocked() {
         ++trimAudioEvicted_;
     };
     auto diskAudioEndPts = [](const DiskAudioPacket& packet) {
-        return diskAudioPacketEndPts100ns(packet);
+        return audioPacketEndPts100ns(packet);
     };
     auto releaseDiskAudio = [this](const DiskAudioPacket& packet) {
         audioRing_.releaseBytes(packet.first.byteCount + packet.second.byteCount);
@@ -1465,11 +1431,7 @@ bool ReplayBuffer::appendRingLocked(const EncodedPacket& packet) {
     const uint32_t size = static_cast<uint32_t>(packet.bytes.size());
 
     DiskVideoPacket entry;
-    entry.meta.pts100ns = packet.pts100ns;
-    entry.meta.dts100ns = packet.dts100ns;
-    entry.meta.duration100ns = packet.duration100ns;
-    entry.meta.hasDts = packet.hasDts;
-    entry.meta.keyFrame = packet.keyFrame;
+    entry.meta = videoMetaOf(packet);
     if (!videoRing_.writeWrapped(packet.bytes.data(), size, entry.first, entry.second, L"ring")) {
         return false;
     }

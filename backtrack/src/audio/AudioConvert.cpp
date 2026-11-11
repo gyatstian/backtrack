@@ -41,6 +41,14 @@ bool isWaveExtensibleSubFormat(const GUID& guid, uint16_t tag) {
            std::equal(std::begin(guid.Data4), std::end(guid.Data4), kWaveSubFormatTail);
 }
 
+const WAVEFORMATEXTENSIBLE* asExtensible(const WaveFormatBlob& blob) {
+    if (blob.bytes.size() < sizeof(WAVEFORMATEXTENSIBLE)) {
+        return nullptr;
+    }
+    const auto* format = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(blob.bytes.data());
+    return format->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE ? format : nullptr;
+}
+
 const std::shared_ptr<const WaveFormatBlob>& canonicalAudioFormatPtr() {
     static const std::shared_ptr<const WaveFormatBlob> blob =
         std::make_shared<const WaveFormatBlob>(canonicalAudioFormat());
@@ -116,8 +124,7 @@ AudioFormatInfo parseAudioFormat(const WaveFormatBlob& blob) {
         info.encoding = AudioSampleEncoding::Pcm;
     } else if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
         info.encoding = AudioSampleEncoding::Float;
-    } else if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && blob.bytes.size() >= sizeof(WAVEFORMATEXTENSIBLE)) {
-        const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(blob.bytes.data());
+    } else if (const auto* extensible = asExtensible(blob)) {
         if (isWaveExtensibleSubFormat(extensible->SubFormat, WAVE_FORMAT_PCM)) {
             info.encoding = AudioSampleEncoding::Pcm;
         } else if (isWaveExtensibleSubFormat(extensible->SubFormat, WAVE_FORMAT_IEEE_FLOAT)) {
@@ -240,13 +247,10 @@ uint32_t defaultChannelMask(uint16_t channels) {
 // A mask that disagrees with the channel count cannot be mapped onto the
 // interleaved layout reliably; prefer the standard default over guessing.
 uint32_t channelMaskForDownmix(const WaveFormatBlob& blob, uint16_t channels) {
-    if (blob.bytes.size() >= sizeof(WAVEFORMATEXTENSIBLE)) {
-        const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(blob.bytes.data());
-        if (extensible->Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-            const uint32_t mask = extensible->dwChannelMask;
-            if (mask != 0 && std::popcount(mask) == channels) {
-                return mask;
-            }
+    if (const auto* extensible = asExtensible(blob)) {
+        const uint32_t mask = extensible->dwChannelMask;
+        if (mask != 0 && std::popcount(mask) == channels) {
+            return mask;
         }
     }
     return defaultChannelMask(channels);

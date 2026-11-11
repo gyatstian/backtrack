@@ -54,22 +54,8 @@ bool D3DDevice::initialize(uint32_t adapterIndex) {
     };
 
     D3D_FEATURE_LEVEL createdLevel = D3D_FEATURE_LEVEL_11_0;
-    hr = D3D11CreateDevice(
-        adapter_.Get(),
-        adapter_ ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        flags,
-        requestedLevels,
-        ARRAYSIZE(requestedLevels),
-        D3D11_SDK_VERSION,
-        &device_,
-        &createdLevel,
-        &context_);
-
-#if defined(_DEBUG)
-    if (hr == DXGI_ERROR_SDK_COMPONENT_MISSING) {
-        flags &= ~D3D11_CREATE_DEVICE_DEBUG;
-        hr = D3D11CreateDevice(
+    const auto createDevice = [&]() {
+        return D3D11CreateDevice(
             adapter_.Get(),
             adapter_ ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
             nullptr,
@@ -80,6 +66,13 @@ bool D3DDevice::initialize(uint32_t adapterIndex) {
             &device_,
             &createdLevel,
             &context_);
+    };
+    hr = createDevice();
+
+#if defined(_DEBUG)
+    if (hr == DXGI_ERROR_SDK_COMPONENT_MISSING) {
+        flags &= ~D3D11_CREATE_DEVICE_DEBUG;
+        hr = createDevice();
     }
 #endif
 

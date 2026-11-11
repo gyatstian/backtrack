@@ -69,7 +69,8 @@ recovery store that keeps a killed recording recoverable.
   metadata value rejects the whole manifest; a torn or non-contiguous sample
   tail keeps the valid prefix, and samples reaching past the end of the
   elementary stream are dropped. Every number must parse as a complete token, so
-  a line torn mid-digits cannot become a plausible-but-wrong offset.
+  a line torn mid-digits cannot become a plausible-but-wrong offset. numeric
+  parsing rejects overflow and unsigned signs; signed timestamps may be negative.
 - `recoverLatestFailedRecording` selects the newest valid manifest across the
   `ClipStorage` roots and publishes to its original output root with an
   exclusively claimed name. startup attempts every recoverable session once;
@@ -105,6 +106,8 @@ recovery store that keeps a killed recording recoverable.
     `ReplayBuffer::writeTimelineAudio`) and log one info line at
     finalize/save when any gaps were filled; the per-packet path itself never
     logs.
+- `WavWriter::open` resets the previous stream and accepts its own `path()` as
+  the next path; preserve that path before clearing writer state.
 - `WavWriter` is the single WAV implementation for the recording tracks, the
   replay tracks, and the mixed PCM copy in `audio/AudioMix.cpp`. It patches the
   RIFF and data sizes on `close`, so a process killed before that leaves zeroed
@@ -163,10 +166,13 @@ recovery store that keeps a killed recording recoverable.
   of damaged metadata, a WAV whose header was never patched, and that a PTS gap
   keeps its full duration in the saved replay audio.
 - `AudioPersistenceTests` (CTest) covers `paceAudioPacket`'s full-gap fill (a
-  long outage keeps its duration on the saved timeline) and `WavWriter` keeping
-  writes past the 4 GiB RIFF boundary.
+  long outage keeps its duration on the saved timeline), frame-aligned silence
+  across chunk boundaries, reopening the writer's own path, and writes past the
+  4 GiB RIFF boundary.
 - `Mp4MuxerTests` (CTest, the only Media Foundation-linked suite) covers
-  recording write-failure retention, inactive abort, same-name retry, and the
+  recording write-failure retention, inactive abort, same-name retry,
+  strict recovery numeric tokens and signed timestamp round trips, failed
+  manifest publication retaining the old file and removing staging, and the
   mux WAV extent (`parseMuxWav`): a clamped data size keeps the payload past the
   RIFF boundary with the frame count and duration covering it, while a
   well-formed extent and a real trailing chunk are left alone. The MP4 write

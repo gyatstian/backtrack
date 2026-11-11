@@ -80,6 +80,9 @@ GPU scaler that converts frames to whatever the active encoder wants.
   `setCursorCaptureEnabled` only flips a flag the next acquired frame reads.
   `hdrBypass` avoids 8-bit quantization on scRGB targets. HDR cursor color,
   white level, and XOR approximations still need hardware validation.
+  retain the cursor constant-buffer fields until layout and rotated/HDR
+  hardware evidence supports a change. `UpdateSubresource` reads all 32 bytes;
+  removing `desktopSize` alone leaves an unsafe 24-byte C++ source object.
   `desktopCopy_` is written only when a cursor is actually composited; otherwise
   the acquired surface is copied straight into the slot and `desktopCopyDirty_`
   marks the intermediate stale, so a cursor that reappears refreshes it before
@@ -119,14 +122,13 @@ GPU scaler that converts frames to whatever the active encoder wants.
   drivers) or immediately when input format/dims change (which also resets the
   count, as does a recovery); latch logs one warning with the next retry in
   seconds, recovery logs info. The legacy path (no `VideoContext1`)
-  programs no HDR input space, so `appliedHdrInputSpace_` stays false and
-  `hdrMappingActive()` is false; HDR input there logs one warning and records
-  without tone-mapping. `inputFormat_` is tracked in `ensureInitialized` /
+  programs no HDR input space, so `appliedHdrInputSpace_` stays false;
+  HDR input there logs one warning and records without tone-mapping.
+  `inputFormat_` is tracked in `ensureInitialized` /
   `ensureCopyPool`, and the copied input texture is rebuilt when the source
   format changes (PQ<->scRGB reuse the copy path at the same resolution).
-  `hdrInputRejected()` / `hdrMappingActive()` expose the latch and the applied
-  mapping; both are read by `app` only under `pipelineGpuMutex_`, which also
-  guards every mutation.
+  `hdrInputRejected()` exposes the latch; `app` reads it only under
+  `pipelineGpuMutex_`, which also guards every mutation.
 - desktop duplication polls output color state through cached `IDXGIOutput6`
   at most once per second, with `monitorHasAdvancedColor` as fallback. it is
   not used to infer the surface format. the pool stays empty until the first
@@ -181,12 +183,14 @@ GPU scaler that converts frames to whatever the active encoder wants.
 ## Verification
 
 `HdrStabilityTests` (CTest) exercises production duplication negotiation with
-fake API calls, format acceptance, retries, and HDR rejection backoff.
+fake API calls, format acceptance, retries, HDR rejection backoff, and the
+header-only advanced-color predicate shared with `platform`.
 `DesktopDuplicationRotationTests` (CTest) exercises the header-inline rotation
 coordinate helpers (dimension normalization and cursor transform for 90/180/270)
 and the cursor carry across a same-output rebuild, without a D3D device. `WgcCopyPoolTests` (CTest) exercises fallback resize with WARP.
 `D3D11FrameScalerTests` (CTest) uses WARP and a fake video device to check the
-copied-input fallback and NV12 failure handling.
+copied-input fallback, NV12 failure handling, and same-size alias/copy paths
+including sticky BGRA fallback.
 
 on HDR hardware, compare recorded gray and highlight ramps with the displayed
 image and an SDR reference, including multiple SDR white levels, fullscreen

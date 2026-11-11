@@ -7,6 +7,7 @@
 #include <array>
 #include <algorithm>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace backtrack {
@@ -48,15 +49,9 @@ WavWriter::~WavWriter() {
 }
 
 bool WavWriter::open(const std::filesystem::path& path, const WaveFormatBlob& format) {
-    close();
-    path_ = path;
-    dataBytes_ = 0;
-    maxDataBytes_ = 0;
-    dataSizePosition_ = {};
-    blockAlign_ = 0;
-    samplesPerSec_ = 0;
-    format_ = WaveFormatBlob{};
-    riffBoundaryLogged_ = false;
+    auto nextPath = path; // path can alias path_.
+    reset();
+    path_ = std::move(nextPath);
     const WaveFormatBlob effectiveFormat = format.bytes.empty() ? fallbackPcmFormat() : format;
     if (effectiveFormat.bytes.size() < sizeof(WAVEFORMATEX)) {
         Logger::instance().warning(L"mux", L"Rejected WAV stream with invalid format metadata: " + path_.wstring());
@@ -128,12 +123,7 @@ bool WavWriter::writeSilenceFrames(uint64_t frames) {
     const uint64_t maxFrames = (std::numeric_limits<uint64_t>::max)() / blockAlign_;
     uint64_t bytesRemaining = std::min<uint64_t>(frames, maxFrames) * blockAlign_;
     while (bytesRemaining > 0) {
-        uint64_t bytesThisChunk = std::min<uint64_t>(bytesRemaining, silence.size());
-        bytesThisChunk -= bytesThisChunk % blockAlign_;
-        if (bytesThisChunk == 0) {
-            break;
-        }
-        const size_t bytesToWrite = static_cast<size_t>(bytesThisChunk);
+        const size_t bytesToWrite = static_cast<size_t>(std::min<uint64_t>(bytesRemaining, silence.size()));
         if (!write(silence.data(), bytesToWrite)) {
             return false;
         }

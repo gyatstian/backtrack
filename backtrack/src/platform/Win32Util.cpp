@@ -290,23 +290,29 @@ std::wstring sanitizeFileNamePart(std::wstring value) {
     return value;
 }
 
+std::filesystem::path knownFolder(REFKNOWNFOLDERID folder) {
+    PWSTR rawPath = nullptr;
+    if (FAILED(SHGetKnownFolderPath(folder, KF_FLAG_CREATE, nullptr, &rawPath))) {
+        return {};
+    }
+    std::filesystem::path path(rawPath);
+    CoTaskMemFree(rawPath);
+    return path;
+}
+
 } // namespace
 
 std::filesystem::path localAppDataPath() {
-    PWSTR rawPath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &rawPath))) {
-        std::filesystem::path path(rawPath);
-        CoTaskMemFree(rawPath);
+    const auto path = knownFolder(FOLDERID_LocalAppData);
+    if (!path.empty()) {
         return path / L"Backtrack";
     }
     return std::filesystem::temp_directory_path() / L"Backtrack";
 }
 
 std::filesystem::path defaultClipDirectory() {
-    PWSTR rawPath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Videos, KF_FLAG_CREATE, nullptr, &rawPath))) {
-        std::filesystem::path path(rawPath);
-        CoTaskMemFree(rawPath);
+    const auto path = knownFolder(FOLDERID_Videos);
+    if (!path.empty()) {
         return path / L"Backtrack";
     }
     return localAppDataPath() / L"Clips";
@@ -718,10 +724,7 @@ bool monitorHasAdvancedColor(HMONITOR monitor) {
             if (FAILED(output6->GetDesc1(&desc1))) {
                 return false;
             }
-            // PQ (ST.2084) and linear scRGB both mean the compositor hands out
-            // HDR surfaces; anything else (or an unresolvable output) is SDR.
-            return desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
-                desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+            return isAdvancedColorSpace(desc1.ColorSpace);
         }
     }
     return false;

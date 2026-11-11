@@ -52,6 +52,31 @@ struct NvencEncoderTestAccess {
         encoder.impl_->caps.effective.bFrames = enabled;
     }
 
+    static void setLookahead(NvencEncoder& encoder, bool enabled, uint32_t depth) {
+        encoder.impl_->caps.effective.lookahead = enabled;
+        encoder.impl_->caps.effective.lookaheadDepth = depth;
+    }
+
+    static void queueReadyAndDisarmKeyframe(NvencEncoder& encoder) {
+        EncodedPacket packet;
+        packet.bytes = {0x42};
+        packet.pts100ns = 999;
+        encoder.impl_->readyPackets.push_back(std::move(packet));
+        encoder.impl_->forceKeyFrame = false;
+    }
+
+    static bool keyframeArmed(const NvencEncoder& encoder) {
+        return encoder.impl_->forceKeyFrame.load();
+    }
+
+    static void retainMapping(NvencEncoder& encoder, ID3D11Texture2D* texture) {
+        encoder.impl_->retainedMappings.push_back({texture, texture, {}});
+    }
+
+    static void exhaustOutputBuffers(NvencEncoder& encoder) {
+        encoder.impl_->availableBitstreams.clear();
+    }
+
     // Simulates an output that has been waiting past the lock deadline.
     static void agePendingOutputs(NvencEncoder& encoder, std::chrono::seconds age) {
         for (auto& pending : encoder.impl_->pendingOutputs) {
@@ -97,6 +122,7 @@ struct FakeNvenc {
     bool submittedWithoutFreshMap = false;
     bool failLock = false;
     bool failMap = false;
+    bool failRegister = false;
     // This driver answers a not-yet-complete non-blocking lock with
     // NV_ENC_ERR_OUT_OF_MEMORY instead of NV_ENC_ERR_LOCK_BUSY.
     bool outOfMemoryWhenIncomplete = false;
@@ -109,7 +135,8 @@ struct FakeNvenc {
 
     static FakeNvenc& from(void* session) { return *static_cast<FakeNvenc*>(session); }
 
-    static NVENCSTATUS NVENCAPI registerResource(void*, NV_ENC_REGISTER_RESOURCE* resource) {
+    static NVENCSTATUS NVENCAPI registerResource(void* session, NV_ENC_REGISTER_RESOURCE* resource) {
+        if (from(session).failRegister) return NV_ENC_ERR_RESOURCE_REGISTER_FAILED;
         resource->registeredResource = resource->resourceToRegister;
         return NV_ENC_SUCCESS;
     }
@@ -393,6 +420,72 @@ void testRepeatedInput() {
            "repeated input was not safely released");
 }
 
+void testDroppedInputsRearmAndReturnReadyTail() {
+    enum class DropCase { Repeated, Retained, Registration, OutputPool };
+    for (const auto test : {DropCase::Repeated, DropCase::Retained, DropCase::Registration, DropCase::OutputPool}) {
+        FakeNvenc fake;
+        InstrumentedPool pool(fake);
+        NvencEncoder encoder;
+        attach(encoder, fake);
+        fake.completeOnEos = true;
+        auto frame = pool.write();
+        std::vector<EncodedPacket> packets;
+        const wchar_t* expectedLog = nullptr;
+        switch (test) {
+        case DropCase::Repeated:
+            encoder.encodeFrame(frame, packets);
+            expectedLog = L"NVENC frame dropped: input texture still mapped; keyframe re-armed";
+            break;
+        case DropCase::Retained:
+            NvencEncoderTestAccess::retainMapping(encoder, frame.texture.Get());
+            fake.mappedResources.insert(frame.texture.Get());
+            fake.mapped = true;
+            expectedLog = L"NVENC frame dropped: retained input mapping; keyframe re-armed";
+            break;
+        case DropCase::Registration:
+            fake.failRegister = true;
+            expectedLog = L"NVENC frame dropped: no registered input resource; keyframe re-armed";
+            break;
+        case DropCase::OutputPool:
+            NvencEncoderTestAccess::exhaustOutputBuffers(encoder);
+            expectedLog = L"NVENC output buffer pool is full; dropping frame until delayed output drains";
+            break;
+        }
+        NvencEncoderTestAccess::queueReadyAndDisarmKeyframe(encoder);
+        encoder.encodeFrame(frame, packets);
+        expect(packets.size() == 1 && packets.front().pts100ns == 999 &&
+               packets.front().bytes == std::vector<uint8_t>{0x42},
+            "a dropped input stranded or changed the ready output tail");
+        expect(encoder.stats().droppedFrames == 1 && NvencEncoderTestAccess::keyframeArmed(encoder),
+            "a dropped input did not count exactly once and re-arm the next keyframe");
+        const int submitted = test == DropCase::Repeated ? 1 : 0;
+        expect(fake.accepted == submitted && fake.mapAttempts == submitted && !fake.submittedWithoutFreshMap,
+            "a dropped input was mapped or submitted again");
+        const auto lines = Logger::instance().recentLines(1);
+        expect(!lines.empty() && lines.back().find(expectedLog) != std::wstring::npos,
+            "a drop path changed its diagnostic text or emitted an extra warning");
+        expect(encoder.resetInputResources(), "drop-path cleanup could not retire inputs");
+        frame = {};
+        expect(!fake.mapped && !fake.releasedWhileMapped && pool.available(),
+            "drop-path cleanup released a still-mapped input");
+    }
+}
+
+void testRetentionBudgetUsesPipelineDelay() {
+    NvencEncoder encoder;
+    for (const bool bFrames : {false, true}) {
+        NvencEncoderTestAccess::setBFrames(encoder, bFrames);
+        for (const bool lookahead : {false, true}) {
+            for (const uint32_t depth : {0u, 24u, 31u, 100u}) {
+                NvencEncoderTestAccess::setLookahead(encoder, lookahead, depth);
+                const uint32_t delay = (bFrames ? 2u : 0u) + (lookahead ? depth : 0u);
+                expect(encoder.inputRetentionBudget() == std::min(delay + 4, 40u),
+                    "the retention budget no longer includes the active pipeline delay and headroom");
+            }
+        }
+    }
+}
+
 void testRejectedSubmission() {
     FakeNvenc fake;
     InstrumentedPool pool(fake);
@@ -464,6 +557,8 @@ void testFailedLockRetainsInput() {
     NvencEncoderTestAccess::harvest(encoder);
     expect(!pool.available() && !fake.invalidUnmap && !fake.invalidDestroy,
            "lock failure released or destroyed an input with work outstanding");
+    expect(encoder.stats().droppedFrames == 1 && !encoder.encoderAvailable(),
+           "lock failure did not count the dropped frame or fault the encoder");
 }
 
 void testShutdownRetainsUnfinishedInput() {
@@ -581,6 +676,8 @@ int main() {
         testReorderedInputRetirement();
         testMapFailureReleasesInput();
         testRepeatedInput();
+        testDroppedInputsRearmAndReturnReadyTail();
+        testRetentionBudgetUsesPipelineDelay();
         testRejectedSubmission();
         testResetAndCaptureHandoff();
         testFailedResetKeepsCaptureFrame();

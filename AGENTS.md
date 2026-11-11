@@ -64,10 +64,8 @@ gate.
 
 Toolchain, verified on 2026-10-11: the only installed Visual Studio is Build
 Tools 2022 (17.14, channel `VisualStudio.17.Release`), so the generator is
-`"Visual Studio 17 2022"`. `cmake` is not on `PATH`; it ships inside the
-install at `Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`
-under `%ProgramFiles(x86)%\Microsoft Visual Studio\2022\BuildTools`, or use
-`LaunchDevCmd.bat`. The app target needs the `C++ ATL for latest v143 build
+`"Visual Studio 17 2022"`. `cmake` and `ctest` are on `PATH` from
+`C:\Program Files\CMake\bin`. The app target needs the `C++ ATL for latest v143 build
 tools` component: `voice/VoiceCommandService.cpp` includes `<sapi.h>`, whose
 `sphelper.h` includes `atlbase.h`. Without ATL installed the test targets still
 build and pass, but the app fails with `C1083 atlbase.h not found`.

@@ -80,27 +80,12 @@ std::wstring formatGiB(uint64_t bytes) {
 // Full-token numeric parsing. std::stoull happily converts the "123" prefix of
 // a line torn mid-number into a plausible-but-wrong offset, which would make
 // the muxer read wrong bytes; requiring full consumption rejects those.
-bool parseUInt64Strict(const std::string& text, uint64_t& value) {
+template <typename T>
+bool parseStrict(const std::string& text, T& value) {
     const char* const first = text.data();
     const char* const last = first + text.size();
     const auto result = std::from_chars(first, last, value);
     return result.ec == std::errc() && result.ptr == last;
-}
-
-bool parseInt64Strict(const std::string& text, int64_t& value) {
-    const char* const first = text.data();
-    const char* const last = first + text.size();
-    const auto result = std::from_chars(first, last, value);
-    return result.ec == std::errc() && result.ptr == last;
-}
-
-bool parseUInt32Strict(const std::string& text, uint32_t& value) {
-    uint64_t wide = 0;
-    if (!parseUInt64Strict(text, wide) || wide > (std::numeric_limits<uint32_t>::max)()) {
-        return false;
-    }
-    value = static_cast<uint32_t>(wide);
-    return true;
 }
 
 // Bounded retry budget for the two publishes that can lose a race with
@@ -192,11 +177,11 @@ bool parseSampleColumns(const std::vector<std::string>& parts, MuxedInputs::Vide
         return false;
     }
     uint32_t keyFrameFlag = 0;
-    if (!(parseUInt64Strict(parts[1], sample.offset) &&
-          parseUInt32Strict(parts[2], sample.size) &&
-          parseInt64Strict(parts[3], sample.pts100ns) &&
-          parseInt64Strict(parts[4], sample.duration100ns) &&
-          parseUInt32Strict(parts[5], keyFrameFlag))) {
+    if (!(parseStrict(parts[1], sample.offset) &&
+          parseStrict(parts[2], sample.size) &&
+          parseStrict(parts[3], sample.pts100ns) &&
+          parseStrict(parts[4], sample.duration100ns) &&
+          parseStrict(parts[5], keyFrameFlag))) {
         return false;
     }
     sample.keyFrame = keyFrameFlag != 0;
@@ -204,7 +189,7 @@ bool parseSampleColumns(const std::vector<std::string>& parts, MuxedInputs::Vide
     // Column added with B-frame support; older manifests fall back to "no
     // decode timestamp", which matches their streams.
     int64_t dts100ns = 0;
-    if ((parts.size() >= 7 && !parseInt64Strict(parts[6], dts100ns))) {
+    if ((parts.size() >= 7 && !parseStrict(parts[6], dts100ns))) {
         return false;
     }
     sample.dts100ns = dts100ns;
@@ -217,7 +202,7 @@ bool parseSampleColumns(const std::vector<std::string>& parts, MuxedInputs::Vide
     // the inferred interpretation above.
     uint32_t hasDtsFlag = 0;
     if (parts.size() >= 8) {
-        if (!parseUInt32Strict(parts[7], hasDtsFlag)) {
+        if (!parseStrict(parts[7], hasDtsFlag)) {
             return false;
         }
         sample.hasDts = hasDtsFlag != 0;
@@ -277,13 +262,13 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
         if (parts[0] == "codec" && parts.size() >= 2) {
             manifest.inputs.codec = codecFromText(parts[1]);
         } else if (parts[0] == "fps" && parts.size() >= 2) {
-            damagedMetadata = !parseUInt32Strict(parts[1], manifest.inputs.fps);
+            damagedMetadata = !parseStrict(parts[1], manifest.inputs.fps);
         } else if (parts[0] == "width" && parts.size() >= 2) {
-            damagedMetadata = !parseUInt32Strict(parts[1], manifest.inputs.width);
+            damagedMetadata = !parseStrict(parts[1], manifest.inputs.width);
         } else if (parts[0] == "height" && parts.size() >= 2) {
-            damagedMetadata = !parseUInt32Strict(parts[1], manifest.inputs.height);
+            damagedMetadata = !parseStrict(parts[1], manifest.inputs.height);
         } else if (parts[0] == "bitrateKbps" && parts.size() >= 2) {
-            damagedMetadata = !parseUInt32Strict(parts[1], manifest.inputs.bitrateKbps);
+            damagedMetadata = !parseStrict(parts[1], manifest.inputs.bitrateKbps);
         } else if ((parts[0] == "video" || parts[0] == "systemAudio" || parts[0] == "microphoneAudio") && parts.size() >= 2) {
             const std::filesystem::path name(parts[1]);
             damagedMetadata = name.empty() || name != name.filename() || name == L"." || name == L".." ||
@@ -295,7 +280,7 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
             }
         } else if (parts[0] == "samples" && parts.size() >= 2) {
             uint64_t count = 0;
-            if (parseUInt64Strict(parts[1], count)) {
+            if (parseStrict(parts[1], count)) {
                 constexpr uint64_t kMaxReservedSamples = 10'000'000;
                 expectedSamples = static_cast<size_t>(count);
                 manifest.inputs.videoSamples.reserve(
@@ -454,6 +439,12 @@ bool writeManifest(const MuxedInputs& inputs, const std::filesystem::path& tempD
     // otherwise fully recoverable session.
     const std::filesystem::path manifestPath = manifestPathFor(tempDirectory);
     const std::filesystem::path tempPath = manifestTempPathFor(tempDirectory);
+    const auto fail = [&tempPath](const std::wstring& reason) {
+        Logger::instance().warning(L"mux", reason);
+        std::error_code removeError;
+        std::filesystem::remove(tempPath, removeError);
+        return false;
+    };
     {
         std::ofstream stream(tempPath, std::ios::out | std::ios::trunc);
         if (!stream.is_open()) {
@@ -468,30 +459,20 @@ bool writeManifest(const MuxedInputs& inputs, const std::filesystem::path& tempD
         }
         stream.flush();
         if (!stream.good()) {
-            Logger::instance().warning(L"mux", L"Could not write recording recovery manifest: " + manifestPath.wstring());
             stream.close();
-            std::error_code removeError;
-            std::filesystem::remove(tempPath, removeError);
-            return false;
+            return fail(L"Could not write recording recovery manifest: " + manifestPath.wstring());
         }
     }
 
     DWORD flushError = ERROR_SUCCESS;
     if (!flushFileToDisk(tempPath, flushError)) {
-        Logger::instance().warning(L"mux",
-            L"Could not flush recording recovery manifest: " + tempPath.wstring() +
+        return fail(L"Could not flush recording recovery manifest: " + tempPath.wstring() +
             L" (Win32 error " + std::to_wstring(flushError) + L")");
-        std::error_code removeError;
-        std::filesystem::remove(tempPath, removeError);
-        return false;
     }
     if (!publishWithRetry(tempPath, manifestPath)) {
-        Logger::instance().warning(L"mux",
-            L"Could not publish recording recovery manifest: " + manifestPath.wstring() +
-            L" (Win32 error " + std::to_wstring(GetLastError()) + L")");
-        std::error_code removeError;
-        std::filesystem::remove(tempPath, removeError);
-        return false;
+        const DWORD publishError = GetLastError();
+        return fail(L"Could not publish recording recovery manifest: " + manifestPath.wstring() +
+            L" (Win32 error " + std::to_wstring(publishError) + L")");
     }
     return true;
 }

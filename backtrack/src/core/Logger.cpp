@@ -214,16 +214,6 @@ void Logger::initialize(const std::filesystem::path& logPath) {
     }
 }
 
-void Logger::setMinLevel(LogLevel level) {
-    std::scoped_lock lock(mutex_);
-    minLevel_ = level;
-}
-
-LogLevel Logger::minLevel() const {
-    std::scoped_lock lock(mutex_);
-    return minLevel_;
-}
-
 void Logger::setEnabled(bool enabled) {
     std::scoped_lock lock(mutex_);
     enabled_ = enabled;

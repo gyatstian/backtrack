@@ -228,7 +228,9 @@ private:
     void clearSettingsBodyControls();
     void storeCurrentPageCache();
     void loadPageCache(Page page);
+    void resetPageControlMembers();
     void rebindPageControlPointers();
+    static void resetPageCache(PageCache& cache);
     void invalidatePageCache(Page page);
     void updateTabChrome();
     void updateSettingsCategoryChrome();
@@ -236,6 +238,9 @@ private:
     void clearButtonHover();
     HWND addControl(const wchar_t* className, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id);
     HWND addSectionLabel(const wchar_t* text, int x, int y, int width);
+    HWND addCheckbox(const wchar_t* text, int x, int y, int width, int height, int id, bool checked);
+    HWND addRowLabel(const wchar_t* text, int x, int y, int width);
+    void addRowHelp(HWND label, HWND control, const std::wstring& text);
     void setDefaultFont(HWND control);
     void createUpdateButton();
     static std::optional<std::wstring> fetchLatestReleaseVersion(
@@ -280,6 +285,8 @@ private:
     int statusHeightForWidth(int width) const;
     void layoutWindow();
     bool layoutCurrentPage();
+    LayoutItem* layoutItemFor(HWND control);
+    bool movePlacedControl(HWND control, int x, int y, int width, int height);
     void detachPageControl(HWND control);
     void scrollPageTo(int position);
     void scrollPageBy(int delta);

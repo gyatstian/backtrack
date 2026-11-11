@@ -55,6 +55,10 @@ static std::wstring hdrFormatName(DXGI_FORMAT format) {
     }
 }
 
+static std::wstring activeBackendName(const RecordingStats& stats) {
+    return stats.captureBackendActive ? captureBackendDisplayName(stats.activeCaptureBackend) : L"inactive";
+}
+
 static std::wstring hdrStatusLine(const RecordingStats& stats) {
     const std::wstring detail =
         std::wstring(L", ") + captureBackendDisplayName(stats.activeCaptureBackend) +
@@ -106,12 +110,7 @@ void MainWindow::saveLog() {
     // updateStats renders).
     const RecordingStats tailStats = controller_.stats();
     std::wstringstream tail;
-    tail << L"\nActive backend: ";
-    if (tailStats.captureBackendActive) {
-        tail << captureBackendDisplayName(tailStats.activeCaptureBackend);
-    } else {
-        tail << L"inactive";
-    }
+    tail << L"\nActive backend: " << activeBackendName(tailStats);
     tail << L"\n" << hdrStatusLine(tailStats) << L"\n";
     // Runtime snapshot: the counters that matter when triaging a log. It is
     // appended at save time, so it reflects the session so far, not shutdown.
@@ -149,12 +148,7 @@ void MainWindow::updateStats() {
         stream << L"Recording: " << (stats.recording ? L"yes" : L"no") << L"\r\n";
         stream << L"Replay buffer: " << (stats.replayEnabled ? L"enabled" : L"disabled") << L"\r\n";
         stream << L"Selected backend: " << captureBackendDisplayName(stats.selectedCaptureBackend) << L"\r\n";
-        stream << L"Active backend: ";
-        if (stats.captureBackendActive) {
-            stream << captureBackendDisplayName(stats.activeCaptureBackend);
-        } else {
-            stream << L"inactive";
-        }
+        stream << L"Active backend: " << activeBackendName(stats);
         if (stats.captureBackendFallbackUsed) {
             stream << L" (fallback)";
         }

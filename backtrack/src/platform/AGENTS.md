@@ -42,7 +42,9 @@ publication helper, and the constants `app` and `ui` share.
   output cannot be resolved (no `IDXGIOutput6`, failed `GetDesc1`, anything
   else). Callers treat SDR as the safe default, which is why it
   must never be allowed to report HDR optimistically.
-  `DesktopDuplicationCapture::queryAdvancedColor` uses the same predicate.
+  `DesktopDuplicationCapture::queryAdvancedColor` shares the inline
+  `isAdvancedColorSpace` predicate in `Win32Util.h`; keep it header-only so
+  suites that stub `Win32Util.cpp` still link.
 - `dxgiOutputForMonitor` searches every adapter, and the returned
   `DxgiOutputLocation` names the adapter a D3D device must be created on for
   Desktop Duplication to work. Adapter choice is not interchangeable with the
@@ -98,8 +100,9 @@ publication helper, and the constants `app` and `ui` share.
 
 ## Verification
 
-No automated suite, and none will link `Win32Util.cpp` as it stands: it drags
-DXGI, avrt and winmm into the test, so `SettingsClipGuardTests` stubs
+`HdrStabilityTests` covers the inline advanced-color predicate (PQ/scRGB true,
+SDR and unrecognized spaces false) without linking `Win32Util.cpp`. the `.cpp`
+drags DXGI, avrt and winmm into tests, so `SettingsClipGuardTests` stubs
 `defaultClipDirectory()` instead. Manual: build, then confirm monitor selection
 and multi-monitor support in the app, that startup registration adds and
 removes the run entry, and that no exception fires at startup with the

@@ -32,7 +32,6 @@ public:
     void setPoolSize(uint32_t poolSize);
     void reset();
     bool hdrInputRejected() const;
-    bool hdrMappingActive() const;
 
 private:
     friend struct D3D11FrameScalerTestAccess;

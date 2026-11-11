@@ -196,10 +196,12 @@ void testNormalRenameAndStorageRoots() {
     expect(manager.setFavorite(source, true) && manager.addTag(source, L"  tag  ") && manager.addTag(source, L"tag"),
            "could not prepare normal sidecars");
     expect(readFile(sidecar(source, L".tags")) == "tag\n", "duplicate tag was not normalized");
+    writeFile(sidecar(target, L".favorite"), "stale favorite");
+    writeFile(sidecar(target, L".tags"), "stale tags");
     expect(!manager.renameClip(source, L"CON"), "invalid clip name was accepted");
     expect(manager.renameClip(source, L"renamed"), "normal clip rename failed");
     expect(!std::filesystem::exists(source) && readFile(target) == "legacy", "normal rename changed media");
-    expect(std::filesystem::exists(sidecar(target, L".favorite")) && readFile(sidecar(target, L".tags")) == "tag\n" &&
+    expect(readFile(sidecar(target, L".favorite")).empty() && readFile(sidecar(target, L".tags")) == "tag\n" &&
            !std::filesystem::exists(sidecar(source, L".favorite")) && !std::filesystem::exists(sidecar(source, L".tags")),
            "normal rename did not move sidecars");
     const auto clips = manager.listClips();
@@ -207,6 +209,48 @@ void testNormalRenameAndStorageRoots() {
         expect(std::any_of(clips.begin(), clips.end(), [&](const auto& clip) { return clip.path == expected; }),
                "supported storage root was not listed");
     }
+}
+
+void testSidecarRenameFailuresStayNonfatal() {
+    for (const wchar_t* blocked : {L".favorite", L".tags"}) {
+        TestRoot root;
+        const auto source = root.path / L"source.mp4";
+        const auto target = root.path / L"target.mp4";
+        writeFile(source, "media");
+        writeFile(sidecar(source, L".favorite"), "favorite");
+        writeFile(sidecar(source, L".tags"), "tags");
+        writeFile(sidecar(target, blocked) / L"blocker", "keep");
+        expect(backtrack::ClipManager(root.path).renameClip(source, L"target"),
+            "a failed sidecar move failed the media rename");
+        expect(!std::filesystem::exists(source) && readFile(target) == "media",
+            "a sidecar failure rolled back or changed media");
+        expect(readFile(sidecar(target, blocked) / L"blocker") == "keep" &&
+               std::filesystem::exists(sidecar(source, blocked)),
+            "a failed sidecar move lost its source or destination");
+        const wchar_t* moved = std::wstring(blocked) == L".favorite" ? L".tags" : L".favorite";
+        expect(std::filesystem::exists(sidecar(target, moved)) &&
+               !std::filesystem::exists(sidecar(source, moved)),
+            "one sidecar failure prevented the other sidecar from moving");
+    }
+}
+
+void testMixedCaseClipPathsAndStagingNames() {
+    TestRoot root;
+    const auto library = root.path / L"Library";
+    const auto clip = library / L"Clip.Mp4";
+    writeFile(clip, "media");
+    writeFile(library / L".BACKTRACK_TMP" / L"Clip.PUBLISH.MP4", "staging");
+    writeFile(library / L".BACKTRACK_TMP" / L"Clip.PuBlIsH.2.Mp4", "staging");
+    const backtrack::ClipManager manager(library);
+    const auto clips = manager.listClips();
+    expect(clips.size() == 1 && clips.front().path == clip,
+        "case folding changed clip extensions or staged-file exclusion");
+    expect(manager.setFavorite(root.path / L"lIbRaRy" / L"cLiP.mP4", true),
+        "case folding rejected a managed path with different capitalization");
+    expect(manager.renameClip(clip, L"renamed"), "mixed-case MP4 extension was rejected");
+    const auto target = library / L"renamed.Mp4";
+    expect(readFile(target) == "media" && std::filesystem::exists(sidecar(target, L".favorite")),
+        "mixed-case rename changed media or lost its sidecar");
 }
 
 void testCancelledScanStopsBeforeReadingClips() {
@@ -232,6 +276,8 @@ int main() {
         testRenameRacePreservesMediaAndMetadata();
         testNormalRenameAndStorageRoots();
         testCancelledScanStopsBeforeReadingClips();
+        testSidecarRenameFailuresStayNonfatal();
+        testMixedCaseClipPathsAndStagingNames();
         std::cout << "ClipManagerTests passed\n";
         return 0;
     } catch (const std::exception& error) {

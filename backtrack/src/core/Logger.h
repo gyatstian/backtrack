@@ -20,8 +20,6 @@ public:
     static Logger& instance();
 
     void initialize(const std::filesystem::path& logPath);
-    void setMinLevel(LogLevel level);
-    LogLevel minLevel() const;
     void setEnabled(bool enabled);
     bool enabled() const;
     void write(LogLevel level, const std::wstring& message);

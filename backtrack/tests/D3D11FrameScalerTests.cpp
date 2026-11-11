@@ -43,6 +43,10 @@ struct D3D11FrameScalerTestAccess {
     static bool nv12Unavailable(const D3D11FrameScaler& scaler) {
         return scaler.nv12Unavailable_;
     }
+
+    static void rejectNv12(D3D11FrameScaler& scaler) {
+        scaler.nv12Unavailable_ = true;
+    }
 };
 
 } // namespace backtrack
@@ -169,11 +173,7 @@ ComPtr<ID3D11Texture2D> makeTexture(ID3D11Device* device, uint32_t color) {
     return texture;
 }
 
-void expectCopiedPixels(D3DDevice& device, ID3D11VideoProcessorInputView* view, uint32_t color) {
-    ComPtr<ID3D11Resource> resource;
-    view->GetResource(&resource);
-    ComPtr<ID3D11Texture2D> copied;
-    expect(SUCCEEDED(resource.As(&copied)), "copied view has no texture");
+void expectCopiedPixels(D3DDevice& device, ID3D11Texture2D* copied, uint32_t color) {
     D3D11_TEXTURE2D_DESC desc{};
     copied->GetDesc(&desc);
     desc.Usage = D3D11_USAGE_STAGING;
@@ -183,7 +183,7 @@ void expectCopiedPixels(D3DDevice& device, ID3D11VideoProcessorInputView* view, 
     ComPtr<ID3D11Texture2D> staging;
     expect(SUCCEEDED(device.device()->CreateTexture2D(&desc, nullptr, &staging)), "create staging texture failed");
     std::scoped_lock lock(device.immediateContextMutex());
-    device.context()->CopyResource(staging.Get(), copied.Get());
+    device.context()->CopyResource(staging.Get(), copied);
     D3D11_MAPPED_SUBRESOURCE mapped{};
     expect(SUCCEEDED(device.context()->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)), "map staging texture failed");
     bool matches = true;
@@ -196,6 +196,53 @@ void expectCopiedPixels(D3DDevice& device, ID3D11VideoProcessorInputView* view, 
     }
     device.context()->Unmap(staging.Get(), 0);
     expect(matches, "copied view did not contain the source pixels");
+}
+
+void expectCopiedPixels(D3DDevice& device, ID3D11VideoProcessorInputView* view, uint32_t color) {
+    ComPtr<ID3D11Resource> resource;
+    view->GetResource(&resource);
+    ComPtr<ID3D11Texture2D> copied;
+    expect(SUCCEEDED(resource.As(&copied)), "copied view has no texture");
+    expectCopiedPixels(device, copied.Get(), color);
+}
+
+void testSameSizeCopyOrAlias() {
+    D3DDevice device;
+    makeWarpDevice(device);
+    GpuFrame input;
+    input.texture = makeTexture(device.device(), 0xff123456);
+    input.lease = std::make_shared<int>(42);
+    input.width = kWidth;
+    input.height = kHeight;
+    input.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    input.frameIndex = 17;
+    input.pts100ns = 1234;
+
+    for (const auto preferredFormat : {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12}) {
+        D3D11FrameScaler scaler;
+        if (preferredFormat == DXGI_FORMAT_NV12) {
+            D3D11FrameScalerTestAccess::rejectNv12(scaler);
+        }
+        GpuFrame alias;
+        expect(scaler.scale(device, input, kWidth, kHeight, alias, false, false, preferredFormat),
+            "same-size alias failed");
+        expect(alias.texture == input.texture && alias.lease == input.lease,
+            "alias did not keep the source texture and lease");
+        expect(alias.format == input.format && alias.width == kWidth && alias.height == kHeight &&
+                   alias.frameIndex == input.frameIndex && alias.pts100ns == input.pts100ns,
+            "alias changed frame metadata");
+
+        GpuFrame copy;
+        expect(scaler.scale(device, input, kWidth, kHeight, copy, false, true, preferredFormat),
+            "same-size forced copy failed");
+        expect(copy.texture != input.texture && copy.lease && copy.lease != input.lease,
+            "forced copy reused the source texture or lease");
+        expect(copy.format == DXGI_FORMAT_B8G8R8A8_UNORM &&
+                   copy.width == kWidth && copy.height == kHeight &&
+                   copy.frameIndex == input.frameIndex && copy.pts100ns == input.pts100ns,
+            "forced copy used the requested NV12 format or changed frame metadata");
+        expectCopiedPixels(device, copy.texture.Get(), 0xff123456);
+    }
 }
 
 void testDirectRejectionUsesUnboundInputCopy() {
@@ -278,6 +325,7 @@ void testInputFailureDoesNotDowngradeNv12() {
 
 int main() {
     try {
+        testSameSizeCopyOrAlias();
         testDirectRejectionUsesUnboundInputCopy();
         testInputFailureDoesNotDowngradeNv12();
     } catch (const std::exception& error) {

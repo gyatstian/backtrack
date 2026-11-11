@@ -171,6 +171,96 @@ void testDeclaredExtentIsTrustedWhenNotClamped() {
     std::filesystem::remove_all(directory, error);
 }
 
+void testRecoveryNumbersRequireCompleteInRangeTokens() {
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"backtrack_manifest_numbers_" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(directory);
+    const auto video = directory / L"video.h264";
+    writeFile(video, std::vector<uint8_t>(12, 0x11));
+    const auto manifest = directory / backtrack::RecoveryStore::kRecoveryManifestName;
+    const std::string header = "backtrack-recovery-v1\nvideo\tvideo.h264\n";
+    const std::string first = "sample\t0\t4\t-1\t333333\t1\t-2\t1\n";
+    const auto retained = [&](const std::string& text, unsigned count) {
+        {
+            std::ofstream stream(manifest, std::ios::binary | std::ios::trunc);
+            stream << text;
+            expect(static_cast<bool>(stream), "could not write numeric manifest fixture");
+        }
+        const auto detail = backtrack::RecoveryStore::preserveFailedRecording(
+            {}, directory / L"clip.mp4", directory, L"test failure");
+        if (count == 0) {
+            expect(detail.find(L"manual recovery") != std::wstring::npos,
+                "damaged recovery metadata was accepted");
+        } else {
+            expect(detail.find(L"Preserved " + std::to_wstring(count) + L" video packets") != std::wstring::npos,
+                "strict numeric parsing lost the valid prefix or accepted a damaged tail");
+        }
+    };
+    retained(header + "fps\t4294967295\nsamples\t0001\n" + first, 1);
+    retained(header + "sample\t0\t4\t-9223372036854775808\t9223372036854775807\t4294967295\t0\t4294967295\n", 1);
+    for (const std::string value : {"", "-1", "+1", " 1", "1 ", "1x", "4294967296", "18446744073709551616"}) {
+        retained(header + "fps\t" + value + "\n" + first, 0);
+    }
+    for (const std::string value : {"", "-1", "+1", " 1", "1 ", "1x", "18446744073709551616"}) {
+        retained(header + "samples\t" + value + "\n" + first, 0);
+    }
+    const std::vector<std::vector<std::string>> invalidColumns = {
+        {"", "-4", "+4", " 4", "4 ", "4x", "18446744073709551616"},
+        {"", "-4", "+4", " 4", "4 ", "4x", "4294967296"},
+        {"", "+1", " 1", "1 ", "1x", "9223372036854775808", "-9223372036854775809"},
+        {"", "+1", " 1", "1 ", "1x", "9223372036854775808", "-9223372036854775809"},
+        {"", "-1", "+1", "1x", "4294967296"},
+        {"", "+1", "1x", "9223372036854775808", "-9223372036854775809"},
+        {"", "-1", "+1", "1x", "4294967296"},
+    };
+    for (size_t column = 0; column < invalidColumns.size(); ++column) {
+        for (const auto& value : invalidColumns[column]) {
+            std::vector<std::string> columns = {"4", "4", "1", "333333", "0", "0", "1"};
+            columns[column] = value;
+            std::string line = "sample";
+            for (const auto& part : columns) line += '\t' + part;
+            retained(header + first + line + "\nsample\t4\t4\t1\t333333\t0\t0\t1\n", 1);
+        }
+    }
+    std::filesystem::remove_all(directory);
+}
+
+void testFailedManifestPublishRemovesStagingOnly() {
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"backtrack_manifest_publish_" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(directory);
+    backtrack::MuxedInputs inputs;
+    inputs.videoPath = directory / L"video.h264";
+    backtrack::MuxedInputs::VideoSample sample;
+    sample.size = 4;
+    sample.pts100ns = -1;
+    sample.dts100ns = -2;
+    sample.hasDts = true;
+    sample.duration100ns = 333333;
+    sample.keyFrame = true;
+    inputs.videoSamples.push_back(sample);
+    writeFile(inputs.videoPath, std::vector<uint8_t>(4, 0x11));
+    expect(backtrack::RecoveryStore::writeManifest(inputs, directory), "could not publish the baseline manifest");
+    const auto manifest = directory / backtrack::RecoveryStore::kRecoveryManifestName;
+    const auto before = readFile(manifest);
+    const auto detail = backtrack::RecoveryStore::preserveFailedRecording(
+        inputs, directory / L"clip.mp4", directory, L"test failure");
+    expect(detail.find(L"Preserved 1 video packets") != std::wstring::npos,
+        "signed sample timestamps did not round trip through the manifest");
+    const HANDLE hold = CreateFileW(manifest.c_str(), GENERIC_READ, 0, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    expect(hold != INVALID_HANDLE_VALUE, "could not lock the baseline manifest");
+    inputs.fps = 144;
+    const bool published = backtrack::RecoveryStore::writeManifest(inputs, directory);
+    CloseHandle(hold);
+    expect(!published && readFile(manifest) == before, "failed publish changed the previous manifest");
+    expect(!std::filesystem::exists(directory / L"recovery.tsv.tmp"), "failed publish left its staging file");
+    expect(backtrack::RecoveryStore::writeManifest(inputs, directory), "manifest publish could not retry after cleanup");
+    // binary reads retain the CRLF emitted by the Windows text-mode writer.
+    expect(readFile(manifest).find("fps\t144\r\n") != std::string::npos, "retried manifest did not contain the new settings");
+    std::filesystem::remove_all(directory);
+}
+
 void testWriteFailurePreservesIncrementalRecording() {
     const auto directory = std::filesystem::temp_directory_path() / L"backtrack_mux_write_failure_test";
     std::error_code error;
@@ -232,6 +322,8 @@ int main() {
         testWriteFailurePreservesIncrementalRecording();
         testClampedWavExtentKeepsTrailingAudio();
         testDeclaredExtentIsTrustedWhenNotClamped();
+        testRecoveryNumbersRequireCompleteInRangeTokens();
+        testFailedManifestPublishRemovesStagingOnly();
         std::cout << "Mp4Muxer tests passed\n";
         return 0;
     } catch (const std::exception& error) {

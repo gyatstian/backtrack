@@ -452,6 +452,18 @@ void testPruningTriggerCanBeTheExpiredKey() {
         "prune-triggering key did not get a fresh budget");
 }
 
+void testMinimumLevelGateRemains() {
+    TestDirectory dir;
+    auto& logger = Logger::instance();
+    LoggerTestAccess::reset(logger);
+    logger.initialize(dir.path / L"source.log");
+    logger.trace(L"test", L"filtered trace marker");
+    logger.debug(L"test", L"visible debug marker");
+    const auto lines = logger.recentLines(200);
+    expect(countLines(lines, L"filtered trace marker") == 0, "minimum-level gate was removed");
+    expect(countLines(lines, L"visible debug marker") == 1, "minimum-level boundary was filtered");
+}
+
 void testGroupedConsecutiveDuplicates() {
     TestDirectory dir;
     auto& logger = Logger::instance();
@@ -640,6 +652,7 @@ int main() {
         testLiveLogCannotBeReplaced();
         testExpiredStatesRetireWithSummaries();
         testPruningTriggerCanBeTheExpiredKey();
+        testMinimumLevelGateRemains();
         testGroupedConsecutiveDuplicates();
         testGroupedErrorsCarryCount();
         testErrorStackTraceAttached();

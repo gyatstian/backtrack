@@ -35,12 +35,11 @@ League of Legends kill reminder.
   `std::string` body; `trimText` only ever sees the extracted player names
   inside it, so its erase-from-front cost is bounded by a name, not by the body.
 - `WinHttpJson.h` owns the status-checked, size-capped GET and `\u`-safe JSON
-  string reader for League and the update check in `ui`. League uses an async
-  session: stop or a five-second total request deadline closes the request, and
-  its callback retains the read buffer and parent handles until handle closing.
-  the update check still supplies a synchronous session and has only per-stage
-  timeouts; switching it to the cancellable overload requires a UI change.
-  `ignoreCert` is for the self-signed local endpoint only.
+  string reader for League and the update check in `ui`. both use async
+  sessions: stop or the total request deadline closes the request, and the
+  callback retains the read buffer and parent handles until handle closing.
+  the synchronous overload has only per-stage timeouts. `ignoreCert` is for
+  the self-signed local endpoint only; a failed status query logs status=0.
 - Liveness and failures are published through `stats()` (`gameAvailable`,
   `lastError`) for the Diagnostics page; the worker sets them on
   detect/loss/fault transitions, not per poll.
@@ -86,10 +85,10 @@ League of Legends kill reminder.
 
 ## Verification
 
-`backtrack/tests/LeagueOfLegendsIntegrationTests.cpp`,
-`backtrack/tests/DiscordRichPresenceTests.cpp`, and
-`backtrack/tests/WinHttpJsonTests.cpp` are not registered with CTest. Manual
-check: with League running, confirm the kill callback fires; with Discord
+`LeagueOfLegendsIntegrationTests`, `DiscordRichPresenceTests`, and
+`WinHttpJsonTests` are registered with CTest; see `backtrack/tests` for their
+field-scanning, feed, pipe, and HTTP checks. manual check: with League running,
+confirm the kill callback fires; with Discord
 running, confirm the presence appears, updates when the foreground application
 changes (the foreground is only re-read every `kActivityUpdateInterval`), and
 disappears on exit.

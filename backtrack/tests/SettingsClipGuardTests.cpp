@@ -643,6 +643,14 @@ void testResolutionPresetOverridesStoredDimensions() {
     expect(sanitized.video.width == 426 && sanitized.video.height == 240,
         "a 240p preset did not replace the stored dimensions");
 
+    settings.video.resolutionMode = static_cast<backtrack::ResolutionMode>(999);
+    settings.video.width = 1000;
+    settings.video.height = 800;
+    sanitized = backtrack::sanitizeSettings(settings);
+    expect(sanitized.video.width == 1000 && sanitized.video.height == 800 &&
+           std::wstring(backtrack::resolutionModeName(settings.video.resolutionMode)) == L"1080p",
+        "an unknown resolution enum no longer preserves dimensions or the name fallback");
+
     // An empty clip directory is replaced with the platform default.
     settings = baseSettings();
     settings.clipDirectory.clear();

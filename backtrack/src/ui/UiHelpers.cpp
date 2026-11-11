@@ -117,6 +117,8 @@ HBITMAP createScaledBitmapFromRgb32(const BYTE* pixels, LONG stride, UINT source
     return bitmap;
 }
 
+HBITMAP scaleBitmapToSizeHalftone(HBITMAP bitmap, int width, int height);
+
 // The shell honors SIIGBF_BIGGERSIZEOK by handing back a bitmap larger than
 // requested; cached thumbnails would then pin that oversized surface for the
 // lifetime of the cache. Downscale once to fit within width x height into a
@@ -141,64 +143,10 @@ HBITMAP downscaleBitmapToFit(HBITMAP bitmap, int width, int height) {
     const int targetWidth = std::max(1, static_cast<int>(info.bmWidth * scale));
     const int targetHeight = std::max(1, static_cast<int>(info.bmHeight * scale));
 
-    BITMAPINFO targetInfo{};
-    targetInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    targetInfo.bmiHeader.biWidth = targetWidth;
-    targetInfo.bmiHeader.biHeight = -targetHeight;
-    targetInfo.bmiHeader.biPlanes = 1;
-    targetInfo.bmiHeader.biBitCount = 32;
-    targetInfo.bmiHeader.biCompression = BI_RGB;
-
-    void* targetBits = nullptr;
-    HBITMAP scaled = CreateDIBSection(nullptr, &targetInfo, DIB_RGB_COLORS, &targetBits, nullptr, 0);
-    if (!scaled || !targetBits) {
-        if (scaled) {
-            DeleteObject(scaled);
-        }
+    HBITMAP scaled = scaleBitmapToSizeHalftone(bitmap, targetWidth, targetHeight);
+    if (!scaled) {
         return bitmap;
     }
-
-    HDC screenDc = GetDC(nullptr);
-    HDC targetDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
-    HDC sourceDc = screenDc ? CreateCompatibleDC(screenDc) : nullptr;
-    if (!targetDc || !sourceDc) {
-        if (targetDc) {
-            DeleteDC(targetDc);
-        }
-        if (sourceDc) {
-            DeleteDC(sourceDc);
-        }
-        if (screenDc) {
-            ReleaseDC(nullptr, screenDc);
-        }
-        DeleteObject(scaled);
-        return bitmap;
-    }
-
-    HGDIOBJ oldTarget = SelectObject(targetDc, scaled);
-    HGDIOBJ oldSource = SelectObject(sourceDc, bitmap);
-    SetStretchBltMode(targetDc, HALFTONE);
-    SetBrushOrgEx(targetDc, 0, 0, nullptr);
-    StretchBlt(
-        targetDc,
-        0,
-        0,
-        targetWidth,
-        targetHeight,
-        sourceDc,
-        0,
-        0,
-        info.bmWidth,
-        info.bmHeight,
-        SRCCOPY);
-    SelectObject(targetDc, oldTarget);
-    SelectObject(sourceDc, oldSource);
-    DeleteDC(targetDc);
-    DeleteDC(sourceDc);
-    ReleaseDC(nullptr, screenDc);
-
-    // Only reached on success: replace the oversized original with the
-    // downscaled copy.
     DeleteObject(bitmap);
     return scaled;
 }
@@ -478,9 +426,9 @@ bool isButtonId(WPARAM id) {
     const int controlId = static_cast<int>(id);
     if ((controlId >= kTabButtonBaseId && controlId < kTabButtonBaseId + kTabCount) ||
         (controlId >= kSettingsCategoryButtonBaseId && controlId < kSettingsCategoryButtonBaseId + kSettingsCategoryCount) ||
-        (controlId >= kSoundSeparationMuteButtonBaseId && controlId < kSoundSeparationMuteButtonBaseId + 512) ||
-        (controlId >= kSoundSeparationRemoveButtonBaseId && controlId < kSoundSeparationRemoveButtonBaseId + 512) ||
-        (controlId >= kAutoRecordRemoveButtonBaseId && controlId < kAutoRecordRemoveButtonBaseId + 512)) {
+        isSoundSeparationMuteButtonId(controlId) ||
+        isSoundSeparationRemoveButtonId(controlId) ||
+        isAutoRecordRemoveButtonId(controlId)) {
         return true;
     }
     for (int single : kSingleOwnerDrawButtonIds) {
@@ -1171,25 +1119,20 @@ HBITMAP scaleBitmapToSizeHalftone(HBITMAP bitmap, int width, int height) {
 
     HGDIOBJ oldTarget = SelectObject(targetDc, scaled);
     HGDIOBJ oldSource = SelectObject(sourceDc, bitmap);
-    SetStretchBltMode(targetDc, HALFTONE);
-    SetBrushOrgEx(targetDc, 0, 0, nullptr);
-    StretchBlt(
-        targetDc,
-        0,
-        0,
-        width,
-        height,
-        sourceDc,
-        0,
-        0,
-        info.bmWidth,
-        info.bmHeight,
-        SRCCOPY);
-    SelectObject(targetDc, oldTarget);
-    SelectObject(sourceDc, oldSource);
+    const bool succeeded = oldTarget && oldSource &&
+        SetStretchBltMode(targetDc, HALFTONE) != 0 &&
+        SetBrushOrgEx(targetDc, 0, 0, nullptr) &&
+        StretchBlt(targetDc, 0, 0, width, height, sourceDc,
+            0, 0, info.bmWidth, info.bmHeight, SRCCOPY);
+    if (oldTarget) SelectObject(targetDc, oldTarget);
+    if (oldSource) SelectObject(sourceDc, oldSource);
     DeleteDC(targetDc);
     DeleteDC(sourceDc);
     ReleaseDC(nullptr, screenDc);
+    if (!succeeded) {
+        DeleteObject(scaled);
+        return nullptr;
+    }
     return scaled;
 }
 

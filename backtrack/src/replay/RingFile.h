@@ -321,6 +321,7 @@ private:
     static bool transferChunk(HANDLE file, bool write, uint64_t offset, uint8_t* data, DWORD size,
                               const Io& io, DWORD timeout, DWORD& moved, DWORD& error,
                               const RingFile* pooled = nullptr) {
+        const DWORD fault = write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT;
         std::shared_ptr<Operation<Io>> operation;
         if constexpr (std::is_same_v<Io, Win32Io>) {
             if (pooled) {
@@ -389,7 +390,7 @@ private:
             if (waitResult == WAIT_OBJECT_0) {
                 completed = io.result(operation->file, &operation->overlapped, &moved) != FALSE;
                 if (!completed && GetLastError() != ERROR_IO_INCOMPLETE) {
-                    error = write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT;
+                    error = fault;
                     returnToPool();
                     return false;
                 }
@@ -413,12 +414,12 @@ private:
                 }
                 owner.release();
                 SetThreadpoolWait(completion, operation->overlapped.hEvent, nullptr);
-                error = write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT;
+                error = fault;
                 return false;
             }
         }
         if (moved == 0 || moved > size) {
-            error = write ? ERROR_WRITE_FAULT : ERROR_READ_FAULT;
+            error = fault;
             returnToPool();
             return false;
         }

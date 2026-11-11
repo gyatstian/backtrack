@@ -138,6 +138,11 @@ recording-stop drain handshake.
   lookahead retains accepted inputs until their output is harvested, so a
   queue-only pool would exhaust and starve the producer; the capture-side
   pools are intermediate and keep their queue-derived size.
+  capture-loop reloads keep separate lock scopes: `reloadActiveSettings` holds
+  `stateMutex_`, `reloadEncoderInputFormat` holds `pipelineGpuMutex_`.
+  device-removal/encoder-fault recovery reloads settings before
+  `resetVideoHandoff` sizes the pool from `gpuSettings`, then reloads the format.
+  target-switch GPU recovery keeps its reset before both reloads.
 - WGC resize and source handoff wait for the encode worker to discard the old
   queue, then reset encoder inputs before releasing capture-held and discarded
   frames. `IEncoder::resetInputResources()` is fallible: false means a driver
@@ -161,6 +166,9 @@ recording-stop drain handshake.
   `stats()`, the stall watchdog, the capture-loop cursor poll, and the audio
   volumes read the mirrors published by `publishLiveMirrors`, which runs
   wherever `settings_` is assigned. Keep new hot reads off `settings()`.
+- the stall watchdog checks pipeline state before loading encoded PTS.
+  `ensurePipeline` resets PTS before publishing `pipelineRunning_ = true`;
+  hoisting the PTS load can carry a prior run's timestamp across that publish.
 - Exclusive-fullscreen recovery state lives in the `CaptureSession`
   supervisor in `RecorderController.h` (explicit `toX()` transitions); the
   loop keeps frame data and clocks only. Partial resets write `session`
@@ -295,8 +303,9 @@ recording-stop drain handshake.
 - `MicrophoneAgc` and the audio-writer packet helpers (canonical gain, block
   levels, noise suppression) live in `app/AudioWriter.h/.cpp`; the denoiser
   follows the same pattern behind `BACKTRACK_HAS_NOISE_SUPPRESSION`. Keep both
-  on the audio writer thread: only `RecorderController::writeAudioPacket` calls
-  them. Member state (mirrors, scratch buffers) stays in `RecorderController`.
+  on the audio writer thread in production, called by
+  `RecorderController::writeAudioPacket`. Member state (mirrors, scratch buffers)
+  stays in `RecorderController`.
   The denoiser rewrites the packet's PTS to the oldest pending sample position
   so fragmented packets stay contiguous on the pacer's timeline; see the
   `RnnoiseDenoiser` bullet in audio/AGENTS.md.
@@ -324,7 +333,9 @@ recording-stop drain handshake.
 - `RecorderControllerShutdownOrderingTests.cpp` exercises the audio-writer drain
   loop (`drainAudioQueues` in `AudioDrain.h`): a late packet enqueued after the
   stop request but before the producers-finished flag is consumed before the
-  writer exits, and packets queued before the flag drain on signal.
+  writer exits, and packets queued before the flag drain on signal. it also
+  covers `AudioWriter` RMS measurement (signed samples, empty/invalid-width
+  blocks, silence) and microphone AGC gain/envelope continuity and metadata.
 - `MainWindowSettingsTests.cpp` exercises settings handoff and ui preferences
   without a capture pipeline.
 - Everything else in this folder is verified by building and by exercising the

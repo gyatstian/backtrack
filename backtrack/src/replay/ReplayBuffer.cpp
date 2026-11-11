@@ -844,6 +844,12 @@ bool ReplayBuffer::saveTo(
     // save has read it. Ring reads happen without holding mutex_. Both the parameter-set probe and
     // the dump loop read through this one function, so the cut/patch/mux path
     // never branches on the backend.
+    const auto readExtents = [](const RingFile& ring, const RingExtent& first,
+                                const RingExtent& second, uint8_t* destination) {
+        return (first.byteCount == 0 || ring.read(first.offset, destination, first.byteCount)) &&
+               (second.byteCount == 0 ||
+                ring.read(second.offset, destination + first.byteCount, second.byteCount));
+    };
     std::vector<uint8_t> ringScratch;
     // A ring read failure means those packet bytes are gone for good, which is
     // a different failure from a full disk: the elementary stream is still
@@ -859,16 +865,7 @@ bool ReplayBuffer::saveTo(
         }
         const uint32_t totalBytes = snapshot.first.byteCount + snapshot.second.byteCount;
         ringScratch.resize(totalBytes);
-        if (snapshot.first.byteCount != 0 &&
-            !videoRing_.read(snapshot.first.offset, ringScratch.data(), snapshot.first.byteCount)) {
-            ringReadFailed = true;
-            return nullptr;
-        }
-        if (snapshot.second.byteCount != 0 &&
-            !videoRing_.read(
-                snapshot.second.offset,
-                ringScratch.data() + snapshot.first.byteCount,
-                snapshot.second.byteCount)) {
+        if (!readExtents(videoRing_, snapshot.first, snapshot.second, ringScratch.data())) {
             ringReadFailed = true;
             return nullptr;
         }
@@ -1020,16 +1017,7 @@ bool ReplayBuffer::saveTo(
         // Read straight into the packet's bytes: the ring holds the packet
         // bytes, and a scratch hop would double-copy the whole audio window.
         packet->bytes.resize(totalBytes);
-        if (entry.first.byteCount != 0 &&
-            !audioRing_.read(entry.first.offset, packet->bytes.data(), entry.first.byteCount)) {
-            audioRingReadFailed = true;
-            break;
-        }
-        if (entry.second.byteCount != 0 &&
-            !audioRing_.read(
-                entry.second.offset,
-                packet->bytes.data() + entry.first.byteCount,
-                entry.second.byteCount)) {
+        if (!readExtents(audioRing_, entry.first, entry.second, packet->bytes.data())) {
             audioRingReadFailed = true;
             break;
         }

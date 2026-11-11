@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <deque>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -99,65 +100,32 @@ GUID codecGuid(VideoCodec codec) {
 }
 
 GUID presetGuid(EncoderPreset preset) {
-    switch (preset) {
-    case EncoderPreset::P1:
-        return NV_ENC_PRESET_P1_GUID;
-    case EncoderPreset::P2:
-        return NV_ENC_PRESET_P2_GUID;
-    case EncoderPreset::P3:
-        return NV_ENC_PRESET_P3_GUID;
-    case EncoderPreset::P4:
-        return NV_ENC_PRESET_P4_GUID;
-    case EncoderPreset::P5:
-        return NV_ENC_PRESET_P5_GUID;
-    case EncoderPreset::P6:
-        return NV_ENC_PRESET_P6_GUID;
-    case EncoderPreset::P7:
-        return NV_ENC_PRESET_P7_GUID;
-    }
-    return NV_ENC_PRESET_P4_GUID;
+    static const GUID presets[] = {
+        NV_ENC_PRESET_P1_GUID, NV_ENC_PRESET_P2_GUID, NV_ENC_PRESET_P3_GUID, NV_ENC_PRESET_P4_GUID,
+        NV_ENC_PRESET_P5_GUID, NV_ENC_PRESET_P6_GUID, NV_ENC_PRESET_P7_GUID};
+    const auto index = static_cast<unsigned>(preset);
+    return index < std::size(presets) ? presets[index] : NV_ENC_PRESET_P4_GUID;
 }
 
 NV_ENC_TUNING_INFO tuningInfo(EncoderMode mode) {
-    switch (mode) {
-    case EncoderMode::HighQuality:
-        return NV_ENC_TUNING_INFO_HIGH_QUALITY;
-    case EncoderMode::LowLatency:
-        return NV_ENC_TUNING_INFO_LOW_LATENCY;
-    case EncoderMode::UltraLowLatency:
-        return NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
-    case EncoderMode::Lossless:
-        return NV_ENC_TUNING_INFO_LOSSLESS;
-    case EncoderMode::UltraHighQuality:
-        return NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY;
-    }
-    return NV_ENC_TUNING_INFO_HIGH_QUALITY;
+    static constexpr NV_ENC_TUNING_INFO modes[] = {
+        NV_ENC_TUNING_INFO_HIGH_QUALITY, NV_ENC_TUNING_INFO_LOW_LATENCY,
+        NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, NV_ENC_TUNING_INFO_LOSSLESS,
+        NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY};
+    const auto index = static_cast<unsigned>(mode);
+    return index < std::size(modes) ? modes[index] : NV_ENC_TUNING_INFO_HIGH_QUALITY;
 }
 
 NV_ENC_MULTI_PASS nvencMultipass(EncoderMultipass multipass) {
-    switch (multipass) {
-    case EncoderMultipass::QuarterResolution:
-        return NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
-    case EncoderMultipass::FullResolution:
-        return NV_ENC_TWO_PASS_FULL_RESOLUTION;
-    case EncoderMultipass::Disabled:
-        break;
-    }
-    return NV_ENC_MULTI_PASS_DISABLED;
+    return multipass == EncoderMultipass::QuarterResolution ? NV_ENC_TWO_PASS_QUARTER_RESOLUTION :
+           multipass == EncoderMultipass::FullResolution ? NV_ENC_TWO_PASS_FULL_RESOLUTION :
+           NV_ENC_MULTI_PASS_DISABLED;
 }
 
 NV_ENC_NUM_REF_FRAMES nvencReferenceFrames(uint32_t referenceFrames) {
-    switch (std::clamp<uint32_t>(referenceFrames, 1, 4)) {
-    case 1:
-        return NV_ENC_NUM_REF_FRAMES_1;
-    case 2:
-        return NV_ENC_NUM_REF_FRAMES_2;
-    case 3:
-        return NV_ENC_NUM_REF_FRAMES_3;
-    case 4:
-        return NV_ENC_NUM_REF_FRAMES_4;
-    }
-    return NV_ENC_NUM_REF_FRAMES_1;
+    static constexpr NV_ENC_NUM_REF_FRAMES frames[] = {
+        NV_ENC_NUM_REF_FRAMES_1, NV_ENC_NUM_REF_FRAMES_2, NV_ENC_NUM_REF_FRAMES_3, NV_ENC_NUM_REF_FRAMES_4};
+    return frames[std::clamp<uint32_t>(referenceFrames, 1, 4) - 1];
 }
 
 // Captured desktop content is RGB; the encoder converts to YUV. Pin BT.709

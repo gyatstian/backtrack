@@ -1,4 +1,5 @@
 #include "clips/ClipManager.h"
+#include "core/EncodingNames.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
@@ -9,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -658,6 +660,49 @@ void testResolutionPresetOverridesStoredDimensions() {
         "an empty clip directory was not replaced with the default");
 }
 
+void testEncodingNames() {
+    using namespace backtrack;
+    const struct { VideoCodec codec; const wchar_t* name; } codecs[] = {
+        {VideoCodec::H264, L"h264"}, {VideoCodec::Hevc, L"hevc"},
+    };
+    for (const auto& entry : codecs) {
+        expect(std::wstring(codecName(entry.codec)) == entry.name, "codec name changed");
+        expect(codecFromName(entry.name) == entry.codec, "codec name did not round trip");
+    }
+    const struct { EncoderPreset preset; const wchar_t* name; } presets[] = {
+        {EncoderPreset::P1, L"p1"}, {EncoderPreset::P2, L"p2"}, {EncoderPreset::P3, L"p3"},
+        {EncoderPreset::P4, L"p4"}, {EncoderPreset::P5, L"p5"}, {EncoderPreset::P6, L"p6"},
+        {EncoderPreset::P7, L"p7"},
+    };
+    for (const auto& entry : presets) {
+        expect(std::wstring(encoderPresetName(entry.preset)) == entry.name, "encoder preset name changed");
+        expect(encoderPresetFromName(entry.name) == entry.preset, "encoder preset name did not round trip");
+    }
+    const struct { EncoderMode mode; const wchar_t* name; } modes[] = {
+        {EncoderMode::HighQuality, L"high-quality"},
+        {EncoderMode::LowLatency, L"low-latency"},
+        {EncoderMode::UltraLowLatency, L"ultra-low-latency"},
+        {EncoderMode::Lossless, L"lossless"},
+        {EncoderMode::UltraHighQuality, L"ultra-high-quality"},
+    };
+    for (const auto& entry : modes) {
+        expect(std::wstring(encoderModeName(entry.mode)) == entry.name, "encoder mode name changed");
+        expect(encoderModeFromName(entry.name) == entry.mode, "encoder mode name did not round trip");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 2, 999, (std::numeric_limits<int>::max)()}) {
+        expect(std::wstring(codecName(static_cast<VideoCodec>(value))) == L"h264",
+            "invalid codec name did not fall back to h264");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 7, 999, (std::numeric_limits<int>::max)()}) {
+        expect(std::wstring(encoderPresetName(static_cast<EncoderPreset>(value))) == L"p4",
+            "invalid preset name did not fall back to p4");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 5, 999, (std::numeric_limits<int>::max)()}) {
+        expect(std::wstring(encoderModeName(static_cast<EncoderMode>(value))) == L"high-quality",
+            "invalid mode name did not fall back to high-quality");
+    }
+}
+
 void testEnumNamesFallBackInsteadOfAborting() {
     // Enum fields are not clamped by sanitizeSettings; the parse path is what
     // keeps them in range, so a hand-edited value falls back to a known one.
@@ -855,6 +900,7 @@ int main() {
         testOutOfRangeValuesAreClamped();
         testInRangeValuesAreUntouched();
         testResolutionPresetOverridesStoredDimensions();
+        testEncodingNames();
         testEnumNamesFallBackInsteadOfAborting();
         testAppListsAreDeduped();
         testHotkeysAreMaskedAndUnsafeBindingsRejected();

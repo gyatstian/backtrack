@@ -503,6 +503,51 @@ void testSurroundDownmixKeepsCenterAndDropsLfe() {
         "test lost sensitivity to a dropped center channel");
 }
 
+void testSurroundScratchReuseAcrossMasks() {
+    constexpr float surround = 0.70710678f;
+    const float scale51 = 1.0f / (1.0f + surround + surround);
+    const float gain51 = surround * scale51;
+    const float scaleSide = 1.0f / (1.0f + surround);
+    const float gainSide = surround * scaleSide;
+    struct MaskCase {
+        uint16_t channels;
+        uint32_t mask;
+        float samples[6];
+        float left;
+        float right;
+    };
+    const MaskCase cases[] = {
+        {6, 0x3F, {0.25f, -0.5f, 0.75f, 1.0f, 0.5f, -0.25f},
+            0.25f * scale51 + 0.75f * gain51 + 0.5f * gain51,
+            -0.5f * scale51 + 0.75f * gain51 - 0.25f * gain51},
+        {3, 0x51, {0.25f, -0.5f, 0.75f}, 0.25f, -0.5f}, // FL BL FLC: left-only fallback.
+        {5, 0xE09, {0.25f, 1.0f, -1.0f, 0.5f, -0.75f}, // FL LFE unknown SL SR.
+            0.25f * scaleSide + 0.5f * gainSide, -0.75f * gainSide},
+        {3, 0xA2, {0.25f, -0.5f, 0.75f}, 0.25f, -0.5f}, // FR BR FRC: right-only fallback.
+        {3, 0xB, {-0.75f, 0.5f, 1.0f}, -0.75f, 0.5f}, // FL FR LFE: no normalization.
+    };
+    backtrack::AudioConvertScratch scratch;
+    for (const auto& test : cases) {
+        auto blob = std::make_shared<WaveFormatBlob>(
+            *extensibleFormat(test.channels, 48000, 32, kFloatSubFormat));
+        reinterpret_cast<WAVEFORMATEXTENSIBLE*>(blob->bytes.data())->dwChannelMask = test.mask;
+        AudioPacket packet;
+        packet.format = blob;
+        packet.pts100ns = 12345;
+        packet.bytes.resize(test.channels * sizeof(float));
+        std::memcpy(packet.bytes.data(), test.samples, packet.bytes.size());
+        expect(backtrack::convertAudioPacketToCanonical(packet, scratch),
+            "surround conversion with reused scratch failed");
+        expect(packet.frameCount == 1 && packet.bytes.size() == 2 * sizeof(float) &&
+               packet.pts100ns == 12345 &&
+               backtrack::isCanonicalAudioFormat(backtrack::parseAudioFormat(*packet.format)),
+            "surround scratch reuse changed packet metadata");
+        expect(std::fabs(sampleAt(packet, 0, 0) - test.left) < 1e-6f &&
+               std::fabs(sampleAt(packet, 0, 1) - test.right) < 1e-6f,
+            "surround scratch reuse changed channel offsets, gains, or fallback");
+    }
+}
+
 void testMuteGainPrimitive() {
     // applyMuteGain is the sole gain stage for canonical float samples: muted
     // zeroes, unity is a no-op, otherwise scale and clamp, never allocating.
@@ -535,6 +580,7 @@ int main() {
         testUnsupportedFormatDropped();
         testSilenceStaysSilent();
         testSurroundDownmixKeepsCenterAndDropsLfe();
+        testSurroundScratchReuseAcrossMasks();
         testMuteGainPrimitive();
         std::cout << "AudioConvert tests passed\n";
         return 0;

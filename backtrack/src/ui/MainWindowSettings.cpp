@@ -54,6 +54,11 @@ void releaseRowIcons(std::vector<Row>& rows) {
 }
 
 void MainWindow::readVisibleSettingsInto(AppSettings& target) {
+    const auto readEnum = [](HWND control, const auto& entries, auto fallback) {
+        int value = static_cast<int>(fallback);
+        return control && readEnumCombo(control, entries, value)
+            ? static_cast<decltype(fallback)>(value) : fallback;
+    };
     if (bitrateEdit_) {
         target.video.bitrateKbps = readUIntControl(bitrateEdit_, target.video.bitrateKbps);
     }
@@ -100,12 +105,7 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
             readCheckControl(followMouseMonitorCheck_, target.followMouseMonitor);
     }
     target.captureCursor = readCheckControl(captureCursorCheck_, target.captureCursor);
-    if (codecCombo_) {
-        int codec = static_cast<int>(target.video.codec);
-        if (readEnumCombo(codecCombo_, kVideoCodecComboEntries, codec)) {
-            target.video.codec = static_cast<VideoCodec>(codec);
-        }
-    }
+    target.video.codec = readEnum(codecCombo_, kVideoCodecComboEntries, target.video.codec);
     target.captureSystemAudio = readCheckControl(systemAudioCheck_, target.captureSystemAudio);
     target.captureMicrophone = readCheckControl(microphoneCheck_, target.captureMicrophone);
     if (outputDeviceCombo_) {
@@ -135,24 +135,9 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (customNotificationSoundEdit_) {
         target.customNotificationSoundPath = trimText(readText(customNotificationSoundEdit_));
     }
-    if (encoderPresetCombo_) {
-        int preset = static_cast<int>(target.video.encoderPreset);
-        if (readEnumCombo(encoderPresetCombo_, kEncoderPresetComboEntries, preset)) {
-            target.video.encoderPreset = static_cast<EncoderPreset>(preset);
-        }
-    }
-    if (encoderModeCombo_) {
-        int mode = static_cast<int>(target.video.encoderMode);
-        if (readEnumCombo(encoderModeCombo_, kEncoderModeComboEntries, mode)) {
-            target.video.encoderMode = static_cast<EncoderMode>(mode);
-        }
-    }
-    if (encoderProfileCombo_) {
-        int profile = static_cast<int>(target.video.encoderProfile);
-        if (readEnumCombo(encoderProfileCombo_, kEncoderProfileComboEntries, profile)) {
-            target.video.encoderProfile = static_cast<EncoderProfile>(profile);
-        }
-    }
+    target.video.encoderPreset = readEnum(encoderPresetCombo_, kEncoderPresetComboEntries, target.video.encoderPreset);
+    target.video.encoderMode = readEnum(encoderModeCombo_, kEncoderModeComboEntries, target.video.encoderMode);
+    target.video.encoderProfile = readEnum(encoderProfileCombo_, kEncoderProfileComboEntries, target.video.encoderProfile);
     target.video.encoderLookahead = readCheckControl(encoderLookaheadCheck_, target.video.encoderLookahead);
     if (encoderLookaheadDepthEdit_) {
         target.video.encoderLookaheadDepth = readUIntControl(encoderLookaheadDepthEdit_, target.video.encoderLookaheadDepth);
@@ -162,12 +147,7 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
         target.video.encoderAQStrength = readUIntControl(encoderAQStrengthEdit_, target.video.encoderAQStrength);
     }
     target.video.encoderTemporalAQ = readCheckControl(encoderTemporalAQCheck_, target.video.encoderTemporalAQ);
-    if (encoderMultipassCombo_) {
-        int multipass = static_cast<int>(target.video.encoderMultipass);
-        if (readEnumCombo(encoderMultipassCombo_, kEncoderMultipassComboEntries, multipass)) {
-            target.video.encoderMultipass = static_cast<EncoderMultipass>(multipass);
-        }
-    }
+    target.video.encoderMultipass = readEnum(encoderMultipassCombo_, kEncoderMultipassComboEntries, target.video.encoderMultipass);
     target.video.encoderBFrames = readCheckControl(encoderBFramesCheck_, target.video.encoderBFrames);
     target.video.encoderAdaptiveBFrames = readCheckControl(encoderAdaptiveBFramesCheck_, target.video.encoderAdaptiveBFrames);
     target.video.encoderAdaptiveIFrames = readCheckControl(encoderAdaptiveIFramesCheck_, target.video.encoderAdaptiveIFrames);
@@ -178,22 +158,12 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (encoderReferenceFramesEdit_) {
         target.video.encoderReferenceFrames = readUIntControl(encoderReferenceFramesEdit_, target.video.encoderReferenceFrames);
     }
-    if (gpuAdaptiveCombo_) {
-        int adaptive = static_cast<int>(target.gpu.adaptiveMode);
-        if (readEnumCombo(gpuAdaptiveCombo_, kGpuAdaptiveComboEntries, adaptive)) {
-            target.gpu.adaptiveMode = static_cast<GpuAdaptiveMode>(adaptive);
-        }
-    }
+    target.gpu.adaptiveMode = readEnum(gpuAdaptiveCombo_, kGpuAdaptiveComboEntries, target.gpu.adaptiveMode);
     if (gpuFrameQueueLimitEdit_) {
         target.gpu.frameQueueLimit = readUIntControl(gpuFrameQueueLimitEdit_, target.gpu.frameQueueLimit);
     }
     target.gpu.allowIdleFrameSkipping = readCheckControl(idleFrameCoalescingCheck_, target.gpu.allowIdleFrameSkipping);
-    if (captureMethodCombo_) {
-        int backend = static_cast<int>(target.preferredCaptureBackend);
-        if (readEnumCombo(captureMethodCombo_, kCaptureBackendComboEntries, backend)) {
-            target.preferredCaptureBackend = static_cast<CaptureBackend>(backend);
-        }
-    }
+    target.preferredCaptureBackend = readEnum(captureMethodCombo_, kCaptureBackendComboEntries, target.preferredCaptureBackend);
     target.gpu.stableMultimonitorFrames = readCheckControl(stableMultimonitorFramesCheck_, target.gpu.stableMultimonitorFrames);
     target.replay.enabled = readCheckControl(replayEnabledCheck_, target.replay.enabled);
     if (replaySecondsEdit_) {
@@ -207,20 +177,8 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     }
     target.gameIntegrations.leagueOfLegendsKillReminder = readCheckControl(leagueKillReminderCheck_, target.gameIntegrations.leagueOfLegendsKillReminder);
     target.autoRecordEnabled = readCheckControl(autoRecordEnabledCheck_, target.autoRecordEnabled);
-    if (voiceCommandCombo_) {
-        int voiceCommand = static_cast<int>(target.gameIntegrations.voiceCommand);
-        if (readEnumCombo(voiceCommandCombo_, kVoiceCommandComboEntries, voiceCommand)) {
-            target.gameIntegrations.voiceCommand =
-                static_cast<GameIntegrationSettings::VoiceCommandMode>(voiceCommand);
-        }
-    }
-    if (discordRichPresenceCombo_) {
-        int presence = static_cast<int>(target.gameIntegrations.discordRichPresence);
-        if (readEnumCombo(discordRichPresenceCombo_, kDiscordPresenceComboEntries, presence)) {
-            target.gameIntegrations.discordRichPresence =
-                static_cast<GameIntegrationSettings::DiscordRichPresenceMode>(presence);
-        }
-    }
+    target.gameIntegrations.voiceCommand = readEnum(voiceCommandCombo_, kVoiceCommandComboEntries, target.gameIntegrations.voiceCommand);
+    target.gameIntegrations.discordRichPresence = readEnum(discordRichPresenceCombo_, kDiscordPresenceComboEntries, target.gameIntegrations.discordRichPresence);
     if (discordPresenceTimerCombo_) {
         const LRESULT selected = SendMessageW(discordPresenceTimerCombo_, CB_GETCURSEL, 0, 0);
         if (selected == 0 || selected == 1) {

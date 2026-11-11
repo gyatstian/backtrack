@@ -13,6 +13,7 @@
 #include <chrono>
 #include <deque>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -110,65 +111,33 @@ std::wstring runtimeVersionString(uint64_t version) {
 // AMF quality preset. AMF exposes three effective steps: SPEED, BALANCED,
 // QUALITY.
 int avcQualityPreset(EncoderPreset preset) {
-    switch (preset) {
-    case EncoderPreset::P1:
-    case EncoderPreset::P2:
-        return AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED;
-    case EncoderPreset::P3:
-    case EncoderPreset::P4:
-    case EncoderPreset::P5:
-        return AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED;
-    case EncoderPreset::P6:
-    case EncoderPreset::P7:
-        return AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY;
-    }
-    return AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED;
+    return preset == EncoderPreset::P1 || preset == EncoderPreset::P2 ? AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED :
+           preset == EncoderPreset::P6 || preset == EncoderPreset::P7 ? AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY :
+           AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED;
 }
 
 int hevcQualityPreset(EncoderPreset preset) {
-    switch (preset) {
-    case EncoderPreset::P1:
-    case EncoderPreset::P2:
-        return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED;
-    case EncoderPreset::P3:
-    case EncoderPreset::P4:
-    case EncoderPreset::P5:
-        return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED;
-    case EncoderPreset::P6:
-    case EncoderPreset::P7:
-        return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY;
-    }
-    return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED;
+    return preset == EncoderPreset::P1 || preset == EncoderPreset::P2 ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED :
+           preset == EncoderPreset::P6 || preset == EncoderPreset::P7 ? AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY :
+           AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED;
 }
 
 int avcUsage(EncoderMode mode) {
-    switch (mode) {
-    case EncoderMode::UltraLowLatency:
-        return AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY;
-    case EncoderMode::LowLatency:
-        return AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY;
-    case EncoderMode::HighQuality:
-    case EncoderMode::UltraHighQuality:
-        return AMF_VIDEO_ENCODER_USAGE_TRANSCODING;
-    case EncoderMode::Lossless:
-        return AMF_VIDEO_ENCODER_USAGE_TRANSCODING;
-    }
-    return AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY;
+    static constexpr int usages[] = {
+        AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY,
+        AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY, AMF_VIDEO_ENCODER_USAGE_TRANSCODING,
+        AMF_VIDEO_ENCODER_USAGE_TRANSCODING};
+    const auto index = static_cast<unsigned>(mode);
+    return index < std::size(usages) ? usages[index] : AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY;
 }
 
 int hevcUsage(EncoderMode mode) {
-    switch (mode) {
-    case EncoderMode::UltraLowLatency:
-        return AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY;
-    case EncoderMode::LowLatency:
-        return AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY;
-    case EncoderMode::HighQuality:
-    case EncoderMode::UltraHighQuality:
-        return AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING;
-    case EncoderMode::Lossless:
-        return AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING;
-    }
-    return AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY;
+    static constexpr int usages[] = {
+        AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY,
+        AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY, AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING,
+        AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING};
+    const auto index = static_cast<unsigned>(mode);
+    return index < std::size(usages) ? usages[index] : AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY;
 }
 
 } // namespace

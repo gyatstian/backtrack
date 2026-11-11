@@ -220,12 +220,6 @@ constexpr uint32_t kSpeakerBackCenter = 0x100;
 constexpr uint32_t kSpeakerSideLeft = 0x400;
 constexpr uint32_t kSpeakerSideRight = 0x800;
 
-// Left/right weights for one source channel in a stereo downmix.
-struct DownmixGain {
-    float left = 0.0f;
-    float right = 0.0f;
-};
-
 // Default Windows speaker ordering per channel count, used when the format
 // blob carries no usable channel mask.
 uint32_t defaultChannelMask(uint16_t channels) {
@@ -260,21 +254,21 @@ uint32_t channelMaskForDownmix(const WaveFormatBlob& blob, uint16_t channels) {
 // at unity, center and surround channels at -3 dB into their outputs, LFE
 // omitted (standard practice keeps the subwoofer out of a stereo mix). Gains
 // are normalized so full-scale input cannot clip after summing. Callers fall
-// back to plain front-left/front-right selection when no gains come back.
-std::vector<DownmixGain> surroundDownmixGains(const WaveFormatBlob& blob, uint16_t channels) {
+// back to plain front-left/front-right selection when no weights come back.
+void surroundDownmixWeights(
+    const WaveFormatBlob& blob, uint16_t channels, size_t bytesPerSample,
+    std::vector<AudioConvertScratch::Weight>& weights) {
     const uint32_t mask = channelMaskForDownmix(blob, channels);
     if (mask == 0 || std::popcount(mask) != channels) {
-        return {};
+        return;
     }
-
-    std::vector<DownmixGain> gains(channels);
     float leftSum = 0.0f;
     float rightSum = 0.0f;
     uint32_t remainingBits = mask;
     for (uint16_t channel = 0; channel < channels && remainingBits != 0; ++channel) {
         const uint32_t speaker = 1u << std::countr_zero(remainingBits);
         remainingBits &= remainingBits - 1;
-        DownmixGain& gain = gains[channel];
+        AudioConvertScratch::Weight gain{static_cast<size_t>(channel) * bytesPerSample};
         switch (speaker) {
         case kSpeakerFrontLeft:
         case kSpeakerFrontLeftOfCenter:
@@ -303,18 +297,25 @@ std::vector<DownmixGain> surroundDownmixGains(const WaveFormatBlob& blob, uint16
         }
         leftSum += gain.left;
         rightSum += gain.right;
+        if (gain.left != 0.0f || gain.right != 0.0f) {
+            weights.push_back(gain);
+        }
     }
     // Normalize by the loudest possible output sum so full-scale content on
     // several channels at once cannot clip after folding.
     const float peak = std::max(leftSum, rightSum);
     if (peak > 1.0f) {
         const float scale = 1.0f / peak;
-        for (auto& gain : gains) {
+        for (auto& gain : weights) {
             gain.left *= scale;
             gain.right *= scale;
         }
     }
-    return gains;
+    // A mask that folds everything onto one side would silently lose the
+    // other channel; fall back to front-left/front-right instead.
+    if (leftSum == 0.0f || rightSum == 0.0f) {
+        weights.clear();
+    }
 }
 
 } // namespace
@@ -383,26 +384,8 @@ bool convertAudioPacketToCanonical(AudioPacket& packet, AudioConvertScratch& scr
     } else if (source.channels == 2) {
         weights.push_back({0, 1.0f, 0.0f});
         weights.push_back({sourceBytesPerSample, 0.0f, 1.0f});
-    } else if (std::vector<DownmixGain> gains =
-                   surroundDownmixGains(*packet.format, source.channels);
-               !gains.empty()) {
-        bool anyLeft = false;
-        bool anyRight = false;
-        for (uint16_t channel = 0; channel < source.channels; ++channel) {
-            if (gains[channel].left != 0.0f || gains[channel].right != 0.0f) {
-                weights.push_back({
-                    static_cast<size_t>(channel) * sourceBytesPerSample,
-                    gains[channel].left,
-                    gains[channel].right});
-            }
-            anyLeft = anyLeft || gains[channel].left > 0.0f;
-            anyRight = anyRight || gains[channel].right > 0.0f;
-        }
-        // A mask that folds everything onto one side would silently lose the
-        // other channel; fall back to front-left/front-right instead.
-        if (!anyLeft || !anyRight) {
-            weights.clear();
-        }
+    } else {
+        surroundDownmixWeights(*packet.format, source.channels, sourceBytesPerSample, weights);
     }
     if (weights.empty()) {
         // Unknown layout without a usable mask: keep the previous

@@ -2,6 +2,8 @@
 
 #include "core/Types.h"
 
+#include <iterator>
+
 namespace backtrack {
 
 // Display/serialization names for the shared codec/preset/mode enums. Used by
@@ -11,49 +13,20 @@ namespace backtrack {
 // parsers stay in settings/SettingsStore.cpp (they are persistence concerns).
 
 inline const wchar_t* codecName(VideoCodec codec) {
-    switch (codec) {
-    case VideoCodec::H264:
-        return L"h264";
-    case VideoCodec::Hevc:
-        return L"hevc";
-    }
-    return L"h264";
+    return codec == VideoCodec::Hevc ? L"hevc" : L"h264";
 }
 
 inline const wchar_t* encoderPresetName(EncoderPreset preset) {
-    switch (preset) {
-    case EncoderPreset::P1:
-        return L"p1";
-    case EncoderPreset::P2:
-        return L"p2";
-    case EncoderPreset::P3:
-        return L"p3";
-    case EncoderPreset::P4:
-        return L"p4";
-    case EncoderPreset::P5:
-        return L"p5";
-    case EncoderPreset::P6:
-        return L"p6";
-    case EncoderPreset::P7:
-        return L"p7";
-    }
-    return L"p4";
+    static constexpr const wchar_t* names[] = {L"p1", L"p2", L"p3", L"p4", L"p5", L"p6", L"p7"};
+    const auto index = static_cast<unsigned>(preset);
+    return index < std::size(names) ? names[index] : L"p4";
 }
 
 inline const wchar_t* encoderModeName(EncoderMode mode) {
-    switch (mode) {
-    case EncoderMode::HighQuality:
-        return L"high-quality";
-    case EncoderMode::LowLatency:
-        return L"low-latency";
-    case EncoderMode::UltraLowLatency:
-        return L"ultra-low-latency";
-    case EncoderMode::Lossless:
-        return L"lossless";
-    case EncoderMode::UltraHighQuality:
-        return L"ultra-high-quality";
-    }
-    return L"high-quality";
+    static constexpr const wchar_t* names[] = {
+        L"high-quality", L"low-latency", L"ultra-low-latency", L"lossless", L"ultra-high-quality"};
+    const auto index = static_cast<unsigned>(mode);
+    return index < std::size(names) ? names[index] : L"high-quality";
 }
 
 } // namespace backtrack

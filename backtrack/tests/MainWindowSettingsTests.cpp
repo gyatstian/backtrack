@@ -27,6 +27,17 @@ struct MainWindowSettingsTestAccess {
     }
     static bool commitDraft(MainWindow& window) { return window.commitSettings(window.settings_); }
     static void read(MainWindow& window, AppSettings& target) { window.readVisibleSettingsInto(target); }
+    static void enumControls(MainWindow& window, HWND control) {
+        window.codecCombo_ = control;
+        window.encoderPresetCombo_ = control;
+        window.encoderModeCombo_ = control;
+        window.encoderProfileCombo_ = control;
+        window.encoderMultipassCombo_ = control;
+        window.gpuAdaptiveCombo_ = control;
+        window.captureMethodCombo_ = control;
+        window.voiceCommandCombo_ = control;
+        window.discordRichPresenceCombo_ = control;
+    }
     static void monitorControls(MainWindow& window, HWND multi, HWND focused, HWND mouse) {
         window.multiMonitorSupportCheck_ = multi;
         window.followFocusedMonitorCheck_ = focused;
@@ -285,6 +296,63 @@ void testMissingCheckboxesPreserveSettings() {
     }
 }
 
+void testEnumCombosPreserveFallbacks() {
+    const auto directory = testRoot() / L"enum_controls";
+    SettingsStore store(directory / L"settings.ini");
+    const auto initial = fixture(directory);
+    RecorderController controller;
+    MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Missing);
+    auto fallback = initial;
+    fallback.video.codec = VideoCodec::Hevc;
+    fallback.video.encoderPreset = EncoderPreset::P2;
+    fallback.video.encoderMode = EncoderMode::LowLatency;
+    fallback.video.encoderProfile = EncoderProfile::Balanced;
+    fallback.video.encoderMultipass = EncoderMultipass::QuarterResolution;
+    fallback.gpu.adaptiveMode = GpuAdaptiveMode::Conservative;
+    fallback.preferredCaptureBackend = CaptureBackend::DesktopDuplication;
+    fallback.gameIntegrations.voiceCommand = GameIntegrationSettings::VoiceCommandMode::ClipThat;
+    fallback.gameIntegrations.discordRichPresence = GameIntegrationSettings::DiscordRichPresenceMode::FullscreenOnly;
+    auto target = fallback;
+    MainWindowSettingsTestAccess::read(window, target);
+    expect(target == fallback, "absent enum combos changed fallback settings");
+
+    const HWND combo = CreateWindowExW(0, L"COMBOBOX", L"", WS_POPUP | CBS_DROPDOWNLIST,
+        0, 0, 100, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    expect(combo != nullptr, "could not create enum combo fixture");
+    MainWindowSettingsTestAccess::bindVoice(window, combo);
+    MainWindowSettingsTestAccess::enumControls(window, combo);
+    // a real selectable row beyond every enum table exercises the bounds check.
+    for (int index = 0; index < 8; ++index) {
+        expect(SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"entry")) == index,
+               "could not populate enum combo fixture");
+    }
+    expect(SendMessageW(combo, CB_SETCURSEL, 0, 0) == 0, "could not select enum combo row");
+    auto expected = initial;
+    expected.video.codec = VideoCodec::H264;
+    expected.video.encoderPreset = EncoderPreset::P1;
+    expected.video.encoderMode = EncoderMode::HighQuality;
+    expected.video.encoderProfile = EncoderProfile::LowestGpu;
+    expected.video.encoderMultipass = EncoderMultipass::Disabled;
+    expected.gpu.adaptiveMode = GpuAdaptiveMode::Disabled;
+    expected.preferredCaptureBackend = CaptureBackend::WindowsGraphicsCapture;
+    expected.gameIntegrations.voiceCommand = GameIntegrationSettings::VoiceCommandMode::Disabled;
+    expected.gameIntegrations.discordRichPresence = GameIntegrationSettings::DiscordRichPresenceMode::Always;
+    MainWindowSettingsTestAccess::read(window, target);
+    expect(target == expected, "selected enum combos did not map through their tables");
+    expect(SendMessageW(combo, CB_SETCURSEL, 1, 0) == 1, "could not select second enum row");
+    MainWindowSettingsTestAccess::read(window, target);
+    expect(target == fallback, "second enum combo selection did not map through its table");
+    for (int selected : {-1, 7}) {
+        SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(selected), 0);
+        expect(SendMessageW(combo, CB_GETCURSEL, 0, 0) == selected,
+               "enum fallback fixture selection was not set");
+        target = fallback;
+        MainWindowSettingsTestAccess::read(window, target);
+        expect(target == fallback, "unselected or out-of-range enum combo changed its fallback");
+    }
+    MainWindowSettingsTestAccess::clearControls(window);
+}
+
 struct Checkbox {
     HWND handle = CreateWindowExW(0, L"BUTTON", L"", WS_POPUP | BS_AUTOCHECKBOX,
         0, 0, 100, 24, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
@@ -357,6 +425,7 @@ int main() {
         testImmediatePreferencesPreserveDraftsAndSavedValues();
         testAutoRecordUsesAppliedSettings();
         testMissingCheckboxesPreserveSettings();
+        testEnumCombosPreserveFallbacks();
         testFollowMouseGateAndPageReset();
         std::filesystem::remove_all(testRoot());
         std::cout << "MainWindowSettingsTests passed\n";

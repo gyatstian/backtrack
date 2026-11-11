@@ -558,83 +558,14 @@ void MainWindow::clearSettingsBodyControls() {
     hoverStickyStatusHeight_ = 0;
     clearButtonHover();
 
-    bitrateEdit_ = nullptr;
-    codecCombo_ = nullptr;
-    clipFolderEdit_ = nullptr;
-    organizeClipsByGameCheck_ = nullptr;
-    // Replay-family controls belong to category bodies (disk-backed toggle and
-    // ring folder live on Capture, voice commands on Game integrations). They
-    // were missing here, so after leaving such a category the pointers stayed
-    // dangling and the next stashVisibleSettings() read dead HWNDs
-    // (BM_GETCHECK -> 0), silently flipping settings like "buffer on disk"
-    // back to off before the body was rebuilt.
-    recordHotkey_ = nullptr;
-    replayEnabledCheck_ = nullptr;
-    replaySecondsEdit_ = nullptr;
-    replayDiskBackedCheck_ = nullptr;
-    replayDiskBackedAudioCheck_ = nullptr;
-    replayRingDirEdit_ = nullptr;
-    replayHotkey_ = nullptr;
-    voiceCommandCombo_ = nullptr;
-    leagueKillReminderCheck_ = nullptr;
-    discordRichPresenceCombo_ = nullptr;
-    discordPresenceTimerCombo_ = nullptr;
-    fpsEdit_ = nullptr;
-    resolutionModeCombo_ = nullptr;
-    widthEdit_ = nullptr;
-    heightEdit_ = nullptr;
-    followFocusedMonitorCheck_ = nullptr;
-    multiMonitorSupportCheck_ = nullptr;
-    followMouseMonitorCheck_ = nullptr;
-    captureCursorCheck_ = nullptr;
-    systemAudioCheck_ = nullptr;
-    microphoneCheck_ = nullptr;
-    outputDeviceCombo_ = nullptr;
-    inputDeviceCombo_ = nullptr;
-    outputVolumeEdit_ = nullptr;
-    inputVolumeEdit_ = nullptr;
-    inputAutoGainCheck_ = nullptr;
-#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-    inputNoiseSuppressionCheck_ = nullptr;
-#endif
-    startWithWindowsCheck_ = nullptr;
-    pruneStaleMicrophoneConsentEntriesCheck_ = nullptr;
-    exitToTrayCheck_ = nullptr;
-    checkForUpdatesCheck_ = nullptr;
-    notificationSoundVolumeEdit_ = nullptr;
-    customNotificationSoundEdit_ = nullptr;
-    encoderPresetCombo_ = nullptr;
-    encoderModeCombo_ = nullptr;
-    encoderProfileCombo_ = nullptr;
-    encoderLookaheadCheck_ = nullptr;
-    encoderLookaheadDepthEdit_ = nullptr;
-    encoderSpatialAQCheck_ = nullptr;
-    encoderAQStrengthEdit_ = nullptr;
-    encoderTemporalAQCheck_ = nullptr;
-    encoderMultipassCombo_ = nullptr;
-    encoderBFramesCheck_ = nullptr;
-    encoderAdaptiveBFramesCheck_ = nullptr;
-    encoderAdaptiveIFramesCheck_ = nullptr;
-    encoderZeroReorderDelayCheck_ = nullptr;
-    encoderGopSecondsEdit_ = nullptr;
-    encoderReferenceFramesEdit_ = nullptr;
-    gpuAdaptiveCombo_ = nullptr;
-    gpuFrameQueueLimitEdit_ = nullptr;
-    idleFrameCoalescingCheck_ = nullptr;
-    captureMethodCombo_ = nullptr;
-    stableMultimonitorFramesCheck_ = nullptr;
-    soundSeparationEnabledCheck_ = nullptr;
-    soundSeparationAppCombo_ = nullptr;
-    soundSeparationRefreshButton_ = nullptr;
-    soundSeparationManualButton_ = nullptr;
+    const HWND saveSettingsButton = saveSettingsButton_;
+    auto categoryButtons = std::move(settingsCategoryButtons_);
+    resetPageControlMembers();
+    saveSettingsButton_ = saveSettingsButton;
+    settingsCategoryButtons_ = std::move(categoryButtons);
     soundSeparationAvailableApps_.clear();
     soundSeparationRowsY_ = 0;
-    autoRecordEnabledCheck_ = nullptr;
-    autoRecordAppCombo_ = nullptr;
-    autoRecordRefreshButton_ = nullptr;
-    autoRecordManualButton_ = nullptr;
     autoRecordAvailableApps_.clear();
-    autoRecordRowsY_ = 0;
 }
 
 HWND MainWindow::addControl(const wchar_t* className, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id) {

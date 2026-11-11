@@ -5,6 +5,7 @@
 #endif
 
 #include <iostream>
+#include <limits>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -74,6 +75,45 @@ using namespace backtrack;
 void expect(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
+    }
+}
+
+void testPureMappings() {
+    const struct { EncoderPreset preset; int avc; int hevc; } presets[] = {
+        {EncoderPreset::P1, AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED},
+        {EncoderPreset::P2, AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED},
+        {EncoderPreset::P3, AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED},
+        {EncoderPreset::P4, AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED},
+        {EncoderPreset::P5, AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED},
+        {EncoderPreset::P6, AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY},
+        {EncoderPreset::P7, AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY, AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY},
+    };
+    for (const auto& entry : presets) {
+        expect(avcQualityPreset(entry.preset) == entry.avc, "AMF AVC quality preset changed");
+        expect(hevcQualityPreset(entry.preset) == entry.hevc, "AMF HEVC quality preset changed");
+    }
+    const struct { EncoderMode mode; int avc; int hevc; } modes[] = {
+        {EncoderMode::HighQuality, AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING},
+        {EncoderMode::LowLatency, AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY, AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY},
+        {EncoderMode::UltraLowLatency, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY, AMF_VIDEO_ENCODER_HEVC_USAGE_ULTRA_LOW_LATENCY},
+        {EncoderMode::Lossless, AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING},
+        {EncoderMode::UltraHighQuality, AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING},
+    };
+    for (const auto& entry : modes) {
+        expect(avcUsage(entry.mode) == entry.avc, "AMF AVC usage changed");
+        expect(hevcUsage(entry.mode) == entry.hevc, "AMF HEVC usage changed");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 7, 999, (std::numeric_limits<int>::max)()}) {
+        expect(avcQualityPreset(static_cast<EncoderPreset>(value)) == AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED,
+            "invalid AMF AVC preset did not fall back to balanced");
+        expect(hevcQualityPreset(static_cast<EncoderPreset>(value)) == AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED,
+            "invalid AMF HEVC preset did not fall back to balanced");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 5, 999, (std::numeric_limits<int>::max)()}) {
+        expect(avcUsage(static_cast<EncoderMode>(value)) == AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY,
+            "invalid AMF AVC mode did not fall back to low latency");
+        expect(hevcUsage(static_cast<EncoderMode>(value)) == AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY,
+            "invalid AMF HEVC mode did not fall back to low latency");
     }
 }
 
@@ -623,6 +663,7 @@ void testSwitchEnablingReorderingFaultsForPipelineRecreation() {
 
 int main() {
     try {
+        testPureMappings();
         testTerminalOutputFailureDuringSwitch();
         testLookaheadReportsOnlyConfiguredFeatures();
         testEffectiveSettingsDoNotOverwriteRequests();

@@ -610,31 +610,21 @@ const wchar_t* resolutionModeName(ResolutionMode mode) {
 
 ResolutionMode resolutionModeFromName(const std::wstring& value) {
     const std::wstring name = foldName(value);
-    if (name == L"240p") {
-        return ResolutionMode::P240;
+    for (const auto& preset : kResolutionPresets) {
+        if (name == preset.name) {
+            return preset.mode;
+        }
     }
-    if (name == L"480p") {
-        return ResolutionMode::P480;
-    }
-    if (name == L"720p") {
-        return ResolutionMode::P720;
-    }
-    if (name == L"2k" || name == L"1440p") {
+    if (name == L"1440p") {
         return ResolutionMode::P2K;
     }
-    if (name == L"4k" || name == L"2160p") {
+    if (name == L"2160p") {
         return ResolutionMode::P4K;
-    }
-    if (name == L"custom") {
-        return ResolutionMode::Custom;
     }
     // Legacy "native" mode was removed. Preserve the persisted width/height by
     // migrating to Custom (which keeps the explicit size) rather than a preset.
     if (name == L"native") {
         return ResolutionMode::Custom;
-    }
-    if (name == L"1080p") {
-        return ResolutionMode::P1080;
     }
     return ResolutionMode::P1080; // fallback for unknown names
 }

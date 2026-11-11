@@ -8,6 +8,7 @@
 
 #include <array>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -96,6 +97,63 @@ enum class Event { Write, Map, Submit, Complete, Unmap, Release, Unregister, Des
 void expect(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
+    }
+}
+
+void testPureMappings() {
+    const struct { EncoderPreset preset; GUID guid; } presets[] = {
+        {EncoderPreset::P1, NV_ENC_PRESET_P1_GUID},
+        {EncoderPreset::P2, NV_ENC_PRESET_P2_GUID},
+        {EncoderPreset::P3, NV_ENC_PRESET_P3_GUID},
+        {EncoderPreset::P4, NV_ENC_PRESET_P4_GUID},
+        {EncoderPreset::P5, NV_ENC_PRESET_P5_GUID},
+        {EncoderPreset::P6, NV_ENC_PRESET_P6_GUID},
+        {EncoderPreset::P7, NV_ENC_PRESET_P7_GUID},
+    };
+    for (const auto& entry : presets) {
+        expect(presetGuid(entry.preset) == entry.guid, "NVENC preset GUID changed");
+    }
+    const struct { EncoderMode mode; NV_ENC_TUNING_INFO tuning; } modes[] = {
+        {EncoderMode::HighQuality, NV_ENC_TUNING_INFO_HIGH_QUALITY},
+        {EncoderMode::LowLatency, NV_ENC_TUNING_INFO_LOW_LATENCY},
+        {EncoderMode::UltraLowLatency, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY},
+        {EncoderMode::Lossless, NV_ENC_TUNING_INFO_LOSSLESS},
+        {EncoderMode::UltraHighQuality, NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY},
+    };
+    for (const auto& entry : modes) {
+        expect(tuningInfo(entry.mode) == entry.tuning, "NVENC tuning info changed");
+    }
+    const struct { EncoderMultipass mode; NV_ENC_MULTI_PASS pass; } passes[] = {
+        {EncoderMultipass::Disabled, NV_ENC_MULTI_PASS_DISABLED},
+        {EncoderMultipass::QuarterResolution, NV_ENC_TWO_PASS_QUARTER_RESOLUTION},
+        {EncoderMultipass::FullResolution, NV_ENC_TWO_PASS_FULL_RESOLUTION},
+    };
+    for (const auto& entry : passes) {
+        expect(nvencMultipass(entry.mode) == entry.pass, "NVENC multipass changed");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 7, 999, (std::numeric_limits<int>::max)()}) {
+        expect(presetGuid(static_cast<EncoderPreset>(value)) == NV_ENC_PRESET_P4_GUID,
+            "invalid NVENC preset did not fall back to P4");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 5, 999, (std::numeric_limits<int>::max)()}) {
+        expect(tuningInfo(static_cast<EncoderMode>(value)) == NV_ENC_TUNING_INFO_HIGH_QUALITY,
+            "invalid NVENC mode did not fall back to high quality");
+    }
+    for (int value : {(std::numeric_limits<int>::min)(), -1, 3, 999, (std::numeric_limits<int>::max)()}) {
+        expect(nvencMultipass(static_cast<EncoderMultipass>(value)) == NV_ENC_MULTI_PASS_DISABLED,
+            "invalid NVENC multipass did not fall back to disabled");
+    }
+    const struct { uint32_t count; NV_ENC_NUM_REF_FRAMES frames; } references[] = {
+        {0, NV_ENC_NUM_REF_FRAMES_1},
+        {1, NV_ENC_NUM_REF_FRAMES_1},
+        {2, NV_ENC_NUM_REF_FRAMES_2},
+        {3, NV_ENC_NUM_REF_FRAMES_3},
+        {4, NV_ENC_NUM_REF_FRAMES_4},
+        {5, NV_ENC_NUM_REF_FRAMES_4},
+        {(std::numeric_limits<uint32_t>::max)(), NV_ENC_NUM_REF_FRAMES_4},
+    };
+    for (const auto& entry : references) {
+        expect(nvencReferenceFrames(entry.count) == entry.frames, "NVENC reference-frame clamp changed");
     }
 }
 
@@ -671,6 +729,7 @@ void testStuckLockStillEscalates() {
 
 int main() {
     try {
+        testPureMappings();
         testCompletionBeforeReuse();
         testRemapAfterCompletion();
         testReorderedInputRetirement();

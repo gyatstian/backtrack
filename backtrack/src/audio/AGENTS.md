@@ -149,7 +149,15 @@ RNNoise microphone denoiser.
   (locked, permission denied, corrupt header) fails the save so recovery
   preserves the recording instead of publishing a silent clip. A valid empty
   WAV is skipped. A failed mixed create or write returns false rather than
-  handing the muxer a missing or truncated audio track.
+  handing the muxer a missing or truncated audio track. A source payload seek or
+  read error after the header parsed also fails the save, through a sticky
+  per-source `readFailed`, so one bad read cannot be mixed as silence; a frame
+  outside the salvaged extent and a file merely shorter than its header claimed
+  are still silence, because `parseWav` clamps the declared extent to what is on
+  disk and a truncated-but-valid file can therefore never fail a save.
+  `setAudioMixReadFailureForTesting` and `WavWriter::failFinalizeForTesting`
+  exist only because no public path provokes those faults deterministically;
+  the app never calls them.
 - `parseWav` reads the recorded WAVs back for mixing and validates
   `mixed_audio.wav` before `Mp4Muxer` publishes. It trusts the declared RIFF
   extent only while it is plausible: a process killed before

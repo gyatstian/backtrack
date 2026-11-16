@@ -34,9 +34,11 @@ the lock-free queue used between threads, and the app version constant.
   resource at construction, so `ensureAudioPacketPool()`
   (`audio/WasapiCapture.h`) must run before any `AudioPacket` exists: `wWinMain`
   calls it before constructing `Application`, whose `RecorderController` builds
-  the audio queues. The pool is process-lifetime and never destroyed;
-  `WasapiCapture::stop` releases its unused chunks. Bytes are still retained per
-  packet by the replay buffer, so nothing recycles a live buffer.
+  the audio queues. The pool is process-lifetime and never released:
+  `synchronized_pool_resource::release()` deallocates every block it owns,
+  including those backing live allocations, and `WasapiCapture::stop()`
+  therefore does not call it - a stopping capture's packets can still be held by
+  the audio writer, the other track's capture, or a RAM-backed replay.
 - Defaults live in the struct definition, once. `SettingsStore` reads and writes
   values; it does not carry a second copy of the defaults.
 - Adding a setting is one change across five sites: the field in `Types.h`, the

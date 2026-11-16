@@ -149,6 +149,13 @@ std::wstring durationToText(uint64_t duration100ns);
 std::wstring tagsToText(const std::vector<std::wstring>& tags);
 int comboIndexForDevice(const std::vector<AudioDeviceInfo>& devices, const std::wstring& selectedId);
 std::wstring selectedDeviceId(HWND combo, const std::vector<AudioDeviceInfo>& devices);
+// Appends the saved device when enumeration does not list it. An unplugged
+// device must stay selectable, or reading the combo back turns the pinned id
+// into Default and every later save keeps that rewrite.
+std::vector<AudioDeviceInfo> deviceChoices(const std::vector<AudioDeviceInfo>& enumerated, const std::wstring& selectedId);
+// Exit status, not openability: a launcher or debugger handle keeps an exited
+// process openable.
+bool isProcessStillRunning(uint32_t processId);
 bool isModifierKey(WPARAM key);
 uint32_t currentModifierState();
 bool isControlDown();

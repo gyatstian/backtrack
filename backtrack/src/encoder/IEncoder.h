@@ -54,10 +54,15 @@ public:
     // Maximum number of pool-backed input surfaces this encoder can hold
     // (retain) before it must produce output. The encoder-feeding pool is
     // sized from this, so a deep-lookahead session cannot exhaust it and drop
-    // frames. NVENC pins each accepted input's lease until its output is
-    // harvested (bounded by its bitstream buffers, which already account for
-    // lookahead and B-frame delay); AMF copies inputs and pins nothing, so it
-    // keeps the default 0.
+    // frames. Both backends keep an accepted input's texture lease until the
+    // output it belongs to is harvested: NVENC through its per-use mapping
+    // bindings (bounded by its bitstream buffers, which already account for
+    // lookahead and B-frame delay), AMF through its in-flight input backlog
+    // (bounded by its own input cap), even though AMF copies the pixels.
+    // 0 is the default and means the backend makes no claim: it retains
+    // nothing, or has no live session yet. It is not a general sentinel - a
+    // backend that retains inputs reports its real count whether or not a
+    // session exists.
     virtual uint32_t inputRetentionBudget() const { return 0; }
 };
 

@@ -9,9 +9,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -528,6 +530,42 @@ void testCallbacksAcrossStop() {
     expect(state->listener == nullptr, "callback stayed registered after stop");
 }
 
+void testPooledPayloadSurvivesStop() {
+    // AudioPacket::bytes binds the process pool as its resource at construction,
+    // so a packet the audio writer or the replay buffer still holds must stay
+    // allocated across stop().
+    std::pmr::memory_resource* const previousDefault = std::pmr::get_default_resource();
+    backtrack::ensureAudioPacketPool();
+    {
+        auto state = std::make_shared<FakeState>();
+        WasapiCapture capture;
+        expect(startCapture(capture, state, AudioTrack::System, L"A"), "pool capture did not start");
+        expect(state->wait([](const auto& s) { return hasPacket(s, 'A'); }), "pool capture delivered no packet");
+
+        // this payload plays the downstream holder; 3840 is the 10 ms stereo
+        // float32 class the pool warms up and lands in one chunk with small
+        // capture packets.
+        AudioPacket held;
+        held.bytes.resize(3840, 0x5A);
+        uint8_t* const payload = held.bytes.data();
+
+        capture.stop();
+
+        held.bytes[0] = 0x11;
+        expect(held.bytes[0] == 0x11 && held.bytes[3839] == 0x5A,
+            "packet payload was freed by stop() while still held downstream");
+        // a released block is reused by the next allocation of its class
+        // (200/200 measured on this toolchain), so getting the held address back
+        // means stop() freed live packet memory. a heap that reuses nothing would
+        // leave the payload intact and hide the free; so would a run that aborts
+        // in the pool while unwinding, which still fails the case.
+        std::pmr::vector<uint8_t> reused(3840);
+        expect(reused.data() != payload,
+            "stop() returned a held packet payload's block to the pool (use after free)");
+    }
+    std::pmr::set_default_resource(previousDefault);
+}
+
 void testUnregisterFailureKeepsCallbackSafe() {
     auto state = std::make_shared<FakeState>();
     state->failUnregister = true;
@@ -561,6 +599,7 @@ int main() {
         testStopDrainsPendingPacket();
         testCallbacksAcrossStop();
         testUnregisterFailureKeepsCallbackSafe();
+        testPooledPayloadSurvivesStop();
         std::cout << "WasapiDefaultDeviceTests passed\n";
         return 0;
     } catch (const std::exception& error) {

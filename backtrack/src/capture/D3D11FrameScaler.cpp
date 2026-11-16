@@ -447,7 +447,10 @@ uint64_t D3D11FrameScaler::poolGeneration() const {
 
 void D3D11FrameScaler::setPoolSize(uint32_t poolSize) {
     // Min 5: captureLoop keeps one slot pinned via lastFrame (effective free = size−1).
-    const uint32_t normalized = GpuPoolBuilder::normalizePoolSize(poolSize);
+    // This pool feeds the encoder, so it takes the feeding ceiling: a deep
+    // NVENC lookahead retains up to 31 accepted inputs before any output.
+    const uint32_t normalized =
+        GpuPoolBuilder::normalizePoolSize(poolSize, kMaxEncoderFeedingPoolSize);
     if (poolSize_ == normalized) {
         return;
     }
@@ -525,7 +528,8 @@ bool D3D11FrameScaler::ensureInitialized(
     std::vector<ComPtr<ID3D11Texture2D>> textures;
     if (!GpuPoolBuilder::build(
             device.device(), outputWidth, outputHeight, outputFormat,
-            poolOptions, poolSize_, textures, L"D3D11 scaler")) {
+            poolOptions, poolSize_, textures, L"D3D11 scaler",
+            kMaxEncoderFeedingPoolSize)) {
         releaseResources();
         return false;
     }
@@ -594,7 +598,8 @@ bool D3D11FrameScaler::ensureCopyPool(
     std::vector<ComPtr<ID3D11Texture2D>> textures;
     if (!GpuPoolBuilder::build(
             device.device(), width, height, format,
-            copyOptions, poolSize_, textures, L"D3D11 scaler copy pool")) {
+            copyOptions, poolSize_, textures, L"D3D11 scaler copy pool",
+            kMaxEncoderFeedingPoolSize)) {
         releaseResources();
         return false;
     }

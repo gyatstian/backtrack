@@ -594,6 +594,35 @@ std::wstring selectedDeviceId(HWND combo, const std::vector<AudioDeviceInfo>& de
     return index < devices.size() ? devices[index].id : std::wstring();
 }
 
+std::vector<AudioDeviceInfo> deviceChoices(const std::vector<AudioDeviceInfo>& enumerated, const std::wstring& selectedId) {
+    std::vector<AudioDeviceInfo> choices = enumerated;
+    if (selectedId.empty()) {
+        return choices;
+    }
+    const bool listed = std::any_of(choices.begin(), choices.end(), [&](const AudioDeviceInfo& device) {
+        return device.id == selectedId;
+    });
+    if (!listed) {
+        // Nothing is known about an unplugged device but its id, and that id is
+        // all the setting stores; it doubles as the label.
+        choices.push_back(AudioDeviceInfo{selectedId, selectedId});
+    }
+    return choices;
+}
+
+bool isProcessStillRunning(uint32_t processId) {
+    // PROCESS_QUERY_LIMITED_INFORMATION matches what enumeration used to find
+    // the app, so the probe asks for no access the poll did not already hold.
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process) {
+        return false;
+    }
+    DWORD exitCode = 0;
+    const bool running = GetExitCodeProcess(process, &exitCode) != FALSE && exitCode == STILL_ACTIVE;
+    CloseHandle(process);
+    return running;
+}
+
 bool isModifierKey(WPARAM key) {
     return key == VK_CONTROL || key == VK_LCONTROL || key == VK_RCONTROL ||
            key == VK_MENU || key == VK_LMENU || key == VK_RMENU ||

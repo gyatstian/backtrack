@@ -81,7 +81,12 @@ recovery store that keeps a killed recording recoverable.
 - recovery muxes from an exclusively created work directory, hard-linking or
   copying inputs so mixed audio cannot overwrite legacy content. original
   sessions and legacy ambiguous hidden reservations remain untouched. a completed
-  session gets an exclusive marker when possible; a missing or invalid marker
+  session gets an exclusive marker when possible; it records the published
+  clip's identity, so the sweep skips the session while that identity still
+  matches it and also while the recorded output path holds no file at all (a
+  delete or rename through the library means the user already acted on the
+  result), and a different file at that path - a restored or recreated clip -
+  makes it recoverable again. a missing or invalid marker
   can cause a later duplicate recovery, never deletion of its streams.
 - Video PTS regression with no decode timestamps is warned about once, not
   corrected: the MP4 timeline cannot represent it, and the sample table is the
@@ -97,9 +102,9 @@ recovery store that keeps a killed recording recoverable.
   - A PTS gap is filled with the full gap's silence so the saved audio keeps
     the real gap duration; the timeline is never compressed, so post-outage
     audio stays aligned with the unchanged video track.
-  - A temporary-WAV write error fails the save: `finalize` reports it for a
-    recording, `saveTo` returns it for a replay, rather than publishing
-    truncated audio.
+  - A temporary-WAV write or finalization error fails the save: `finalize`
+    reports it for a recording, `saveTo` returns it for a replay, rather than
+    publishing truncated audio.
   - `paceAudioPacket` accumulates gap-fill statistics into its `AudioGapStats&`
     argument (fill events, silence bytes, max gap ms). Both callers own one
     (`AudioTimelineState::gapStats` on the recording side, a local in
@@ -110,7 +115,10 @@ recovery store that keeps a killed recording recoverable.
   the next path; preserve that path before clearing writer state.
 - `WavWriter` is the single WAV implementation for the recording tracks, the
   replay tracks, and the mixed PCM copy in `audio/AudioMix.cpp`. It patches the
-  RIFF and data sizes on `close`, so a process killed before that leaves zeroed
+  RIFF and data sizes in `patchHeader` from `bool close()`. `close()` reports a
+  header-patch or final-flush failure, and that fails the save for a recording
+  and for a replay instead of publishing shortened audio and deleting the
+  session. A process killed before that leaves zeroed
   fields - `parseWav` recovers from that by falling back to the real file size.
   Writes past the 4 GiB RIFF boundary keep going (large-file internal audio) and
   the header clamps both sizes to the uint32 maximum on `close`, so the data
@@ -158,7 +166,8 @@ recovery store that keeps a killed recording recoverable.
 - `StorageLayoutTests` (CTest) covers nested recovery and collision
   preservation: recovery muxes an owned work copy, so the original sessions and
   their streams are retained, and a completed recovery is marked so the sweep
-  does not repeat it.
+  does not repeat it - including after the recovered clip was deleted or
+  renamed, while a session that was never published is still recovered.
 - `ReplayBufferTests` (CTest) links the real `RecoveryStore.cpp` and
   `WavWriter.cpp` and stubs `Mp4Muxer::muxToMp4` at link time. It covers the
   manifest round trip and its atomic publish, the end-of-stream tail trim, a
@@ -175,10 +184,15 @@ recovery store that keeps a killed recording recoverable.
   manifest publication retaining the old file and removing staging, and the
   mux WAV extent (`parseMuxWav`): a clamped data size keeps the payload past the
   RIFF boundary with the frame count and duration covering it, while a
-  well-formed extent and a real trailing chunk are left alone. The MP4 write
-  itself (that the trailing audio lands in the track) still needs a hand check,
-  together with recording and replay publication and recovery of a killed
-  session in the app.
+  well-formed extent and a real trailing chunk are left alone. It also covers
+  the MP4 write itself: a real recording reopened for video subtype, size,
+  audio track and duration; the `stts`/`ctts` timeline checked against the
+  written packets including a decode-ordered B-frame stream; decoding of an
+  OS-encoded H.264 stream when those MFTs exist (a printed skip otherwise);
+  and a recording WAV-finalization failure failing the save while keeping
+  `system.wav` and the manifest recoverable. Real NVENC/AMF streams, HEVC,
+  hardware decode, and app-level publication and recovery of a killed session
+  still need a hand check.
 
 ## Child DOX Index
 

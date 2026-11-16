@@ -71,6 +71,11 @@ struct MainWindowSettingsTestAccess {
         window.switchPage(MainWindow::Page::Capture);
         window.clearPageControls();
     }
+    static void bindDeviceCombos(MainWindow& window, HWND output, HWND input) {
+        window.outputDeviceCombo_ = output;
+        window.inputDeviceCombo_ = input;
+    }
+    static void loadDeviceCombos(MainWindow& window) { window.loadAudioDeviceCombos(); }
     static bool applyQueued(MainWindow& window) {
         if (window.controllerQueue_.empty()) {
             return false;
@@ -376,6 +381,67 @@ struct Checkbox {
     void check(bool value) const { SendMessageW(handle, BM_SETCHECK, value ? BST_CHECKED : BST_UNCHECKED, 0); }
 };
 
+struct Combo {
+    HWND handle = CreateWindowExW(0, L"COMBOBOX", L"", WS_POPUP | CBS_DROPDOWNLIST,
+        0, 0, 100, 200, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    Combo() { expect(handle != nullptr, "could not create combo fixture"); }
+    ~Combo() { if (IsWindow(handle)) DestroyWindow(handle); }
+};
+
+void testUnavailableAudioDeviceSurvivesUnrelatedSave() {
+    const std::vector<AudioDeviceInfo> enumerated = {{L"{mic-a}", L"USB microphone"}, {L"{mic-b}", L"Headset"}};
+    const auto choices = deviceChoices(enumerated, L"{mic-gone}");
+    expect(choices.size() == 3 && choices.back().id == L"{mic-gone}",
+           "an unplugged device was dropped from the combo choices");
+    expect(deviceChoices(enumerated, L"").size() == 2, "the default selection gained an entry");
+    expect(deviceChoices(enumerated, L"{mic-b}").size() == 2, "a listed device was appended twice");
+
+    const auto directory = testRoot() / L"audio_devices";
+    SettingsStore store(directory / L"settings.ini");
+    auto initial = fixture(directory);
+    initial.audioInputDeviceId = L"{0.0.0.00000000}.{unplugged-mic}";
+    initial.audioOutputDeviceId = L"{0.0.0.00000000}.{unplugged-speaker}";
+    RecorderController controller;
+    MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Missing);
+    Combo output, input;
+    MainWindowSettingsTestAccess::bindDeviceCombos(window, output.handle, input.handle);
+    MainWindowSettingsTestAccess::loadDeviceCombos(window);
+
+    // An unrelated audio edit must not rewrite either pinned id.
+    auto target = initial;
+    target.audioInputVolumePercent = 42;
+    MainWindowSettingsTestAccess::read(window, target);
+    expect(target.audioInputDeviceId == initial.audioInputDeviceId &&
+           target.audioOutputDeviceId == initial.audioOutputDeviceId,
+           "a save that left the device combos alone rewrote the pinned devices");
+
+    SendMessageW(input.handle, CB_SETCURSEL, 0, 0);
+    SendMessageW(output.handle, CB_SETCURSEL, 0, 0);
+    MainWindowSettingsTestAccess::read(window, target);
+    expect(target.audioInputDeviceId.empty() && target.audioOutputDeviceId.empty(),
+           "explicitly picking Default did not clear the pinned devices");
+}
+
+void testAutoRecordLivenessCheckIgnoresRetainedHandle() {
+    expect(isProcessStillRunning(GetCurrentProcessId()), "liveness check reported a running process as gone");
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION child{};
+    std::wstring commandLine = L"cmd.exe /c exit 7";
+    expect(CreateProcessW(nullptr, commandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+               nullptr, nullptr, &startup, &child) != FALSE,
+           "could not start the liveness fixture process");
+    expect(WaitForSingleObject(child.hProcess, 10000) == WAIT_OBJECT_0,
+           "the liveness fixture process did not exit");
+    // The handle stays open after exit, the way a launcher or debugger holds one:
+    // opening the process still succeeds, so only the exit status proves it ended.
+    expect(!isProcessStillRunning(child.dwProcessId),
+           "an exited process with a retained handle was reported alive");
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+}
+
 void testFollowMouseGateAndPageReset() {
     const auto directory = testRoot() / L"monitor_controls";
     SettingsStore store(directory / L"settings.ini");
@@ -514,6 +580,8 @@ int main() {
         testAutoRecordUsesAppliedSettings();
         testMissingCheckboxesPreserveSettings();
         testEnumCombosPreserveFallbacks();
+        testUnavailableAudioDeviceSurvivesUnrelatedSave();
+        testAutoRecordLivenessCheckIgnoresRetainedHandle();
         testFollowMouseGateAndPageReset();
         testClipOverlapSetting();
         std::filesystem::remove_all(testRoot());

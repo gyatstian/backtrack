@@ -47,7 +47,10 @@ build.
   - `DecodeOrderTimestampsTests` - `encoder/DecodeOrderTimestamps.h` plus
     `core/Logger.cpp`. DTS equals PTS with no reordering, the offset settles at
     the pipeline depth under B-frames, ctts offsets stay non-negative, a batched
-    harvest does not lose a slot, and `reset` with the full depth
+    harvest does not lose a slot, variable submission and packet durations keep
+    the extrapolated early DTS strictly increasing on the documented formula
+    (earliest submission's duration, never the arriving packet's), and `reset`
+    with the full depth
     (`bFrames ? 2 : 0` + `lookahead ? depth : 0`) is contrasted with the
     too-small depth `encoder/AGENTS.md` warns about.
   - `SpscQueueTests` - `core/SpscQueue.h` alone. FIFO order, `tryPush` failing
@@ -95,8 +98,14 @@ build.
     `mux/WavReader.cpp`, `mux/WavWriter.cpp`, `audio/WavReader.cpp`,
     `audio/AudioConvert.cpp`, `audio/AudioMix.cpp`, `core/Logger.cpp`,
     `LIBS mfplat mfreadwrite mfuuid ole32 shlwapi`. The only Media Foundation
-    link: write-failure retention, abort, same-name retry, and `parseMuxWav`'s
-    RIFF-boundary extent recovery.
+    link: write-failure retention, abort, same-name retry, `parseMuxWav`'s
+    RIFF-boundary extent recovery, a real mux round trip reopened through
+    `IMFSourceReader` for subtype, size, audio track and duration, the
+    `stts`/`ctts` tables checked against the written packet timeline including
+    a decode-ordered B-frame stream, decoding of an OS-encoded H.264 stream
+    when those MFTs are usable (a printed skip otherwise), and the recording
+    path's WAV-finalization failure preserving `system.wav` plus its manifest
+    with nothing published.
   - `StorageLayoutTests` - the `ReplayBufferTests` source set plus
     `clips/ClipManager.cpp`, `LIBS propsys`: reservation collisions, the shared
     root rules, game-root and nested recovery, and that recovery muxes an owned
@@ -122,9 +131,11 @@ build.
   - `D3D11FrameScalerTests` - `capture/D3D11FrameScaler.cpp`,
     `core/Logger.cpp`, `LIBS d3d11`: same-size alias/copy ownership and pixels,
     copied-input fallback, and NV12 failure handling on WARP plus a fake video
-    device.
+    device, and the negotiated 33-slot feeding pool surviving `setPoolSize` and
+    the pool build.
   - `EncoderFeedingPoolTests` - `capture/GpuTexturePool.h` with a fake
-    deep-lookahead encoder, `core/Logger.cpp`.
+    deep-lookahead encoder, `core/Logger.cpp`: the two-argument clamp arithmetic
+    and the negotiation through `GpuTexturePool`, not the scaler itself.
   - `WasapiDefaultDeviceTests` - `audio/WasapiCapture.cpp`,
     `audio/SessionMuteStore.cpp`, `core/Logger.cpp`,
     `LIBS avrt mmdevapi ole32 propsys user32 uuid windowsapp`: default-device
@@ -145,14 +156,18 @@ build.
     `encoder/EncoderCommon.cpp`, `encoder/BitstreamUtils.cpp`, `core/Logger.cpp`,
     `DEFINES BACKTRACK_HAS_NVENC=1`, the SDK include path, `LIBS d3d11`. Drives
     the real encoder with a fake NVENC API and WARP textures: mapping per use,
-    B-frame token matching including out-of-order retirement, repeated input,
-    rejection, reset, lock/unmap failure, shutdown retention, and the early
+    B-frame token matching including out-of-order retirement, output buffers
+    locked in submission order while retirement follows the timestamp, repeated
+    input (one bounded harvest before the drop), rejection, reset, lock/unmap
+    failure, shutdown retention, and the early
     non-blocking lock statuses (`LOCK_BUSY`/`OUT_OF_MEMORY` retry, a stuck lock
     still escalates after the deadline).
   - `AmfEncoderTests` - includes `encoder/AmfEncoder.cpp` itself, plus
     `encoder/EncoderCommon.cpp`, `encoder/BitstreamUtils.cpp`, `core/Logger.cpp`,
     `DEFINES BACKTRACK_HAS_AMF=1`, the AMF include path, `LIBS ole32`. Registered
-    only when the AMF headers are found.
+    only when the AMF headers are found. The retention budget is checked against
+    the pinned leases it reports, and an aged backlog faulting at its deadline
+    releases every lease.
   - `AudioDenoiseTests` - `audio/RnnoiseDenoiser.cpp`, `LIBS rnnoise`. Built
     only when `BACKTRACK_NOISE_SUPPRESSION=ON`; the suite itself has no
     `#ifdef`, the CMake `if` around `add_backtrack_test` is the whole gate.

@@ -168,8 +168,9 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   `paceAudioPacket` core (`mux/AudioTimeline.h`) with the replay window
   `[start, end]` as its bound, so a packet past the window end is not written
   and the clip's audio stops with the video.
-- each `saveTo` owns a freshly created session directory. a failed stream or
-  mux write retains its files; `RecoveryStore` creates a manifest for a usable
+- each `saveTo` owns a freshly created session directory. a failed stream
+  write, audio-WAV finalization, or mux failure retains its files;
+  `RecoveryStore` creates a manifest for a usable
   video prefix where possible and reports when manual recovery may be needed.
   a same-name retry never truncates an earlier session.
 - `newestVideoPts100ns` exists because PTS-age trimming cannot detect a stalled
@@ -213,7 +214,8 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   disk-audio ring (byte-exact wrap reassembly with reversed track timestamps,
   skew, age trimming and saves between track drains, capacity-only reconfigure,
   audio-only read-failure failover), the
-  mux-failure recovery path, same-name retry, aged startup sessions and failed
+  mux-failure recovery path, an audio-WAV finalization failure keeping the
+  session recoverable, same-name retry, aged startup sessions and failed
   manifest rewrites, a capacity-only reconfigure (buffer kept, retained
   extents read back byte for byte, deferred resize applied once the buffer
   drains), backend and directory switches, a failed ring open, an oversized

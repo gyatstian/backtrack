@@ -44,8 +44,12 @@ lives beside the sources. `backtrack.slnx` is the Visual Studio entry point,
 - Compile-time switches, all owned by the build files; never set one from
   source:
   - `BACKTRACK_HAS_NVENC` / `BACKTRACK_HAS_AMF`: header detection, always
-    defined as `=1` or `=0`. CMake resolves them with `find_path`, the vcxproj
-    with `Exists()` on the same files under `src\Interface`. Absent headers
+    defined as `=1` or `=0`. CMake probes ordered candidate roots for the same
+    prefixed paths the sources include (`Interface/nvEncodeAPI.h`,
+    `AMF/core/Factory.h`): an explicit `NV_CODEC_SDK_PATH` / `AMF_SDK_PATH`
+    root wins over the vendored headers, which are the last candidate. The
+    vcxproj only ever sees the vendored files (`Exists()` under
+    `src\Interface`), so an external SDK is a CMake-only route. Absent headers
     compile the backend to a stub reporting unavailable.
   - `BACKTRACK_HAS_NOISE_SUPPRESSION`: enables the RNNoise wrapper, its UI
     checkbox, and `AudioDenoiseTests`. All three must agree, so toggle the
@@ -81,16 +85,21 @@ lives beside the sources. `backtrack.slnx` is the Visual Studio entry point,
 ## Verification
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Ninja Multi-Config"
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release
 ```
 
-Toolchain paths and ATL requirements are in the root `AGENTS.md`.
+Run these from a shell that has the MSVC developer environment
+(`vcvars64.bat`); a bare shell cannot find the C++ standard library headers.
+`"Visual Studio 17 2022"` only configures where the `v143` toolset is
+installed, so it is not the portable route. Toolchain paths and ATL
+requirements are in the root `AGENTS.md`.
 
-34 suites build unconditionally. `NvencLifecycleTests` and `AmfEncoderTests`
-are added when the NVENC and AMF headers are found (both are vendored), and
-`AudioDenoiseTests` only with `-DBACKTRACK_NOISE_SUPPRESSION=ON`.
+Every registered suite builds unconditionally except `NvencLifecycleTests` and
+`AmfEncoderTests`, added when the NVENC and AMF headers are found (both are
+vendored), and `AudioDenoiseTests`, which needs
+`-DBACKTRACK_NOISE_SUPPRESSION=ON`.
 
 ## Child DOX Index
 

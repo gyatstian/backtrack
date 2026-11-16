@@ -165,6 +165,9 @@ struct AmfEncoder::Impl {
     // per-iteration health probe (IEncoder::encoderAvailable). Written only on
     // paths that already hold mutex, so the pair never disagrees observably.
     std::atomic<bool> availableAtomic{false};
+    // Lock-free mirror of inFlightCap() for IEncoder::inputRetentionBudget, which
+    // the capture loop queries while encode() holds mutex across QueryOutput.
+    std::atomic<uint32_t> retentionBudget{0};
 
     void publishAvailability(bool available) {
         encoderStats.encoderAvailable = available;
@@ -525,6 +528,12 @@ struct AmfEncoder::Impl {
         effective.lookahead = false;
         effective.lookaheadDepth = 0;
         caps.effective = effective;
+        // Each accepted input keeps its scaler-pool lease until its output is
+        // harvested, so the retention budget is the negotiated input cap the
+        // backlog check in encode() enforces.
+        retentionBudget.store(
+            encoder && !encoderFaulted ? static_cast<uint32_t>(inFlightCap()) : 0,
+            std::memory_order_release);
     }
 
     bool configureAvc(const EncoderEffectiveSettings& effective) {
@@ -1027,6 +1036,20 @@ struct AmfEncoder::Impl {
         if (inFlight.size() >= maxInFlight && !harvestOutputs(false)) {
             return false;
         }
+
+        // Hard lifetime for accepted-but-unharvested frames: a healthy driver
+        // drains within a few frame intervals, so an input this old means the
+        // encoder stopped producing output. Fault the session (the capture
+        // loop recreates it) instead of querying a dead component forever.
+        // Sits after the harvest above and before the drop below so a full
+        // backlog cannot shed new frames forever while the oldest one ages out.
+        if (!inFlight.empty() &&
+            SteadyClock::now() - inFlight.front().submittedAt >= kInFlightMaxAge) {
+            return fail(
+                L"AMF encoder produced no output for a submitted frame within " +
+                std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(kInFlightMaxAge).count()) +
+                L"s; encoder faulted so the capture pipeline can recreate it");
+        }
         if (inFlight.size() >= maxInFlight) {
             ++encoderStats.droppedFrames;
             ++inFlightDropCount;
@@ -1051,18 +1074,6 @@ struct AmfEncoder::Impl {
             }
             return failures == kEncoderMaxConsecutiveFailures;
         };
-
-        // Hard lifetime for accepted-but-unharvested frames: a healthy driver
-        // drains within a few frame intervals, so an input this old means the
-        // encoder stopped producing output. Fault the session (the capture
-        // loop recreates it) instead of querying a dead component forever.
-        if (!inFlight.empty() &&
-            SteadyClock::now() - inFlight.front().submittedAt >= kInFlightMaxAge) {
-            return fail(
-                L"AMF encoder produced no output for a submitted frame within " +
-                std::to_wstring(std::chrono::duration_cast<std::chrono::seconds>(kInFlightMaxAge).count()) +
-                L"s; encoder faulted so the capture pipeline can recreate it");
-        }
 
         amf::AMFSurfacePtr surface;
         AMF_RESULT result = context->CreateSurfaceFromDX11Native(frame.texture.Get(), &surface, nullptr);
@@ -1137,7 +1148,7 @@ struct AmfEncoder::Impl {
         // Accepted input: AMF produces exactly one output packet for it, in
         // decode order. Record the submission slot for decode-timestamp
         // assignment.
-        decodeTimestamps.onSubmit(frame.pts100ns);
+        decodeTimestamps.onSubmit(frame.pts100ns, duration100ns);
 
         PendingInput pending;
         pending.surface = surface;
@@ -1228,6 +1239,7 @@ struct AmfEncoder::Impl {
 
     void shutdownEncoder() {
         inFlight.clear();
+        retentionBudget.store(0, std::memory_order_release);
         decodeTimestamps.reset(0);
         if (drainAbandoned && (encoder || context)) {
             // An abandoned Drain() may still be executing inside the driver.
@@ -1389,6 +1401,14 @@ EncoderStats AmfEncoder::stats() const {
         impl_->statsSnapshot = impl_->encoderStats;
     }
     return impl_->statsSnapshot;
+}
+
+uint32_t AmfEncoder::inputRetentionBudget() const {
+#if BACKTRACK_HAS_AMF
+    return impl_->retentionBudget.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
 }
 
 DXGI_FORMAT AmfEncoder::preferredInputFormat() const {

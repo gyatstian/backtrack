@@ -17,4 +17,10 @@ bool buildMixedPcmAudio(
     const std::filesystem::path& outputPath,
     std::filesystem::path& mixedPath);
 
+// Test-only: fail every source payload chunk read after the first one, which is
+// the shape of a storage error found after the header parsed. No public path
+// can provoke it (a short but valid file is salvaged on purpose). The app never
+// calls it.
+void setAudioMixReadFailureForTesting(bool fail);
+
 } // namespace backtrack

@@ -47,6 +47,14 @@ struct D3D11FrameScalerTestAccess {
     static void rejectNv12(D3D11FrameScaler& scaler) {
         scaler.nv12Unavailable_ = true;
     }
+
+    static uint32_t poolSize(const D3D11FrameScaler& scaler) {
+        return scaler.poolSize_;
+    }
+
+    static size_t slotCount(const D3D11FrameScaler& scaler) {
+        return scaler.pool_.size();
+    }
 };
 
 } // namespace backtrack
@@ -152,6 +160,21 @@ void makeWarpDevice(D3DDevice& device) {
         D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
         &d3d, nullptr, &context)), "create WARP device failed");
     D3D11FrameScalerTestAccess::setDevice(device, d3d.Get(), context.Get());
+}
+
+// WARP is present on every supported build; a machine without it skips the
+// GPU-backed pool assertion instead of failing it.
+bool tryMakeWarpDevice(D3DDevice& device) {
+    ComPtr<ID3D11Device> d3d;
+    ComPtr<ID3D11DeviceContext> context;
+    const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION,
+        &d3d, nullptr, &context);
+    if (FAILED(hr)) {
+        return false;
+    }
+    D3D11FrameScalerTestAccess::setDevice(device, d3d.Get(), context.Get());
+    return true;
 }
 
 ComPtr<ID3D11Texture2D> makeTexture(ID3D11Device* device, uint32_t color) {
@@ -289,6 +312,40 @@ void testDirectRejectionUsesUnboundInputCopy() {
     expectCopiedPixels(device, nextView, 0xffaabbcc);
 }
 
+// The scaler's output pool feeds the encoder, so it must hold the negotiated
+// input-retention budget (encoderFeedingPoolSizeFor, 5..64) instead of the
+// intermediate 16-texture cap. A deep NVENC lookahead retains up to 31
+// accepted inputs before any output, so a 16-slot pool starves the producer.
+void testEncoderFeedingPoolKeepsNegotiatedSize() {
+    D3D11FrameScaler clamped;
+    clamped.setPoolSize(kMaxEncoderFeedingPoolSize + 1);
+    expect(D3D11FrameScalerTestAccess::poolSize(clamped) == kMaxEncoderFeedingPoolSize,
+        "scaler must cap its feeding pool at the feeding ceiling, not the intermediate one");
+
+    clamped.setPoolSize(encoderFeedingPoolSizeFor(4, 28));
+    expect(D3D11FrameScalerTestAccess::poolSize(clamped) == 33u,
+        "scaler dropped the 33-texture feeding pool a lookahead-24 session negotiates");
+
+    D3DDevice device;
+    if (!tryMakeWarpDevice(device)) {
+        std::cout << "D3D11FrameScalerTests: no WARP device, skipping the pooled-size build\n";
+        return;
+    }
+    D3D11FrameScaler scaler;
+    scaler.setPoolSize(33);
+    GpuFrame input;
+    input.texture = makeTexture(device.device(), 0xff334455);
+    input.lease = std::make_shared<int>(1);
+    input.width = kWidth;
+    input.height = kHeight;
+    input.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    GpuFrame copy;
+    expect(scaler.scale(device, input, kWidth, kHeight, copy, false, true, DXGI_FORMAT_B8G8R8A8_UNORM),
+        "forced copy with a deep feeding pool failed");
+    expect(D3D11FrameScalerTestAccess::slotCount(scaler) == 33u,
+        "the built scaler pool ignored the negotiated feeding size");
+}
+
 void testInputFailureDoesNotDowngradeNv12() {
     D3DDevice device;
     makeWarpDevice(device);
@@ -328,6 +385,7 @@ int main() {
         testSameSizeCopyOrAlias();
         testDirectRejectionUsesUnboundInputCopy();
         testInputFailureDoesNotDowngradeNv12();
+        testEncoderFeedingPoolKeepsNegotiatedSize();
     } catch (const std::exception& error) {
         std::cerr << "D3D11FrameScalerTests: " << error.what() << '\n';
         return 1;

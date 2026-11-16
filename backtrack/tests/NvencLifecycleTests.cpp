@@ -7,6 +7,7 @@
 #error NvencLifecycleTests requires the NVENC SDK header
 #endif
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <limits>
@@ -173,8 +174,13 @@ struct FakeNvenc {
     std::unordered_map<NV_ENC_INPUT_PTR, uint64_t> inputTokens;
     std::unordered_set<NV_ENC_INPUT_PTR> mappedResources;
     std::unordered_set<uint64_t> completedTokens;
-    std::vector<uint64_t> lockOrder;
-    size_t lockIndex = 0;
+    // Handles in submission order, and the input token the driver encoded into
+    // each of them. The driver fills buffers in encode order, so a handle's
+    // picture is decided by its submission position, not by the handle.
+    std::vector<NV_ENC_OUTPUT_PTR> submissionOrder;
+    std::vector<uint64_t> encodeOrder;
+    std::vector<NV_ENC_OUTPUT_PTR> lockHandles;
+    bool lockedUnsubmitted = false;
     std::vector<Event> events;
     NVENCSTATUS submitStatus = NV_ENC_SUCCESS;
     int completionCredits = 0;
@@ -231,6 +237,7 @@ struct FakeNvenc {
             ++fake.outstanding;
             fake.timestamps[pic->outputBitstream] = pic->inputTimeStamp;
             fake.inputTokens[pic->inputBuffer] = pic->inputTimeStamp;
+            fake.submissionOrder.push_back(pic->outputBitstream);
         }
         return fake.submitStatus;
     }
@@ -242,14 +249,23 @@ struct FakeNvenc {
             return fake.outOfMemoryWhenIncomplete ? NV_ENC_ERR_OUT_OF_MEMORY
                                                   : NV_ENC_ERR_LOCK_BUSY;
         }
+        const auto position = std::find(fake.submissionOrder.begin(), fake.submissionOrder.end(),
+            output->outputBitstream);
+        if (position == fake.submissionOrder.end()) {
+            fake.lockedUnsubmitted = true;
+            return NV_ENC_ERR_INVALID_PARAM;
+        }
         --fake.completionCredits;
         --fake.outstanding;
+        const size_t submittedIndex = static_cast<size_t>(position - fake.submissionOrder.begin());
+        const uint64_t token = submittedIndex < fake.encodeOrder.size()
+            ? fake.encodeOrder[submittedIndex]
+            : fake.timestamps.at(output->outputBitstream);
         fake.events.push_back(Event::Complete);
+        fake.lockHandles.push_back(output->outputBitstream);
+        fake.bytes[5] = static_cast<uint8_t>(token);
         output->bitstreamBufferPtr = fake.bytes.data();
         output->bitstreamSizeInBytes = static_cast<uint32_t>(fake.bytes.size());
-        const uint64_t token = fake.lockIndex < fake.lockOrder.size()
-            ? fake.lockOrder[fake.lockIndex++]
-            : fake.timestamps.at(output->outputBitstream);
         fake.completedTokens.insert(token);
         output->outputTimeStamp = token;
         output->outputDuration = 166667;
@@ -313,7 +329,9 @@ class InstrumentedPool {
         std::shared_ptr<Slot> slot;
         FakeNvenc* fake = nullptr;
         ~Lease() {
-            fake->releasedWhileMapped |= fake->mapped;
+            // Per texture: several inputs may be mapped at once, so only a
+            // release of a texture the encoder still owns is a defect.
+            fake->releasedWhileMapped |= fake->mappedResources.count(slot->texture.Get()) != 0;
             fake->events.push_back(Event::Release);
         }
     };
@@ -432,7 +450,8 @@ void testReorderedInputRetirement() {
     attach(encoder, fake);
     auto first = poolA.write();
     auto second = poolB.write();
-    fake.lockOrder = {2, 1};
+    // O1 carries the second input's picture, O2 the first one's.
+    fake.encodeOrder = {2, 1};
     std::vector<EncodedPacket> packets;
     encoder.encodeFrame(first, packets);
     encoder.encodeFrame(second, packets);
@@ -447,6 +466,58 @@ void testReorderedInputRetirement() {
     expect(NvencEncoderTestAccess::harvest(encoder), "second reordered output was not harvested");
     expect(poolA.available() && poolB.available() && !fake.mapped,
            "reordered inputs were not retired in output-timestamp order");
+}
+
+// The SDK requires the output buffers to be locked in submission order: the
+// driver writes encode-order pictures into them, so buffer N does not
+// necessarily carry submission N's input. The buffers stay in submission order
+// while retirement follows the timestamp.
+void testOutputBuffersLockInSubmissionOrder() {
+    FakeNvenc fake;
+    InstrumentedPool poolA(fake);
+    InstrumentedPool poolB(fake);
+    InstrumentedPool poolC(fake);
+    InstrumentedPool poolD(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    std::vector<GpuFrame> frames{poolA.write(), poolB.write(), poolC.write(), poolD.write()};
+    for (size_t index = 0; index < frames.size(); ++index) {
+        frames[index].pts100ns = 1000 * static_cast<int64_t>(index + 1);
+    }
+    std::vector<EncodedPacket> packets;
+    for (auto& frame : frames) {
+        encoder.encodeFrame(frame, packets);
+    }
+    frames.clear();
+    expect(fake.accepted == 4, "not every frame was submitted");
+
+    // Encode order: pictures 1, 4, 2, 3 land in buffers O1, O2, O3, O4.
+    fake.encodeOrder = {1, 4, 2, 3};
+    fake.completionCredits = 4;
+    expect(NvencEncoderTestAccess::harvest(encoder), "the reordered outputs were not harvested");
+
+    expect(!fake.lockedUnsubmitted, "a buffer that was never submitted was locked");
+    expect(fake.lockHandles == fake.submissionOrder,
+           "output buffers were not locked in submission order");
+
+    std::vector<EncodedPacket> published;
+    EncodedPacket packet;
+    while (NvencEncoderTestAccess::popReady(encoder, packet)) {
+        published.push_back(std::move(packet));
+    }
+    const int64_t expectedPts[] = {1000, 4000, 2000, 3000};
+    const uint8_t expectedToken[] = {1, 4, 2, 3};
+    expect(published.size() == 4, "a reordered output was lost or duplicated");
+    for (size_t index = 0; index < published.size(); ++index) {
+        expect(published[index].pts100ns == expectedPts[index],
+               "packets did not leave in encode order");
+        expect(published[index].bytes.size() == fake.bytes.size() &&
+               published[index].bytes.back() == expectedToken[index],
+               "a packet carried another input's payload");
+    }
+    expect(poolA.available() && poolB.available() && poolC.available() && poolD.available() &&
+           !fake.mapped && !fake.invalidUnmap && !fake.releasedWhileMapped,
+           "a reordered input was retired at the wrong time");
 }
 
 void testMapFailureReleasesInput() {
@@ -483,6 +554,39 @@ void testRepeatedInput() {
     expect(pool.available() && !fake.mapped && !fake.releasedWhileMapped &&
            !fake.invalidUnmap && !fake.invalidDestroy,
            "repeated input was not safely released");
+}
+
+// A same-size producer reuses one texture for idle heartbeats, so a repeat
+// submission must first give the encoder one bounded chance to retire the
+// earlier one instead of dropping itself out of the pipeline.
+void testRepeatedInputHarvestsBeforeDropping() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake);
+    NvencEncoder encoder;
+    attach(encoder, fake);
+    auto frame = pool.write();
+    frame.pts100ns = 1000;
+    std::vector<EncodedPacket> packets;
+    encoder.encodeFrame(frame, packets);
+    expect(fake.accepted == 1, "the first submission was not accepted");
+
+    fake.completionCredits = 1;
+    frame.pts100ns = 2000;
+    encoder.encodeFrame(frame, packets);
+    expect(fake.accepted == 2,
+           "a repeated input was dropped without harvesting its pending output");
+    expect(!fake.submittedWithoutFreshMap, "the repeat was submitted without a fresh mapping");
+    expect(!fake.invalidUnmap && !fake.releasedWhileMapped,
+           "the repeat was submitted over a texture the encoder still owned");
+    expect(packets.size() == 1 && packets.front().pts100ns == 1000,
+           "the harvest that unblocked the repeat did not publish the first output");
+    expect(encoder.stats().droppedFrames == 0, "the harvestable repeat was counted as a drop");
+
+    fake.completionCredits = 1;
+    expect(NvencEncoderTestAccess::harvest(encoder), "the repeated output was not harvested");
+    frame = {};
+    expect(pool.available() && !fake.mapped && !fake.releasedWhileMapped && !fake.invalidUnmap,
+           "the repeated input was not safely released");
 }
 
 void testDroppedInputsRearmAndReturnReadyTail() {
@@ -751,8 +855,10 @@ int main() {
         testCompletionBeforeReuse();
         testRemapAfterCompletion();
         testReorderedInputRetirement();
+        testOutputBuffersLockInSubmissionOrder();
         testMapFailureReleasesInput();
         testRepeatedInput();
+        testRepeatedInputHarvestsBeforeDropping();
         testDroppedInputsRearmAndReturnReadyTail();
         testRetentionBudgetUsesPipelineDelay();
         testRejectedSubmission();

@@ -1,23 +1,33 @@
-// Regressions for audit findings 06 and 08 in RecorderController:
+// Regressions for audit findings 06, 08 and 12 in RecorderController:
 //  - 06: a missing encoder after a failed capture init is a pipeline fault
 //    (the old `encoder_ && !encoder_->encoderAvailable()` treated null as
 //    healthy, so the health check never recreated the pipeline);
 //  - 08: a recording stop drains by encode-thread acknowledgement, not by PTS
 //    (B-frame reordering lets a post-stop P frame complete before a pre-stop
-//    B frame, so a highest-PTS comparison cut the recording early).
+//    B frame, so a highest-PTS comparison cut the recording early);
+//  - 08 (race): the 5 s encoder health probe reads encoder_ while a live GPU
+//    recreate replaces it, so it must hold pipelineGpuMutex_.
+//  - 12: a volume/cursor-only change with non-default replay settings is still
+//    a live apply, not a pipeline restart that stops the active recording.
 // The cutoff handshake lives in app/RecordingCutoffTracker.h and the fault
-// predicate in app/RecorderController.h, so this suite compiles them
-// standalone like the other controller-adjacent suites. The full pipeline
-// behavior (capture-loop recovery, encode-thread handshake) is a manual check.
+// predicate, probe snapshot and settings comparison views in
+// app/RecorderController.h, so this suite compiles them standalone like the
+// other controller-adjacent suites. The full pipeline behavior (capture-loop
+// recovery, encode-thread handshake, the live-apply path itself) is a manual
+// check.
 
 #include "app/RecordingCutoffTracker.h"
 #include "app/RecorderController.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -222,6 +232,229 @@ void testEncoderHealthProbe() {
            "zero fps with no submissions must still warn on high latency");
 }
 
+// ---------------------------------------------------------------- finding 08 (encoder probe race)
+
+// Stand-in for IEncoder::stats(): the probe must only reach it while it owns the
+// pipeline GPU lock, because a recreate destroys and replaces that encoder there.
+struct ProbeEncoder {
+    const std::atomic<bool>* recreating = nullptr;
+    std::atomic<bool>* reachedDuringRecreate = nullptr;
+    int calls = 0;
+
+    backtrack::EncoderStats stats() {
+        ++calls;
+        if (recreating && reachedDuringRecreate && recreating->load()) {
+            reachedDuringRecreate->store(true);
+        }
+        backtrack::EncoderStats snapshot;
+        snapshot.averageEncodeMs = 12.5;
+        snapshot.submittedFrames = 7;
+        return snapshot;
+    }
+};
+
+void testEncoderProbeTakesTheGpuLock() {
+    std::mutex gpuMutex;
+    std::unique_ptr<ProbeEncoder> encoder = std::make_unique<ProbeEncoder>();
+
+    const auto free_ = backtrack::probeEncoderStats(gpuMutex, encoder);
+    expect(free_.has_value() && free_->submittedFrames == 7 && encoder->calls == 1,
+           "a free pipeline lock must yield the encoder stats");
+
+    {
+        std::scoped_lock recreate(gpuMutex);
+        expect(!backtrack::probeEncoderStats(gpuMutex, encoder).has_value(),
+               "a running recreate must skip the probe tick");
+        expect(encoder->calls == 1, "a running recreate must not be raced by the probe");
+    }
+
+    encoder.reset();
+    expect(!backtrack::probeEncoderStats(gpuMutex, encoder).has_value(),
+           "a missing encoder (failed recreate) has no stats to report");
+}
+
+// The probe runs on every encode-loop iteration while a recreate replaces the
+// encoder on another thread. Reading the pointer outside the lock is the
+// finding-08 data race; the helper must never expose the encoder to the probe
+// while the recreate owns it.
+void testEncoderProbeDuringEncoderReplacement() {
+    std::mutex gpuMutex;
+    std::atomic<bool> recreating{false};
+    std::atomic<bool> reachedDuringRecreate{false};
+    std::unique_ptr<ProbeEncoder> encoder = std::make_unique<ProbeEncoder>();
+    encoder->recreating = &recreating;
+    encoder->reachedDuringRecreate = &reachedDuringRecreate;
+
+    std::thread probe([&] {
+        for (int i = 0; i < 2000; ++i) {
+            (void)backtrack::probeEncoderStats(gpuMutex, encoder);
+        }
+    });
+    for (int i = 0; i < 50; ++i) {
+        {
+            std::scoped_lock recreate(gpuMutex);
+            recreating.store(true);
+            encoder = std::make_unique<ProbeEncoder>();
+            encoder->recreating = &recreating;
+            encoder->reachedDuringRecreate = &reachedDuringRecreate;
+            recreating.store(false);
+        }
+        std::this_thread::yield();
+    }
+    probe.join();
+    expect(!reachedDuringRecreate.load(),
+           "the probe must never read an encoder a recreate is replacing");
+}
+
+// ---------------------------------------------------------------- finding 12
+
+// A volume/cursor/AGC-only change applies through the mirror fields, so it must
+// classify as live even when the replay settings are non-default (disabled, a
+// custom window, a ring-folder override). The old comparison stripped replay
+// from the incoming side only, so those settings looked like a pipeline change
+// and a full restart stopped the active recording.
+void testLiveSettingsClassification() {
+    backtrack::AppSettings current;
+    current.replay.enabled = false;
+    current.replay.seconds = 300;
+    current.replay.diskBackedVideo = false;
+    current.replayRingDirectory = L"D:\\ring";
+    current.audioOutputVolumePercent = 80;
+    current.captureCursor = true;
+
+    auto volumeOnly = current;
+    volumeOnly.audioOutputVolumePercent = 60;
+    expect(volumeOnly != current, "the volume change must be a real change");
+    // The live view keeps the real replay settings. The finding-12 defect was an
+    // asymmetric strip (incoming replay cleared, current replay real), which made
+    // every such change look like a pipeline change and restart the pipeline.
+    expect(backtrack::liveFieldsCleared(current).replay == current.replay &&
+               backtrack::liveFieldsCleared(current).replayRingDirectory == current.replayRingDirectory,
+           "the live comparison must compare the real replay settings, not cleared ones");
+    expect(backtrack::liveFieldsCleared(volumeOnly) == backtrack::liveFieldsCleared(current),
+           "a volume-only change with non-default replay settings must take the live path");
+
+    auto cursorOnly = current;
+    cursorOnly.captureCursor = false;
+    expect(backtrack::liveFieldsCleared(cursorOnly) == backtrack::liveFieldsCleared(current),
+           "a cursor-only change must take the live path");
+
+    auto agcOnly = current;
+    agcOnly.audioInputAutoGainEnabled = true;
+    agcOnly.audioInputVolumePercent = 140;
+    expect(backtrack::liveFieldsCleared(agcOnly) == backtrack::liveFieldsCleared(current),
+           "an AGC/input-volume change must take the live path");
+
+    auto pipelineChange = current;
+    pipelineChange.video.fps = current.video.fps + 30;
+    expect(backtrack::liveFieldsCleared(pipelineChange) != backtrack::liveFieldsCleared(current),
+           "a video change must still take the restart path");
+
+    // A replay change is never a live-apply: the replay branch above owns it,
+    // and the restart path owns it while the pipeline is stopped.
+    auto replayWindow = current;
+    replayWindow.replay.seconds = 30;
+    expect(backtrack::replayFieldsCleared(replayWindow) == backtrack::replayFieldsCleared(current),
+           "a replay-window change is confined to the replay fields");
+    expect(backtrack::liveFieldsCleared(replayWindow) != backtrack::liveFieldsCleared(current),
+           "a replay-window change must never be applied as a live change");
+
+    auto replayToggled = current;
+    replayToggled.replay.enabled = true;
+    expect(backtrack::replayFieldsCleared(replayToggled) == backtrack::replayFieldsCleared(current),
+           "re-enabling replay is confined to the replay fields");
+    expect(backtrack::liveFieldsCleared(replayToggled) != backtrack::liveFieldsCleared(current),
+           "re-enabling replay must not be swallowed by the live path");
+
+    // Live fields on both sides of one update still classify as live, and the
+    // replay fields are untouched, so the replay branch cannot claim it either.
+    auto both = current;
+    both.audioOutputVolumePercent = 90;
+    both.captureCursor = false;
+    expect(backtrack::liveFieldsCleared(both) == backtrack::liveFieldsCleared(current),
+           "several live-field changes together must still be live");
+    expect(both.replay == current.replay &&
+               both.replayRingDirectory == current.replayRingDirectory,
+           "a live-only change leaves the replay settings alone");
+}
+
+// The dispatch itself, not just the two comparison views: updateSettings has to
+// pick the live path for a live-only change even with non-default replay
+// settings, and the replay path only for a replay-only change. Dropping the
+// moved-replay-fields term makes a volume tick take the replay branch, which
+// rewrites the unchanged replay settings and silently drops the volume, and
+// every view assertion above still holds.
+void testSettingsApplyDispatch() {
+    backtrack::AppSettings current;
+    current.replay.enabled = false;
+    current.replay.seconds = 300;
+    current.replay.diskBackedVideo = false;
+    current.replayRingDirectory = L"D:\\ring";
+    current.audioOutputVolumePercent = 80;
+    const bool running = true;
+    const bool startOnly = false;
+
+    const auto path = [&](const backtrack::AppSettings& incoming, bool pipelineRunning = true,
+                          bool startReplayPipeline = false) {
+        return backtrack::settingsApplyPath(current, incoming, pipelineRunning, startReplayPipeline);
+    };
+    const auto replayPath = backtrack::SettingsApplyPath::ReplayInPlace;
+    const auto livePath = backtrack::SettingsApplyPath::LiveInPlace;
+    const auto restartPath = backtrack::SettingsApplyPath::Restart;
+
+    auto volume = current;
+    volume.audioOutputVolumePercent = 60;
+    expect(path(volume) == livePath,
+           "a volume tick with non-default replay settings must take the live path");
+    expect(path(volume) != replayPath,
+           "a volume tick must never take the in-place replay path (it drops the volume)");
+
+    auto cursor = current;
+    cursor.captureCursor = false;
+    expect(path(cursor) == livePath, "a cursor-only change must take the live path");
+
+    auto inputGain = current;
+    inputGain.audioInputAutoGainEnabled = true;
+    inputGain.audioInputVolumePercent = 140;
+    expect(path(inputGain) == livePath, "an AGC/input-volume change must take the live path");
+
+    auto replayWindow = current;
+    replayWindow.replay.seconds = 30;
+    expect(path(replayWindow) == replayPath,
+           "a replay-only change with the pipeline running must reconfigure in place");
+    expect(path(replayWindow) != livePath, "a replay-only change must never take the live path");
+    expect(path(replayWindow, !running) == restartPath,
+           "a replay-only change with the pipeline stopped must take the restart path");
+
+    auto ringDirectory = current;
+    ringDirectory.replayRingDirectory = L"E:\\ring";
+    expect(path(ringDirectory) == replayPath,
+           "a ring-folder-only change must reconfigure the buffer in place");
+
+    auto replayEnabled = current;
+    replayEnabled.replay.enabled = true;
+    expect(path(replayEnabled) == restartPath,
+           "toggling replay must not be applied by an in-place replay reconfigure");
+
+    auto videoChange = current;
+    videoChange.video.fps = current.video.fps + 30;
+    expect(path(videoChange) == restartPath, "a video change must take the restart path");
+
+    // The live mirrors are published even while the pipeline is stopped, and a
+    // run that only starts the pipeline resolves Restart through ensurePipeline.
+    expect(path(volume, !running) == livePath,
+           "a live-only change applies with the pipeline stopped too");
+    expect(path(volume, running, true) == restartPath,
+           "a start-only run must reach ensurePipeline, not the live path");
+    expect(path(volume, !running, startOnly) == livePath,
+           "an ordinary live-only change is unaffected by the start-only flag");
+    // The in-place replay path requires the replay fields to have actually moved:
+    // an unchanged run must never be routed into a buffer reconfigure, not even a
+    // start-only one whose running flag already reads settled.
+    expect(path(current, running, true) == restartPath,
+           "the in-place replay path needs a real replay change");
+}
+
 } // namespace
 
 int main() {
@@ -236,6 +469,10 @@ int main() {
         testMissingEncoderIsAFault();
         testEncoderFaultBackoff();
         testEncoderHealthProbe();
+        testEncoderProbeTakesTheGpuLock();
+        testEncoderProbeDuringEncoderReplacement();
+        testLiveSettingsClassification();
+        testSettingsApplyDispatch();
         std::cout << "RecorderControllerCutoffTests: all tests passed" << std::endl;
         return 0;
     } catch (const std::exception& error) {

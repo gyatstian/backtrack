@@ -230,14 +230,11 @@ struct Encoder::Impl {
         NV_ENC_REGISTERED_PTR registered = nullptr;
     };
 
+    // Output buffers are consumed strictly in submission order: the driver
+    // writes encoded pictures into them in encode order, so which input a
+    // buffer carries is only known from its output timestamp.
     struct PendingOutput {
         NV_ENC_OUTPUT_PTR bitstream = nullptr;
-        NV_ENC_INPUT_PTR mapped = nullptr;
-        ID3D11Texture2D* inputTexture = nullptr;
-        std::shared_ptr<void> lease;
-        uint64_t token = 0;
-        int64_t pts100ns = 0;
-        int64_t duration100ns = 0;
         std::chrono::steady_clock::time_point submittedAt;
         uint64_t submittedFramesAtSubmission = 0;
         uint64_t outputToken = 0;
@@ -247,6 +244,18 @@ struct Encoder::Impl {
         NV_ENC_PIC_TYPE lockedPictureType = NV_ENC_PIC_TYPE_UNKNOWN;
         bool completed = false;
         bool locked = false;
+    };
+
+    // Submitted inputs are a separate set, matched to an output by token in
+    // any order. The mapping and lease live until that output is locked.
+    struct PendingInput {
+        NV_ENC_INPUT_PTR mapped = nullptr;
+        ID3D11Texture2D* inputTexture = nullptr;
+        std::shared_ptr<void> lease;
+        uint64_t token = 0;
+        int64_t pts100ns = 0;
+        int64_t duration100ns = 0;
+        std::chrono::steady_clock::time_point submittedAt;
         bool finalized = false;
     };
 
@@ -266,6 +275,7 @@ struct Encoder::Impl {
     std::vector<NV_ENC_OUTPUT_PTR> bitstreamBuffers;
     std::deque<NV_ENC_OUTPUT_PTR> availableBitstreams;
     std::deque<PendingOutput> pendingOutputs;
+    std::deque<PendingInput> pendingInputs;
     std::deque<RetainedMapping> retainedMappings;
     std::deque<EncodedPacket> readyPackets;
     DecodeOrderTimestamps decodeTimestamps;
@@ -654,7 +664,7 @@ struct Encoder::Impl {
     bool flushAndUnregisterResources() {
         if (!session) {
             return registeredResources.empty() && pendingOutputs.empty() &&
-                   retainedMappings.empty();
+                   pendingInputs.empty() && retainedMappings.empty();
         }
         while (!retainedMappings.empty()) {
             const auto& retained = retainedMappings.front();
@@ -674,7 +684,7 @@ struct Encoder::Impl {
                 return false;
             }
         }
-        if (!pendingOutputs.empty() || !retainedMappings.empty()) {
+        if (!pendingOutputs.empty() || !pendingInputs.empty() || !retainedMappings.empty()) {
             return false;
         }
         while (!registeredResources.empty()) {
@@ -865,22 +875,17 @@ struct Encoder::Impl {
                 }
                 idleDeadline = SteadyClock::now() + kBitstreamLockTimeout;
             }
-            // B-frame output reorders: the output that just locked carries the
-            // timestamp of the input it encodes, which is not necessarily the
-            // front slot's own input. Retire that input, and keep its mapping
-            // until then.
-            PendingOutput* matched = nullptr;
+            // The locked output carries the picture the driver encoded into
+            // this buffer, which is not necessarily the input submitted with
+            // it. Identify that submission by its token and finalize it there.
             if (pending.outputToken == 0) {
                 return failEncoder(L"NVENC output did not carry an input timestamp");
             }
-            const uint64_t matchedToken = pending.outputToken;
-            for (auto& candidate : pendingOutputs) {
-                if (candidate.token == matchedToken) {
-                    matched = &candidate;
-                    break;
-                }
-            }
-            if (!matched) {
+            const auto matched = std::find_if(pendingInputs.begin(), pendingInputs.end(),
+                [token = pending.outputToken](const PendingInput& entry) {
+                    return entry.token == token;
+                });
+            if (matched == pendingInputs.end()) {
                 return failEncoder(L"NVENC output did not identify a submitted input");
             }
             if (pending.locked) {
@@ -903,32 +908,21 @@ struct Encoder::Impl {
                 }
                 pending.locked = false;
             }
+            // Retire the matched input before recycling its buffer slot: a
+            // failed unmap must keep the mapping and lease alive, so the entry
+            // is only dropped once the driver released it.
             if (matched->mapped) {
                 const NVENCSTATUS status = api.nvEncUnmapInputResource(session, matched->mapped);
                 if (status != NV_ENC_SUCCESS) {
                     return failEncoder(L"nvEncUnmapInputResource failed: " + nvStatusName(status));
                 }
-                matched->mapped = nullptr;
-                matched->lease.reset();
             }
-            releaseBitstreamBuffer(pending.bitstream);
-            if (matched == &pending) {
-                pendingOutputs.pop_front();
-            } else {
-                // The lock returned a later submission's output, so the front
-                // submission is still pending and has to keep its mapping and
-                // lease. Give it the finished submission's bitstream slot and
-                // clear the completion state that output left behind, then drop
-                // the finished entry rather than the front one.
-                PendingOutput& front = pendingOutputs.front();
-                front.bitstream = matched->bitstream;
-                front.completed = false;
-                front.locked = false;
-                front.outputToken = 0;
-                std::erase_if(pendingOutputs, [matchedToken](const PendingOutput& entry) {
-                    return entry.token == matchedToken;
-                });
-            }
+            pendingInputs.erase(matched);
+            // The slot itself is always consumed in submission order, whatever
+            // input it ended up carrying.
+            const NV_ENC_OUTPUT_PTR bitstream = pending.bitstream;
+            pendingOutputs.pop_front();
+            releaseBitstreamBuffer(bitstream);
         }
         if (waitForCompletion) {
             readyOutputCount = 0;
@@ -975,10 +969,22 @@ struct Encoder::Impl {
 
         // A texture stays mapped until the output carrying its timestamp is
         // harvested. Submitting the same zero-copy lastFrame again while it is
-        // still mapped would touch a texture the encoder owns; drop the repeat.
-        // After unmap the producer may reuse it, so only mapped entries block.
-        for (const auto& pending : pendingOutputs) {
-            if (pending.mapped != nullptr && pending.inputTexture == texture) {
+        // still mapped would touch a texture the encoder owns; after unmap the
+        // producer may reuse it, so only live mappings block. A same-size
+        // producer reuses one texture for idle heartbeats, so try one bounded
+        // harvest first: dropping without it never reaches the lock that would
+        // unmap the texture and the repeated submissions could stall forever.
+        const auto textureStillMapped = [this, texture] {
+            return std::any_of(pendingInputs.begin(), pendingInputs.end(),
+                [texture](const PendingInput& input) {
+                    return input.mapped != nullptr && input.inputTexture == texture;
+                });
+        };
+        if (textureStillMapped()) {
+            if (!harvestPendingOutputs(false)) {
+                return false;
+            }
+            if (textureStillMapped()) {
                 return dropFrame(L"NVENC frame dropped: input texture still mapped; keyframe re-armed");
             }
         }
@@ -1067,14 +1073,17 @@ struct Encoder::Impl {
 
         PendingOutput pending;
         pending.bitstream = bitstream;
-        pending.mapped = map.mappedResource;
-        pending.inputTexture = texture;
-        pending.lease = frame.lease;
-        pending.token = token;
-        pending.pts100ns = frame.pts100ns;
-        pending.duration100ns = static_cast<int64_t>(pic.inputDuration);
         pending.submittedAt = start;
         pending.submittedFramesAtSubmission = encoderStats.submittedFrames;
+
+        PendingInput pendingInput;
+        pendingInput.mapped = map.mappedResource;
+        pendingInput.inputTexture = texture;
+        pendingInput.lease = frame.lease;
+        pendingInput.token = token;
+        pendingInput.pts100ns = frame.pts100ns;
+        pendingInput.duration100ns = static_cast<int64_t>(pic.inputDuration);
+        pendingInput.submittedAt = start;
 
         if (status != NV_ENC_SUCCESS && status != NV_ENC_ERR_NEED_MORE_INPUT) {
             Logger::instance().error(L"encoder", L"nvEncEncodePicture failed: " + nvStatusName(status));
@@ -1084,9 +1093,9 @@ struct Encoder::Impl {
             forceKeyFrame = true;
             releaseBitstreamBuffer(bitstream);
             ++encoderStats.droppedFrames;
-            if (api.nvEncUnmapInputResource(session, pending.mapped) != NV_ENC_SUCCESS) {
+            if (api.nvEncUnmapInputResource(session, pendingInput.mapped) != NV_ENC_SUCCESS) {
                 retainedMappings.push_back(
-                    {pending.mapped, pending.inputTexture, std::move(pending.lease)});
+                    {pendingInput.mapped, pendingInput.inputTexture, std::move(pendingInput.lease)});
                 return failInputMapping(L"nvEncUnmapInputResource failed after a rejected submission");
             }
             if (consecutiveEncodeFailures >= kMaxConsecutiveEncodeFailures) {
@@ -1104,10 +1113,11 @@ struct Encoder::Impl {
         // Accepted input: NVENC produces exactly one output packet for it, in
         // decode order. Record the submission slot for decode-timestamp
         // assignment.
-        decodeTimestamps.onSubmit(frame.pts100ns);
+        decodeTimestamps.onSubmit(frame.pts100ns, pendingInput.duration100ns);
 
         if (status == NV_ENC_ERR_NEED_MORE_INPUT) {
             pendingOutputs.push_back(std::move(pending));
+            pendingInputs.push_back(std::move(pendingInput));
             ++consecutiveNeedMoreInput;
             if (consecutiveNeedMoreInput == 1) {
                 Logger::instance().info(L"encoder", L"NVENC delayed output until more input is available");
@@ -1121,6 +1131,7 @@ struct Encoder::Impl {
 
         consecutiveNeedMoreInput = 0;
         pendingOutputs.push_back(std::move(pending));
+        pendingInputs.push_back(std::move(pendingInput));
         ++readyOutputCount;
         // A submission cannot be complete while the reorder pipeline is still
         // filling, so polling then only costs a driver call (and this driver
@@ -1161,7 +1172,7 @@ struct Encoder::Impl {
     }
 
     bool destroyBitstreamBuffers() {
-        if (!pendingOutputs.empty() || !retainedMappings.empty()) {
+        if (!pendingOutputs.empty() || !pendingInputs.empty() || !retainedMappings.empty()) {
             return false;
         }
         readyPackets.clear();

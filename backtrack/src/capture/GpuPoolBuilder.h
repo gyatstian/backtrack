@@ -40,13 +40,17 @@ public:
     }
 
     // Single clamp for every texture pool (covers the capture loop's lastFrame
-    // pin, so the floor is above the queue limit's minimum).
-    static uint32_t normalizePoolSize(uint32_t count) {
-        return std::clamp<uint32_t>(count, kMinTexturePoolSize, kMaxTexturePoolSize);
+    // pin, so the floor is above the queue limit's minimum). `maxSize` is the
+    // ceiling: the scaler's encoder-feeding pool passes
+    // kMaxEncoderFeedingPoolSize, all queue-derived capture and source pools
+    // keep the intermediate default. One ceiling per caller, not a second
+    // clamp.
+    static uint32_t normalizePoolSize(uint32_t count, uint32_t maxSize = kMaxTexturePoolSize) {
+        return std::clamp<uint32_t>(count, kMinTexturePoolSize, maxSize);
     }
 
-    // Creates `count` (normalized) textures into `out`; false on failure with
-    // `out` cleared. Views and footprint stay with the owner.
+    // Creates `count` (normalized to `maxSize`) textures into `out`; false on
+    // failure with `out` cleared. Views and footprint stay with the owner.
     static bool build(
         ID3D11Device* device,
         uint32_t width,
@@ -55,9 +59,10 @@ public:
         const GpuPoolBuildOptions& options,
         uint32_t count,
         std::vector<ComPtr<ID3D11Texture2D>>& out,
-        const wchar_t* poolLogName) {
+        const wchar_t* poolLogName,
+        uint32_t maxSize = kMaxTexturePoolSize) {
         out.clear();
-        const uint32_t normalized = normalizePoolSize(count);
+        const uint32_t normalized = normalizePoolSize(count, maxSize);
 
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = width;

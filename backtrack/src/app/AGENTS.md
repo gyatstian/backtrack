@@ -76,7 +76,11 @@ recording-stop drain handshake.
     `encoderBehindBudget` gates the probe on real feed rate (>= half the target
     submissions in the window; idle holds submit only a heartbeat IDR per GOP
     interval) and a three-frame-period threshold, otherwise a healthy pipeline
-    or an idle desktop alarms forever. Drop branches in `emitFrame`
+    or an idle desktop alarms forever. The probe reads through
+    `probeEncoderStats`, which takes `pipelineGpuMutex_` with `try_to_lock`: a
+    recreate replaces `encoder_` under that lock and the frame-discard ack is not
+    a pause barrier, so a held lock skips the tick and leaves the window open to
+    retry on the next iteration. Drop branches in `emitFrame`
     and the audio canonicalize-failure drop log rate-limited WARNs; the save
     and ring-push latency WARNs live in `app` (via `core/LogTiming.h`) and
     `replay`.
@@ -113,6 +117,12 @@ recording-stop drain handshake.
     enumeration) the poll stops system audio and keeps it stopped: recording
     audio the user asked to exclude is worse than a video-only clip. It logs one
     error per failure episode and resumes capture when the exclusion holds again.
+    `refreshSystemAudioCapture` stops the capture object unconditionally in that
+    branch and again when `start()` fails, in both cases before any mute is
+    restored: a failed start or a reconnecting worker reports `running() ==
+    false` while its thread is alive, and that thread would reconnect into the
+    now-unmuted mix. The muted keys stay recorded so the next poll re-establishes
+    the exclusion first.
     `systemAudioExclusionFailed_` and `systemAudioMutedExecutableKeys_` are
     guarded by `systemAudioCaptureMutex_`; `stopPipeline` resets both.
   - `stopPipeline`'s thread joins are unbounded and must stay that way. A worker
@@ -161,7 +171,13 @@ recording-stop drain handshake.
   replay-buffer, and live audio/cursor changes (volumes, AGC enable, denoiser
   enable, cursor capture) apply in place through the lock-free mirrors; a
   volume drag must never split the replay timeline or the active recording.
-  Anything else takes the full stop/start path.
+  The classification is the pure `settingsApplyPath` in `RecorderController.h`,
+  built on the `replayFieldsCleared` / `liveFieldsCleared` views: the replay
+  in-place branch additionally requires the replay fields to have actually
+  changed, and the live comparison keeps the real replay fields on both sides,
+  so a volume/cursor/AGC/denoiser-only change never restarts the pipeline or
+  stops the active recording, whatever the replay settings are. Anything else
+  takes the full stop/start path.
 - Per-second reads never copy `AppSettings` (paths and vectors allocate).
   `stats()`, the stall watchdog, the capture-loop cursor poll, and the audio
   volumes read the mirrors published by `publishLiveMirrors`, which runs
@@ -324,7 +340,13 @@ recording-stop drain handshake.
   handshake (finding 08: the delayed pre-cutoff tail stays in the recording,
   the ack waits on the post-stop boundary and the publication quiesce, and a
   dropped frame cannot stall the stop), the missing-encoder fault predicate
-  (finding 06), and the encoder-fault recreate backoff schedule.
+  (finding 06), the encoder-fault recreate backoff schedule, the
+  `try_to_lock` probe against a live recreate, and the settings classification
+  and dispatch (`liveFieldsCleared`/`replayFieldsCleared` plus
+  `settingsApplyPath`): a live-only change stays live with non-default replay
+  settings, a replay-only change reconfigures in place only while the pipeline
+  runs and only when the replay fields really moved, and everything else
+  restarts.
 - `RecorderControllerLeaseTests.cpp` exercises the frame-handoff ordering with a
   lease-checking source.
 - `PendingDurationTrackerTests.cpp` covers insert/coalesce/consume, smallest-PTS

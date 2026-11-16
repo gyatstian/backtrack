@@ -7,6 +7,7 @@
 #include <mmreg.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -60,7 +61,12 @@ struct AudioSource {
     uint64_t outputFrames = 0;
     uint64_t loadedStartFrame = 0;
     uint64_t loadedFrames = 0;
+    // Set only for a stream failure (failed seek/read), never for a frame that
+    // is simply outside this source's extent.
+    bool readFailed = false;
 };
+
+std::atomic<bool> g_failSourceReadsForTesting{false};
 
 uint64_t audioSourceChunkFrames(const AudioSource& source) {
     constexpr uint64_t kAudioSourceChunkBytes = 256 * 1024;
@@ -141,11 +147,25 @@ bool ensureSourceFrameLoaded(AudioSource& source, uint64_t sourceFrame) {
     source.chunk.resize(static_cast<size_t>(bytesToRead));
     source.stream.clear();
     source.stream.seekg(static_cast<std::streamoff>(byteOffset), std::ios::beg);
+    if (!source.stream) {
+        source.readFailed = true;
+        return false;
+    }
     source.stream.read(
         reinterpret_cast<char*>(source.chunk.data()),
         static_cast<std::streamsize>(source.chunk.size()));
+    if (startFrame > 0 && g_failSourceReadsForTesting.load(std::memory_order_relaxed)) {
+        source.stream.setstate(std::ios::badbit);
+    }
+    if (source.stream.fail()) {
+        // The header already declared this payload: a short or failed read here
+        // is a storage error, not an ordinary short file. Mixing it as silence
+        // would publish a damaged MP4 and delete the recordings.
+        source.readFailed = true;
+        return false;
+    }
 
-    const uint64_t bytesRead = static_cast<uint64_t>(std::max<std::streamsize>(0, source.stream.gcount()));
+    const uint64_t bytesRead = static_cast<uint64_t>(source.stream.gcount());
     source.loadedStartFrame = startFrame;
     source.loadedFrames = bytesRead / source.info.blockAlign;
     source.chunk.resize(static_cast<size_t>(source.loadedFrames * source.info.blockAlign));
@@ -154,9 +174,12 @@ bool ensureSourceFrameLoaded(AudioSource& source, uint64_t sourceFrame) {
            sourceFrame < source.loadedStartFrame + source.loadedFrames;
 }
 
-float sourceChannelAt(AudioSource& source, uint64_t outputFrame, uint16_t outputChannel, uint32_t targetSamplesPerSec) {
+// Adds this source's contribution for one output frame and channel. Returns
+// false only when a payload read failed, so the mix can fail instead of
+// publishing silence.
+bool addSourceChannel(AudioSource& source, uint64_t outputFrame, uint16_t outputChannel, uint32_t targetSamplesPerSec, float& total) {
     if (outputFrame >= source.outputFrames || source.frames == 0 || targetSamplesPerSec == 0) {
-        return 0.0f;
+        return true;
     }
 
     const double sourcePosition = std::min<double>(
@@ -165,7 +188,7 @@ float sourceChannelAt(AudioSource& source, uint64_t outputFrame, uint16_t output
     const uint64_t sourceFrame0 = static_cast<uint64_t>(sourcePosition);
     const uint64_t sourceFrame1 = std::min<uint64_t>(source.frames - 1, sourceFrame0 + 1);
     if (!ensureSourceFrameLoaded(source, sourceFrame0)) {
-        return 0.0f;
+        return !source.readFailed;
     }
     const uint16_t sourceChannel = source.info.channels == 1
         ? 0
@@ -175,25 +198,31 @@ float sourceChannelAt(AudioSource& source, uint64_t outputFrame, uint16_t output
         static_cast<size_t>(sourceFrame0 - source.loadedStartFrame) * source.info.blockAlign +
         static_cast<size_t>(sourceChannel) * bytesPerSample;
     if (bytesPerSample == 0 || frameOffset + bytesPerSample > source.chunk.size()) {
-        return 0.0f;
+        return true;
     }
     const float sample0 = readSourceSample(source.chunk.data() + frameOffset, source.info);
     if (sourceFrame1 == sourceFrame0) {
-        return sample0;
+        total += sample0;
+        return true;
     }
 
     if (!ensureSourceFrameLoaded(source, sourceFrame1)) {
-        return sample0;
+        // A frame in the next chunk that is not there is the repeat case; a read
+        // failure is not, and must fail the mix.
+        total += source.readFailed ? 0.0f : sample0;
+        return !source.readFailed;
     }
     const size_t nextFrameOffset =
         static_cast<size_t>(sourceFrame1 - source.loadedStartFrame) * source.info.blockAlign +
         static_cast<size_t>(sourceChannel) * bytesPerSample;
     if (nextFrameOffset + bytesPerSample > source.chunk.size()) {
-        return sample0;
+        total += sample0;
+        return true;
     }
     const float sample1 = readSourceSample(source.chunk.data() + nextFrameOffset, source.info);
     const float fraction = static_cast<float>(sourcePosition - static_cast<double>(sourceFrame0));
-    return sample0 + (sample1 - sample0) * fraction;
+    total += sample0 + (sample1 - sample0) * fraction;
+    return true;
 }
 
 WaveFormatBlob pcm16StereoFormat(uint32_t samplesPerSec) {
@@ -292,7 +321,8 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
     constexpr uint64_t kChunkFrames = 4096;
     std::vector<int16_t> chunk;
     chunk.reserve(static_cast<size_t>(kChunkFrames * 2));
-    for (uint64_t frame = 0; frame < outputFrames; frame += kChunkFrames) {
+    bool mixFailed = false;
+    for (uint64_t frame = 0; frame < outputFrames && !mixFailed; frame += kChunkFrames) {
         const uint64_t framesThisChunk = std::min<uint64_t>(kChunkFrames, outputFrames - frame);
         chunk.clear();
         for (uint64_t index = 0; index < framesThisChunk; ++index) {
@@ -300,9 +330,14 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
                 float mixed = 0.0f;
                 const uint64_t outputFrame = frame + index;
                 for (auto& source : sources) {
-                    if (outputFrame < source.outputFrames) {
-                        mixed += sourceChannelAt(source, outputFrame, channel, kMuxAudioSampleRate);
+                    if (outputFrame < source.outputFrames &&
+                        !addSourceChannel(source, outputFrame, channel, kMuxAudioSampleRate, mixed)) {
+                        mixFailed = true;
+                        break;
                     }
+                }
+                if (mixFailed) {
+                    break;
                 }
                 // Sum, do not average: each track's volume/gain is already baked
                 // into its WAV, and averaging would cancel microphone gain against
@@ -311,6 +346,15 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
                 chunk.push_back(static_cast<int16_t>(std::lrintf(mixed * 32767.0f)));
             }
         }
+        if (mixFailed) {
+            writer.close();
+            // A payload read error leaves the mixed track damaged; publishing it
+            // would ship silence into the MP4 and delete the source recordings.
+            Logger::instance().error(L"audio",
+                L"Recorded audio stream could not be read while mixing; failing the MP4 save so the recording is preserved");
+            mixedPath.clear();
+            return false;
+        }
         if (!writer.write(reinterpret_cast<const uint8_t*>(chunk.data()), chunk.size() * sizeof(int16_t))) {
             writer.close();
             // A failed mixed-audio write is a hard error (disk full), not a
@@ -318,11 +362,21 @@ bool buildMixedPcmAudio(const MuxedInputs& inputs, const std::filesystem::path& 
             // and the mux would publish silently truncated audio.
             Logger::instance().error(L"audio",
                 L"Failed to write mixed audio for MP4 mux (disk full?); MP4 save will fail");
+            mixedPath.clear();
             return false;
         }
     }
-    writer.close();
+    if (!writer.close()) {
+        Logger::instance().error(L"audio",
+            L"Mixed audio stream could not be finalized; failing the MP4 save so the recording is preserved");
+        mixedPath.clear();
+        return false;
+    }
     return true;
+}
+
+void setAudioMixReadFailureForTesting(bool fail) {
+    g_failSourceReadsForTesting.store(fail);
 }
 
 } // namespace backtrack

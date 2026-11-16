@@ -63,7 +63,7 @@ Required:
 
 - Windows 10/11 SDK
 - Visual Studio C++ toolchain with C++20
-- The `C++ ATL for latest v143 build tools` component: the app includes `<sapi.h>` for voice commands and its `sphelper.h` pulls in `<atlbase.h>`. Without ATL the app fails with `C1083 atlbase.h not found`.
+- The C++ ATL component of the installed MSVC toolset: the app includes `<sapi.h>` for voice commands and its `sphelper.h` pulls in `<atlbase.h>`. Without ATL the app fails with `C1083 atlbase.h not found`.
 - A hardware encoder: NVIDIA NVENC-capable GPU or AMD AMF-capable GPU (Radeon/Ryzen APU)
 
 Encoder backend is auto-detected from the active GPU vendor at runtime:
@@ -75,7 +75,7 @@ Encoder backend is auto-detected from the active GPU vendor at runtime:
 Optional at compile time:
 
 - NVENC headers (`backtrack/src/Interface/nvEncodeAPI.h`, NVIDIA Video Codec SDK 13.0) are vendored, so NVENC builds out of the box. The same SDK one major version older (`nvEncodeAPI_11_1.h`) is vendored beside it: the app picks whichever tier the installed driver implements, so drivers that predate NVENC API 13.0 still record. If the headers are absent the build sets `BACKTRACK_HAS_NVENC=0`.
-- AMD AMF headers are bundled in `backtrack/src/Interface/AMF` (Apache/MIT, headers only), so AMF builds out of the box. Set the `AMF_SDK_PATH` environment variable to point at a different copy if needed.
+- AMD AMF headers are bundled in `backtrack/src/Interface/AMF` (Apache/MIT, headers only), so AMF builds out of the box. Set the `AMF_SDK_PATH` environment variable to the AMF SDK root (the copy must contain `amf/public/include/AMF/core/Factory.h`) to build against a different version.
 - If a backend's headers are absent, the app still builds and the Diagnostics page reports why that backend is unavailable. Neither SDK ships a link-time library; both runtimes are loaded dynamically from the installed driver.
 
 Vendored third-party:
@@ -84,22 +84,24 @@ Vendored third-party:
 
 ## Build
 
-Visual Studio solution:
+CMake, from a shell with the MSVC environment (`vcvars64.bat` or an x64 Native Tools prompt; a bare shell has no `cl` and cannot find the standard library headers):
+
+```powershell
+cmake -S . -B build -G "Ninja Multi-Config"
+cmake --build build --config Release --parallel
+```
+
+This generator works with any installed MSVC and keeps the `build/Release/` output layout. Delete `build/` before switching generators; the cache records absolute paths.
+
+Visual Studio solution, for installations that have the `v143` toolset (`backtrack.vcxproj` pins it, and VS 2026 does not ship it):
 
 ```powershell
 MSBuild.exe backtrack.slnx /p:Configuration=Release /p:Platform=x64 /m
 ```
 
-CMake:
-
-```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release --parallel
-```
-
 Microphone noise suppression is off by default. Add `-DBACKTRACK_NOISE_SUPPRESSION=ON` to the CMake configure line, or build the solution with `/p:BacktrackNoiseSuppression=true`, to compile it in. The Settings page then grows a checkbox for it.
 
-The build looks for the NVIDIA Video Codec SDK in `backtrack/src/Interface` first. To use a different copy, set:
+The bundled NVENC headers in `backtrack/src/Interface` are used unless `NV_CODEC_SDK_PATH` names an SDK root (the directory holding `Interface/nvEncodeAPI.h`). A named SDK takes precedence over the bundled copy:
 
 ```powershell
 $env:NV_CODEC_SDK_PATH = 'C:\Path\To\Video_Codec_SDK'
@@ -122,7 +124,7 @@ x64/Release/backtrack.exe
 Unit tests live in `backtrack/tests` and are registered with CTest by the root `CMakeLists.txt`. The solution has no test targets, so use CMake:
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Ninja Multi-Config"
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release
 ```

@@ -26,6 +26,16 @@ int64_t submittedPts(int index) {
     return static_cast<int64_t>(index) * kFrameDuration100ns + (index % 4) * 3'000;
 }
 
+// Cumulative PTS for a submission stream whose durations cycle through
+// `durations`.
+int64_t cumulativePts(int index, const int64_t* durations, int period) {
+    int64_t pts = 0;
+    for (int i = 0; i < index; ++i) {
+        pts += durations[i % period];
+    }
+    return pts;
+}
+
 // Presentation order 0,1,2,3,4,5,6,... becomes decode order 0,3,1,2,6,4,5,...
 int presentationIndex(int outputIndex) {
     if (outputIndex == 0) {
@@ -181,6 +191,55 @@ void testResetClearsPendingSlotsAndRestartsTimeline() {
         "reset did not apply the new depth or preserve a negative timestamp");
 }
 
+void testVariableFrameDurationsKeepExtrapolatedDtsMonotone() {
+    constexpr uint32_t kReorderDelay = 2;
+    // one then four nominal frames: the cadence collapse that used to run the
+    // extrapolated slots backwards
+    const int64_t durations[] = {kFrameDuration100ns, kFrameDuration100ns, 4 * kFrameDuration100ns};
+    constexpr int kPeriod = 3;
+    constexpr int kFrameCount = 40;
+
+    DecodeOrderTimestamps dts(kReorderDelay);
+    std::vector<int64_t> decoded;
+
+    for (int k = 0; k < kFrameCount; ++k) {
+        const int64_t pts = cumulativePts(k, durations, kPeriod);
+        dts.onSubmit(pts, durations[k % kPeriod]);
+        // the arriving packet reports a duration that is not its own slot's
+        decoded.push_back(dts.onOutput(pts, durations[(2 * k) % kPeriod]));
+    }
+
+    const int64_t firstSlotDuration = durations[0];
+    int64_t previous = (std::numeric_limits<int64_t>::min)();
+    for (int i = 0; i < kFrameCount; ++i) {
+        const int slot = i - static_cast<int>(kReorderDelay);
+        const int64_t expected = slot < 0
+            ? -static_cast<int64_t>(-slot) * firstSlotDuration
+            : cumulativePts(slot, durations, kPeriod);
+        const int64_t decodedAt = decoded[static_cast<std::size_t>(i)];
+        expect(decodedAt == expected,
+            "a variable-duration slot changed the documented formula at output " + std::to_string(i));
+        expect(decodedAt > previous,
+            "the variable-duration decode timestamp sequence is not strictly increasing at output " +
+                std::to_string(i));
+        previous = decodedAt;
+    }
+
+    // the per-slot duration comes from the earliest submission, not from the
+    // nominal frame duration the mux would otherwise assume
+    const int64_t longFirst[] = {4 * kFrameDuration100ns, kFrameDuration100ns, kFrameDuration100ns};
+    DecodeOrderTimestamps longFirstDts(kReorderDelay);
+    longFirstDts.onSubmit(0, longFirst[0]);
+    longFirstDts.onSubmit(longFirst[0], longFirst[1]);
+    longFirstDts.onSubmit(longFirst[0] + longFirst[1], longFirst[2]);
+    expect(longFirstDts.onOutput(0, kFrameDuration100ns) == -8 * kFrameDuration100ns,
+        "the extrapolation ignored the earliest submission's duration");
+    expect(longFirstDts.onOutput(longFirst[0], kFrameDuration100ns) == -4 * kFrameDuration100ns,
+        "the extrapolation did not keep one stable per-slot duration");
+    expect(longFirstDts.onOutput(longFirst[1], kFrameDuration100ns) == 0,
+        "the extrapolated slots did not lead into the first submission");
+}
+
 } // namespace
 
 int main() {
@@ -188,6 +247,7 @@ int main() {
         testReorderedBacklogAndFullDrain();
         testDtsEqualsPtsWithoutReordering();
         testResetClearsPendingSlotsAndRestartsTimeline();
+        testVariableFrameDurationsKeepExtrapolatedDtsMonotone();
         std::cout << "DecodeOrderTimestamps tests passed\n";
         return 0;
     } catch (const std::exception& error) {

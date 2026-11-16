@@ -65,15 +65,39 @@ if (BACKTRACK_NOISE_SUPPRESSION)
     target_link_libraries(BacktrackApp PUBLIC rnnoise)
 endif()
 
-find_path(NVENC_INCLUDE_DIR    NAMES nvEncodeAPI.h
-    PATHS
-        "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/Interface"
-        "$ENV{NV_CODEC_SDK_PATH}/Interface"
-        "$ENV{NV_CODEC_SDK}/Interface"
-        "$ENV{ProgramFiles}/NVIDIA Corporation/NVIDIA Video Codec SDK/Interface")
+# The sources include the vendor headers with a prefix: "Interface/nvEncodeAPI.h"
+# and "AMF/core/Factory.h". The include directory is therefore the one that holds
+# Interface/ or AMF/, never the leaf directory those spellings append. Each
+# candidate is probed for the exact file the sources ask for, so an external SDK
+# in its conventional layout resolves the same way the bundled copy does. The
+# bundled root comes last: a path the user names explicitly must win, which is
+# what find_path cannot promise because it searches system prefixes first.
+set(NVENC_SDK_ROOTS
+    "$ENV{NV_CODEC_SDK_PATH}"
+    "$ENV{NV_CODEC_SDK}"
+    "$ENV{ProgramFiles}/NVIDIA Corporation/NVIDIA Video Codec SDK"
+    "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src")
+set(NVENC_INCLUDE_DIR "")
+foreach(root IN LISTS NVENC_SDK_ROOTS)
+    if (root AND EXISTS "${root}/Interface/nvEncodeAPI.h")
+        set(NVENC_INCLUDE_DIR "${root}")
+        break()
+    endif()
+endforeach()
+foreach(var NV_CODEC_SDK_PATH NV_CODEC_SDK)
+    if (DEFINED ENV{${var}})
+        set(nvenc_env_root "$ENV{${var}}")
+        if (NOT NVENC_INCLUDE_DIR STREQUAL "${nvenc_env_root}")
+            message(WARNING "${nvenc_env_root} has no Interface/nvEncodeAPI.h; ignoring it.")
+        endif()
+    endif()
+endforeach()
 
 if (NVENC_INCLUDE_DIR)
-    target_include_directories(BacktrackApp PRIVATE "${NVENC_INCLUDE_DIR}")
+    # BEFORE: the bundled header stays reachable through the src include root, so
+    # an external SDK has to be ordered ahead of it to be the one compiled against.
+    # The bundled root is src itself, which is already first.
+    target_include_directories(BacktrackApp BEFORE PRIVATE "${NVENC_INCLUDE_DIR}")
     target_compile_definitions(BacktrackApp PUBLIC BACKTRACK_HAS_NVENC=1)
     message(STATUS "NVENC headers found: ${NVENC_INCLUDE_DIR}")
 else()
@@ -84,18 +108,30 @@ endif()
 # AMD AMF is loaded at runtime through amfrt64.dll; only the public headers are
 # needed at compile time. They are bundled under backtrack/src/Interface/AMF but
 # an external AMF SDK can be pointed at via AMF_SDK_PATH.
-find_path(AMF_INCLUDE_DIR
-    NAMES core/Factory.h
-    PATHS
-        "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/Interface/AMF"
-        "$ENV{AMF_SDK_PATH}/amf/public/include"
-        "$ENV{AMF_SDK_PATH}/include")
+set(AMF_SDK_ROOTS
+    "$ENV{AMF_SDK_PATH}/amf/public/include"
+    "$ENV{AMF_SDK_PATH}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src/Interface")
+set(AMF_INCLUDE_PARENT "")
+foreach(root IN LISTS AMF_SDK_ROOTS)
+    if (root AND EXISTS "${root}/AMF/core/Factory.h")
+        set(AMF_INCLUDE_PARENT "${root}")
+        break()
+    endif()
+endforeach()
+if (DEFINED ENV{AMF_SDK_PATH}
+    AND NOT EXISTS "$ENV{AMF_SDK_PATH}/amf/public/include/AMF/core/Factory.h"
+    AND NOT EXISTS "$ENV{AMF_SDK_PATH}/include/AMF/core/Factory.h")
+    message(WARNING "$ENV{AMF_SDK_PATH} has no AMF/core/Factory.h; ignoring it.")
+endif()
+# Kept for the test registration below, which guards on the directory holding
+# core/Factory.h rather than on its parent.
+set(AMF_INCLUDE_DIR "")
+if (AMF_INCLUDE_PARENT)
+    set(AMF_INCLUDE_DIR "${AMF_INCLUDE_PARENT}/AMF")
+endif()
 
-if (AMF_INCLUDE_DIR)
-    # The bundled headers use "AMF/..." include prefixes, so expose the parent of
-    # the AMF directory. src/Interface is already on the include path for the
-    # bundled copy; add the external parent when a custom SDK path is used.
-    get_filename_component(AMF_INCLUDE_PARENT "${AMF_INCLUDE_DIR}" DIRECTORY)
+if (AMF_INCLUDE_PARENT)
     target_include_directories(BacktrackApp PRIVATE "${AMF_INCLUDE_PARENT}")
     target_compile_definitions(BacktrackApp PUBLIC BACKTRACK_HAS_AMF=1)
     message(STATUS "AMF headers found: ${AMF_INCLUDE_DIR}")

@@ -790,10 +790,11 @@ void WasapiCapture::stop() {
         wakeEvent_ = nullptr;
     }
     running_ = false;
-    // Hand back the pool's unused chunks: a replay window's worth of retained
-    // payloads would otherwise stay reserved for the process lifetime. Only
-    // unused blocks are freed, so packets still held downstream are safe.
-    audioPacketPool().release();
+    // The pool is not released here: synchronized_pool_resource::release() frees
+    // every block it owns, including those backing packets the audio writer, the
+    // other track's capture, or the replay buffer still hold (RecorderController
+    // stops both captures before it joins the audio writer). It is process
+    // lifetime and reclaimed at exit.
 }
 
 void WasapiCapture::captureThread(CaptureOptions options, AudioPacketCallback callback, std::promise<bool> startedPromise) {

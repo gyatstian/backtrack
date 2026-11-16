@@ -36,21 +36,6 @@
 
 namespace backtrack {
 
-namespace {
-
-// Liveness probe for the stable-state auto record poll. A matched app was
-// readable with PROCESS_QUERY_LIMITED_INFORMATION during enumeration, so the
-// same probe works here without walking the desktop.
-bool isAutoRecordAppAlive(uint32_t processId) {
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
-    if (process) {
-        CloseHandle(process);
-    }
-    return process != nullptr;
-}
-
-} // namespace
-
 void MainWindow::handleHotkey(int id) {
     if (id == HotkeyService::kStartStopId) {
         ControllerAction action;
@@ -190,7 +175,7 @@ void MainWindow::pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps
         // liveness or its membership in the applied list can change. Confirm
         // both cheaply; on any doubt fall back to the desktop walk so a list
         // edit or another selected app resolves exactly as the full scan would.
-        if (isAutoRecordAppAlive(autoRecordMatchedApp_.processId) &&
+        if (isProcessStillRunning(autoRecordMatchedApp_.processId) &&
             matchingAutoRecordApp(applied, {autoRecordMatchedApp_})) {
             matchedApp = autoRecordMatchedApp_;
         } else {

@@ -49,6 +49,10 @@ struct AmfEncoderTestAccess {
     }
     static uint32_t delay(const AmfEncoder& owner) { return owner.impl_->reorderDelayFrames(); }
     static size_t inFlightCap(const AmfEncoder& owner) { return owner.impl_->inFlightCap(); }
+    static size_t inFlightCount(const AmfEncoder& owner) { return owner.impl_->inFlight.size(); }
+    static void ageFrontInput(AmfEncoder& owner) {
+        owner.impl_->inFlight.front().submittedAt -= kEncoderInFlightMaxAge;
+    }
     static void retain(AmfEncoder& owner, const std::shared_ptr<void>& lease) {
         AmfEncoder::Impl::PendingInput input;
         input.lease = lease;
@@ -170,6 +174,7 @@ struct FakeComponent : PropertyStorage<amf::AMFComponent> {
     FakeCaps caps;
     AMF_RESULT outputResult = AMF_REPEAT;
     int queries = 0;
+    int submits = 0;
     size_t writesAtInit = 0;
     bool overridePattern = false;
     bool overridePatternAfterRateControl = false;
@@ -205,7 +210,7 @@ struct FakeComponent : PropertyStorage<amf::AMFComponent> {
     AMF_RESULT AMF_STD_CALL Terminate() override { touch(); ++terminateCalls; terminated = true; return AMF_OK; }
     AMF_RESULT AMF_STD_CALL Drain() override { touch(); return AMF_OK; }
     AMF_RESULT AMF_STD_CALL Flush() override { touch(); return AMF_OK; }
-    AMF_RESULT AMF_STD_CALL SubmitInput(amf::AMFData*) override { touch(); return AMF_NOT_IMPLEMENTED; }
+    AMF_RESULT AMF_STD_CALL SubmitInput(amf::AMFData*) override { touch(); ++submits; return AMF_OK; }
     AMF_RESULT AMF_STD_CALL QueryOutput(amf::AMFData** data) override { touch(); ++queries; *data = nullptr; return outputResult; }
     amf::AMFContext* AMF_STD_CALL GetContext() override { touch(); return nullptr; }
     AMF_RESULT AMF_STD_CALL SetOutputDataAllocatorCB(amf::AMFDataAllocatorCB*) override { touch(); return AMF_NOT_IMPLEMENTED; }
@@ -213,7 +218,35 @@ struct FakeComponent : PropertyStorage<amf::AMFComponent> {
     AMF_RESULT AMF_STD_CALL Optimize(amf::AMFComponentOptimizationCallback*) override { touch(); return AMF_NOT_IMPLEMENTED; }
 };
 
+struct FakeSurface : PropertyStorage<amf::AMFSurface> {
+    amf_pts pts = 0;
+    amf_pts duration = 0;
+
+    amf::AMF_MEMORY_TYPE AMF_STD_CALL GetMemoryType() override { return amf::AMF_MEMORY_DX11; }
+    AMF_RESULT AMF_STD_CALL Duplicate(amf::AMF_MEMORY_TYPE, amf::AMFData**) override { return AMF_NOT_IMPLEMENTED; }
+    AMF_RESULT AMF_STD_CALL Convert(amf::AMF_MEMORY_TYPE) override { return AMF_NOT_IMPLEMENTED; }
+    AMF_RESULT AMF_STD_CALL Interop(amf::AMF_MEMORY_TYPE) override { return AMF_NOT_IMPLEMENTED; }
+    amf::AMF_DATA_TYPE AMF_STD_CALL GetDataType() override { return amf::AMF_DATA_SURFACE; }
+    amf_bool AMF_STD_CALL IsReusable() override { return false; }
+    void AMF_STD_CALL SetPts(amf_pts value) override { pts = value; }
+    amf_pts AMF_STD_CALL GetPts() override { return pts; }
+    void AMF_STD_CALL SetDuration(amf_pts value) override { duration = value; }
+    amf_pts AMF_STD_CALL GetDuration() override { return duration; }
+    amf::AMF_SURFACE_FORMAT AMF_STD_CALL GetFormat() override { return amf::AMF_SURFACE_NV12; }
+    amf_size AMF_STD_CALL GetPlanesCount() override { return 0; }
+    amf::AMFPlane* AMF_STD_CALL GetPlaneAt(amf_size) override { return nullptr; }
+    amf::AMFPlane* AMF_STD_CALL GetPlane(amf::AMF_PLANE_TYPE) override { return nullptr; }
+    amf::AMF_FRAME_TYPE AMF_STD_CALL GetFrameType() override { return amf::AMF_FRAME_PROGRESSIVE; }
+    void AMF_STD_CALL SetFrameType(amf::AMF_FRAME_TYPE) override {}
+    AMF_RESULT AMF_STD_CALL SetCrop(amf_int32, amf_int32, amf_int32, amf_int32) override { return AMF_NOT_IMPLEMENTED; }
+    AMF_RESULT AMF_STD_CALL CopySurfaceRegion(amf::AMFSurface*, amf_int32, amf_int32, amf_int32, amf_int32,
+                                              amf_int32, amf_int32) override { return AMF_NOT_IMPLEMENTED; }
+    void AMF_STD_CALL AddObserver(amf::AMFSurfaceObserver*) override {}
+    void AMF_STD_CALL RemoveObserver(amf::AMFSurfaceObserver*) override {}
+};
+
 struct FakeContext : PropertyStorage<amf::AMFContext> {
+    FakeSurface* nextSurface = nullptr;
     AMF_RESULT AMF_STD_CALL Terminate() override { touch(); ++terminateCalls; terminated = true; return AMF_OK; }
     AMF_RESULT AMF_STD_CALL InitDX9(void*) override { return AMF_NOT_IMPLEMENTED; }
     void* AMF_STD_CALL GetDX9Device(amf::AMF_DX_VERSION) override { return nullptr; }
@@ -250,7 +283,11 @@ struct FakeContext : PropertyStorage<amf::AMFContext> {
     AMF_RESULT AMF_STD_CALL CreateBufferFromHostNative(void*, amf_size, amf::AMFBuffer**, amf::AMFBufferObserver*) override { return AMF_NOT_IMPLEMENTED; }
     AMF_RESULT AMF_STD_CALL CreateSurfaceFromHostNative(amf::AMF_SURFACE_FORMAT, amf_int32, amf_int32, amf_int32, amf_int32, void*, amf::AMFSurface**, amf::AMFSurfaceObserver*) override { return AMF_NOT_IMPLEMENTED; }
     AMF_RESULT AMF_STD_CALL CreateSurfaceFromDX9Native(void*, amf::AMFSurface**, amf::AMFSurfaceObserver*) override { return AMF_NOT_IMPLEMENTED; }
-    AMF_RESULT AMF_STD_CALL CreateSurfaceFromDX11Native(void*, amf::AMFSurface**, amf::AMFSurfaceObserver*) override { touch(); return AMF_NOT_IMPLEMENTED; }
+    AMF_RESULT AMF_STD_CALL CreateSurfaceFromDX11Native(void*, amf::AMFSurface** surface, amf::AMFSurfaceObserver*) override {
+        touch();
+        *surface = nextSurface;
+        return nextSurface ? AMF_OK : AMF_NOT_IMPLEMENTED;
+    }
     AMF_RESULT AMF_STD_CALL CreateSurfaceFromOpenGLNative(amf::AMF_SURFACE_FORMAT, amf_handle, amf::AMFSurface**, amf::AMFSurfaceObserver*) override { return AMF_NOT_IMPLEMENTED; }
     AMF_RESULT AMF_STD_CALL CreateSurfaceFromGrallocNative(amf_handle, amf::AMFSurface**, amf::AMFSurfaceObserver*) override { return AMF_NOT_IMPLEMENTED; }
     AMF_RESULT AMF_STD_CALL CreateSurfaceFromOpenCLNative(amf::AMF_SURFACE_FORMAT, amf_int32, amf_int32, void**, amf::AMFSurface**, amf::AMFSurfaceObserver*) override { return AMF_NOT_IMPLEMENTED; }
@@ -659,6 +696,120 @@ void testSwitchEnablingReorderingFaultsForPipelineRecreation() {
         "the unsafe format switch did not report why it faulted");
 }
 
+void testInputRetentionBudgetMatchesPinnedLeases() {
+    FakeSurface surface;
+    FakeComponent component;
+    FakeContext context;
+    FakeFactory factory;
+    FakeTexture texture;
+    AmfEncoder encoder;
+    const auto settings = requestedSettings();
+    setCaps(component, true, true);
+    context.nextSurface = &surface;
+
+    expect(encoder.inputRetentionBudget() == 0, "an uninitialized AMF encoder claimed input retention");
+
+    AmfEncoderTestAccess::attach(encoder, &component, &context, &factory, settings);
+    AmfEncoderTestAccess::updateCaps(encoder);
+    expect(AmfEncoderTestAccess::configure(encoder), "the retention configuration failed");
+
+    const uint32_t budget = encoder.inputRetentionBudget();
+    expect(budget > 0 && budget == AmfEncoderTestAccess::inFlightCap(encoder),
+        "the AMF retention budget did not match the input backlog it can pin");
+
+    GpuFrame frame;
+    frame.texture = &texture;
+    frame.width = settings.width;
+    frame.height = settings.height;
+    frame.format = DXGI_FORMAT_NV12;
+    frame.duration100ns = 100000;
+
+    std::vector<std::weak_ptr<void>> leases;
+    EncodedPacket packet;
+    for (uint32_t i = 0; i < budget; ++i) {
+        frame.pts100ns = static_cast<int64_t>(i) * 100000;
+        frame.lease = std::make_shared<int>(static_cast<int>(i));
+        const std::weak_ptr<void> lease = frame.lease;
+        const bool produced = encoder.encodeFrame(frame, packet);
+        const int accepted = component.submits;
+        frame.lease.reset();
+        expect(!produced && accepted == static_cast<int>(i) + 1 && !lease.expired(),
+            "an accepted AMF frame did not retain its pool lease");
+        leases.push_back(lease);
+    }
+    expect(AmfEncoderTestAccess::inFlightCount(encoder) == budget,
+        "the AMF encoder held fewer inputs than its reported retention budget");
+
+    // One frame past the budget: shed drop-newest, lease returned immediately.
+    frame.pts100ns = static_cast<int64_t>(budget) * 100000;
+    frame.lease = std::make_shared<int>(42);
+    const std::weak_ptr<void> extra = frame.lease;
+    const bool produced = encoder.encodeFrame(frame, packet);
+    frame.lease.reset();
+    expect(!produced && extra.expired(), "a shed AMF frame kept its pool lease");
+    expect(component.submits == static_cast<int>(budget) && encoder.stats().droppedFrames == 1 &&
+           encoder.encoderAvailable(),
+        "a full backlog submitted anyway or faulted the session");
+    expect(encoder.inputRetentionBudget() == budget, "the retention budget changed without a session change");
+    for (const auto& lease : leases) {
+        expect(!lease.expired(), "a retained AMF input lost its lease");
+    }
+}
+
+void testAgedBacklogFaultsAtDeadline() {
+    FakeSurface surface;
+    FakeComponent component;
+    FakeContext context;
+    FakeFactory factory;
+    FakeTexture texture;
+    AmfEncoder encoder;
+    const auto settings = requestedSettings();
+    setCaps(component, true, true);
+    context.nextSurface = &surface;
+    AmfEncoderTestAccess::attach(encoder, &component, &context, &factory, settings);
+    AmfEncoderTestAccess::updateCaps(encoder);
+    expect(AmfEncoderTestAccess::configure(encoder), "the deadline configuration failed");
+
+    const size_t cap = AmfEncoderTestAccess::inFlightCap(encoder);
+    GpuFrame frame;
+    frame.texture = &texture;
+    frame.width = settings.width;
+    frame.height = settings.height;
+    frame.format = DXGI_FORMAT_NV12;
+    frame.duration100ns = 100000;
+
+    std::vector<std::weak_ptr<void>> leases;
+    EncodedPacket packet;
+    for (size_t i = 0; i < cap; ++i) {
+        frame.pts100ns = static_cast<int64_t>(i) * 100000;
+        frame.lease = std::make_shared<int>(static_cast<int>(i));
+        const std::weak_ptr<void> lease = frame.lease;
+        encoder.encodeFrame(frame, packet);
+        frame.lease.reset();
+        leases.push_back(lease);
+    }
+    expect(AmfEncoderTestAccess::inFlightCount(encoder) == cap,
+        "the deadline case did not fill the input backlog");
+
+    // Stalled driver: the front input ages out while the backlog stays full,
+    // which is the state the drop path used to swallow forever.
+    AmfEncoderTestAccess::ageFrontInput(encoder);
+    frame.pts100ns = static_cast<int64_t>(cap) * 100000;
+    frame.lease = std::make_shared<int>(99);
+    const std::weak_ptr<void> fresh = frame.lease;
+    const bool produced = encoder.encodeFrame(frame, packet);
+    frame.lease.reset();
+    expect(!produced && !encoder.encoderAvailable() && AmfEncoderTestAccess::faulted(encoder),
+        "a full backlog bypassed the input-age deadline instead of faulting the session");
+    expect(fresh.expired(), "the faulted session retained the shed frame's lease");
+    expect(encoder.inputRetentionBudget() == 0, "a faulted session still reported input retention");
+    expect(encoder.capabilities().detail.find(L"produced no output") != std::wstring::npos,
+        "the deadline fault did not report why it faulted");
+    for (const auto& lease : leases) {
+        expect(lease.expired(), "the faulted session kept a retained input lease");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -672,6 +823,8 @@ int main() {
         testBFramePatternControlsEffectiveTiming();
         testSuccessfulSwitchResetsTiming();
         testSwitchEnablingReorderingFaultsForPipelineRecreation();
+        testInputRetentionBudgetMatchesPinnedLeases();
+        testAgedBacklogFaultsAtDeadline();
         std::cout << "AmfEncoder tests passed\n";
         return 0;
     } catch (const std::exception& error) {

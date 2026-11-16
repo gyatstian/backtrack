@@ -353,15 +353,9 @@ bool RecorderController::updateSettings(AppSettings settings) {
         // wedged on a stalled GPU/NVENC; avoiding it here keeps a pure replay
         // setting change from hanging updateSettings (and thereby blocking every
         // later controller action) until the app restarts.
-        AppSettings currentNoReplay = currentWithoutVoice;
-        currentNoReplay.replay = {};
-        currentNoReplay.replayRingDirectory.clear();
-        AppSettings incomingNoReplay = settings;
-        incomingNoReplay.replay = {};
-        incomingNoReplay.replayRingDirectory.clear();
-        if (currentNoReplay == incomingNoReplay &&
-            currentWithoutVoice.replay.enabled == settings.replay.enabled &&
-            pipelineRunning_.load()) {
+        const SettingsApplyPath applyPath = settingsApplyPath(
+            currentWithoutVoice, settings, pipelineRunning_.load(), startReplayPipeline);
+        if (applyPath == SettingsApplyPath::ReplayInPlace) {
             settings_.gameIntegrations.voiceCommand = settings.gameIntegrations.voiceCommand;
             settings_.replay = settings.replay;
             settings_.replayRingDirectory = settings.replayRingDirectory;
@@ -375,25 +369,12 @@ bool RecorderController::updateSettings(AppSettings settings) {
         // polls the cursor mirror every second. Restarting the pipeline here
         // would split the replay timeline (and the active recording) on every
         // volume-drag tick, so store and publish instead of bouncing.
-        // currentWithoutVoice and incomingNoReplay are dead past the two
-        // comparisons above, so the live-apply copies take them over instead of
-        // duplicating both executable lists once more.
-        const auto clearLiveApplied = [](AppSettings& base) {
-            base.audioOutputVolumePercent = 0;
-            base.audioInputVolumePercent = 0;
-            base.audioInputAutoGainEnabled = false;
-#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-            base.audioInputNoiseSuppressionEnabled = false;
-#endif
-            base.captureCursor = false;
-        };
-        AppSettings currentBase = std::move(currentWithoutVoice);
-        clearLiveApplied(currentBase);
-        AppSettings incomingBase = std::move(incomingNoReplay);
-        clearLiveApplied(incomingBase);
+        // The comparison clears only the mirror-applied fields, so replay stays
+        // part of it: a replay change that fell past the branch above (pipeline
+        // stopped, or replay toggled) must still take the full restart path.
         // startReplayPipeline means nothing actually changed (voice branch fell
         // through): let it reach ensurePipeline below instead of returning here.
-        if (!startReplayPipeline && currentBase == incomingBase) {
+        if (applyPath == SettingsApplyPath::LiveInPlace) {
             const bool agcChanged =
                 settings_.audioInputAutoGainEnabled != settings.audioInputAutoGainEnabled;
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
@@ -3011,24 +2992,25 @@ void RecorderController::encodeLoopImpl() {
         // gated on real feed rate and a three-period threshold.
         const auto healthNow = SteadyClock::now();
         if (healthNow - lastEncodeHealthCheck >= std::chrono::seconds(5)) {
-            lastEncodeHealthCheck = healthNow;
-            if (encoder_) {
-                const auto healthStats = encoder_->stats();
+            // A recreate holding the GPU lock skipped this tick; leave the
+            // window open so the probe retries on the next iteration.
+            if (const auto healthStats = probeEncoderStats(pipelineGpuMutex_, encoder_)) {
+                lastEncodeHealthCheck = healthNow;
                 VideoSettings healthVideo;
                 {
                     std::scoped_lock lock(stateMutex_);
                     healthVideo = activeVideoSettings_;
                 }
                 const uint64_t submittedThisWindow =
-                    healthStats.submittedFrames - lastHealthCheckSubmissions;
-                lastHealthCheckSubmissions = healthStats.submittedFrames;
-                if (encoderBehindBudget(healthStats.averageEncodeMs, healthVideo.fps,
+                    healthStats->submittedFrames - lastHealthCheckSubmissions;
+                lastHealthCheckSubmissions = healthStats->submittedFrames;
+                if (encoderBehindBudget(healthStats->averageEncodeMs, healthVideo.fps,
                                         submittedThisWindow, 5)) {
                     const double budgetMs =
                         healthVideo.fps > 0 ? 1000.0 / healthVideo.fps : 16.667;
                     Logger::instance().warning(L"recorder",
                         L"Encoder is behind the frame budget (average_encode_ms=" +
-                        std::to_wstring(healthStats.averageEncodeMs) + L" budget_ms=" +
+                        std::to_wstring(healthStats->averageEncodeMs) + L" budget_ms=" +
                         std::to_wstring(budgetMs * 3.0) + L" fps=" +
                         std::to_wstring(healthVideo.fps) + L")");
                 }
@@ -3259,9 +3241,12 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings,
         // so an unverifiable mute means no system audio at all rather than the
         // audio the user excluded. The poll retries and capture resumes as soon
         // as the exclusion holds again.
-        if (systemAudio_.running()) {
-            systemAudio_.stop();
-        }
+        // Unconditional: a capture whose worker is still retrying reports
+        // running() == false while its thread is alive, and that thread would
+        // reconnect into the recording once the mutes are restored. stop() reaps
+        // it, and the keys stay recorded so the next poll re-establishes the
+        // exclusion before it starts capture again.
+        systemAudio_.stop();
         systemAudioMutedExecutableKeys_ = mutedKeys;
         if (!systemAudioExclusionFailed_) {
             systemAudioExclusionFailed_ = true;
@@ -3310,8 +3295,13 @@ void RecorderController::refreshSystemAudioCapture(const AppSettings& settings,
 
     if (!started) {
         Logger::instance().warning(L"recorder", L"System audio capture did not start");
+        // start() can fail while its worker keeps retrying to reconnect, so the
+        // object is still in use even though running() is false. Reap that thread
+        // before the mutes below are restored, or the reconnect records the mix
+        // the user excluded. The keys stay recorded so the next poll re-applies
+        // the exclusion first.
+        systemAudio_.stop();
         restoreSessionMutes(L"for the next launch");
-        systemAudioMutedExecutableKeys_.clear();
     }
 }
 

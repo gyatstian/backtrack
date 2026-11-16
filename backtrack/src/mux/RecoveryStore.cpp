@@ -675,7 +675,17 @@ bool alreadyRecovered(const LocatedManifest& located) {
             fileName.native().find(L':') != std::wstring::npos) continue;
         std::array<DWORD, 7> expected{}, actual{};
         for (auto& value : expected) stream >> value;
-        if (stream && outputIdentity(located.outputDirectory / fileName, actual) && expected == actual) return true;
+        if (!stream) continue;
+        const auto output = located.outputDirectory / fileName;
+        if (outputIdentity(output, actual) && expected == actual) return true;
+        // The published clip is gone from the recorded path, so the user deleted
+        // or renamed it in the library: the session was already published and
+        // acted on, and recovering it again would resurrect or duplicate it.
+        // A file still at that path is a different clip and may recover again.
+        if (GetFileAttributesW(output.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            const DWORD missing = GetLastError();
+            if (missing == ERROR_FILE_NOT_FOUND || missing == ERROR_PATH_NOT_FOUND) return true;
+        }
     }
     return false;
 }

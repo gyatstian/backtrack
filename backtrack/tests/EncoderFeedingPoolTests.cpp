@@ -5,7 +5,11 @@
 // inputRetentionBudget) plus the queue and held-frame slack, so a fake
 // deep-lookahead encoder backed by a real GpuTexturePool reaches its first
 // output without any earlier lease being released. Intermediate queue-sized
-// pools are left untouched.
+// pools are left untouched. This file builds its pool through the same
+// two-argument GpuPoolBuilder clamp the scaler uses, so it pins the clamp
+// arithmetic; the end-to-end proof that D3D11FrameScaler::setPoolSize keeps a
+// negotiated 33-slot pool lives in D3D11FrameScalerTests.
+#include "capture/GpuPoolBuilder.h"
 #include "capture/GpuTexturePool.h"
 #include "encoder/IEncoder.h"
 
@@ -68,9 +72,16 @@ struct FakeRetainingEncoder final : IEncoder {
 
 void testDeepLookaheadReachesFirstOutputWithoutEarlierRelease() {
     const uint32_t queueLimit = 4;
-    const uint32_t retention = 20; // deeper than any pre-fix pool (5..12)
+    // lookahead depth 24, no B-frames: the deepest real NVENC budget that is
+    // not the 31-frame ceiling. Retained inputs alone exceed the intermediate
+    // 16-texture cap, so a pool built through the queue-derived clamp starves
+    // here.
+    const uint32_t retention = 28;
     GpuTexturePool<TestSlot> pool;
-    const uint32_t poolSize = encoderFeedingPoolSizeFor(queueLimit, retention);
+    const uint32_t poolSize = GpuPoolBuilder::normalizePoolSize(
+        encoderFeedingPoolSizeFor(queueLimit, retention), kMaxEncoderFeedingPoolSize);
+    expect(poolSize == queueLimit + retention + 1,
+        "the scaler-side clamp dropped part of the negotiated feeding pool");
     for (uint32_t i = 0; i < poolSize; ++i) {
         pool.push_back(std::make_shared<TestSlot>());
     }
@@ -120,12 +131,33 @@ void testNegotiationBounds() {
         "only the feeding pool may exceed the intermediate cap");
 }
 
+// The scaler normalizes its pool with the feeding ceiling; a pool it clamps
+// back to the intermediate cap is the starvation the deep-lookahead case
+// above shows. Both ceilings go through the one GpuPoolBuilder clamp.
+void testScalerSideClampKeepsFeedingCeiling() {
+    const uint32_t negotiated = encoderFeedingPoolSizeFor(4, 28);
+    expect(negotiated == 33u, "lookahead-24 no-B-frame budget negotiates 33 textures");
+    expect(GpuPoolBuilder::normalizePoolSize(negotiated, kMaxEncoderFeedingPoolSize) == negotiated,
+        "scaler-side clamp must keep a 33-texture feeding pool");
+    expect(GpuPoolBuilder::normalizePoolSize(kMaxEncoderFeedingPoolSize, kMaxEncoderFeedingPoolSize) ==
+            kMaxEncoderFeedingPoolSize,
+        "scaler-side clamp accepts its own ceiling");
+    expect(GpuPoolBuilder::normalizePoolSize(kMaxEncoderFeedingPoolSize + 1, kMaxEncoderFeedingPoolSize) ==
+            kMaxEncoderFeedingPoolSize,
+        "scaler-side clamp still caps above the ceiling");
+    expect(GpuPoolBuilder::normalizePoolSize(33u) == kMaxTexturePoolSize,
+        "queue-derived clamp must still cap at the intermediate size");
+    expect(GpuPoolBuilder::normalizePoolSize(0, kMaxEncoderFeedingPoolSize) == kMinTexturePoolSize,
+        "the feeding ceiling keeps the shared floor");
+}
+
 void testNoRetentionStillServesQueueBacklog() {
     // AMF-style encoder (copies inputs, retains nothing, budget 0): the
     // feeding pool still covers a full queue plus the next in-flight scale.
     const uint32_t queueLimit = 4;
     GpuTexturePool<TestSlot> pool;
-    const uint32_t poolSize = encoderFeedingPoolSizeFor(queueLimit, 0);
+    const uint32_t poolSize = GpuPoolBuilder::normalizePoolSize(
+        encoderFeedingPoolSizeFor(queueLimit, 0), kMaxEncoderFeedingPoolSize);
     for (uint32_t i = 0; i < poolSize; ++i) {
         pool.push_back(std::make_shared<TestSlot>());
     }
@@ -149,6 +181,7 @@ int main() {
     try {
         testDeepLookaheadReachesFirstOutputWithoutEarlierRelease();
         testNegotiationBounds();
+        testScalerSideClampKeepsFeedingCeiling();
         testNoRetentionStillServesQueueBacklog();
         return 0;
     } catch (const std::exception& error) {

@@ -203,8 +203,9 @@ bool writeTimelineAudio(
             L" events, total_silence=" + std::to_wstring(gapStats.fillBytes) +
             L"B, max_gap_ms=" + std::to_wstring(gapStats.maxGapMs));
     }
-    writer.close();
-    return true;
+    // A WAV that cannot patch its header or flush its tail leaves shortened
+    // audio on disk, so the save fails instead of publishing it.
+    return writer.close();
 }
 
 template <typename Packet>
@@ -994,6 +995,8 @@ bool ReplayBuffer::saveTo(
     WavWriter systemWriter;
     WavWriter microphoneWriter;
     auto preserveFailure = [&](const std::wstring& reason) {
+        // Already failing: the writers only need to leave their payload on disk
+        // for recovery, so a close failure here adds nothing the caller can act on.
         systemWriter.close();
         microphoneWriter.close();
         inputs.systemAudioPath = systemWriter.dataBytes() > 0 ? systemWriter.path() : std::filesystem::path();
@@ -1079,9 +1082,10 @@ bool ReplayBuffer::saveTo(
         }
         outPath = tempDirectory / fileName;
         if (!writeTimelineAudio(writer, packets, outPath, replayStartPts, replayEndPts)) {
-            // Muxing after a failed WAV write would publish truncated audio.
-            return preserveFailure(L"could not write the temporary replay audio stream " + outPath.wstring() +
-                        L" (disk full?)");
+            // Muxing after a failed WAV write or finalization would publish
+            // truncated audio.
+            return preserveFailure(L"could not write or finalize the temporary replay audio stream " +
+                        outPath.wstring() + L" (disk full?)");
         }
         if (writer.dataBytes() == 0) {
             outPath.clear();

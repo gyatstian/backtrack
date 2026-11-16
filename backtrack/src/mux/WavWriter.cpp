@@ -6,6 +6,7 @@
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -13,6 +14,8 @@
 namespace backtrack {
 
 namespace {
+
+std::atomic<bool> g_failFinalizeForTesting{false};
 
 void writeTag(std::ofstream& stream, const char tag[4]) {
     stream.write(tag, 4);
@@ -45,7 +48,12 @@ WaveFormatBlob fallbackPcmFormat() {
 } // namespace
 
 WavWriter::~WavWriter() {
-    close();
+    // close() logs its own failure; a destructor has no caller to report to.
+    (void)close();
+}
+
+void WavWriter::failFinalizeForTesting(bool fail) {
+    g_failFinalizeForTesting.store(fail);
 }
 
 bool WavWriter::open(const std::filesystem::path& path, const WaveFormatBlob& format) {
@@ -132,12 +140,21 @@ bool WavWriter::writeSilenceFrames(uint64_t frames) {
     return true;
 }
 
-void WavWriter::close() {
+bool WavWriter::close() {
     if (!stream_.is_open()) {
-        return;
+        return true;
     }
-    patchHeader();
+    const bool headerPatched = patchHeader();
+    // close() flushes, so its state afterwards is the only proof that the last
+    // buffered payload bytes reached the disk.
     stream_.close();
+    if (!headerPatched || stream_.fail() ||
+        g_failFinalizeForTesting.load(std::memory_order_relaxed)) {
+        Logger::instance().error(L"mux",
+            L"Could not finalize WAV stream (header sizes or trailing audio not written): " + path_.wstring());
+        return false;
+    }
+    return true;
 }
 
 void WavWriter::reset() {
@@ -171,7 +188,7 @@ void WavWriter::writeHeader(const WaveFormatBlob& format) {
         : 0;
 }
 
-void WavWriter::patchHeader() {
+bool WavWriter::patchHeader() {
     const auto end = stream_.tellp();
     const uint64_t riffSize64 = static_cast<uint64_t>(end) - 8;
     const uint32_t riffSize = static_cast<uint32_t>(std::min<uint64_t>(
@@ -186,6 +203,7 @@ void WavWriter::patchHeader() {
     stream_.seekp(dataSizePosition_, std::ios::beg);
     writeU32(stream_, dataSize);
     stream_.seekp(end, std::ios::beg);
+    return static_cast<bool>(stream_);
 }
 
 } // namespace backtrack

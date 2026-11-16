@@ -586,8 +586,14 @@ std::filesystem::path Mp4Muxer::finalize() {
         videoStream_.close();
         writeFailed_ = writeFailed_ || !videoStream_;
         flushPendingAudioLocked();
-        systemAudio_.writer.close();
-        microphoneAudio_.writer.close();
+        // A WAV whose header patch or final flush fails leaves shortened audio on
+        // disk; finalization failure therefore fails the save like a write does.
+        if (!systemAudio_.writer.close()) {
+            noteAudioWriteFailedLocked(L"system.wav");
+        }
+        if (!microphoneAudio_.writer.close()) {
+            noteAudioWriteFailedLocked(L"microphone.wav");
+        }
         {
             // One gap-fill aggregate per recording; zero events stays silent.
             AudioGapStats combined;
@@ -810,9 +816,9 @@ void Mp4Muxer::writeTimelineAudioPacket(AudioTimelineState& state, const AudioPa
     }
 }
 
-// A failed temporary-WAV write (typically a full disk) must fail the save
-// instead of silently truncating audio while video keeps going: stop
-// consuming packets and let finalize() report the reason.
+// A failed temporary-WAV write or finalization (typically a full disk) must
+// fail the save instead of silently truncating audio while video keeps going:
+// stop consuming packets and let finalize() report the reason.
 void Mp4Muxer::noteAudioWriteFailedLocked(const wchar_t* fileName) {
     if (writeFailed_) {
         return;

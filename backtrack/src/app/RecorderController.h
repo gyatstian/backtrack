@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -51,6 +52,75 @@ inline bool encoderBehindBudget(double averageEncodeMs, uint32_t fps,
     const uint64_t expected = static_cast<uint64_t>(fps) * windowSeconds;
     const bool fedAtRate = expected == 0 || submittedThisWindow >= expected / 2;
     return fedAtRate && averageEncodeMs > budgetMs * 3.0;
+}
+
+// Views for updateSettings' in-place paths. Each returns a copy with the fields
+// that path applies on its own zeroed, so comparing two views tells a live-only
+// change (or a replay-only one) apart from a pipeline change. Pure, so the
+// suite can pin the classification without a capture pipeline.
+inline AppSettings replayFieldsCleared(AppSettings settings) {
+    settings.replay = {};
+    settings.replayRingDirectory.clear();
+    return settings;
+}
+
+inline AppSettings liveFieldsCleared(AppSettings settings) {
+    settings.audioOutputVolumePercent = 0;
+    settings.audioInputVolumePercent = 0;
+    settings.audioInputAutoGainEnabled = false;
+#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
+    settings.audioInputNoiseSuppressionEnabled = false;
+#endif
+    settings.captureCursor = false;
+    return settings;
+}
+
+// updateSettings dispatch. The two in-place paths are decided by the moved
+// fields alone: a change confined to replay.* is applied by reconfiguring the
+// buffer, a change confined to the mirror-applied fields is applied live, and
+// everything else takes the stop/start path. ReplayInPlace also needs the replay
+// fields to have actually changed: without that an unchanged run reaches a buffer
+// reconfigure. Order matters: replay is decided before live, and a run that only
+// starts the pipeline (startReplayPipeline) never applies live. Returns Restart
+// for "not an in-place path", which the caller resolves through ensurePipeline
+// when startReplayPipeline is set.
+enum class SettingsApplyPath {
+    Restart,
+    ReplayInPlace,
+    LiveInPlace,
+};
+
+inline SettingsApplyPath settingsApplyPath(const AppSettings& current,
+                                           const AppSettings& incoming,
+                                           bool pipelineRunning,
+                                           bool startReplayPipeline) {
+    const bool replayFieldsChanged =
+        current.replay != incoming.replay ||
+        current.replayRingDirectory != incoming.replayRingDirectory;
+    if (replayFieldsChanged && pipelineRunning &&
+        current.replay.enabled == incoming.replay.enabled &&
+        replayFieldsCleared(current) == replayFieldsCleared(incoming)) {
+        return SettingsApplyPath::ReplayInPlace;
+    }
+    if (!startReplayPipeline &&
+        liveFieldsCleared(current) == liveFieldsCleared(incoming)) {
+        return SettingsApplyPath::LiveInPlace;
+    }
+    return SettingsApplyPath::Restart;
+}
+
+// Encoder health-probe snapshot. The probe runs on the encode thread while a
+// GPU recreate destroys and replaces encoder_ under pipelineGpuMutex_, and the
+// frame-discard acknowledgement is not a pause barrier, so the read has to hold
+// that lock. try_to_lock: the probe is diagnostics only, so a recreate in
+// progress skips this tick instead of blocking the encode loop.
+template <typename EncoderPtr>
+inline std::optional<EncoderStats> probeEncoderStats(std::mutex& gpuMutex, const EncoderPtr& encoder) {
+    std::unique_lock lock(gpuMutex, std::try_to_lock);
+    if (!lock.owns_lock() || !encoder) {
+        return std::nullopt;
+    }
+    return encoder->stats();
 }
 
 // Encoder-fault recreate pacing. A pipeline that faults again before it

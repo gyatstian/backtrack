@@ -1,6 +1,10 @@
 // Audio persistence regressions (audit finding #14):
 // - a source WAV that existed when the save started but cannot be read back
 //   (read-denied WAV) fails the save instead of silently becoming "no audio"
+// - a payload read error after the header and the first chunk parsed fails the
+//   mix instead of being mixed as silence
+// - a mixed track that cannot be finalized fails the save instead of being
+//   published while the source recordings are deleted
 // - a PTS gap longer than the old 10 s fill cap is preserved in the saved
 //   audio (timed markers around a long outage)
 // - WavWriter keeps accepting audio past the 4 GiB RIFF boundary (markers
@@ -116,6 +120,74 @@ void testReadDeniedLockedWavFailsSave() {
     std::filesystem::remove_all(testOutputDir(), error);
 }
 
+// The header and the first payload chunk read fine; the storage then fails. The
+// mix used to return 0.0f for that frame (and repeat the previous sample for the
+// next), report success, and let the save publish a damaged MP4 and delete the
+// temporary recordings. A genuine stream failure must fail the mix.
+void testMidPayloadReadFailureFailsMix() {
+    std::error_code error;
+    const auto dir = testOutputDir() / L"readerror";
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(dir, error);
+
+    const auto systemWav = dir / L"system.wav";
+    {
+        WavWriter writer;
+        expect(writer.open(systemWav, pcm16Stereo()), "open failed");
+        // Long enough that the reader loads it in several chunks, so the
+        // injected failure lands after one chunk was read successfully.
+        std::vector<uint8_t> payload(3 * 48000 * 4, 0x80);
+        expect(writer.write(payload.data(), payload.size()), "write failed");
+        expect(writer.close(), "the source WAV did not finalize");
+    }
+
+    backtrack::setAudioMixReadFailureForTesting(true);
+    MuxedInputs inputs;
+    inputs.videoPath = dir / L"video.h264";
+    inputs.systemAudioPath = systemWav;
+    std::filesystem::path mixedPath = dir / L"mixed_audio.wav";
+    const bool mixed = backtrack::buildMixedPcmAudio(inputs, dir / L"out.mp4", mixedPath);
+    backtrack::setAudioMixReadFailureForTesting(false);
+
+    expect(!mixed, "a payload read error was mixed and reported as success");
+    expect(mixedPath.empty(), "a failed mix left a mixed path behind");
+
+    // Same fixture, no injected failure: the source is otherwise readable, so
+    // the failure above was the read error and not the fixture.
+    expect(backtrack::buildMixedPcmAudio(inputs, dir / L"out.mp4", mixedPath),
+        "the readable source did not mix after the injected failure was cleared");
+    std::filesystem::remove_all(testOutputDir(), error);
+}
+
+// WavWriter::close() used to return void, so a failed header patch or final
+// flush was invisible to the mix and the save published shortened audio.
+void testMixedAudioFinalizeFailureFailsMix() {
+    std::error_code error;
+    const auto dir = testOutputDir() / L"finalize";
+    std::filesystem::remove_all(dir, error);
+    std::filesystem::create_directories(dir, error);
+
+    const auto systemWav = dir / L"system.wav";
+    {
+        WavWriter writer;
+        expect(writer.open(systemWav, pcm16Stereo()), "open failed");
+        expect(writer.writeSilenceFrames(48000), "write failed");
+        expect(writer.close(), "the source WAV did not finalize");
+    }
+
+    backtrack::WavWriter::failFinalizeForTesting(true);
+    MuxedInputs inputs;
+    inputs.videoPath = dir / L"video.h264";
+    inputs.systemAudioPath = systemWav;
+    std::filesystem::path mixedPath;
+    const bool mixed = backtrack::buildMixedPcmAudio(inputs, dir / L"out.mp4", mixedPath);
+    backtrack::WavWriter::failFinalizeForTesting(false);
+
+    expect(!mixed, "a mixed track that could not be finalized was reported as saved");
+    expect(mixedPath.empty(), "a failed mix left a mixed path behind");
+    std::filesystem::remove_all(testOutputDir(), error);
+}
+
 void testAbsentTrackStaysVideoOnly() {
     // No file on either track: the save must continue video-only, not fail.
     MuxedInputs inputs;
@@ -158,7 +230,7 @@ void testValidWavMixes() {
         expect(writer.open(systemWav, pcm16Stereo()), "open failed");
         std::vector<uint8_t> payload(48000 * 4, 0x80);  // 1 s of 16-bit PCM
         expect(writer.write(payload.data(), payload.size()), "write failed");
-        writer.close();
+        expect(writer.close(), "the mixed WAV did not finalize");
     }
     MuxedInputs inputs;
     inputs.videoPath = dir / L"video.h264";
@@ -313,6 +385,8 @@ int main() {
     try {
         testReadDeniedExpectedWavFailsSave();
         testReadDeniedLockedWavFailsSave();
+        testMidPayloadReadFailureFailsMix();
+        testMixedAudioFinalizeFailureFailsMix();
         testAbsentTrackStaysVideoOnly();
         testValidEmptyWavIsSkippedNotFailed();
         testValidWavMixes();

@@ -21,7 +21,11 @@ public:
     // instead of dropping audio.
     bool write(const uint8_t* data, size_t size);
     bool writeSilenceFrames(uint64_t frames);
-    void close();
+    // Flushes, patches the RIFF/data sizes and closes. False means a header
+    // step or the final flush failed, so the file's extent on disk is not what
+    // the header declares; callers that publish audio must fail their save
+    // instead. Destructor and reset() report nothing, they only log.
+    bool close();
     void reset();
     bool isOpen() const { return stream_.is_open(); }
     uint64_t dataBytes() const { return dataBytes_; }
@@ -33,10 +37,15 @@ public:
     // Test-only: shrink the RIFF boundary so the large-file path is reachable
     // without writing 4 GiB. The app never calls it.
     void setMaxDataBytesForTesting(uint64_t maxDataBytes) { maxDataBytes_ = maxDataBytes; }
+    // Test-only: make close() report a finalization failure. No path can
+    // provoke a real flush/patch error deterministically, and this failure used
+    // to be unreportable at all. Process-wide because callers such as
+    // ReplayBuffer::saveTo own their writers. The app never calls it.
+    static void failFinalizeForTesting(bool fail);
 
 private:
     void writeHeader(const WaveFormatBlob& format);
-    void patchHeader();
+    bool patchHeader();
 
     std::filesystem::path path_;
     std::ofstream stream_;

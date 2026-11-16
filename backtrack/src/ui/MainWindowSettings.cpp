@@ -435,8 +435,15 @@ bool MainWindow::promptSaveSettingsIfDirty(bool allowCancel) {
         replayHotkeyVirtualKey_ = settings_.hotkeys.saveReplayVirtualKey;
         clearSettingsDirty();
         // Cached Capture/Settings HWNDs no longer match discarded values.
+        const Page livePage = page_;
         invalidatePageCache(Page::Capture);
         invalidatePageCache(Page::Settings);
+        if ((livePage == Page::Capture || livePage == Page::Settings) && pageHost_ && IsWindow(pageHost_)) {
+            // The refusal just destroyed the page it refused to leave. Rebuild it
+            // from the restored snapshot, or a later show (tray restore, or a
+            // failed tray add) faces an empty page until the next tab switch.
+            switchPage(livePage);
+        }
         return true;
     }
     return false;
@@ -565,8 +572,8 @@ int MainWindow::statusHeightForText(int width, const std::wstring& text) const {
 }
 
 void MainWindow::loadAudioDeviceCombos() {
-    outputDevices_ = WasapiCapture::enumerateDevices(AudioTrack::System);
-    inputDevices_ = WasapiCapture::enumerateDevices(AudioTrack::Microphone);
+    outputDevices_ = deviceChoices(WasapiCapture::enumerateDevices(AudioTrack::System), settings_.audioOutputDeviceId);
+    inputDevices_ = deviceChoices(WasapiCapture::enumerateDevices(AudioTrack::Microphone), settings_.audioInputDeviceId);
 
     if (outputDeviceCombo_) {
         ScopedRedrawLock redraw(outputDeviceCombo_);

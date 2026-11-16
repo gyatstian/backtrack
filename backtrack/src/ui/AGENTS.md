@@ -117,6 +117,18 @@ icon.
   until restart so defaults cannot replace an unreadable file. immediate logging
   enabled and library view commits overlay only their field on the saved snapshot.
   page construction never replaces that snapshot from the controller.
+  Declining the unsaved-settings prompt restores the saved snapshot, invalidates
+  both the Capture and Settings page caches and rebuilds the live one: the cache
+  entries hold discarded drafts, and invalidation alone would leave the page the
+  user refused to leave with no controls.
+- The output and input device combos come from `deviceChoices`, which appends
+  the saved device when enumeration does not list it. Row 0 is still Default.
+  Without the appended entry an unplugged pinned device reads back as an empty
+  id, and the next unrelated save rewrites the setting to Default, defeating
+  `WasapiCapture`'s rule that an explicit id stays pinned and never falls back to
+  the default device. Accepted cost: an unplugged
+  pinned entry is labelled with its raw endpoint id, because that id is the only
+  value persisted and no friendly name exists for an absent device.
 - Dark theme is applied by hand: `applyDarkTheme` per control (DWM dark mode
   plus `SetWindowTheme`) and the owner-draw and `WM_CTLCOLOR*` handlers, which
   return the brushes created in `create`. There is no theming API to hook.
@@ -222,7 +234,11 @@ icon.
 - The auto record poll walks the open-app list only until it owns a recording
   of a matched app; in that stable state it liveness-checks the stored process
   id plus its membership in the applied list, and falls back to the desktop
-  walk only when the match is lost.
+  walk only when the match is lost. The liveness check is
+  `isProcessStillRunning`, which reads exit status rather than `OpenProcess`
+  success: a launcher or debugger handle keeps an exited process openable. A
+  failed `OpenProcess` (an unqueryable process) counts as gone, so the poll ends
+  the stale auto-record rather than recording a window it cannot prove is live.
 - `applyVisibleSettings` checks the controller busy flag before persisting
   anything, so a save that loses the race cannot leave disk saved without the
   recorder ever receiving `ApplySettings`.
@@ -258,7 +274,10 @@ icon.
 `LoggerDiagnosticsTests.cpp` covers log export without a window.
 `MainWindowSettingsTests.cpp` covers settings publication, preferences,
 applied auto record, absent-checkbox fallbacks, the follow-mouse gate,
-clip overlap placement/help/read/dirty tracking and page-control reset.
+clip overlap placement/help/read/dirty tracking and page-control reset, an
+unplugged pinned audio device surviving an unrelated save while Default still
+clears it, and the liveness probe ignoring a retained handle to an exited
+process.
 `MainWindowNotificationTests.cpp` covers busy feedback while loading or
 playback is blocked. `MainWindowUpdateCheckTests.cpp` covers
 loopback success, slow progress, stop and destruction.

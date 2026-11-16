@@ -14,19 +14,24 @@ namespace backtrack {
 //
 //     dts(k) = ptsSubmitted(k - reorderDelayFrames)
 //
-// Earlier slots are extrapolated backwards from the first submitted PTS by
-// whole frame durations. The submission queue can exceed the configured
-// offset when inputs are still in flight or outputs are harvested in batches;
-// its size alone cannot identify a lost output.
+// Slots before the first submission are extrapolated backwards from the first
+// submitted PTS by that submission's own duration, once per slot. Using the
+// arriving packet's duration instead steps those slots backwards: cadence
+// collapse makes it larger than the PTS gaps the queue actually had. The
+// submission queue can exceed the configured offset when inputs are still in
+// flight or outputs are harvested in batches; its size alone cannot identify a
+// lost output.
 class DecodeOrderTimestamps {
 public:
     explicit DecodeOrderTimestamps(uint32_t reorderDelayFrames = 0)
         : reorderDelayFrames_(reorderDelayFrames) {
     }
 
-    // Call once per accepted encoder submission, with the frame's PTS.
-    void onSubmit(int64_t pts100ns) {
-        submittedPts_.push_back(pts100ns);
+    // Call once per accepted encoder submission, with the frame's PTS and its
+    // duration. duration100ns only feeds the extrapolated slots; 0 means
+    // unknown and defers to onOutput's duration.
+    void onSubmit(int64_t pts100ns, int64_t duration100ns = 0) {
+        submissions_.push_back({pts100ns, duration100ns});
     }
 
     // Call once per produced output packet, in decode order. Returns the
@@ -37,28 +42,37 @@ public:
         ++outputsConsumed_;
         const int64_t frameDuration = frameDuration100ns > 0 ? frameDuration100ns : 1;
 
-        if (submittedPts_.empty()) {
+        if (submissions_.empty()) {
             return fallbackPts100ns - static_cast<int64_t>(reorderDelayFrames_) * frameDuration;
         }
+        const Submission& earliest = submissions_.front();
         if (outputIndex >= static_cast<int64_t>(reorderDelayFrames_)) {
-            const int64_t dts = submittedPts_.front();
-            submittedPts_.pop_front();
+            const int64_t dts = earliest.pts100ns;
+            submissions_.pop_front();
             return dts;
         }
-        return submittedPts_.front()
-            - static_cast<int64_t>(reorderDelayFrames_ - outputIndex) * frameDuration;
+        // One stable per-slot duration for every extrapolated slot, clamped off
+        // zero so the sequence stays strictly increasing.
+        const int64_t slotDuration = earliest.duration100ns > 0 ? earliest.duration100ns : frameDuration;
+        return earliest.pts100ns
+            - static_cast<int64_t>(reorderDelayFrames_ - outputIndex) * slotDuration;
     }
 
     // Discards pending state when the encoder session is torn down or
     // re-initialized.
     void reset(uint32_t reorderDelayFrames) {
-        submittedPts_.clear();
+        submissions_.clear();
         outputsConsumed_ = 0;
         reorderDelayFrames_ = reorderDelayFrames;
     }
 
 private:
-    std::deque<int64_t> submittedPts_;
+    struct Submission {
+        int64_t pts100ns;
+        int64_t duration100ns;
+    };
+
+    std::deque<Submission> submissions_;
     uint64_t outputsConsumed_ = 0;
     uint32_t reorderDelayFrames_;
 };

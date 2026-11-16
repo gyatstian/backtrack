@@ -302,6 +302,40 @@ void testNestedRecoveryAndUnrelatedCleanup() {
            "ring-name recovery output was misplaced");
 }
 
+// a clip the user deleted or renamed through the library must not come back.
+void testDeletedOrRenamedRecoveryIsNotRepeated() {
+    TestRoot root;
+    const auto game = root.path / L"Game";
+    writeSession(game / L".backtrack_tmp" / L"deleted");
+    writeSession(game / L".backtrack_tmp" / L"renamed");
+    const unsigned before = muxCalls;
+    RecoveryStore::sweepOrphanedRecoveryData(root.path);
+    expect(muxCalls == before + 2, "startup did not recover the failed sessions");
+    const auto deleted = game / L"deleted.mp4";
+    const auto renamed = game / L"renamed.mp4";
+    expect(readFile(deleted) == "published" && readFile(renamed) == "published",
+           "recovery did not publish the expected names");
+
+    std::error_code error;
+    expect(std::filesystem::remove(deleted, error) && !error, "could not delete recovered clip");
+    const auto moved = game / L"User Rename.mp4";
+    std::filesystem::rename(renamed, moved, error);
+    expect(!error, "could not rename recovered clip");
+
+    RecoveryStore::sweepOrphanedRecoveryData(root.path);
+    expect(muxCalls == before + 2, "a deleted or renamed clip was recovered again");
+    expect(!std::filesystem::exists(deleted), "deleted clip came back");
+    expect(!std::filesystem::exists(game / L"deleted_recovered.mp4"), "deleted clip came back under a second name");
+    expect(!std::filesystem::exists(renamed) && readFile(moved) == "published",
+           "renamed clip was duplicated or lost");
+
+    // a session that was never published stays recoverable after the sweep.
+    writeSession(game / L".backtrack_tmp" / L"fresh");
+    RecoveryStore::sweepOrphanedRecoveryData(root.path);
+    expect(muxCalls == before + 3, "a fresh failed session was not recovered");
+    expect(readFile(game / L"fresh.mp4") == "published", "fresh session published nothing");
+}
+
 void testManualRecoverySelectsNewestAcrossRoots() {
     TestRoot root;
     const auto older = root.path / L".backtrack_tmp" / L"older";
@@ -432,6 +466,7 @@ int main() {
         testClipRootsAndTags();
         testFailedGameReplayAndDiscovery();
         testNestedRecoveryAndUnrelatedCleanup();
+        testDeletedOrRenamedRecoveryIsNotRepeated();
         testManualRecoverySelectsNewestAcrossRoots();
         testEscapingManifestIsPreserved();
         testRingCollisionIsPreserved();

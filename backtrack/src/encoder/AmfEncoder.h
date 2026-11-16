@@ -6,9 +6,11 @@
 
 namespace backtrack {
 
-// AMD Advanced Media Framework (AMF) hardware encoder. Wraps BGRA D3D11
-// textures via CreateSurfaceFromDX11Native (AMF converts to NV12 internally)
-// through amfrt64.dll. Builds as a stub when the AMF headers are absent.
+// AMD Advanced Media Framework (AMF) hardware encoder. Wraps D3D11 textures via
+// CreateSurfaceFromDX11Native through amfrt64.dll. The surface format follows
+// the frame: NV12 by default, BGRA when the capture scaler fell back to it, and
+// the component is re-created through switchInputFormat on that change.
+// Builds as a stub when the AMF headers are absent.
 class AmfEncoder final : public IEncoder {
 public:
     AmfEncoder();
@@ -25,6 +27,7 @@ public:
     EncoderStats stats() const override;
     bool encoderAvailable() const noexcept override;
     DXGI_FORMAT preferredInputFormat() const override;
+    uint32_t inputRetentionBudget() const override;
 
 private:
     friend struct AmfEncoderTestAccess;

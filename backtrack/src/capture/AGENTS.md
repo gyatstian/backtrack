@@ -139,12 +139,16 @@ GPU scaler that converts frames to whatever the active encoder wants.
 - Textures come from fixed `GpuTexturePool` pools sized by
   `texturePoolSizeForQueueLimit` (`frameQueueLimit + 4`, clamped 5..16; the
   sanitize 1..8 limit makes the live range 5..12), headroom over the queue
-  limit because the capture loop pins one slot as `lastFrame`, and `app` feeds
-  the same value to the scaler through `setPoolSize`. `GpuPoolBuilder` is the
-  single clamp and texture factory for all four pool builds (owners keep only
-  views and sidecars); its comment owns the bind-flag matrix. Pool exhaustion is a drop,
-  counted as such, never a blocking wait on the capture thread; every pool logs
-  through `acquireOrLog` (1st + every 300th). WGC zero-copy
+  limit because the capture loop pins one slot as `lastFrame`. `GpuPoolBuilder`
+  is the single clamp and texture factory for all four pool builds (DD pool,
+  WGC copy pool, scaler output pool, scaler copy pool; owners keep only views and
+  sidecars), and its clamp takes a ceiling: the queue-derived capture and source
+  pools use `kMaxTexturePoolSize` (16), while both scaler pool builds and
+  `setPoolSize` pass `kMaxEncoderFeedingPoolSize` (64). A scaler-side call that
+  omits the ceiling silently re-caps the feeding pool at 16 and starves a
+  deep-lookahead encoder. Its comment owns the bind-flag matrix. Pool exhaustion
+  is a drop, counted as such, never a blocking wait on the capture thread; every
+  pool logs through `acquireOrLog` (1st + every 300th). WGC zero-copy
   has a second cap, `wgcMaxZeroCopyLeases` (`framePoolSize - 1`, the frame pool
   itself is `wgcFramePoolSizeForQueueLimit`: `frameQueueLimit + 2`, 3..8);
   hitting it drops that frame onto the copy path instead of holding the
@@ -190,7 +194,11 @@ coordinate helpers (dimension normalization and cursor transform for 90/180/270)
 and the cursor carry across a same-output rebuild, without a D3D device. `WgcCopyPoolTests` (CTest) exercises fallback resize with WARP.
 `D3D11FrameScalerTests` (CTest) uses WARP and a fake video device to check the
 copied-input fallback, NV12 failure handling, and same-size alias/copy paths
-including sticky BGRA fallback.
+including sticky BGRA fallback, and that a negotiated pool above the
+intermediate cap survives `setPoolSize` and the pool build (33 slots for a
+lookahead-24 budget). `EncoderFeedingPoolTests` (CTest) pins the two-argument
+clamp arithmetic and the deep-lookahead negotiation through `GpuTexturePool`; the
+end-to-end scaler proof is the `D3D11FrameScalerTests` case above.
 
 on HDR hardware, compare recorded gray and highlight ramps with the displayed
 image and an SDR reference, including multiple SDR white levels, fullscreen

@@ -2587,6 +2587,44 @@ void testRamModeEnforcesByteCap() {
     std::filesystem::remove_all(output.parent_path(), error);
 }
 
+// A WAV finalization failure (header patch or final flush) used to be
+// unreportable: the replay was published with shortened audio and its source
+// session deleted. It must fail the save and preserve the session instead.
+void testAudioFinalizeFailureKeepsSession() {
+    std::error_code error;
+    std::filesystem::remove_all(testOutputDir(), error);
+
+    ReplayBuffer buffer;
+    buffer.configure(settings(30));
+    for (int64_t pts = 0; pts < 6; ++pts) {
+        buffer.pushVideo(makeVideoPayload(
+            pts * kSecond100ns, kSecond100ns, pts == 0, static_cast<uint8_t>(0xF0 + pts), 1024));
+    }
+    buffer.pushAudio(makeAudio(kSecond100ns, 1));
+
+    // The stub records what the muxer was handed; clearing it makes "was the
+    // muxer reached at all" a real assertion rather than a leftover value.
+    backtrack::g_lastMuxedInputs.videoSamples.clear();
+    backtrack::WavWriter::failFinalizeForTesting(true);
+    const auto output = testOutputDir() / L"finalize_failure" / L"clip.mp4";
+    std::wstring detail;
+    const bool saved = buffer.saveTo(output, defaultVideoSettings(), &detail);
+    backtrack::WavWriter::failFinalizeForTesting(false);
+
+    expect(!saved, "saveTo published a replay whose audio could not be finalized");
+    expect(!detail.empty(), "a failed audio finalization produced no reason");
+    expect(backtrack::g_lastMuxedInputs.videoSamples.empty(),
+        "a replay with unfinalized audio reached the muxer");
+    expect(!std::filesystem::exists(output, error),
+        "a replay with unfinalized audio was published");
+    const auto staging = output.parent_path() / L".backtrack_tmp" / output.stem();
+    expect(std::filesystem::exists(staging / backtrack::RecoveryStore::kRecoveryManifestName, error),
+        "a failed audio finalization dropped the streams needed for recovery");
+
+    buffer.clear();
+    std::filesystem::remove_all(testOutputDir(), error);
+}
+
 } // namespace
 
 int main() {
@@ -2639,6 +2677,7 @@ int main() {
         testBackendAndDirectorySwitchesResetBuffer();
         testRingReadFailureFailsSaveAndFailsOver();
         testMuxFailurePreservesStreamsAndReportsReason();
+        testAudioFinalizeFailureKeepsSession();
         testSameNameRetryDoesNotTouchPreservedReplay();
         testOrphanedRingFolderIsPreserved();
         testDayHoldStaysWithinWindow();

@@ -41,11 +41,11 @@ struct MainWindowSettingsTestAccess {
         window.voiceCommandCombo_ = control;
         window.discordRichPresenceCombo_ = control;
     }
-    static void monitorControls(MainWindow& window, HWND multi, HWND focused, HWND mouse) {
+    static void monitorControls(MainWindow& window, HWND multi, HWND followCombo) {
         window.multiMonitorSupportCheck_ = multi;
-        window.followFocusedMonitorCheck_ = focused;
-        window.followMouseMonitorCheck_ = mouse;
+        window.monitorFollowCombo_ = followCombo;
     }
+    static HWND monitorFollow(const MainWindow& window) { return window.monitorFollowCombo_; }
     static void bindVoice(MainWindow& window, HWND control) {
         window.voiceCommandCombo_ = control;
         window.pageControls_.push_back(control);
@@ -290,7 +290,7 @@ void testMissingCheckboxesPreserveSettings() {
     MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Missing);
     auto target = initial;
     bool* fields[] = {
-        &target.multiMonitorSupport, &target.followFocusedMonitor, &target.followMouseMonitor,
+        &target.multiMonitorSupport, &target.followMouseMonitor,
         &target.captureCursor, &target.captureSystemAudio, &target.captureMicrophone,
         &target.audioInputAutoGainEnabled,
 #ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
@@ -447,26 +447,31 @@ void testFollowMouseGateAndPageReset() {
     SettingsStore store(directory / L"settings.ini");
     const auto initial = fixture(directory);
     RecorderController controller;
-    Checkbox multi, focused, mouse;
+    Checkbox multi;
+    Combo follow;
+    fillEnumCombo(follow.handle, kMonitorFollowComboEntries, 0);
     MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Missing);
-    MainWindowSettingsTestAccess::monitorControls(window, multi.handle, focused.handle, mouse.handle);
-    for (int bits = 0; bits < 8; ++bits) {
-        multi.check((bits & 1) != 0);
-        focused.check((bits & 2) != 0);
-        mouse.check((bits & 4) != 0);
+    MainWindowSettingsTestAccess::monitorControls(window, multi.handle, follow.handle);
+    for (int bits = 0; bits < 4; ++bits) {
+        const bool multiOn = (bits & 1) != 0;
+        const bool followMouse = (bits & 2) != 0;
+        multi.check(multiOn);
+        SendMessageW(follow.handle, CB_SETCURSEL, followMouse ? 1 : 0, 0);
         auto target = initial;
         MainWindowSettingsTestAccess::read(window, target);
-        expect(target.multiMonitorSupport == ((bits & 1) != 0) &&
-               target.followFocusedMonitor == ((bits & 2) != 0) &&
-               target.followMouseMonitor == (bits == 7), "follow-mouse gate or checkbox read changed");
+        expect(target.multiMonitorSupport == multiOn &&
+               target.followMouseMonitor == (multiOn && followMouse),
+               "monitor follow gate or combo read changed");
     }
-    MainWindowSettingsTestAccess::bindVoice(window, mouse.handle);
+    MainWindowSettingsTestAccess::bindVoice(window, follow.handle);
     MainWindowSettingsTestAccess::clearControls(window);
-    expect(MainWindowSettingsTestAccess::voice(window) == nullptr, "page teardown retained the voice control");
-    expect(!IsWindow(mouse.handle), "page teardown did not destroy its control");
-    MainWindowSettingsTestAccess::bindVoice(window, focused.handle);
+    expect(MainWindowSettingsTestAccess::monitorFollow(window) == nullptr,
+           "page teardown retained the follow combo");
+    expect(!IsWindow(follow.handle), "page teardown did not destroy its control");
+    MainWindowSettingsTestAccess::monitorControls(window, multi.handle, multi.handle);
     MainWindowSettingsTestAccess::rebind(window);
-    expect(MainWindowSettingsTestAccess::voice(window) == nullptr, "empty-host rebind retained the voice control");
+    expect(MainWindowSettingsTestAccess::monitorFollow(window) == nullptr,
+           "empty-host rebind retained the follow combo");
     MainWindowSettingsTestAccess::clearControls(window);
 }
 

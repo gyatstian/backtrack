@@ -374,7 +374,6 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
         readString(values, L"general.customNotificationSoundPath", settings.customNotificationSoundPath.wstring());
     settings.monitorIndex = readUInt(values, L"capture.monitorIndex", settings.monitorIndex);
     settings.multiMonitorSupport = readBool(values, L"capture.multiMonitorSupport", settings.multiMonitorSupport);
-    settings.followFocusedMonitor = readBool(values, L"capture.followFocusedMonitor", settings.followFocusedMonitor);
     settings.followMouseMonitor = readBool(values, L"capture.followMouseMonitor", settings.followMouseMonitor);
     settings.captureCursor = readBool(values, L"capture.cursor", settings.captureCursor);
     settings.preferredCaptureBackend = captureBackendFromName(
@@ -499,7 +498,6 @@ bool SettingsStore::save(const AppSettings& settings) const {
     output << L"general.customNotificationSoundPath=" << normalized.customNotificationSoundPath.wstring() << L"\n";
     output << L"capture.monitorIndex=" << normalized.monitorIndex << L"\n";
     output << L"capture.multiMonitorSupport=" << (normalized.multiMonitorSupport ? 1 : 0) << L"\n";
-    output << L"capture.followFocusedMonitor=" << (normalized.followFocusedMonitor ? 1 : 0) << L"\n";
     output << L"capture.followMouseMonitor=" << (normalized.followMouseMonitor ? 1 : 0) << L"\n";
     output << L"capture.cursor=" << (normalized.captureCursor ? 1 : 0) << L"\n";
     output << L"capture.backend=" << captureBackendName(normalized.preferredCaptureBackend) << L"\n";
@@ -582,7 +580,7 @@ AppSettings sanitizeSettings(AppSettings settings) {
             settings.hotkeys.saveReplayVirtualKey = 0;
         }
     }
-    if (!settings.multiMonitorSupport || !settings.followFocusedMonitor) {
+    if (!settings.multiMonitorSupport) {
         settings.followMouseMonitor = false;
     }
     if (settings.clipDirectory.empty()) {

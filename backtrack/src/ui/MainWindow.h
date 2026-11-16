@@ -504,9 +504,8 @@ private:
     std::vector<MonitorEnumEntry> resolutionMonitorEntries_;
     HWND widthEdit_ = nullptr;
     HWND heightEdit_ = nullptr;
-    HWND followFocusedMonitorCheck_ = nullptr;
     HWND multiMonitorSupportCheck_ = nullptr;
-    HWND followMouseMonitorCheck_ = nullptr;
+    HWND monitorFollowCombo_ = nullptr;
     HWND captureCursorCheck_ = nullptr;
     HWND systemAudioCheck_ = nullptr;
     HWND microphoneCheck_ = nullptr;

@@ -54,7 +54,7 @@ untrusted values, and the enum name mappings that cross the file boundary.
   - `video.encoderLookaheadDepth` is capped at 31 with no lower bound
   It also masks hotkey modifiers, resolves derived settings (adaptive
   B-frames need B-frames, adaptive I-frames need lookahead, follow-mouse needs
-  multi-monitor and follow-focused), caps each executable list at 128 entries,
+  multi-monitor), caps each executable list at 128 entries,
   dedupes them by `platform/Win32Util.h:normalizedPathKey` (the same key the
   sound-separation mute list uses), fills a blank name from the path
   stem, replaces CR/LF in names with spaces, and replaces an empty

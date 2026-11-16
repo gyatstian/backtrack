@@ -509,8 +509,7 @@ bool isSettingsControlId(int controlId) {
     case kGpuFrameQueueLimitEditId:
     case kIdleFrameCoalescingCheckId:
     case kCaptureMethodComboId:
-    case kFollowMouseMonitorCheckId:
-    case kFollowFocusedMonitorCheckId:
+    case kMonitorFollowComboId:
     case kMultiMonitorSupportCheckId:
     case kCaptureCursorCheckId:
     case kStableMultimonitorFramesCheckId:

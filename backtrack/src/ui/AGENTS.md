@@ -207,9 +207,11 @@ icon.
   the table when the enum grows, never raw-cast a combo index.
 - `readVisibleSettingsInto` reads controls raw and never clamps:
   `sanitizeSettings` is the sole clamp (stash, save, and dirty all run through
-  it). The follow-mouse read applies the full
-  `multiMonitorSupport && followFocusedMonitor` gate so a checked box is exactly
-  what sanitize keeps.
+  it). The follow-mouse read combines the
+  `multiMonitorSupport` checkbox with the `kMonitorFollowComboEntries` index so
+  a checked state is exactly what sanitize keeps. Following focus is not a
+  setting: multi-monitor on records the focused monitor unless the combo picks
+  the cursor.
 - Preferences and behavior the user expects to persist go into `AppSettings`,
   not into a local variable in a page builder.
 - `Clip overlap (seconds)` is the last setting in Settings -> Capture, not
@@ -273,7 +275,7 @@ icon.
 
 `LoggerDiagnosticsTests.cpp` covers log export without a window.
 `MainWindowSettingsTests.cpp` covers settings publication, preferences,
-applied auto record, absent-checkbox fallbacks, the follow-mouse gate,
+applied auto record, absent-checkbox fallbacks, the monitor-follow gate,
 clip overlap placement/help/read/dirty tracking and page-control reset, an
 unplugged pinned audio device surviving an unrelated save while Default still
 clears it, and the liveness probe ignoring a retained handle to an exited

@@ -86,7 +86,7 @@ const wchar_t* hdrFormatName(DXGI_FORMAT format) {
 CaptureTarget captureTargetForSettings(const AppSettings& settings) {
     CaptureTarget target;
     target.monitorIndex = settings.monitorIndex;
-    if (settings.multiMonitorSupport && settings.followFocusedMonitor) {
+    if (settings.multiMonitorSupport) {
         target.monitor = settings.followMouseMonitor
             ? cursorMonitorOrFallback(settings.monitorIndex)
             : focusedMonitorOrFallback(settings.monitorIndex);
@@ -949,7 +949,7 @@ bool RecorderController::ensurePipeline() {
                             (snapshot.preferredCaptureBackend == CaptureBackend::DesktopDuplication
                                  ? L"Desktop Duplication"
                                  : L"WGC") +
-                            L", followFocusedMonitor=" + (snapshot.followFocusedMonitor ? L"yes" : L"no") +
+                            L", multiMonitorSupport=" + (snapshot.multiMonitorSupport ? L"yes" : L"no") +
                             L", followMouseMonitor=" + (snapshot.followMouseMonitor ? L"yes" : L"no") +
                             L", systemAudio=" + (snapshot.captureSystemAudio ? L"yes" : L"no") +
                             L", microphone=" + (snapshot.captureMicrophone ? L"yes" : L"no"));
@@ -1836,7 +1836,7 @@ void RecorderController::captureLoopImpl() {
                 encoderInputFormat == DXGI_FORMAT_B8G8R8A8_UNORM;
             const bool forceOwnedTexture =
                 !wgcZeroCopyEligible ||
-                (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && gpuSettings.stableMultimonitorFrames);
+                (captureSettings.multiMonitorSupport && gpuSettings.stableMultimonitorFrames);
             const uint64_t poolGeneration = scaler_.poolGeneration();
             const bool scaled = scaler_.scale(
                     d3d_,
@@ -1844,7 +1844,7 @@ void RecorderController::captureLoopImpl() {
                     videoSettings.width,
                     videoSettings.height,
                     encodeFrame,
-                    captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor,
+                    captureSettings.multiMonitorSupport,
                     forceOwnedTexture,
                     encoderInputFormat);
             if (scaler_.poolGeneration() != poolGeneration && encoder_) {
@@ -2045,7 +2045,7 @@ void RecorderController::captureLoopImpl() {
             refreshSystemAudioCapture(captureSettings, soundSeparationKeys);
         }
 
-        if (captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor && loopNow >= nextMonitorPoll) {
+        if (captureSettings.multiMonitorSupport && loopNow >= nextMonitorPoll) {
             nextMonitorPoll = loopNow + monitorPollInterval;
             CaptureTarget focusedTarget = captureTargetForSettings(captureSettings);
             if (!focusedTarget.monitor || focusedTarget.monitor == activeCaptureTarget_.monitor) {
@@ -2376,7 +2376,7 @@ void RecorderController::captureLoopImpl() {
         bool encoderFaulted = pipelineEncoderFaulted(encoder_.get());
 
         if (deviceRemoved || encoderFaulted) {
-            CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
+            CaptureTarget target = captureSettings.multiMonitorSupport
                 ? captureTargetForSettings(captureSettings)
                 : activeCaptureTarget_;
             Logger::instance().warning(L"recorder",
@@ -2540,7 +2540,7 @@ void RecorderController::captureLoopImpl() {
                         exclusiveCoverActive &&
                         session.exclusiveWindow &&
                         GetForegroundWindow() == session.exclusiveWindow;
-                    CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
+                    CaptureTarget target = captureSettings.multiMonitorSupport
                         ? captureTargetForSettings(captureSettings)
                         : activeCaptureTarget_;
                     target.window = validatedExclusiveTarget ? session.exclusiveWindow : nullptr;
@@ -2681,7 +2681,7 @@ void RecorderController::captureLoopImpl() {
                     session.lastRebindAt = SteadyClock::time_point::min();
                     session.rebindBornAt = SteadyClock::time_point::min();
                     session.sustainedLive = 0;
-                    CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
+                    CaptureTarget target = captureSettings.multiMonitorSupport
                         ? captureTargetForSettings(captureSettings)
                         : activeCaptureTarget_;
                     target.window = nullptr;
@@ -2759,7 +2759,7 @@ void RecorderController::captureLoopImpl() {
                             cumulativeSoftStallWindowStart = nowLoop;
                         }
 
-                        CaptureTarget target = captureSettings.multiMonitorSupport && captureSettings.followFocusedMonitor
+                        CaptureTarget target = captureSettings.multiMonitorSupport
                             ? captureTargetForSettings(captureSettings)
                             : activeCaptureTarget_;
                         target.window = nullptr;

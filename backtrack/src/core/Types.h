@@ -250,7 +250,7 @@ struct AppSettings {
     bool libraryGalleryView = false;
     uint32_t monitorIndex = 0;
     bool multiMonitorSupport = false;
-    bool followFocusedMonitor = false;
+    // Multi-monitor on with this set follows the cursor instead of the focused window.
     bool followMouseMonitor = false;
     bool captureCursor = true;
     bool loggingEnabled = true;

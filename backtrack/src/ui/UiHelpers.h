@@ -92,6 +92,11 @@ inline constexpr EnumComboEntry kGpuAdaptiveComboEntries[] = {
     {static_cast<int>(GpuAdaptiveMode::Conservative), L"Conservative"},
     {static_cast<int>(GpuAdaptiveMode::Aggressive), L"Aggressive"},
 };
+// Multi-monitor follow source. 1 = follow the cursor instead of focus.
+inline constexpr EnumComboEntry kMonitorFollowComboEntries[] = {
+    {0, L"Focused monitor"},
+    {1, L"Follow mouse"},
+};
 inline constexpr EnumComboEntry kCaptureBackendComboEntries[] = {
     {static_cast<int>(CaptureBackend::WindowsGraphicsCapture), L"WGC"},
     {static_cast<int>(CaptureBackend::DesktopDuplication), L"DXGI"},

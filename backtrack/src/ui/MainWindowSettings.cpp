@@ -99,10 +99,11 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
         target.video.height = readUIntControl(heightEdit_, target.video.height);
     }
     target.multiMonitorSupport = readCheckControl(multiMonitorSupportCheck_, target.multiMonitorSupport);
-    target.followFocusedMonitor = readCheckControl(followFocusedMonitorCheck_, target.followFocusedMonitor);
-    if (followMouseMonitorCheck_) {
-        target.followMouseMonitor = target.multiMonitorSupport && target.followFocusedMonitor &&
-            readCheckControl(followMouseMonitorCheck_, target.followMouseMonitor);
+    if (monitorFollowCombo_) {
+        int followMode = target.followMouseMonitor ? 1 : 0;
+        if (readEnumCombo(monitorFollowCombo_, kMonitorFollowComboEntries, followMode)) {
+            target.followMouseMonitor = target.multiMonitorSupport && followMode != 0;
+        }
     }
     target.captureCursor = readCheckControl(captureCursorCheck_, target.captureCursor);
     target.video.codec = readEnum(codecCombo_, kVideoCodecComboEntries, target.video.codec);

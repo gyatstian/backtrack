@@ -459,7 +459,6 @@ void testEverySerializedKeyRoundTrips() {
     original.customNotificationSoundPath = L"C:\\Sounds\\saved.wav";
     original.monitorIndex = 1;
     original.multiMonitorSupport = true;
-    original.followFocusedMonitor = true;
     original.followMouseMonitor = true;
     original.captureCursor = false;
     original.libraryGalleryView = true;
@@ -617,11 +616,10 @@ void testOutOfRangeValuesAreClamped() {
 void testInRangeValuesAreUntouched() {
     // Every branch of sanitizeSettings that fires on the defaults either makes
     // no change or makes this one, so a valid configuration must survive a
-    // round trip byte for byte. multiMonitor/follow flags are enabled so the
+    // round trip byte for byte. multiMonitor is enabled so the
     // followMouseMonitor reset does not fire.
     AppSettings settings = baseSettings();
     settings.multiMonitorSupport = true;
-    settings.followFocusedMonitor = true;
     settings.followMouseMonitor = true;
 
     expect(backtrack::sanitizeSettings(settings) == settings,

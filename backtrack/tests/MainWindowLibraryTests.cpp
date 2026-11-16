@@ -318,7 +318,7 @@ void testSettingsRebuildNotifications() {
     } cases[] = {
         {2, kResolutionModeComboId, CBN_SELCHANGE, L"Custom size", L"1080p", kWidthEditId},
         {4, kDiscordRichPresenceComboId, CBN_SELCHANGE, L"Always", L"Never", kDiscordPresenceTimerComboId},
-        {1, kMultiMonitorSupportCheckId, BN_CLICKED, nullptr, nullptr, kFollowFocusedMonitorCheckId},
+        {1, kMultiMonitorSupportCheckId, BN_CLICKED, nullptr, nullptr, kMonitorFollowComboId},
         {2, kEncoderProfileComboId, CBN_SELCHANGE, L"Custom", L"Balanced", kEncoderPresetComboId},
         {1, kReplayDiskBackedCheckId, BN_CLICKED, nullptr, nullptr, kReplayRingDirEditId},
         {1, kReplayDiskBackedAudioCheckId, BN_CLICKED, nullptr, nullptr, kReplayRingDirEditId},

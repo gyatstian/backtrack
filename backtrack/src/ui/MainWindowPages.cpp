@@ -124,9 +124,8 @@ void MainWindow::resetPageControlMembers() {
         &MainWindow::resolutionModeCombo_,
         &MainWindow::widthEdit_,
         &MainWindow::heightEdit_,
-        &MainWindow::followFocusedMonitorCheck_,
         &MainWindow::multiMonitorSupportCheck_,
-        &MainWindow::followMouseMonitorCheck_,
+        &MainWindow::monitorFollowCombo_,
         &MainWindow::captureCursorCheck_,
         &MainWindow::systemAudioCheck_,
         &MainWindow::microphoneCheck_,
@@ -209,9 +208,8 @@ void MainWindow::rebindPageControlPointers() {
     resolutionModeCombo_ = child(kResolutionModeComboId);
     widthEdit_ = child(kWidthEditId);
     heightEdit_ = child(kHeightEditId);
-    followFocusedMonitorCheck_ = child(kFollowFocusedMonitorCheckId);
     multiMonitorSupportCheck_ = child(kMultiMonitorSupportCheckId);
-    followMouseMonitorCheck_ = child(kFollowMouseMonitorCheckId);
+    monitorFollowCombo_ = child(kMonitorFollowComboId);
     captureCursorCheck_ = child(kCaptureCursorCheckId);
     systemAudioCheck_ = child(kSystemAudioCheckId);
     microphoneCheck_ = child(kMicrophoneCheckId);
@@ -1004,6 +1002,10 @@ void MainWindow::buildSettingsCapturePage() {
         captureMethodCombo_,
         L"Screen capture backend. WGC (Windows Graphics Capture) is the modern API and supports zero-copy frames into the encoder. DXGI (Desktop Duplication) is the legacy path, sometimes lighter on old systems but must copy every frame. Recommended: WGC; Backtrack falls back automatically if the selected backend fails to start.");
     y += kRowHeight;
+    HWND cursorLabel = addRowLabel(L"Capture cursor", kX, y + 4, kLabelWidth);
+    captureCursorCheck_ = addCheckbox(L"Capture cursor", kControlX, y, kControlWidth, 24, kCaptureCursorCheckId, settings_.captureCursor);
+    addRowHelp(cursorLabel, captureCursorCheck_, L"Draws the mouse cursor into recorded frames. Negligible GPU impact either way; disable for clean gameplay footage.");
+    y += kRowHeight;
     HWND diskBackedLabel = addRowLabel(L"Buffer on disk", kX, y + 4, kLabelWidth);
     replayDiskBackedCheck_ = addCheckbox(L"Video", kControlX, y, 140, 24, kReplayDiskBackedCheckId, settings_.replay.diskBackedVideo);
     replayDiskBackedAudioCheck_ = addCheckbox(L"Sound", kControlX + 150, y, 140, 24, kReplayDiskBackedAudioCheckId, settings_.replay.diskBackedAudio);
@@ -1039,24 +1041,17 @@ void MainWindow::buildSettingsCapturePage() {
     addSection(L"Multi-monitor");
     HWND multiMonitorLabel = addRowLabel(L"Multi-monitor support", kX, y + 4, kLabelWidth);
     multiMonitorSupportCheck_ = addCheckbox(L"Enable multi-monitor support", kControlX, y, kControlWidth, 24, kMultiMonitorSupportCheckId, settings_.multiMonitorSupport);
-    addRowHelp(multiMonitorLabel, multiMonitorSupportCheck_, L"Allows capturing any connected monitor instead of a fixed one and unlocks the follow options below. Adds a brief rebind hitch when the active monitor changes.");
+    addRowHelp(multiMonitorLabel, multiMonitorSupportCheck_, L"Allows capturing any connected monitor instead of a fixed one and unlocks the monitor choice below. Adds a brief rebind hitch when the active monitor changes.");
     y += kRowHeight;
     if (settings_.multiMonitorSupport) {
-        HWND followFocusedLabel = addRowLabel(L"Follow focused monitor", kX, y + 4, kLabelWidth);
-        followFocusedMonitorCheck_ = addCheckbox(L"Follow focused monitor", kControlX, y, kControlWidth, 24, kFollowFocusedMonitorCheckId, settings_.followFocusedMonitor);
-        addRowHelp(followFocusedLabel, followFocusedMonitorCheck_, L"Captures whichever monitor currently holds input focus; focus switches move the recording after a short stability delay. Small GPU cost per frame for the owned copy this uses.");
-        y += kRowHeight;
-        HWND followMouseLabel = addRowLabel(L"Follow mouse", kX, y + 4, kLabelWidth);
-        followMouseMonitorCheck_ = addCheckbox(L"Follow mouse", kControlX, y, kControlWidth, 24, kFollowMouseMonitorCheckId, settings_.followMouseMonitor);
-        addRowHelp(followMouseLabel, followMouseMonitorCheck_, L"The captured monitor follows the cursor position instead of keyboard focus. Requires Follow focused monitor.");
+        HWND monitorFollowLabel = addRowLabel(L"Record which monitor", kX, y + 4, kLabelWidth);
+        monitorFollowCombo_ = addControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_TABSTOP, kControlX, y, kControlWidth, 100, kMonitorFollowComboId);
+        fillEnumCombo(monitorFollowCombo_, kMonitorFollowComboEntries, settings_.followMouseMonitor ? 1 : 0);
+        addRowHelp(monitorFollowLabel, monitorFollowCombo_, L"Focused monitor records whichever display owns the active window; focus changes move the recording after a short stability delay. Follow mouse records the display under the cursor instead.");
         y += kRowHeight;
         HWND stableFramesLabel = addRowLabel(L"Stable multi-monitor frames", kX, y + 4, kLabelWidth);
         stableMultimonitorFramesCheck_ = addCheckbox(L"Stable multi-monitor frames", kControlX, y, kControlWidth, 24, kStableMultimonitorFramesCheckId, settings_.gpu.stableMultimonitorFrames);
-        addRowHelp(stableFramesLabel, stableMultimonitorFramesCheck_, L"Forces an owned copy of every frame so monitor switches never tear or flash stale colors. Costs one extra GPU copy per frame; disable only if you want absolute lowest overhead and accept switch glitches. Only applies with WGC zero-copy + Follow focused monitor.");
-        y += kRowHeight;
-        HWND cursorLabel = addRowLabel(L"Capture cursor", kX, y + 4, kLabelWidth);
-        captureCursorCheck_ = addCheckbox(L"Capture cursor", kControlX, y, kControlWidth, 24, kCaptureCursorCheckId, settings_.captureCursor);
-        addRowHelp(cursorLabel, captureCursorCheck_, L"Draws the mouse cursor into recorded frames. Negligible GPU impact either way; disable for clean gameplay footage.");
+        addRowHelp(stableFramesLabel, stableMultimonitorFramesCheck_, L"Forces an owned copy of every frame so monitor switches never tear or flash stale colors. Costs one extra GPU copy per frame; disable only if you want absolute lowest overhead and accept switch glitches. Only applies with WGC capture.");
         y += kRowHeight;
     }
     finishSection();

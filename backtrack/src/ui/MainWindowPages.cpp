@@ -102,6 +102,7 @@ void MainWindow::resetPageControlMembers() {
         &MainWindow::organizeClipsByGameCheck_,
         &MainWindow::replayEnabledCheck_,
         &MainWindow::replaySecondsEdit_,
+        &MainWindow::replayOverlapSecondsEdit_,
         &MainWindow::replayDiskBackedCheck_,
         &MainWindow::replayDiskBackedAudioCheck_,
         &MainWindow::replayRingDirEdit_,
@@ -194,6 +195,7 @@ void MainWindow::rebindPageControlPointers() {
     recordHotkey_ = child(kRecordHotkeyId);
     replayEnabledCheck_ = child(kReplayEnabledId);
     replaySecondsEdit_ = child(kReplaySecondsEditId);
+    replayOverlapSecondsEdit_ = child(kReplayOverlapSecondsEditId);
     replayDiskBackedCheck_ = child(kReplayDiskBackedCheckId);
     replayDiskBackedAudioCheck_ = child(kReplayDiskBackedAudioCheckId);
     replayRingDirEdit_ = child(kReplayRingDirEditId);
@@ -966,6 +968,7 @@ void MainWindow::buildSettingsVideoPage() {
 }
 
 void MainWindow::buildSettingsCapturePage() {
+    constexpr int kNumericWidth = 96;
     constexpr int kX = 44;
     constexpr int kLabelWidth = 160;
     constexpr int kControlX = 224;
@@ -1028,6 +1031,10 @@ void MainWindow::buildSettingsCapturePage() {
             L"A fast SSD is recommended when gaming on an HDD; avoid cloud-synced folders. Changing it clears the current replay buffer.");
         y += kRowHeight;
     }
+    HWND overlapLabel = addRowLabel(L"Clip overlap (seconds)", kX, y + 4, kLabelWidth);
+    replayOverlapSecondsEdit_ = addControl(L"EDIT", std::to_wstring(settings_.replay.overlapSeconds).c_str(), WS_BORDER | ES_NUMBER | WS_TABSTOP, kControlX, y, kNumericWidth, 24, kReplayOverlapSecondsEditId);
+    addRowHelp(overlapLabel, replayOverlapSecondsEdit_, L"When saving again within the replay window, save only new footage plus this much of the previous clip.");
+    y += kRowHeight;
     finishSection();
     addSection(L"Multi-monitor");
     HWND multiMonitorLabel = addRowLabel(L"Multi-monitor support", kX, y + 4, kLabelWidth);
@@ -1052,6 +1059,7 @@ void MainWindow::buildSettingsCapturePage() {
         addRowHelp(cursorLabel, captureCursorCheck_, L"Draws the mouse cursor into recorded frames. Negligible GPU impact either way; disable for clean gameplay footage.");
         y += kRowHeight;
     }
+    finishSection();
 }
 
 void MainWindow::buildSettingsAudioPage() {

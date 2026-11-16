@@ -169,6 +169,9 @@ void MainWindow::readVisibleSettingsInto(AppSettings& target) {
     if (replaySecondsEdit_) {
         target.replay.seconds = readUIntControl(replaySecondsEdit_, target.replay.seconds);
     }
+    if (replayOverlapSecondsEdit_) {
+        target.replay.overlapSeconds = readUIntControl(replayOverlapSecondsEdit_, target.replay.overlapSeconds);
+    }
     target.replay.diskBackedVideo = readCheckControl(replayDiskBackedCheck_, target.replay.diskBackedVideo);
     target.replay.diskBackedAudio = readCheckControl(replayDiskBackedAudioCheck_, target.replay.diskBackedAudio);
     if (replayRingDirEdit_) {

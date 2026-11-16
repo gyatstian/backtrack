@@ -408,8 +408,9 @@ add_backtrack_test(LeagueOfLegendsIntegrationTests
 
 # --- Encoders ---
 
-# NvencStubTests compiles the real NvencEncoder.cpp with the SDK forced off, so
-# the unavailable-backend path is what gets exercised.
+# NvencStubTests compiles the real NvencEncoder.cpp (the tier dispatcher) with
+# the SDK forced off, so the unavailable-backend path is what gets exercised.
+# The tier translation units compile to nothing under the same define.
 add_backtrack_test(NvencStubTests
     SOURCES
         backtrack/tests/NvencStubTests.cpp
@@ -417,9 +418,10 @@ add_backtrack_test(NvencStubTests
         backtrack/src/core/Logger.cpp
     DEFINES BACKTRACK_HAS_NVENC=0)
 
-# NvencLifecycleTests includes NvencEncoder.cpp itself to reach its private
-# implementation and drives it with a fake NVENC API, so the real SDK header is
-# required (no registration without it) and the .cpp must not be linked twice.
+# NvencLifecycleTests includes the 13.0 tier translation unit itself to reach
+# its private implementation and drives it with a fake NVENC API, so the SDK
+# header is required (no registration without it) and the file must not be
+# linked twice.
 if (NVENC_INCLUDE_DIR)
     add_backtrack_test(NvencLifecycleTests
         SOURCES

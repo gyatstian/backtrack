@@ -74,7 +74,7 @@ Encoder backend is auto-detected from the active GPU vendor at runtime:
 
 Optional at compile time:
 
-- NVENC headers (`backtrack/src/Interface/nvEncodeAPI.h`, NVIDIA Video Codec SDK) are vendored, so NVENC builds out of the box. If they are absent the build sets `BACKTRACK_HAS_NVENC=0`.
+- NVENC headers (`backtrack/src/Interface/nvEncodeAPI.h`, NVIDIA Video Codec SDK 13.0) are vendored, so NVENC builds out of the box. The same SDK one major version older (`nvEncodeAPI_11_1.h`) is vendored beside it: the app picks whichever tier the installed driver implements, so drivers that predate NVENC API 13.0 still record. If the headers are absent the build sets `BACKTRACK_HAS_NVENC=0`.
 - AMD AMF headers are bundled in `backtrack/src/Interface/AMF` (Apache/MIT, headers only), so AMF builds out of the box. Set the `AMF_SDK_PATH` environment variable to point at a different copy if needed.
 - If a backend's headers are absent, the app still builds and the Diagnostics page reports why that backend is unavailable. Neither SDK ships a link-time library; both runtimes are loaded dynamically from the installed driver.
 
@@ -130,6 +130,8 @@ ctest --test-dir build -C Release
 34 suites always build. `NvencLifecycleTests` and `AmfEncoderTests` are added when the NVENC and AMF headers are found (both are vendored), and `AudioDenoiseTests` when noise suppression is enabled. What each suite covers is listed in `backtrack/tests/AGENTS.md`.
 
 The recording and replay hotkeys are configurable in Settings. The clip folder is configurable in the Capture settings. Audio devices, sound separation, resolution, encoder tuning, GPU protection, and game integrations are all configured in the Settings page.
+
+clip overlap is configurable as the last setting in Settings → Capture. it defaults to 3 seconds: consecutive saves include new footage plus overlap from the previous clip, aligned to a keyframe. 0 removes intentional overlap; it does not force full-length replays.
 
 ## Notes
 

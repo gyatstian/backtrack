@@ -426,6 +426,41 @@ void testAppListCountBoundsAndGaps() {
            loaded.autoRecordApps.size() == 1, "a gap inside the count hint hid later entries");
 }
 
+void testReplayOverlapPersistence() {
+    expect(AppSettings{}.replay.overlapSeconds == 3, "replay overlap default changed");
+    const auto path = testRoot() / L"overlap" / L"settings.ini";
+    const SettingsStore store(path);
+    expect(store.load().replay.overlapSeconds == 3, "missing file lost the overlap default");
+    writeBytes(path, "replay.seconds=1\n");
+    expect(store.load().replay.overlapSeconds == 3, "missing key lost the overlap default");
+
+    for (const char* malformed : {"", "invalid", "-1", "+5", "1.5", "5seconds", "4294967296"}) {
+        writeBytes(path, std::string("replay.overlapSeconds=") + malformed + "\n");
+        expect(store.load().replay.overlapSeconds == 3, "malformed overlap did not use the default");
+    }
+    const struct {
+        uint32_t input;
+        uint32_t expected;
+    } cases[] = {{0, 0}, {3, 3}, {17, 17}, {3600, 3600}, {3601, 3600}, {0xFFFFFFFFu, 3600}};
+    for (const auto& entry : cases) {
+        writeBytes(path, "replay.seconds=1\nreplay.overlapSeconds=" + std::to_string(entry.input) + "\n");
+        expect(store.load().replay.overlapSeconds == entry.expected,
+            "loaded overlap was not clamped independently of replay duration");
+        AppSettings settings;
+        settings.replay.seconds = 1;
+        settings.replay.overlapSeconds = entry.input;
+        const auto normalized = backtrack::sanitizeSettings(settings);
+        expect(normalized.replay.overlapSeconds == entry.expected && normalized.replay.seconds == 1,
+            "overlap sanitization changed the independent replay duration");
+        expect(store.save(settings), "could not save replay overlap");
+        const auto bytes = readBytes(path);
+        expect(std::string(bytes.begin(), bytes.end()).find(
+            "replay.overlapSeconds=" + std::to_string(entry.expected) + "\n") != std::string::npos,
+            "overlap was not persisted with the normalized value");
+        expect(store.load().replay.overlapSeconds == entry.expected, "replay overlap did not round trip");
+    }
+}
+
 void testResolutionPersistence() {
     using backtrack::ResolutionMode;
     const struct {
@@ -527,6 +562,7 @@ int main() {
         testBomAndOverlongLine();
         testAppListCountBoundsAndGaps();
         testResolutionPersistence();
+        testReplayOverlapPersistence();
         std::filesystem::remove_all(testRoot());
         std::cout << "SettingsStoreTests passed\n";
         return 0;

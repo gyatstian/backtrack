@@ -48,6 +48,8 @@ untrusted values, and the enum name mappings that cross the file boundary.
   - width to 16-7680 and height to 16-4320, both forced to an even value
   - fps 1-240, bitrate 1000-200000 kbps, GOP 1-30 s, AQ strength 1-15,
     reference frames 1-4, replay seconds 1-3600, frame queue limit 1-8
+  - `replay.overlapSeconds` 0-3600, independent of the selected replay duration;
+    its default lives in `ReplaySettings` and zero requests no intentional overlap
   - input and output volume 0-200 %, notification volume 0-100 %
   - `video.encoderLookaheadDepth` is capped at 31 with no lower bound
   It also masks hotkey modifiers, resolves derived settings (adaptive
@@ -117,8 +119,9 @@ and hotkey masking. `backtrack/tests/SettingsStoreTests.cpp` (CTest) adds
 settings-only regressions, including linked destinations, staging collisions,
 a UTF-8 BOM on the first key, an over-long dropped line, and an executable list
 without its `.count` hint. it also covers app-list count bounds and gaps,
-default-muted normalization, and every persisted resolution preset and legacy
-alias. symbolic link cases skip when link creation is unavailable.
+default-muted normalization, every persisted resolution preset and legacy
+alias, and replay overlap defaults, malformed input, independent clamping, and
+normalized round trips. symbolic link cases skip when link creation is unavailable.
 
 The only `platform/Win32Util.h` symbols this folder uses are the `inline`
 `trimText` and `normalizedPathKey`, plus `defaultClipDirectory()`, which the

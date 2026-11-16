@@ -307,6 +307,7 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     settings.video.encoderReferenceFrames = readUInt(values, L"video.encoderReferenceFrames", settings.video.encoderReferenceFrames);
     settings.replay.enabled = readBool(values, L"replay.enabled", settings.replay.enabled);
     settings.replay.seconds = readUInt(values, L"replay.seconds", settings.replay.seconds);
+    settings.replay.overlapSeconds = readUInt(values, L"replay.overlapSeconds", settings.replay.overlapSeconds);
     settings.replay.diskBackedVideo = readBool(values, L"replay.diskBackedVideo", settings.replay.diskBackedVideo);
     settings.replay.diskBackedAudio = readBool(values, L"replay.diskBackedAudio", settings.replay.diskBackedAudio);
     settings.replayRingDirectory = readString(values, L"replay.ringDirectory", settings.replayRingDirectory.wstring());
@@ -447,6 +448,7 @@ bool SettingsStore::save(const AppSettings& settings) const {
     output << L"video.encoderReferenceFrames=" << normalized.video.encoderReferenceFrames << L"\n";
     output << L"replay.enabled=" << (normalized.replay.enabled ? 1 : 0) << L"\n";
     output << L"replay.seconds=" << normalized.replay.seconds << L"\n";
+    output << L"replay.overlapSeconds=" << normalized.replay.overlapSeconds << L"\n";
     output << L"replay.diskBackedVideo=" << (normalized.replay.diskBackedVideo ? 1 : 0) << L"\n";
     output << L"replay.diskBackedAudio=" << (normalized.replay.diskBackedAudio ? 1 : 0) << L"\n";
     output << L"replay.ringDirectory=" << normalized.replayRingDirectory.wstring() << L"\n";
@@ -554,6 +556,7 @@ AppSettings sanitizeSettings(AppSettings settings) {
     }
     settings.video = validateEncoderConfig(settings.video);
     settings.replay.seconds = std::clamp<uint32_t>(settings.replay.seconds, 1, 3600);
+    settings.replay.overlapSeconds = std::clamp<uint32_t>(settings.replay.overlapSeconds, 0, 3600);
     settings.gpu.frameQueueLimit = std::clamp<uint32_t>(settings.gpu.frameQueueLimit, 1, 8);
     settings.audioInputVolumePercent = std::clamp<uint32_t>(settings.audioInputVolumePercent, 0, 200);
     settings.audioOutputVolumePercent = std::clamp<uint32_t>(settings.audioOutputVolumePercent, 0, 200);

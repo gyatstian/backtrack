@@ -321,6 +321,52 @@ void testConsecutiveSaveOverlap() {
     std::filesystem::remove_all(output.parent_path(), error);
 }
 
+void testConfiguredConsecutiveSaveOverlap() {
+    for (const bool diskBacked : {false, true}) {
+        for (const uint32_t overlapSeconds : {0u, 5u, 3600u}) {
+            const auto root = testOutputDir() / L"configured_overlap";
+            std::error_code error;
+            std::filesystem::remove_all(root, error);
+            std::filesystem::create_directories(root);
+            {
+                ReplayBuffer buffer;
+                auto replaySettings = settings(30);
+                replaySettings.diskBackedVideo = diskBacked;
+                buffer.configure(replaySettings, root, 8ULL * 1024 * 1024);
+                for (int64_t pts = 0; pts < 12; ++pts) {
+                    buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, pts % 3 == 0));
+                }
+                const auto output = root / L"clip.mp4";
+                VideoSettings videoSettings;
+                videoSettings.codec = VideoCodec::H264;
+                expect(buffer.saveTo(output, videoSettings), "initial configured-overlap save failed");
+
+                replaySettings.overlapSeconds = overlapSeconds;
+                buffer.configure(replaySettings, root, 8ULL * 1024 * 1024);
+                for (int64_t pts = 12; pts < 18; ++pts) {
+                    buffer.pushVideo(makeVideo(pts * kSecond100ns, kSecond100ns, pts % 3 == 0));
+                }
+                const int64_t expectedStart = overlapSeconds == 0 ? 12 : overlapSeconds == 5 ? 6 : 0;
+                backtrack::g_muxShouldFail = true;
+                const bool failedSave = buffer.saveTo(output, videoSettings);
+                backtrack::g_muxShouldFail = false;
+                expect(!failedSave, "injected configured-overlap save did not fail");
+                expect(backtrack::g_lastMuxedInputs.videoSamples.front().pts100ns == expectedStart * kSecond100ns,
+                    "configured overlap did not align to the expected keyframe");
+
+                buffer.pushVideo(makeVideo(18 * kSecond100ns, kSecond100ns, true));
+                expect(buffer.saveTo(output, videoSettings), "configured-overlap retry failed");
+                const auto& samples = backtrack::g_lastMuxedInputs.videoSamples;
+                expect(samples.front().pts100ns == expectedStart * kSecond100ns,
+                    "failed save advanced consecutive-save accounting");
+                expect(samples.front().keyFrame && samples.back().pts100ns == 18 * kSecond100ns,
+                    "configured overlap lost keyframe alignment or the live tail");
+            }
+            std::filesystem::remove_all(root, error);
+        }
+    }
+}
+
 void testAudioTimelineMatchesVideo() {
     ReplayBuffer buffer;
     buffer.configure(settings(30));
@@ -2549,6 +2595,7 @@ int main() {
         testTailExtension();
         testSaveToHonorsLiveTailAndKeyframeStart();
         testConsecutiveSaveOverlap();
+        testConfiguredConsecutiveSaveOverlap();
         testAudioTimelineMatchesVideo();
         testSaveWithoutKeyframeFails();
         testParseWavRecoversUnpatchedCrashHeader();

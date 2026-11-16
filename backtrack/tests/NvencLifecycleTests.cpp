@@ -1,4 +1,5 @@
-#include "encoder/NvencEncoder.cpp"
+#include "encoder/NvencApiTier.h"
+#include "encoder/NvencEncoder13.cpp"
 #include "app/CaptureFrameHandoff.h"
 #include "capture/GpuTexturePool.h"
 
@@ -17,6 +18,12 @@
 #include <vector>
 
 namespace backtrack {
+
+// The tier translation unit is included rather than linked so this suite can
+// reach the private implementation. NvencEncoder dispatches between tiers, so
+// the name points at the one every current driver uses.
+using NvencEncoder = nvenc13::Encoder;
+using namespace nvenc13;
 
 struct NvencEncoderTestAccess {
     static void attach(NvencEncoder& encoder, void* session,
@@ -727,8 +734,19 @@ void testStuckLockStillEscalates() {
 
 } // namespace
 
+void testApiTierSelection() {
+    // Boundaries of NvEncodeAPIGetMaxSupportedVersion's (major << 4) | minor.
+    expect(selectNvencApiTier(kNvencApiVersion13) == NvencApiTier::Api13, "13.0 did not select the 13.0 tier");
+    expect(selectNvencApiTier(nvencApiVersion(13, 1)) == NvencApiTier::Api13, "13.1 did not select the 13.0 tier");
+    expect(selectNvencApiTier(nvencApiVersion(12, 2)) == NvencApiTier::Api11, "12.2 did not fall back to the 11.1 tier");
+    expect(selectNvencApiTier(kNvencApiVersion11) == NvencApiTier::Api11, "11.1 did not select the 11.1 tier");
+    expect(selectNvencApiTier(nvencApiVersion(11, 0)) == NvencApiTier::Api11, "a driver below every tier did not select the 11.1 tier");
+    expect(selectNvencApiTier(0) == NvencApiTier::Api11, "an unreadable driver version did not select the 11.1 tier");
+}
+
 int main() {
     try {
+        testApiTierSelection();
         testPureMappings();
         testCompletionBeforeReuse();
         testRemapAfterCompletion();

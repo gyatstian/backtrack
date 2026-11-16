@@ -8,7 +8,9 @@ share.
 
 ## Ownership
 
-- Owns: `IEncoder`, `NvencEncoder`, `AmfEncoder`, `EncoderFactory`,
+- Owns: `IEncoder`, `NvencEncoder` and its API tiers (`NvencApiTier.h`,
+  `NvencTierFactories.h`, `NvencSdkHeader.h`, `NvencEncoderBody.inl`,
+  `NvencEncoder13.cpp`, `NvencEncoder11.cpp`), `AmfEncoder`, `EncoderFactory`,
   `EncoderCommon`, `BitstreamUtils`, `DecodeOrderTimestamps.h`.
 - Does not own: frame timing (that is `app/VideoTimelineScheduler.h`) or muxing
   (`mux`).
@@ -79,6 +81,29 @@ share.
 - `BACKTRACK_HAS_NVENC` and `BACKTRACK_HAS_AMF` guard the SDK includes. Both
   `.cpp` files must compile with the flag off, producing a stub that reports the
   backend unavailable with a reason.
+- NVENC is compiled once per supported API tier. The API version is baked into
+  every struct version macro and a driver rejects any client above its own, so
+  it cannot be negotiated at run time. `NvencEncoder13.cpp` and
+  `NvencEncoder11.cpp` each include their own vendored header
+  (`Interface/nvEncodeAPI.h`, `Interface/nvEncodeAPI_11_1.h`) and then
+  `NvencEncoderBody.inl` with `BACKTRACK_NVENC_NAMESPACE` set. Both headers
+  declare the same type names, so they must never share a translation unit, and
+  no SDK type may leave its tier namespace.
+- `NvencEncoderBody.inl` guards anything newer than 11.1 with
+  `BACKTRACK_NVENC_API12`. The tiers are a major version apart, so the major
+  test is exact; keep it that way rather than adding minor-version arithmetic.
+  The 11.1 tier writes the BT.709 VUI fields as literal H.264 Annex E values
+  (the named enums arrived with API 12.0) and cannot honor
+  `EncoderMode::UltraHighQuality`, which falls back to high quality. Everything
+  else it sets is identical, so clips from either tier differ only in the
+  requested tuning mode.
+- `NvencEncoder` is a dispatcher over `IEncoder`: it reads
+  `NvEncodeAPIGetMaxSupportedVersion` from the same runtime-loaded DLL, selects
+  the newest tier at or below the reported version (`NvencApiTier.h`), logs the
+  driver's version and the choice, and forwards every call. A driver below the
+  oldest tier is not refused up front; that tier reports the driver's own
+  status. Do not add SDK types to `NvencEncoder.h`: `EncoderFactory` and
+  `RecorderController` only ever see `IEncoder`.
 - `EncoderFactory::createEncoderForDevice` keys off `D3DDevice::vendor()`, which
   is derived from the DXGI vendor id: AMD `0x1002` uses AMF, NVIDIA `0x10DE`
   uses NVENC, Intel and unknown default to NVENC.
@@ -183,8 +208,8 @@ share.
 
 `DecodeOrderTimestampsTests` covers reordered backlog, batched output, drain,
 and same-session continuation.
-`NvencLifecycleTests` (CTest, needs the SDK header) drives the real encoder
-through a fake NVENC API: per-use mapping, B-frame token matching and
+`NvencLifecycleTests` (CTest, needs the SDK header) includes the 13.0 tier and
+drives it through a fake NVENC API: per-use mapping, B-frame token matching and
 out-of-order retirement, repeated input, rejection, reset, lock/unmap failure,
 shutdown retention, and the early non-blocking lock statuses (an incomplete
 `LOCK_BUSY`/`OUT_OF_MEMORY` lock keeps the encoder available and still
@@ -192,6 +217,11 @@ publishes once the picture completes, while a permanently stuck lock escalates
 after the deadline without latching the mapping fault). drop-path regressions
 cover counters, keyframe rearm, ready tails, unchanged diagnostics, and mapping
 retirement; retention-budget cases cover pipeline delay and the buffer-count cap.
+The same suite covers tier selection: 13.0 and 13.1 pick the 13.0 tier, 12.2 and
+11.1 pick the 11.1 tier, and an unreadable version picks the 11.1 tier. The 11.1
+tier itself is compile-checked and smoke-checked by hand only; it has no
+fake-API lifecycle suite because the fake function list layout is
+version-specific.
 `NvencStubTests` (CTest) covers the `BACKTRACK_HAS_NVENC=0` stub and zero retention.
 `AmfEncoderTests` (CTest, needs the AMF headers) exercises AMF configuration,
 lookahead feature reporting, pre-analysis readback, B-frame timing, and

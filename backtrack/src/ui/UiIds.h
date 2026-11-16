@@ -62,6 +62,7 @@ constexpr int kSettingsCategoryButtonBaseId = 120;
     constexpr int kCaptureCursorCheckId = 213;
 constexpr int kReplayEnabledId = 201;
 constexpr int kReplaySecondsEditId = 202;
+constexpr int kReplayOverlapSecondsEditId = 241;
 constexpr int kSaveReplayButtonId = 203;
 constexpr int kReplayHotkeyId = 204;
 constexpr int kReplayDiskBackedCheckId = 230;

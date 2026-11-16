@@ -139,6 +139,7 @@ struct VideoSettings {
 
 struct ReplaySettings {
     uint32_t seconds = 120;
+    uint32_t overlapSeconds = 3;
     bool enabled = true;
     // Default on: buffer encoded replay video and/or sound in fixed-capacity
     // on-disk ring files instead of process RAM. When false the replay buffer

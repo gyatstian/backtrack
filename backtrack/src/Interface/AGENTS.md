@@ -25,6 +25,12 @@ linked, and no source file lives in this folder.
   nothing includes them; removing them flips nothing. Do not add a stub header
   to make the build succeed artificially, and do not commit a copy that is not
   licensed for redistribution.
+- `nvEncodeAPI_11_1.h` is the same SDK one major version older, kept for the
+  driver fallback (`encoder/AGENTS.md`). Header detection must keep pointing at
+  `nvEncodeAPI.h` alone: it is the only file `find_path` / `Exists()` looks for,
+  and the 11.1 copy is included by path from one tier translation unit. Do not
+  rename it to `nvEncodeAPI.h` or merge the two, or detection and the tier
+  include root would disagree about which version is current.
 - `AMF/` is the bundled AMD AMF public headers (Apache/MIT, headers only), so the
   AMD path builds with no external download. CMake resolves it through
   `AMF_SDK_PATH` and adds the *parent* of the resolved directory to the include

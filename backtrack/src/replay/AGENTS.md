@@ -79,11 +79,14 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   bitstreams itself. `trimLocked` and `freeRingSpaceLocked` both realign to the
   oldest buffered keyframe, so a buffer that has lost its keyframes saves
   nothing rather than an undecodable clip.
-- `lastSaveEndPts100ns_` makes consecutive saves overlap instead of starting
-  cold. The next cut prefers the last keyframe at or before
-  `lastSaveEndPts100ns_ - 3 s`, falls back to the first keyframe after that,
-  and finally to the oldest buffered keyframe. it updates only when a save
-  publishes, so a failed save re-cuts the same range instead of losing it.
+- `lastSaveEndPts100ns_` bounds consecutive saves using
+  `ReplaySettings::overlapSeconds` (default 3). the next cut prefers the last
+  keyframe at or before `lastSaveEndPts100ns_ - overlapSeconds`, falls back to
+  the first keyframe after that, and finally to the oldest buffered keyframe.
+  zero requests no intentional overlap, not the full replay window; keyframe
+  alignment can still add overlap. overlap and window seconds are snapshotted
+  under the packet mutex. the saved end updates only when a save publishes,
+  so a failed save re-cuts the same range instead of losing it.
 - video packets are in decode order. the replay end, audio end bound and
   consecutive-save accounting use the maximum retained presentation end,
   recalculated after cuts. `videoSpan100ns` uses the same window cut before
@@ -204,7 +207,8 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   reassembly, byte-identical parity between the two backends,
   parameter-set prepending on both backends, decode-timestamp round-trip,
   RAM reconfiguration with payload-exact retained video, reordered presentation
-  ends across both backends and cuts, consecutive-save overlap, audio on the
+  ends across both backends and cuts, default/configured/zero consecutive-save
+  overlap and failed-save accounting on RAM and disk, audio on the
   shared timeline (RAM and disk), the
   disk-audio ring (byte-exact wrap reassembly with reversed track timestamps,
   skew, age trimming and saves between track drains, capacity-only reconfigure,

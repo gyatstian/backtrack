@@ -200,6 +200,9 @@ icon.
   what sanitize keeps.
 - Preferences and behavior the user expects to persist go into `AppSettings`,
   not into a local variable in a page builder.
+- `Clip overlap (seconds)` is the last setting in Settings -> Capture, not
+  the Capture tab. its label and numeric field share this hover/focus footer
+  help: "When saving again within the replay window, save only new footage plus this much of the previous clip."
 - Copy in this folder is user-facing English in a deliberately plain voice.
   Keep it short and specific.
 - Keyboard handling goes through `handleShortcut` in
@@ -254,9 +257,10 @@ icon.
 
 `LoggerDiagnosticsTests.cpp` covers log export without a window.
 `MainWindowSettingsTests.cpp` covers settings publication, preferences,
-applied auto record, absent-checkbox fallbacks, the follow-mouse gate and
-page-control reset. `MainWindowNotificationTests.cpp` covers busy feedback
-while loading or playback is blocked. `MainWindowUpdateCheckTests.cpp` covers
+applied auto record, absent-checkbox fallbacks, the follow-mouse gate,
+clip overlap placement/help/read/dirty tracking and page-control reset.
+`MainWindowNotificationTests.cpp` covers busy feedback while loading or
+playback is blocked. `MainWindowUpdateCheckTests.cpp` covers
 loopback success, slow progress, stop and destruction.
 `MainWindowAccessibilityTests.cpp` exercises dialog-key traversal, settings-body
 lifetime, shared row help, tab chrome, placed-layout memoization and page-cache

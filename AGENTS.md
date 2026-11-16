@@ -53,7 +53,7 @@ RNNoise.
 ### Verification
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -G "Ninja Multi-Config"
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release
 ```
@@ -62,17 +62,19 @@ MSBuild path: `MSBuild.exe backtrack.slnx /p:Configuration=Release
 /p:Platform=x64 /m`. There is no CI; a green local build plus `ctest` is the
 gate.
 
-Toolchain, verified on 2026-10-11: the only installed Visual Studio is Build
-Tools 2022 (17.14, channel `VisualStudio.17.Release`), so the generator is
-`"Visual Studio 17 2022"`. `cmake` and `ctest` are on `PATH` from
-`C:\Program Files\CMake\bin`. The app target needs the `C++ ATL for latest v143 build
-tools` component: `voice/VoiceCommandService.cpp` includes `<sapi.h>`, whose
-`sphelper.h` includes `atlbase.h`. Without ATL installed the test targets still
-build and pass, but the app fails with `C1083 atlbase.h not found`.
+Toolchain, verified on 2026-11-16: only Visual Studio 2026 (18 Community, MSVC
+14.52) is installed and it has no `v143` toolset, so `"Visual Studio 17 2022"`
+no longer configures and `backtrack.slnx` / `backtrack.vcxproj` (pinned to
+`v143`) no longer builds on this machine. The gate above therefore uses
+`Ninja Multi-Config`, which keeps the `build/Release/` output layout the app's
+recorded startup path points at. Delete `build/` before configuring with a
+different generator. `cmake` and `ctest` are on `PATH` from
+`C:\Program Files\CMake\bin`. ATL is present in that install, so the app target
+builds as well.
 
-`backtrack.vcxproj` pins `PlatformToolset` to `v143` to match that install. Do
-not raise it from a machine with a newer Visual Studio; the vcxproj is the only
-build definition that names a toolset, and CMake picks up whatever is installed.
+Do not raise `PlatformToolset` in `backtrack.vcxproj` from a machine with a
+newer Visual Studio without checking the other build definition: the vcxproj is
+the only one that names a toolset, and CMake picks up whatever is installed.
 
 Build directories are generated output and do not survive a move: `build/`
 (CMake) and `x64/` plus `backtrack/x64/` (MSBuild output and intermediates)

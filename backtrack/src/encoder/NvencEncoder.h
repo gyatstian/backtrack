@@ -6,6 +6,10 @@
 
 namespace backtrack {
 
+// NVENC entry point. The driver only accepts a client built with an NVENC API
+// version at or below the one it implements, and that version is compiled into
+// every NVENC struct, so the tier cannot be switched at run time. This picks the
+// compiled tier once from the driver's reported version and delegates to it.
 class NvencEncoder final : public IEncoder {
 public:
     NvencEncoder();
@@ -25,10 +29,7 @@ public:
     uint32_t inputRetentionBudget() const override;
 
 private:
-    friend struct NvencEncoderTestAccess;
-    struct Impl;
-    void abandonImpl();
-    std::unique_ptr<Impl> impl_;
+    std::unique_ptr<IEncoder> inner_;
 };
 
 } // namespace backtrack

@@ -516,6 +516,7 @@ bool isSettingsControlId(int controlId) {
     case kStableMultimonitorFramesCheckId:
     case kReplayEnabledId:
     case kReplaySecondsEditId:
+    case kReplayOverlapSecondsEditId:
     case kReplayDiskBackedCheckId:
     case kReplayDiskBackedAudioCheckId:
     case kReplayRingDirEditId:

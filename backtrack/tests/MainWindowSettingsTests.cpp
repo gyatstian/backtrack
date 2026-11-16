@@ -1,8 +1,11 @@
 #include "ui/MainWindow.h"
+#include "ui/UiHelpers.h"
+#include "ui/UiIds.h"
 #include "core/Logger.h"
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -48,6 +51,18 @@ struct MainWindowSettingsTestAccess {
         window.pageControls_.push_back(control);
     }
     static HWND voice(const MainWindow& window) { return window.voiceCommandCombo_; }
+    static HWND overlap(const MainWindow& window) { return window.replayOverlapSecondsEdit_; }
+    static void buildCaptureSettings(MainWindow& window, HWND host) {
+        window.pageHost_ = host;
+        window.buildSettingsCapturePage();
+    }
+    static void buildCaptureTab(MainWindow& window) { window.buildCapturePage(); }
+    static void clearBody(MainWindow& window) { window.clearSettingsBodyControls(); }
+    static const std::vector<HWND>& controls(const MainWindow& window) { return window.pageControls_; }
+    static std::wstring help(const MainWindow& window, HWND control) {
+        const auto found = window.statusHelpTexts_.find(control);
+        return found != window.statusHelpTexts_.end() ? found->second : L"";
+    }
     static void clearControls(MainWindow& window) { window.clearPageControls(); }
     static void rebind(MainWindow& window) { window.rebindPageControlPointers(); }
     static void switchPages(MainWindow& window) {
@@ -389,6 +404,79 @@ void testFollowMouseGateAndPageReset() {
     MainWindowSettingsTestAccess::clearControls(window);
 }
 
+void testClipOverlapSetting() {
+    expect(AppSettings{}.replay.overlapSeconds == 3, "clip overlap default changed");
+    expect(isSettingsControlId(kReplayOverlapSecondsEditId), "clip overlap does not mark settings dirty");
+    for (bool expanded : {false, true}) {
+        const auto directory = testRoot() / L"clip_overlap";
+        SettingsStore store(directory / L"settings.ini");
+        auto initial = fixture(directory);
+        initial.multiMonitorSupport = expanded;
+        initial.replay.diskBackedVideo = expanded;
+        initial.replay.overlapSeconds = 17;
+        RecorderController controller;
+        MainWindow window(controller, store, initial, SettingsStore::LoadStatus::Missing);
+        struct Host {
+            HWND handle = CreateWindowExW(0, L"STATIC", L"", WS_POPUP,
+                0, 0, 900, 900, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+            ~Host() { if (handle) DestroyWindow(handle); }
+        } host;
+        expect(host.handle != nullptr, "could not create clip overlap page host");
+        MainWindowSettingsTestAccess::buildCaptureSettings(window, host.handle);
+        const HWND edit = MainWindowSettingsTestAccess::overlap(window);
+        expect(edit && GetDlgItem(host.handle, kReplayOverlapSecondsEditId) == edit,
+               "Settings Capture did not create clip overlap");
+        expect((GetWindowLongPtrW(edit, GWL_STYLE) & (ES_NUMBER | WS_TABSTOP)) == (ES_NUMBER | WS_TABSTOP),
+               "clip overlap is not a keyboard-accessible numeric field");
+        expect(readText(edit) == L"17", "clip overlap did not display the draft value");
+        const auto& controls = MainWindowSettingsTestAccess::controls(window);
+        const auto editAt = std::find(controls.begin(), controls.end(), edit);
+        expect(editAt != controls.end() && editAt != controls.begin(),
+               "clip overlap is not a page control");
+        // Last row of the Capture section: the next control built is the
+        // Multi-monitor heading.
+        expect(editAt + 1 != controls.end() && readText(*(editAt + 1)) == L"Multi-monitor",
+               "clip overlap is not the last Capture setting");
+        const HWND label = *(editAt - 1);
+        expect(readText(label) == L"Clip overlap (seconds)", "clip overlap label changed");
+        const std::wstring help = L"When saving again within the replay window, save only new footage plus this much of the previous clip.";
+        expect(MainWindowSettingsTestAccess::help(window, edit) == help &&
+               MainWindowSettingsTestAccess::help(window, label) == help,
+               "clip overlap label/control footer help changed");
+        MainWindowSettingsTestAccess::rebind(window);
+        expect(MainWindowSettingsTestAccess::overlap(window) == edit, "clip overlap was not rebound");
+        MainWindowSettingsTestAccess::markDirty(window);
+        expect(!MainWindowSettingsTestAccess::dirty(window), "unchanged clip overlap is dirty");
+        for (uint32_t value : {0u, 3600u, 3601u}) {
+            SetWindowTextW(edit, std::to_wstring(value).c_str());
+            auto target = initial;
+            MainWindowSettingsTestAccess::read(window, target);
+            expect(target.replay.overlapSeconds == value, "clip overlap reader changed or clamped the value");
+            expect(sanitizeSettings(target).replay.overlapSeconds == (value > 3600 ? 3600 : value),
+                   "clip overlap did not use shared sanitization");
+            MainWindowSettingsTestAccess::markDirty(window);
+            expect(MainWindowSettingsTestAccess::dirty(window), "edited clip overlap is not dirty");
+        }
+        SetWindowTextW(edit, L"17");
+        MainWindowSettingsTestAccess::markDirty(window);
+        expect(!MainWindowSettingsTestAccess::dirty(window), "restored clip overlap remained dirty");
+        MainWindowSettingsTestAccess::clearBody(window);
+        expect(!IsWindow(edit) && MainWindowSettingsTestAccess::overlap(window) == nullptr,
+               "settings body teardown retained clip overlap");
+        auto target = initial;
+        MainWindowSettingsTestAccess::read(window, target);
+        expect(target.replay.overlapSeconds == 17, "absent clip overlap lost the fallback");
+        MainWindowSettingsTestAccess::buildCaptureSettings(window, host.handle);
+        MainWindowSettingsTestAccess::clearControls(window);
+        expect(MainWindowSettingsTestAccess::overlap(window) == nullptr, "page teardown retained clip overlap");
+        MainWindowSettingsTestAccess::buildCaptureTab(window);
+        expect(!GetDlgItem(host.handle, kReplayOverlapSecondsEditId) &&
+               MainWindowSettingsTestAccess::overlap(window) == nullptr,
+               "clip overlap appeared on the Capture tab");
+        MainWindowSettingsTestAccess::clearControls(window);
+    }
+}
+
 void testAutoRecordUsesAppliedSettings() {
     const auto directory = testRoot() / L"auto_record";
     SettingsStore store(directory / L"settings.ini");
@@ -427,6 +515,7 @@ int main() {
         testMissingCheckboxesPreserveSettings();
         testEnumCombosPreserveFallbacks();
         testFollowMouseGateAndPageReset();
+        testClipOverlapSetting();
         std::filesystem::remove_all(testRoot());
         std::cout << "MainWindowSettingsTests passed\n";
         return 0;

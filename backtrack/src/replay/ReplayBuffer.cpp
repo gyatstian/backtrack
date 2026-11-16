@@ -668,6 +668,7 @@ bool ReplayBuffer::saveTo(
     std::vector<DiskAudioPacket> diskAudio;
     int64_t lastSaveEndPts100ns = 0;
     uint32_t replayWindowSeconds = 0;
+    uint32_t replayOverlapSeconds = 0;
     uint32_t saveGopSeconds = 2;
     std::vector<uint8_t> codecHeaderBytes;
     bool diskMode = false;
@@ -710,6 +711,7 @@ bool ReplayBuffer::saveTo(
         }
         lastSaveEndPts100ns = lastSaveEndPts100ns_;
         replayWindowSeconds = settings_.seconds;
+        replayOverlapSeconds = settings_.overlapSeconds;
         // Cache for videoSpan100ns, which has no VideoSettings of its own.
         lastGopSeconds_ = (std::max<uint32_t>)(1, videoSettings.gopSeconds);
         saveGopSeconds = lastGopSeconds_;
@@ -779,7 +781,6 @@ bool ReplayBuffer::saveTo(
 
     const auto metaOf = [](auto& snapshot) -> auto& { return snapshot.meta; };
     const int64_t bufferedVideoEndPts = latestPresentationEnd(video, metaOf);
-    constexpr int64_t kConsecutiveSaveGrace100ns = 3 * kHundredNanosecondsPerSecond;
     const bool saveSinceLastClip =
         lastSaveEndPts100ns > 0 &&
         lastSaveEndPts100ns <= bufferedVideoEndPts &&
@@ -787,7 +788,8 @@ bool ReplayBuffer::saveTo(
 
     auto firstKeyFrame = video.end();
     if (saveSinceLastClip) {
-        const int64_t desiredStartPts = lastSaveEndPts100ns - kConsecutiveSaveGrace100ns;
+        const int64_t desiredStartPts = lastSaveEndPts100ns -
+            static_cast<int64_t>(replayOverlapSeconds) * kHundredNanosecondsPerSecond;
         for (auto it = video.begin(); it != video.end(); ++it) {
             if (it->meta.keyFrame && it->meta.pts100ns <= desiredStartPts &&
                 (firstKeyFrame == video.end() || it->meta.pts100ns > firstKeyFrame->meta.pts100ns)) {

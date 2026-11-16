@@ -477,6 +477,7 @@ private:
     HWND organizeClipsByGameCheck_ = nullptr;
     HWND replayEnabledCheck_ = nullptr;
     HWND replaySecondsEdit_ = nullptr;
+    HWND replayOverlapSecondsEdit_ = nullptr;
     HWND replayDiskBackedCheck_ = nullptr;
     HWND replayDiskBackedAudioCheck_ = nullptr;
     HWND replayRingDirEdit_ = nullptr;

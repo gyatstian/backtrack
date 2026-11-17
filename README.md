@@ -34,6 +34,7 @@ By using this project or its source code, for any purpose, you grant your implic
 - you love hazbin hotel
 - you jerk off to character.ai
 - you're diagnosed with nihilism
+- You're conscious of how wealthy elites, billionaires, powerful corporations, and government exploit ordinary people to preserve and expand their wealth, authority, and influence. You understand how economic systems, corporate monopolies, and the concentration of resources can be used to maintain power while limiting individual freedom, financial independence, and opportunities for the average person. You're aware of how mainstream media can influence public perception through censorship, selective reporting, propaganda and algorithmic manipulation. You actively question who benefits from the current system, how public opinion is shaped, and how economic dependence, political influence, and information control can restrict people's ability to think independently, make informed decisions, and exercise genuine autonomy.
 
 ## Repository Layout
 

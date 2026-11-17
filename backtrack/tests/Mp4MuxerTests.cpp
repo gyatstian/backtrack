@@ -205,7 +205,10 @@ void testRecoveryNumbersRequireCompleteInRangeTokens() {
         }
     };
     retained(header + "fps\t4294967295\nsamples\t0001\n" + first, 1);
-    retained(header + "sample\t0\t4\t-9223372036854775808\t9223372036854775807\t4294967295\t0\t4294967295\n", 1);
+    // Extreme signed round trip. pts and dts carry the same extreme value on
+    // purpose: RecoveryStore rejects a pair whose |pts - dts| does not fit in
+    // int64, because every downstream sum from it would wrap.
+    retained(header + "sample\t0\t4\t-9223372036854775808\t9223372036854775807\t4294967295\t-9223372036854775808\t4294967295\n", 1);
     for (const std::string value : {"", "-1", "+1", " 1", "1 ", "1x", "4294967296", "18446744073709551616"}) {
         retained(header + "fps\t" + value + "\n" + first, 0);
     }
@@ -1065,6 +1068,78 @@ void testBFrameMuxKeepsDecodeOrder() {
     expect(!error, "could not remove the B-frame fixture");
 }
 
+// A recording stop cuts the compressed stream where the presentation time
+// passed the cutoff, but a compressed stream can only be cut at a decode-order
+// prefix: dropping the first post-cut P picture would leave the B pictures that
+// follow it in decode order referencing a picture that is not in the file. The
+// muxer therefore holds the post-cut packets and finalize keeps the held prefix
+// up to the last one at or below the cut (audit finding 04). Sequence in decode
+// order, cut between B5's and B6's presentation times:
+//   I0(pts 0) P3(pts 3d) B1(pts 1d) B2(pts 2d) I4(pts 4d) P7(pts 7d) B5(pts 5d) B6(pts 6d)
+// P7 completes before B5 and is above the cut; it still has to be written
+// because B5 (kept) references it. B6 is the only dropped packet.
+void testCutKeepsDecodeOrderPrefix() {
+    const auto directory = std::filesystem::temp_directory_path() / L"backtrack_mux_cut_test";
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+    std::filesystem::create_directories(directory, error);
+    expect(!error, "could not create the cut fixture");
+    const auto output = directory / L"clip.mp4";
+
+    backtrack::VideoSettings settings;
+    settings.codec = backtrack::VideoCodec::H264;
+    settings.width = 320;
+    settings.height = 240;
+    settings.fps = 30;
+    settings.bitrateKbps = 1000;
+
+    constexpr int64_t d = 333333;
+    struct Timestamp {
+        int64_t pts100ns;
+        int64_t dts100ns;
+        bool keyFrame;
+    };
+    // One reorder delay for every sample, so decode order is strictly
+    // increasing DTS while presentation order regresses inside each GOP.
+    const std::vector<Timestamp> packets{
+        {0 * d, -2 * d, true},
+        {3 * d, -1 * d, false},
+        {1 * d, 0 * d, false},
+        {2 * d, 1 * d, false},
+        {4 * d, 2 * d, true},
+        {7 * d, 3 * d, false},
+        {5 * d, 4 * d, false},
+        {6 * d, 5 * d, false},
+    };
+    constexpr int64_t kCutPts100ns = 5 * d + d / 2; // between B5 (5d) and B6 (6d)
+
+    backtrack::Mp4Muxer muxer;
+    expect(muxer.startRecording(output, settings), "could not start the cut recording");
+    muxer.setCutPts100ns(kCutPts100ns);
+    for (size_t index = 0; index < packets.size(); ++index) {
+        muxer.writeVideoPacket(makeVideoPacket(static_cast<int>(index), packets[index].pts100ns,
+            packets[index].dts100ns, true, d, packets[index].keyFrame));
+    }
+    expect(muxer.finalize() == output,
+        "the muxer rejected a decode-ordered cut stream: " + narrow(muxer.lastError()));
+
+    MfRuntime runtime;
+    expect(runtime.usable(), "Media Foundation is unavailable for the read-back");
+    const auto probe = probeMp4(output);
+    expect(probe.opened && probe.hasVideo, "the cut MP4 did not open with a video stream");
+
+    Mp4SampleTimeline timeline;
+    expect(readVideoTimeline(output, timeline), "could not read the cut MP4 sample tables");
+    // I0, P3, B1, B2, I4 written directly; then P7 (above the cut, but the
+    // reference B5 needs) and B5 from the held prefix; B6 dropped.
+    expectTimeline(timeline, {0 * d, 3 * d, 1 * d, 2 * d, 4 * d, 7 * d, 5 * d}, "cut recording");
+    expect(timeline.dts100ns.size() == 7,
+        "the cut must keep the decode-order prefix and drop the trailing post-cut picture");
+
+    std::filesystem::remove_all(directory, error);
+    expect(!error, "could not remove the cut fixture");
+}
+
 // Stretch leg: encode real frames with the OS H.264 encoder, mux them through
 // the production path, and decode at least one frame back. Skipped, not failed,
 // on a machine without a usable encoder or decoder MFT.
@@ -1193,6 +1268,7 @@ int main() {
         testWriteFailurePreservesIncrementalRecording();
         testSuccessfulMuxRoundTrip();
         testBFrameMuxKeepsDecodeOrder();
+        testCutKeepsDecodeOrderPrefix();
         testOsH264StreamDecodes();
         testFinalizeFailurePreservesRecordingAudio();
         testClampedWavExtentKeepsTrailingAudio();

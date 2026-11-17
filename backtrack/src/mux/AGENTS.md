@@ -25,6 +25,15 @@ recovery store that keeps a killed recording recoverable.
   verifiable timing, the error points to the streams for manual recovery.
   `abort` explicitly discards only an active recording. a recording with no
   encoded video may be discarded.
+- the recording stop cut is a decode-order prefix, owned here:
+  `setCutPts100ns` writes packets at or below the cutoff and latches a bounded
+  hold at the first packet above it (later pre-cutoff B pictures included, since
+  they follow their reference in decode order), and `finalize` writes the held
+  prefix up to the last held packet at or below the cutoff. Dropping the
+  post-cutoff reference while keeping those B pictures produces a tail no
+  decoder can decode; a hold overflow drops the tail and keeps the written
+  prefix, which is still decodable. Audio is not held: a track slightly longer
+  than the video is valid.
 - Audio that arrives before the first video packet is held in `pendingAudio_`
   (at most 512 packets) and flushed when that packet anchors the timeline, so
   short recordings and pre-keyframe audio are not dropped.
@@ -38,11 +47,18 @@ recovery store that keeps a killed recording recoverable.
 - Audio and video share one 100 ns timeline. `MFSampleExtension_DecodeTimestamp`
   is set only when some sample has a DTS differing from its PTS, and both tracks
   are measured from the same `timeBase` (the first sample's DTS, or its PTS when
-  there is none), so PTS-DTS lands exactly as the ctts composition offset.
-  Audio sample times start at `videoCompositionDelay100ns` - the first video
-  sample's PTS minus its DTS, capped at 2 s as a plausibility guard, 0 without
-  reordering - which is the first video sample's own sample time, so B-frame
-  reordering holds audio back by the same amount it holds back the picture.
+  there is none, `muxTimeBase100ns` in `MuxedInputs.h`), so PTS-DTS lands exactly
+  as the ctts composition offset. Audio sample times start at
+  `videoCompositionDelay100ns` - the first video sample's PTS minus its DTS, 0
+  without reordering - which is the first video sample's own sample time, so
+  B-frame reordering holds audio back by the same amount it holds back the
+  picture. Do not cap that delay independently of the video: a shorter audio
+  offset than the video's decode lead desynchronises the tracks.
+- Every sample time the mux writes is `value - timeBase`, and recovery reads its
+  timestamps from a file on disk. `int64DifferenceFits` bounds that subtraction:
+  `readRecoveryManifest` closes the table before the first sample whose span is
+  unrepresentable, and `writeVideoSamples` refuses one instead of letting the
+  subtraction wrap into a plausible-looking sample time.
 - System and microphone audio are mixed into one PCM track by
   `buildMixedPcmAudio` and encoded as a single AAC stream. If that stream cannot
   be configured the save falls back to video-only rather than failing; if the
@@ -65,6 +81,10 @@ recovery store that keeps a killed recording recoverable.
 - A 7-column manifest carries no DTS-validity flag, so `hasDts` is inferred as
   `dts100ns != pts100ns` (their writers stored the presentation time whenever
   the decode time was invalid). Column 8 carries the explicit flag and wins.
+- `RecoveryStore::discover` treats a declared sample count as a claim, never as
+  capacity: the sample vector grows with the lines actually parsed. A manifest
+  claiming ten million samples must not reserve half a gigabyte before one media
+  byte is validated.
 - Recovery tolerance is asymmetric on purpose. A wrong magic line or a damaged
   metadata value rejects the whole manifest; a torn or non-contiguous sample
   tail keeps the valid prefix, and samples reaching past the end of the
@@ -187,7 +207,9 @@ recovery store that keeps a killed recording recoverable.
   well-formed extent and a real trailing chunk are left alone. It also covers
   the MP4 write itself: a real recording reopened for video subtype, size,
   audio track and duration; the `stts`/`ctts` timeline checked against the
-  written packets including a decode-ordered B-frame stream; decoding of an
+  written packets including a decode-ordered B-frame stream; the recording cut
+  keeping the future reference and the pre-cutoff B pictures while dropping the
+  trailing post-cutoff packets; decoding of an
   OS-encoded H.264 stream when those MFTs exist (a printed skip otherwise);
   and a recording WAV-finalization failure failing the save while keeping
   `system.wav` and the manifest recoverable. Real NVENC/AMF streams, HEVC,

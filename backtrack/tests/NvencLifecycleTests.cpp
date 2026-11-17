@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -64,6 +65,25 @@ struct NvencEncoderTestAccess {
     static void setLookahead(NvencEncoder& encoder, bool enabled, uint32_t depth) {
         encoder.impl_->caps.effective.lookahead = enabled;
         encoder.impl_->caps.effective.lookaheadDepth = depth;
+    }
+
+    // Drives the post-open-session configuration against an injected fake API,
+    // so the suite asserts what nvEncInitializeEncoder is actually handed and
+    // how a failure after the capability query leaves the availability flags.
+    static void prepareSession(NvencEncoder& encoder, void* session,
+                               const NV_ENCODE_API_FUNCTION_LIST& api,
+                               const VideoSettings& settings) {
+        auto& impl = *encoder.impl_;
+        impl.session = session;
+        impl.api = api;
+        impl.settings = settings;
+        impl.caps = {};
+        impl.caps.backendName = L"NVENC";
+        impl.caps.adapterName = L"fake adapter";
+    }
+
+    static bool configureSession(NvencEncoder& encoder) {
+        return encoder.impl_->configureSession(L"fake adapter");
     }
 
     static void queueReadyAndDisarmKeyframe(NvencEncoder& encoder) {
@@ -204,6 +224,18 @@ struct FakeNvenc {
     bool invalidDestroy = false;
     bool releasedWhileMapped = false;
 
+    // Session-configuration query results and the config the fake driver was
+    // handed, so the suite asserts the submitted configuration itself.
+    int capsRateControlModes = NV_ENC_PARAMS_RC_CONSTQP | NV_ENC_PARAMS_RC_VBR | NV_ENC_PARAMS_RC_CBR;
+    int capsBFrames = 0;
+    int capsLookahead = 0;
+    NVENCSTATUS initStatus = NV_ENC_SUCCESS;
+    NVENCSTATUS bufferStatus = NV_ENC_SUCCESS;
+    NV_ENC_TUNING_INFO submittedTuning = NV_ENC_TUNING_INFO_UNDEFINED;
+    NV_ENC_CONFIG submittedConfig{};
+    bool submittedConfigValid = false;
+    std::deque<std::array<unsigned char, 4>> createdBuffers;
+
     static FakeNvenc& from(void* session) { return *static_cast<FakeNvenc*>(session); }
 
     static NVENCSTATUS NVENCAPI registerResource(void* session, NV_ENC_REGISTER_RESOURCE* resource) {
@@ -308,8 +340,50 @@ struct FakeNvenc {
         return fake.invalidDestroy ? NV_ENC_ERR_GENERIC : NV_ENC_SUCCESS;
     }
 
+    static NVENCSTATUS NVENCAPI getEncodeCaps(void* session, GUID, NV_ENC_CAPS_PARAM* param, int* value) {
+        auto& fake = from(session);
+        switch (param->capsToQuery) {
+        case NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES: *value = fake.capsRateControlModes; break;
+        case NV_ENC_CAPS_NUM_MAX_BFRAMES: *value = fake.capsBFrames; break;
+        case NV_ENC_CAPS_SUPPORT_LOOKAHEAD: *value = fake.capsLookahead; break;
+        case NV_ENC_CAPS_SUPPORT_MULTIPLE_REF_FRAMES: *value = 1; break;
+        case NV_ENC_CAPS_WIDTH_MAX:
+        case NV_ENC_CAPS_HEIGHT_MAX: *value = 4096; break;
+        default: *value = 0; break;
+        }
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI getPresetConfig(void* session, GUID, GUID,
+                                                NV_ENC_TUNING_INFO tuning, NV_ENC_PRESET_CONFIG* preset) {
+        auto& fake = from(session);
+        fake.submittedTuning = tuning;
+        preset->presetCfg = NV_ENC_CONFIG{};
+        preset->presetCfg.version = NV_ENC_CONFIG_VER;
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI initializeEncoder(void* session, NV_ENC_INITIALIZE_PARAMS* params) {
+        auto& fake = from(session);
+        if (fake.initStatus != NV_ENC_SUCCESS) return fake.initStatus;
+        fake.submittedTuning = params->tuningInfo;
+        if (params->encodeConfig) {
+            fake.submittedConfig = *params->encodeConfig;
+            fake.submittedConfigValid = true;
+        }
+        return NV_ENC_SUCCESS;
+    }
+    static NVENCSTATUS NVENCAPI createBitstreamBuffer(void* session, NV_ENC_CREATE_BITSTREAM_BUFFER* buffer) {
+        auto& fake = from(session);
+        if (fake.bufferStatus != NV_ENC_SUCCESS) return fake.bufferStatus;
+        buffer->bitstreamBuffer = fake.createdBuffers.emplace_back().data();
+        return NV_ENC_SUCCESS;
+    }
+
     NV_ENCODE_API_FUNCTION_LIST api() {
         NV_ENCODE_API_FUNCTION_LIST result{};
+        result.nvEncGetEncodeCaps = getEncodeCaps;
+        result.nvEncGetEncodePresetConfigEx = getPresetConfig;
+        result.nvEncInitializeEncoder = initializeEncoder;
+        result.nvEncCreateBitstreamBuffer = createBitstreamBuffer;
         result.nvEncRegisterResource = registerResource;
         result.nvEncMapInputResource = map;
         result.nvEncEncodePicture = submit;
@@ -627,6 +701,8 @@ void testDroppedInputsRearmAndReturnReadyTail() {
             "a dropped input stranded or changed the ready output tail");
         expect(encoder.stats().droppedFrames == 1 && NvencEncoderTestAccess::keyframeArmed(encoder),
             "a dropped input did not count exactly once and re-arm the next keyframe");
+        expect(encoder.droppedInputs() == 1,
+            "a dropped input was not mirrored on the lock-free abandoned-input counter");
         const int submitted = test == DropCase::Repeated ? 1 : 0;
         expect(fake.accepted == submitted && fake.mapAttempts == submitted && !fake.submittedWithoutFreshMap,
             "a dropped input was mapped or submitted again");
@@ -667,6 +743,8 @@ void testRejectedSubmission() {
     frame = {};
     expect(fake.accepted == 0 && !fake.mapped && !fake.releasedWhileMapped && pool.available(),
            "rejected input was returned to its producer before unmap");
+    expect(encoder.droppedInputs() == 1,
+           "a rejected submission was not counted as an abandoned input");
 }
 
 void testResetAndCaptureHandoff() {
@@ -836,6 +914,139 @@ void testStuckLockStillEscalates() {
     encoder.shutdown();
 }
 
+VideoSettings configuredSettings() {
+    VideoSettings settings;
+    settings.width = 2;
+    settings.height = 2;
+    settings.fps = 60;
+    settings.encoderProfile = EncoderProfile::Custom;
+    return settings;
+}
+
+// Lossless needs the High 4:4:4 Predictive profile plus the transform bypass
+// (nvEncodeAPI.h h264Config.qpPrimeYZeroTransformBypassFlag) and YUV444 input,
+// which this 4:2:0 capture path cannot feed, so the session runs as high
+// quality and must say so instead of echoing the request.
+void testLosslessRequestReportsTheProgrammedConfiguration() {
+    FakeNvenc fake;
+    NvencEncoder encoder;
+    auto settings = configuredSettings();
+    settings.encoderMode = EncoderMode::Lossless;
+    NvencEncoderTestAccess::prepareSession(encoder, &fake, fake.api(), settings);
+    expect(NvencEncoderTestAccess::configureSession(encoder), "the lossless session did not initialize");
+
+    const auto caps = encoder.capabilities();
+    expect(caps.effective.mode == EncoderMode::HighQuality,
+        "a lossless request was reported as configured");
+    expect(fake.submittedConfigValid && fake.submittedTuning == NV_ENC_TUNING_INFO_HIGH_QUALITY,
+        "the submitted tuning disagreed with the reported mode");
+    const auto& rateControl = fake.submittedConfig.rcParams;
+    expect(rateControl.rateControlMode == NV_ENC_PARAMS_RC_CBR &&
+           rateControl.averageBitRate == settings.bitrateKbps * 1000u &&
+           rateControl.maxBitRate == rateControl.averageBitRate &&
+           rateControl.vbvBufferSize == rateControl.averageBitRate,
+        "the submitted rate control disagreed with the reported high quality mode");
+    expect(fake.submittedConfig.encodeCodecConfig.h264Config.qpPrimeYZeroTransformBypassFlag == 0 &&
+           rateControl.constQP.qpIntra == 0 && rateControl.constQP.qpInterP == 0 &&
+           rateControl.constQP.qpInterB == 0,
+        "a lossless vendor configuration was submitted while reporting high quality");
+    expect(caps.detail.find(L"lossless") != std::wstring::npos,
+        "the lossless fallback was not stated in the detail");
+}
+
+// The 13.0 tier does have ultra high quality tuning, so that request must
+// survive unchanged and reach the driver.
+void testUltraHighQualitySurvivesOnTheApi13Tier() {
+    FakeNvenc fake;
+    NvencEncoder encoder;
+    auto settings = configuredSettings();
+    settings.encoderMode = EncoderMode::UltraHighQuality;
+    NvencEncoderTestAccess::prepareSession(encoder, &fake, fake.api(), settings);
+    expect(NvencEncoderTestAccess::configureSession(encoder), "the ultra high quality session did not initialize");
+
+    const auto caps = encoder.capabilities();
+    expect(caps.effective.mode == EncoderMode::UltraHighQuality &&
+           fake.submittedTuning == NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY,
+        "the 13.0 tier downgraded a supported ultra high quality request");
+    expect(caps.detail.find(L"ultra high quality") == std::wstring::npos,
+        "a supported tuning was reported as a fallback");
+}
+
+// A failure after the capability query used to leave the destroyed session
+// reporting available, which makes RecorderController keep capturing without an
+// encoder. Availability is published only once every step succeeded.
+void testInitializationFailureNeverReportsAvailable() {
+    for (const bool afterInit : {false, true}) {
+        FakeNvenc fake;
+        NvencEncoder encoder;
+        if (afterInit) {
+            fake.bufferStatus = NV_ENC_ERR_OUT_OF_MEMORY;
+        } else {
+            fake.initStatus = NV_ENC_ERR_OUT_OF_MEMORY;
+        }
+        NvencEncoderTestAccess::prepareSession(encoder, &fake, fake.api(), configuredSettings());
+        expect(!NvencEncoderTestAccess::configureSession(encoder), "a failing session reported success");
+        const auto caps = encoder.capabilities();
+        expect(!encoder.encoderAvailable() && !caps.available,
+            "a session that failed after the capability query still reported available");
+        expect(!caps.detail.empty() && caps.detail.find(L"OUT_OF_MEMORY") != std::wstring::npos,
+            "the failed session lost its reason");
+        expect(!encoder.stats().encoderAvailable, "the stats snapshot disagreed with the fault");
+    }
+
+    FakeNvenc fake;
+    NvencEncoder encoder;
+    NvencEncoderTestAccess::prepareSession(encoder, &fake, fake.api(), configuredSettings());
+    expect(NvencEncoderTestAccess::configureSession(encoder), "the healthy session did not initialize");
+    const auto caps = encoder.capabilities();
+    expect(encoder.encoderAvailable() && caps.available && !caps.detail.empty(),
+        "a successful initialization did not publish availability");
+    expect(encoder.stats().encoderAvailable, "the stats snapshot was not published with the session");
+}
+
+// Lookahead buffers submissions; it does not reorder pictures, so it must not
+// shift decode timestamps away from presentation timestamps.
+void testLookaheadDoesNotShiftDecodeTimestamps() {
+    FakeNvenc fake;
+    InstrumentedPool pool(fake, 4);
+    NvencEncoder encoder;
+    auto settings = configuredSettings();
+    settings.encoderLookahead = true;
+    settings.encoderLookaheadDepth = 31;
+    settings.encoderBFrames = false;
+    fake.capsLookahead = 1;
+    NvencEncoderTestAccess::prepareSession(encoder, &fake, fake.api(), settings);
+    expect(NvencEncoderTestAccess::configureSession(encoder), "the lookahead session did not initialize");
+    expect(encoder.capabilities().effective.lookahead &&
+           encoder.capabilities().effective.lookaheadDepth == 31,
+        "the requested lookahead depth was not configured");
+
+    std::vector<GpuFrame> frames{pool.write(), pool.write()};
+    frames[0].pts100ns = 1000;
+    frames[1].pts100ns = 2000;
+    std::vector<EncodedPacket> packets;
+    for (auto& frame : frames) {
+        encoder.encodeFrame(frame, packets);
+    }
+    frames.clear();
+    expect(fake.accepted == 2, "the lookahead session did not accept both frames");
+
+    fake.completionCredits = 2;
+    expect(NvencEncoderTestAccess::harvest(encoder), "the buffered outputs were not harvested");
+    EncodedPacket packet;
+    int64_t expectedPts = 1000;
+    int published = 0;
+    while (NvencEncoderTestAccess::popReady(encoder, packet)) {
+        expect(packet.hasDts, "a lookahead packet lost its DTS flag");
+        expect(packet.pts100ns == expectedPts && packet.dts100ns == packet.pts100ns,
+            "lookahead shifted the decode timestamp away from presentation order");
+        expectedPts += 1000;
+        ++published;
+    }
+    expect(published == 2, "a lookahead output was lost");
+    expect(!fake.mapped && !fake.releasedWhileMapped, "a lookahead input was released while mapped");
+}
+
 } // namespace
 
 void testApiTierSelection() {
@@ -869,6 +1080,10 @@ int main() {
         testFailedUnmapRetainsInput();
         testIncompleteLockStatusIsNotAFault();
         testStuckLockStillEscalates();
+        testLosslessRequestReportsTheProgrammedConfiguration();
+        testUltraHighQualitySurvivesOnTheApi13Tier();
+        testInitializationFailureNeverReportsAvailable();
+        testLookaheadDoesNotShiftDecodeTimestamps();
     } catch (const std::exception& error) {
         std::cerr << "NvencLifecycleTests: " << error.what() << '\n';
         return 1;

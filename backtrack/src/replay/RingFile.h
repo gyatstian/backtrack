@@ -254,6 +254,22 @@ private:
         void cancel(HANDLE file, OVERLAPPED* overlapped) const {
             CancelIoEx(file, overlapped);
         }
+        // Owner box that keeps a cancelled operation, its private buffer, its
+        // duplicated handle and its OVERLAPPED alive until the kernel is done
+        // with them (CancelIoEx does not wait). Part of the Io policy so the
+        // allocation can fail before the transfer is in flight and be injected
+        // from a test policy instead of a process-wide hook.
+        template <typename Operation>
+        std::unique_ptr<std::shared_ptr<Operation>> retain(const std::shared_ptr<Operation>& operation) const {
+            try {
+                return std::make_unique<std::shared_ptr<Operation>>(operation);
+            } catch (const std::bad_alloc&) {
+                return nullptr;
+            }
+        }
+        PTP_WAIT createWait(PTP_WAIT_CALLBACK callback, void* context) const {
+            return CreateThreadpoolWait(callback, context, nullptr);
+        }
     };
 
     template <typename Io>
@@ -375,6 +391,17 @@ private:
         if (write) std::memcpy(operation->buffer.get(), data, size);
 
         const ULONGLONG deadline = GetTickCount64() + timeout;
+        // The retained owner is allocated before the transfer can be in flight.
+        // Once submitted, a failure to retain would free the private buffer,
+        // the duplicated handle and the OVERLAPPED while the kernel may still
+        // be using them, so the allocation happens first and fails before
+        // submit instead.
+        std::unique_ptr<std::shared_ptr<Operation<Io>>> retained = io.retain(operation);
+        if (!retained) {
+            error = ERROR_NOT_ENOUGH_MEMORY;
+            returnToPool();
+            return false;
+        }
         const BOOL started = io.submit(operation->file, write, operation->buffer.get(), size,
                                        &moved, &operation->overlapped);
         if (!started) {
@@ -401,18 +428,21 @@ private:
                 // are created only on this rare path - the happy path reaps
                 // synchronously and needs neither.
                 io.cancel(operation->file, &operation->overlapped);
-                auto owner = std::unique_ptr<std::shared_ptr<Operation<Io>>>(
-                    new (std::nothrow) std::shared_ptr<Operation<Io>>(operation));
-                if (!owner) {
-                    error = ERROR_NOT_ENOUGH_MEMORY;
-                    return false;
-                }
-                PTP_WAIT completion = CreateThreadpoolWait(drain<Io>, owner.get(), nullptr);
+                PTP_WAIT completion = io.createWait(drain<Io>, retained.get());
                 if (!completion) {
-                    error = GetLastError();
+                    // Reachable only when the threadpool itself cannot allocate,
+                    // and by now the transfer is in flight: dropping the
+                    // operation would free the buffer, the handle and the
+                    // OVERLAPPED under the kernel. Blocking is the safe answer
+                    // here - the cancel above already bounds this wait to the
+                    // one request - and the operation then returns to the pool.
+                    WaitForSingleObject(operation->overlapped.hEvent, INFINITE);
+                    io.result(operation->file, &operation->overlapped, &moved);
+                    error = fault;
+                    returnToPool();
                     return false;
                 }
-                owner.release();
+                retained.release();
                 SetThreadpoolWait(completion, operation->overlapped.hEvent, nullptr);
                 error = fault;
                 return false;

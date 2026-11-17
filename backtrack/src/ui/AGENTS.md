@@ -86,7 +86,11 @@ icon.
   pending callbacks retain their request buffers and parent handles.
 - notification playback keeps asynchronous sound buffers alive until replaced.
   custom WAV loading and its volume scaling happen outside the playback mutex;
-  contended optional feedback is skipped rather than blocking the caller.
+  contended optional feedback is skipped rather than blocking the caller. The
+  scaler operates on the exact `data` chunk extent only (trailing chunks stay
+  byte-identical) and supports PCM8 and PCM16; a format it cannot scale is
+  dropped so the built-in indicator plays at the configured volume instead of
+  an unattenuated custom file.
 - Controller actions are serialized through one worker thread and a busy timer
   (`queueControllerAction`, `kControllerBusySoftTimeoutMs`). The timer only
   rewrites the status line; it never clears the pending flag, so a second
@@ -241,6 +245,14 @@ icon.
   success: a launcher or debugger handle keeps an exited process openable. A
   failed `OpenProcess` (an unqueryable process) counts as gone, so the poll ends
   the stale auto-record rather than recording a window it cannot prove is live.
+- Auto-record ownership follows the action, not the poll: `ControllerAction`
+  and its result carry `automatic`, and `handleControllerActionComplete`
+  reconciles through the pure `reconcileAutoRecordOwnership` /
+  `reconcileAutoRecordAfterSettings` helpers before the next poll reads the
+  state. A manual start/stop between two polls must not keep automatic
+  ownership (a later target exit would end the user's recording), and a
+  settings restart that stopped the recording must drop ownership without
+  suppressing, or automatic recording silently never resumes.
 - `applyVisibleSettings` checks the controller busy flag before persisting
   anything, so a save that loses the race cannot leave disk saved without the
   recorder ever receiving `ApplySettings`.
@@ -278,10 +290,12 @@ icon.
 applied auto record, absent-checkbox fallbacks, the monitor-follow gate,
 clip overlap placement/help/read/dirty tracking and page-control reset, an
 unplugged pinned audio device surviving an unrelated save while Default still
-clears it, and the liveness probe ignoring a retained handle to an exited
-process.
+clears it, the liveness probe ignoring a retained handle to an exited
+process, and the auto-record ownership reconciliation (settings-induced stop
+restarts, manual stop/start between polls keeps manual ownership).
 `MainWindowNotificationTests.cpp` covers busy feedback while loading or
-playback is blocked. `MainWindowUpdateCheckTests.cpp` covers
+playback is blocked, and the notification volume scaler: the exact data extent,
+PCM8 and PCM16, and the built-in fallback for a format it cannot attenuate. `MainWindowUpdateCheckTests.cpp` covers
 loopback success, slow progress, stop and destruction.
 `MainWindowAccessibilityTests.cpp` exercises dialog-key traversal, settings-body
 lifetime, shared row help, tab chrome, placed-layout memoization and page-cache

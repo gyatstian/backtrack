@@ -49,6 +49,13 @@ public:
     // Best effort and noexcept; skips when another thread holds the registry.
     static void emergencyRestoreSessionMutes() noexcept;
 
+    // Ownership of the mute journal and of the live mutes this process applied.
+    // Only the process that won the single-instance mutex may restore mutes or
+    // rewrite the journal: a rejected second launch still constructs and
+    // destroys a controller, and its restore would unmute the live instance's
+    // exclusions. Default false, so a losing launch restores nothing.
+    static void setSessionMuteOwnership(bool owned) noexcept;
+
     bool start(AudioTrack track, const std::wstring& deviceId, AudioPacketCallback callback);
     void stop();
     bool running() const { return running_.load(); }
@@ -61,6 +68,10 @@ private:
         std::wstring deviceId;
         std::function<HRESULT(IMMDeviceEnumerator**)> createEnumerator;
     };
+
+    // Test-only seam: the IMMDeviceEnumerator the session-mute enumeration
+    // creates. Empty in production, which then creates the real one.
+    static std::function<HRESULT(IMMDeviceEnumerator**)>& sessionMuteEnumeratorFactory();
 
     bool start(CaptureOptions options, AudioPacketCallback callback);
     void captureThread(CaptureOptions options, AudioPacketCallback callback, std::promise<bool> startedPromise);

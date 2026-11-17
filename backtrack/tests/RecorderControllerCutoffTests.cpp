@@ -1,10 +1,14 @@
-// Regressions for audit findings 06, 08 and 12 in RecorderController:
+// Regressions for audit findings 04, 06, 08 and 12 in RecorderController:
 //  - 06: a missing encoder after a failed capture init is a pipeline fault
 //    (the old `encoder_ && !encoder_->encoderAvailable()` treated null as
 //    healthy, so the health check never recreated the pipeline);
 //  - 08: a recording stop drains by encode-thread acknowledgement, not by PTS
 //    (B-frame reordering lets a post-stop P frame complete before a pre-stop
 //    B frame, so a highest-PTS comparison cut the recording early);
+//  - 04: the acknowledgement is real completion accounting (submissions at or
+//    below the cutoff, minus publications and encoder drops, plus the
+//    boundary latch). A publication quiesce acked while accepted pre-cutoff
+//    inputs were still retained by a deep-lookahead encoder;
 //  - 08 (race): the 5 s encoder health probe reads encoder_ while a live GPU
 //    recreate replaces it, so it must hold pipelineGpuMutex_.
 //  - 12: a volume/cursor-only change with non-default replay settings is still
@@ -40,88 +44,113 @@ void expect(bool condition, const std::string& message) {
     }
 }
 
-// ---------------------------------------------------------------- finding 08
+// ---------------------------------------------------------------- finding 04
 
-void testPtsGate() {
+// The stop drains on real completion accounting: every submitted frame at or
+// below the cutoff is pending until its packet is published, a drop or an
+// abandoned drain removes one, and the ack needs the post-stop boundary plus a
+// zero pending count. A publication quiesce would ack while accepted pre-cutoff
+// inputs still sat inside a deep-lookahead encoder (at 5 fps the next
+// submission is a whole frame period away).
+
+void testNoAckBeforeTheBoundary() {
     RecordingCutoffTracker tracker;
-    expect(tracker.shouldPublishToMuxer(1000), "no pending stop must pass every PTS");
-
-    tracker.beginStop(500, 0);
-    expect(tracker.shouldPublishToMuxer(500), "the cutoff packet itself must pass");
-    expect(tracker.shouldPublishToMuxer(499), "an older packet must pass");
-    expect(!tracker.shouldPublishToMuxer(501), "a post-cutoff packet must be blocked");
-
-    tracker.endStop();
-    expect(tracker.shouldPublishToMuxer(9999), "the gate must reopen after endStop");
-}
-
-void testNoAckWithoutPostStopBoundary() {
-    RecordingCutoffTracker tracker;
-    const uint64_t gen = tracker.beginStop(500, 0);
-    tracker.notePacketPublished(480, 0);
-    // No post-stop frame has been submitted, so pre-stop frames may still sit
-    // in the queue. The tracker refuses to acknowledge no matter how long the
-    // wait; the caller bounds it (finding 08: a PTS comparison could not tell
-    // this stalled case from a completed flush).
-    expect(!tracker.acknowledgeIfDrained(10 * 100 * 10000),
-           "must not ack before the post-stop boundary");
+    const uint64_t gen = tracker.beginStop(500);
+    tracker.noteFrameSubmitted(400);
+    tracker.notePacketPublished(400);
+    // No post-stop frame was submitted, so further pre-stop frames may still sit
+    // in the queue; the boundary is what proves they all reached the encoder.
+    expect(!tracker.acknowledgeIfDrained(), "must not ack before the post-stop boundary");
     expect(!tracker.acknowledged(gen), "not acknowledged without the boundary");
 }
 
-void testQuiesceGatesTheAck() {
+void testEmptyDrainAcksOnTheBoundary() {
     RecordingCutoffTracker tracker;
-    const uint64_t gen = tracker.beginStop(500, 0);
-    tracker.noteFrameSubmitted(600); // boundary reached: capture kept producing
-    tracker.notePacketPublished(500, 0);
-    expect(!tracker.acknowledgeIfDrained(99 * 10000),
-           "must not ack inside the quiesce window");
-    expect(tracker.acknowledgeIfDrained(100 * 10000),
-           "ack once the quiesce window has passed");
+    const uint64_t gen = tracker.beginStop(500);
+    // A packet from a submission made before beginStop: it decrements nothing
+    // (saturating), so nothing is pending.
+    tracker.notePacketPublished(400);
+    expect(!tracker.acknowledgeIfDrained(), "nothing acks before the boundary");
+    tracker.noteFrameSubmitted(600); // boundary reached, nothing in flight
+    expect(tracker.acknowledgeIfDrained(), "the boundary alone completes an empty drain");
     expect(tracker.acknowledged(gen), "the generation must be acknowledged");
-    expect(!tracker.acknowledgeIfDrained(200 * 10000), "the ack fires once");
+    expect(!tracker.acknowledgeIfDrained(), "the ack fires once");
 }
 
-void testDelayedPreCutoffTailIsKept() {
+void testDelayedPreCutoffPublicationKeepsTheDrainOpen() {
     RecordingCutoffTracker tracker;
-    const uint64_t gen = tracker.beginStop(500, 0);
-    // Capture keeps producing after the stop, so the boundary latches.
-    tracker.noteFrameSubmitted(520);
+    const uint64_t gen = tracker.beginStop(500);
+    tracker.noteFrameSubmitted(480);
+    tracker.noteFrameSubmitted(500);
+    tracker.noteFrameSubmitted(520); // boundary: capture keeps producing
     // A post-stop P frame completes first (B-frame reordering). It must not
-    // reach the recording, and publishing it alone must not acknowledge.
-    expect(!tracker.shouldPublishToMuxer(520), "post-stop output must not reach the recording");
-    tracker.notePacketPublished(520, 10);
-    expect(!tracker.acknowledgeIfDrained(10 + 99 * 10000),
-           "must not ack while the pre-stop tail is still retained");
-    // The retained pre-stop frames arrive late, in decode order, and must all
-    // reach the recording (the regression: they used to go to replay only).
-    expect(tracker.shouldPublishToMuxer(490), "delayed pre-stop frame must pass the gate");
-    expect(tracker.shouldPublishToMuxer(500), "delayed pre-stop frame must pass the gate");
-    tracker.notePacketPublished(490, 20);
-    tracker.notePacketPublished(500, 30);
-    expect(!tracker.acknowledgeIfDrained(30 + 99 * 10000),
-           "must not ack before the newest pre-stop packet is out");
-    expect(tracker.acknowledgeIfDrained(30 + 100 * 10000),
-           "ack once the newest pre-stop packet is out and quiesced");
+    // acknowledge: two pre-cutoff inputs are still inside the encoder.
+    tracker.notePacketPublished(520);
+    expect(!tracker.acknowledgeIfDrained(),
+           "a post-cutoff publication must not ack pending pre-cutoff inputs");
+    expect(!tracker.acknowledged(gen), "the stop must stay open");
+    // The retained pre-cutoff frames arrive late, in decode order.
+    tracker.notePacketPublished(480);
+    expect(!tracker.acknowledgeIfDrained(), "one pre-cutoff input is still pending");
+    // The publication itself carries the ack, so it is the return value to check.
+    expect(tracker.notePacketPublished(500), "the drain completes with the last pre-cutoff packet");
     expect(tracker.acknowledged(gen), "the stop generation must be acknowledged");
 }
 
-void testDroppedPreCutoffFrameDoesNotStall() {
+void testPendingReachesZeroWithoutAnyQuiesce() {
     RecordingCutoffTracker tracker;
-    const uint64_t gen = tracker.beginStop(500, 0);
+    tracker.beginStop(500);
+    tracker.noteFrameSubmitted(500);
     tracker.noteFrameSubmitted(600);
-    // The encoder dropped the remaining pre-stop frames (queue pressure or a
-    // session error); the 100 ms publication quiesce must let the stop finish
-    // instead of stalling forever.
-    tracker.notePacketPublished(480, 0);
-    expect(!tracker.acknowledgeIfDrained(99 * 10000), "not yet inside the quiesce");
-    expect(tracker.acknowledgeIfDrained(100 * 10000),
-           "a dropped frame must not stall the stop");
+    // No clock argument exists: the ack depends on the counter, not on elapsed
+    // time. A quiesce-based tracker would refuse this immediately after the
+    // publication.
+    expect(tracker.notePacketPublished(500), "pending reaching zero must ack at once");
+}
+
+void testDroppedInputReleasesTheDrain() {
+    RecordingCutoffTracker tracker;
+    const uint64_t gen = tracker.beginStop(500);
+    tracker.noteFrameSubmitted(480);
+    tracker.noteFrameSubmitted(500);
+    tracker.noteFrameSubmitted(520);
+    tracker.notePacketPublished(480);
+    expect(!tracker.acknowledgeIfDrained(), "one pre-cutoff input is still pending");
+    // The encoder rejected 500; no packet will ever arrive for it.
+    tracker.noteInputDropped();
+    expect(tracker.acknowledgeIfDrained(), "a dropped input must not stall the stop");
     expect(tracker.acknowledged(gen), "the stop must be acknowledged");
+}
+
+void testDecrementsSaturateAtZero() {
+    RecordingCutoffTracker tracker;
+    tracker.beginStop(500);
+    // More decrements than increments: publications from before beginStop plus
+    // a drop. The counter must stay at zero instead of wrapping.
+    tracker.notePacketPublished(480);
+    tracker.notePacketPublished(490);
+    tracker.noteInputDropped();
+    tracker.noteFrameSubmitted(600);
+    expect(tracker.acknowledgeIfDrained(), "a saturated counter reads as an empty drain");
+}
+
+void testAbandonedDrainAcksWithoutTheBoundary() {
+    RecordingCutoffTracker tracker;
+    const uint64_t gen = tracker.beginStop(500);
+    tracker.noteFrameSubmitted(480);
+    expect(!tracker.acknowledgeIfDrained(), "no ack while a pre-cutoff input is pending");
+    // The encoder faulted mid-drain: nothing can be published and no further
+    // submission can arrive either.
+    expect(tracker.abandonPending(), "abandoning the pending inputs acks the stop");
+    expect(tracker.acknowledged(gen), "the faulted-encoder escape must unblock the stop");
+    expect(!tracker.abandonPending(), "the ack fires once per stop");
+    tracker.endStop();
+    expect(!tracker.abandonPending(), "no abandonment without a pending stop");
 }
 
 void testSynchronousDrainAcksWithoutBoundary() {
     RecordingCutoffTracker tracker;
-    const uint64_t gen = tracker.beginStop(500, 0);
+    const uint64_t gen = tracker.beginStop(500);
     // stopPipeline drains the queue and the encoder on the same thread. No
     // post-stop frame was ever captured, so the boundary never latched, but
     // the completed synchronous drain IS the acknowledgement.
@@ -133,22 +162,31 @@ void testSynchronousDrainAcksWithoutBoundary() {
 void testStopAndResetCycle() {
     RecordingCutoffTracker tracker;
     tracker.reset();
-    const uint64_t gen1 = tracker.beginStop(100, 0);
+    const uint64_t gen1 = tracker.beginStop(100);
     tracker.noteFrameSubmitted(200);
-    tracker.notePacketPublished(100, 0);
+    tracker.notePacketPublished(100);
     tracker.forceAcknowledge();
     expect(tracker.acknowledged(gen1), "the first stop must be acknowledged");
     tracker.endStop();
+    tracker.noteFrameSubmitted(50);
+    expect(!tracker.stopping(), "endStop must clear the pending stop state");
 
-    const uint64_t gen2 = tracker.beginStop(200, 0);
+    const uint64_t gen2 = tracker.beginStop(200);
     expect(!tracker.acknowledged(gen2), "a fresh stop must not start acknowledged");
-    tracker.forceAcknowledge();
-    expect(tracker.acknowledged(gen2), "the second stop must be acknowledged");
+    // A publication of a submission made before this beginStop has no matching
+    // increment in the new generation.
+    tracker.notePacketPublished(100);
+    tracker.noteFrameSubmitted(150);
+    expect(!tracker.acknowledgeIfDrained(), "the new stop has its own pending count");
+    tracker.noteFrameSubmitted(250);
+    expect(!tracker.acknowledgeIfDrained(), "the pre-cutoff submission is still pending");
+    expect(tracker.notePacketPublished(150), "the boundary plus the last pre-cutoff packet ack the stop");
     tracker.endStop();
 
     tracker.reset();
-    const uint64_t gen3 = tracker.beginStop(300, 0);
+    const uint64_t gen3 = tracker.beginStop(300);
     expect(!tracker.acknowledged(gen3), "a reset must not leak an acknowledged stop");
+    expect(tracker.stopping(), "a started stop stays pending until endStop");
     tracker.endStop();
 }
 
@@ -459,11 +497,13 @@ void testSettingsApplyDispatch() {
 
 int main() {
     try {
-        testPtsGate();
-        testNoAckWithoutPostStopBoundary();
-        testQuiesceGatesTheAck();
-        testDelayedPreCutoffTailIsKept();
-        testDroppedPreCutoffFrameDoesNotStall();
+        testNoAckBeforeTheBoundary();
+        testEmptyDrainAcksOnTheBoundary();
+        testDelayedPreCutoffPublicationKeepsTheDrainOpen();
+        testPendingReachesZeroWithoutAnyQuiesce();
+        testDroppedInputReleasesTheDrain();
+        testDecrementsSaturateAtZero();
+        testAbandonedDrainAcksWithoutTheBoundary();
         testSynchronousDrainAcksWithoutBoundary();
         testStopAndResetCycle();
         testMissingEncoderIsAFault();

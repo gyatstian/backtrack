@@ -62,6 +62,24 @@ inline uint32_t wgcMaxZeroCopyLeases(uint32_t framePoolSize) {
     return framePoolSize > 1 ? framePoolSize - 1 : 1;
 }
 
+// How many inputs the source side can pin when a frame is not copied: the WGC
+// zero-copy leases plus the queue-derived capture pool. This matters because a
+// same-size, same-format WGC frame skips the scaler and aliases the source
+// texture, so it pins a source-side slot instead of a scaler output slot and
+// never reaches the (enlarged) encoder-feeding pool.
+inline uint32_t wgcAliasInputCapacity(uint32_t frameQueueLimit) {
+    return wgcMaxZeroCopyLeases(wgcFramePoolSizeForQueueLimit(frameQueueLimit)) +
+        texturePoolSizeForQueueLimit(frameQueueLimit);
+}
+
+// The alias path bypasses the encoder-feeding pool, so a deep-lookahead
+// encoder that retains more inputs than the source side can pin would starve
+// the one pool the alias does use. False means the caller must take the owned
+// (scaler output) path for that pipeline run.
+inline bool encoderAliasFitsRetention(uint32_t aliasCapacity, uint32_t encoderRetention) {
+    return encoderRetention <= aliasCapacity;
+}
+
 // Shared 1st + every-300th drop logging for every pool exhaustion counter,
 // including the WGC zero-copy lease cap, which is not a texture pool.
 inline bool gpuDropShouldLog(uint64_t& count) {

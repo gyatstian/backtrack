@@ -1155,7 +1155,7 @@ void MainWindow::buildSettingsAudioPage() {
     soundSeparationEnabledCheck_ = addCheckbox(
         L"Enable sound separation", kControlX, y, kComboWidth, 24,
         kSoundSeparationEnabledCheckId, settings_.soundSeparationEnabled);
-    addRowHelp(separationModeLabel, soundSeparationEnabledCheck_, L"Turns app audio exclusion on or off. When off, Backtrack records normal system audio.");
+    addRowHelp(separationModeLabel, soundSeparationEnabledCheck_, L"Mutes the selected apps while you record. Best effort: an app that starts or unmutes its audio between checks can still be heard for a moment.");
     y += kRowHeight;
 
     HWND activeAppLabel = addRowLabel(L"Active app", kX, y + 4, kLabelWidth);

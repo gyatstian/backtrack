@@ -6,7 +6,8 @@ Application lifetime and the recording pipeline. `Application` is the startup
 sequence, `RecorderController` owns the four worker threads it starts and the
 objects they share, `VideoTimelineScheduler.h` owns frame cadence,
 `CaptureFrameHandoff.h` orders release of capture frames, `AudioDrain.h`
-provides the audio-writer drain loop, and `RecordingCutoffTracker.h` tracks the
+provides the audio-writer drain loop, `VideoDrain.h` the encode-loop exit
+predicate, and `RecordingCutoffTracker.h` tracks the
 recording-stop drain handshake.
 
 ## Ownership
@@ -22,19 +23,26 @@ recording-stop drain handshake.
   control handler. Each one calls
   `WasapiCapture::emergencyRestoreSessionMutes()` before returning or aborting,
   because session mutes are global state that outlives a crash. Any new fatal
-  exit path needs the same call.
+  exit path needs the same call. Restoration is gated on this process owning
+  the mute journal (`WasapiCapture::setSessionMuteOwnership`), so a rejected
+  duplicate launch cannot restore or rewrite the live instance's journal.
 - Startup order in `Application::run` is a contract, not a preference:
   1. single-instance mutex (`Local\Backtrack.SingleInstance`), activate an
      existing window and exit if one is running, then load settings. normalize
      only a complete read; missing or failed reads are not saved back. skip
      startup-registration updates after a failed read. the mutex keeps a losing
-     launch from racing the live instance's settings I/O.
+     launch from racing the live instance's settings I/O. Taking the mute
+     ownership (`setSessionMuteOwnership(true)`) belongs here, before any
+     setting is loaded and before any mute is touched; the duplicate path
+     returns disowned.
   2. initialize the logger, set the log level, log the session config
   3. startup registration, then `restoreOrphanedSessionMutes()` (must be after
      logger init and under the mutex)
   4. `OleInitialize`, `controller_.initialize(settings)`
   5. create and run `MainWindow` with the startup settings snapshot and load
-     status, then `controller_.shutdown()`
+     status, then `controller_.shutdown()` (which restores the session mutes
+     while ownership and the mutex are still held), then `setSessionMuteOwnership(false)`
+     and release the mutex.
 - The pipeline runs while replay is enabled; `recording_` only controls whether
   packets are muxed to a file. `startRecording` and `saveReplay` call
   `ensurePipeline()` when it is stopped, and `stopRecording` calls
@@ -42,16 +50,24 @@ recording-stop drain handshake.
 - A recording stop drains by encode-thread acknowledgement, not by PTS:
   `stopRecording` starts a `RecordingCutoffTracker` stop at the cutoff PTS and
   waits (5 s, on `recordingCutoffComplete_`) for the encode thread to
-  acknowledge every pre-stop frame was published. The encode thread feeds
-  submissions (`noteFrameSubmitted`, which latches the post-stop boundary) and
-  publications (`notePacketPublished`) into the tracker, and the muxer accepts
-  only packets at or below the cutoff while a stop is pending
-  (`publishVideoPacket`, shared with the recreate drain). With replay disabled
-  `stopPipeline` drains the frame queue and encoder synchronously on the
-  stopping thread, so the completed drain is the acknowledgement and no CV
-  wait runs. PTS alone cannot cut the recording (finding 08): B-frame
-  reordering lets a post-stop P frame complete before a pre-stop B frame, so a
-  highest-PTS comparison would strand the pre-stop tail.
+  acknowledge real completion: the post-stop boundary is latched (the first
+  post-cutoff submission proves every earlier frame reached the encoder) AND
+  every frame submitted at or below the cutoff has been published or the
+  encoder reported it dropped (`noteInputDropped`). `notePacketPublished`
+  settles each arriving packet, held ones included; `abandonPending` is the
+  escape when the encoder reports unavailable, so a faulted backend cannot
+  stall the stop. With replay disabled `stopPipeline` drains the frame queue
+  and encoder synchronously on the stopping thread, so the completed drain is
+  the acknowledgement and no CV wait runs.
+- The recording cut belongs to `Mp4Muxer`, not to a PTS gate: `stopRecording`
+  passes the cutoff with `setCutPts100ns`, the muxer writes packets at or below
+  it and latches into a bounded hold at the first packet above it, and
+  `finalize` writes the held prefix up to the last held packet at or below the
+  cutoff. A compressed stream can only be cut at a decode-order prefix, so the
+  B pictures that follow their reference in decode order are kept instead of
+  being written without it (finding 04). Do not reintroduce a PTS comparison
+  in `publishVideoPacket`; B-frame reordering lets a post-stop P frame arrive
+  before a pre-stop B frame, and only the prefix rule is decodable.
 - The pipeline-recreate predicate treats a missing encoder as a fault
   (`pipelineEncoderFaulted`): after a full GPU recreate where D3D init
   succeeded but capture init failed, `encoder_` is null, and the health check
@@ -88,10 +104,14 @@ recording-stop drain handshake.
     Per-operation immediate-context access uses `D3DDevice::immediateContextMutex()`.
     The encode worker starts before the capture worker can request a discard.
   - `stopPipeline` drains `frameQueue_` instead of discarding it, so
-    `encodeLoopImpl` leaves its loop only when `stopRequested_` is set and the
-    queue is empty and no duration update is pending. Keep that condition whole:
-    tightening it silently drops queued frames on shutdown and on settings
-    switches.
+    `encodeLoopImpl` leaves its loop only when `videoEncodeLoopDone`
+    (`VideoDrain.h`: stop requested, capture worker finished, queue empty, no
+    duration update pending) is true. Keep that condition whole: tightening it
+    silently drops queued frames on shutdown and on settings switches, and the
+    capture-finished term is what keeps a worker paused inside its final push
+    from publishing into a queue nobody drains. `captureFinished_` is reset in
+    `ensurePipeline` and set at the end of the capture worker on every exit
+    path, including the exception path.
   - `stopPipeline` separates the capture/video stop flag (`stopRequested_`)
     from the audio-producers-finished signal (`audioProducersFinished_`). The
     writer loop (`drainAudioQueues` in `AudioDrain.h`) exits only on
@@ -148,6 +168,12 @@ recording-stop drain handshake.
   lookahead retains accepted inputs until their output is harvested, so a
   queue-only pool would exhaust and starve the producer; the capture-side
   pools are intermediate and keep their queue-derived size.
+  The same-size WGC alias path pins a source texture instead of a feeding-pool
+  slot, so it is only eligible when the source side can hold the whole
+  retention window (`wgcAliasInputCapacity` + `encoderAliasFitsRetention`,
+  decided once per pipeline run into `encoderAliasFitsRetention_`). An alias
+  with a deeper encoder retention than the source capacity is starved and
+  resubmits mapped inputs; own the copy instead.
   capture-loop reloads keep separate lock scopes: `reloadActiveSettings` holds
   `stateMutex_`, `reloadEncoderInputFormat` holds `pipelineGpuMutex_`.
   device-removal/encoder-fault recovery reloads settings before
@@ -265,7 +291,10 @@ recording-stop drain handshake.
   escape dot-prefixed names before creation and fall back to the library root
   for reparse-point game folders. failed per-game saves remain recoverable from
   the configured clip library. new clip outputs are returned only after
-  exclusive name reservation succeeds.
+  exclusive name reservation succeeds. `saveReplay` releases its own
+  reservation on a failed or throwing save (`removeEmptyOutputReservation`
+  only deletes a hidden zero-byte file, so a published clip is safe): an
+  abandoned reservation blocks the name and leaves a hidden empty file behind.
 - Frame cadence, PTS, and frame durations are decided by
   `VideoTimelineScheduler`. Keep that header free of Windows, D3D, and project
   includes so `VideoTimelineSchedulerTests.cpp` still compiles standalone with
@@ -337,12 +366,14 @@ recording-stop drain handshake.
   math, including the `maxCoalescedDuration100ns` cap on held-frame durations.
   Extend it for any scheduler change.
 - `RecorderControllerCutoffTests.cpp` covers the recording-stop cutoff
-  handshake (finding 08: the delayed pre-cutoff tail stays in the recording,
-  the ack waits on the post-stop boundary and the publication quiesce, and a
-  dropped frame cannot stall the stop), the missing-encoder fault predicate
-  (finding 06), the encoder-fault recreate backoff schedule, the
-  `try_to_lock` probe against a live recreate, and the settings classification
-  and dispatch (`liveFieldsCleared`/`replayFieldsCleared` plus
+  handshake: the delayed pre-cutoff tail stays in the recording, the ack waits
+  for real completion (every pre-cutoff submission published or dropped) and
+  not for a quiet output window, a dropped input settles its slot, an
+  unavailable encoder abandons the pending set instead of stalling, and a
+  dropped frame cannot stall the stop. It also covers the missing-encoder
+  fault predicate (finding 06), the encoder-fault recreate backoff schedule,
+  the `try_to_lock` probe against a live recreate, and the settings
+  classification and dispatch (`liveFieldsCleared`/`replayFieldsCleared` plus
   `settingsApplyPath`): a live-only change stays live with non-default replay
   settings, a replay-only change reconfigures in place only while the pipeline
   runs and only when the replay fields really moved, and everything else
@@ -355,9 +386,13 @@ recording-stop drain handshake.
 - `RecorderControllerShutdownOrderingTests.cpp` exercises the audio-writer drain
   loop (`drainAudioQueues` in `AudioDrain.h`): a late packet enqueued after the
   stop request but before the producers-finished flag is consumed before the
-  writer exits, and packets queued before the flag drain on signal. it also
-  covers `AudioWriter` RMS measurement (signed samples, empty/invalid-width
-  blocks, silence) and microphone AGC gain/envelope continuity and metadata.
+  writer exits, and packets queued before the flag drain on signal. It also
+  covers the video encode-loop exit predicate (`VideoDrain.h`): a stop whose
+  capture worker still has its final push to make must keep the loop alive, and
+  a stop with the capture finished and the queue and duration bookkeeping
+  drained ends it. It also covers `AudioWriter` RMS measurement (signed
+  samples, empty/invalid-width blocks, silence) and microphone AGC
+  gain/envelope continuity and metadata.
 - `MainWindowSettingsTests.cpp` exercises settings handoff and ui preferences
   without a capture pipeline.
 - Everything else in this folder is verified by building and by exercising the

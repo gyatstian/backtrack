@@ -28,6 +28,7 @@ public:
     bool encoderAvailable() const noexcept override;
     DXGI_FORMAT preferredInputFormat() const override;
     uint32_t inputRetentionBudget() const override;
+    uint64_t droppedInputs() const noexcept override;
 
 private:
     friend struct AmfEncoderTestAccess;

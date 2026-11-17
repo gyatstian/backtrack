@@ -78,17 +78,31 @@ RNNoise microphone denoiser.
   startup sweep. fatal handlers attempt `emergencyRestoreSessionMutes()` before
   logging; the emergency path only try_locks. keys use
   `platform/Win32Util.h:normalizedPathKey`.
+- the mute journal has exactly one owning process: the one that took the
+  single-instance mutex. `setSessionMuteOwnership` gates `clearSessionMutes` and
+  the emergency path, so a rejected duplicate launch, whose controller is
+  constructed and destroyed anyway, cannot restore the live instance's mutes or
+  rewrite its journal. `Application::run` takes ownership after the duplicate
+  check and drops it before releasing the mutex; `RecorderController::shutdown`
+  restores while it is still owned. anything that restores mutes on a new exit
+  path needs the same gate.
 - live mutes are tracked per session instance - endpoint id plus
   `IAudioSessionControl2::GetSessionInstanceIdentifier` - not per PID, because
   one process can own several render sessions (one per endpoint, plus a
   replacement after it recreates its stream). a record whose exact instance is
   gone is retired: Windows keeps a mute per session, so the mute died with it.
   a wanted session that is no longer muted is re-asserted on every apply.
-- the journal keeps the durable identity only: PID and path key. session
-  instance identifiers do not survive an application restart, so a startup
-  sweep pairs one record with one still-muted live session and restores that
-  record's own previous state. do not add an instance id to the journal and
-  expect it to match after a restart.
+- the journal stores the durable identity plus a matching hint: PID, previous
+  mute, path key, endpoint id and session instance id, tab separated. matching
+  order in `findSessionForRecord`: the exact (pid, path, endpoint, instance)
+  record wins; a live process whose exact instance is gone has lost its mute
+  with the session, so its record is retired and never re-paired with a
+  sibling session of the same process; a dead process's record is reconciled
+  once against a live unused session with the same path and endpoint (Windows
+  persists an app's mute across a restart, so a replacement can inherit it).
+  When no such session is live the record is retired: nothing can be muted by
+  an app that is not running. an instance id is a hint, never a required
+  match - it does not survive an application restart.
 - each mute is journaled before the session is touched, and a journal failure is
   reported to the caller instead of ignored. `apply` returns
   `SessionMuteApplyResult`: `exclusionEstablished()` is false on a mute failure,
@@ -97,13 +111,25 @@ RNNoise microphone denoiser.
   a session is never muted - an unverifiable previous state is not a safe change
   to the user's audio.
 - a record is retired only after its restore is verified (`SetMute` succeeded, or
-  the session is already unmuted) or when its session/process is gone. failed
+  the session is already unmuted), when its exact session instance is gone in a
+  live process, or when its process and any replacement session are gone. failed
   restores and unreachable journal obligations stay journaled and are retried; a
   later apply merges them with its own mutes instead of overwriting them. a
   fully restored journal is deleted, including after a complete startup sweep.
 - ordinary orphan restoration seeds claimed sessions from surviving live mutes.
   emergency restoration deliberately starts with an empty claim set and does no
   process-liveness pruning; keep its try-lock and exception containment.
+- `WasapiCapture`'s session enumeration reports completeness, not just
+  success. a structural failure (endpoint item, endpoint id, activation, session
+  enumerator, session item) makes the snapshot incomplete and returns false, so
+  the caller keeps system audio stopped instead of recording audio it could not
+  check. intentional exclusions (system sounds, own process, pid 0) and
+  per-session property failures (path, volume, instance id, mute state) are not
+  incompleteness: the store already refuses to mute an unverifiable session and
+  counts it as a mute failure when it was wanted.
+- the journal is published through `platform/AtomicWrite.h:atomicWriteSibling`,
+  never a fixed `.tmp` name: a pre-existing hard link at a predictable staging
+  name would let the write clobber another file before the rename.
 - COM ownership: the store holds no COM interface. `WasapiCapture` initializes
   the apartment for the whole store call, and the store invokes every callback
   and releases every candidate before returning, so enumeration, callback
@@ -186,11 +212,15 @@ RNNoise microphone denoiser.
 - `SessionMuteStoreTests` (CTest) covers the journal codec round trip and
   malformed-line skipping, journaling the intent before the session is touched,
   per-instance tracking of two sessions that share a PID (own previous states,
-  replacement of one, re-assertion of a mute the app cleared), a failed mute and
-  a failed journal write surfaced to the caller and retried without muting,
-  unknown `GetMute` state left untouched, a failed restore retried until it
-  succeeds, a partial startup sweep followed by an unrelated apply/clear (the
-  orphan is preserved, then retired once its process is gone), a complete sweep
+  replacement of one, re-assertion of a mute the app cleared), a user-muted
+  sibling left alone while the store restores only its own record, a dead
+  process's record reconciled against a muted replacement and retired when the
+  app is gone, a live process releasing the record of a vanished instance
+  instead of unmuting a sibling, legacy 3-column journals, a pre-existing file
+  at the old staging name surviving a journal write, a failed mute and a failed
+  journal write surfaced to the caller and retried without muting, unknown
+  `GetMute` state left untouched, a failed restore retried until it succeeds, a
+  partial startup sweep followed by an unrelated apply/clear, a complete sweep
   retiring the journal (including the empty-write-cache case), surviving live claims,
   one-to-one orphan pairing across endpoints, emergency empty claims and retained
   obligations, emergency enumeration/callback exceptions, and callbacks
@@ -211,9 +241,16 @@ RNNoise microphone denoiser.
   endpoints: default-device switches, a pinned explicit device, switch during
   resolution and inside a packet callback, default loss and recovery, and
   registration/stop races, repeated failures at every setup retry site, and stop
-  during setup backoff. real endpoint switching still needs a listening
-  check.
+  during setup backoff. It also drives the real session-mute adapter through an
+  injected session enumerator: a structural enumeration failure must report the
+  exclusion as not established while an intentional skip does not, and
+  `clearSessionMutes` must leave the journal untouched when this process does
+  not own it. real endpoint switching still needs a listening check.
 - The mixed track and sound separation are verified by building and listening.
+  Exclusion is best effort: it is applied as a session mute on a 2 s poll, so an
+  app that starts or unmutes a session between two polls can contribute audio
+  until the next one. Nothing claims a hard guarantee; only capture-source
+  isolation could provide one.
 
 ## Child DOX Index
 

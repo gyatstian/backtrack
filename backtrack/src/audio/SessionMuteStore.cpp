@@ -1,6 +1,7 @@
 #include "audio/SessionMuteStore.h"
 
 #include "core/Logger.h"
+#include "platform/AtomicWrite.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -29,18 +30,81 @@ std::wstring sessionKey(const std::wstring& endpointId, const std::wstring& inst
     return endpointId + L'\x1f' + instanceId;
 }
 
-// A journal record only carries the durable identity, so several records can
-// match the same PID and path. `claimed` keeps the pairing one record to one
-// session instance, which is what restores each session's own previous state.
-const SessionMuteCandidate* findSessionForRecord(
+// A record's live identity only narrows the search; it is never required, and
+// the pairing still claims one session per record so each restores its own
+// previous state.
+struct RecordMatch {
+    const SessionMuteCandidate* session = nullptr;
+    // The record describes no session that can still be restored.
+    bool retire = false;
+};
+
+bool claimedBy(const std::unordered_set<std::wstring>& claimed, const SessionMuteCandidate& session) {
+    return claimed.contains(sessionKey(session.endpointId, session.instanceId));
+}
+
+// Pairs one journal record with one live session. `isProcessAlive` empty means
+// the caller has no liveness knowledge (the crash path) and nothing is retired
+// on it.
+RecordMatch findSessionForRecord(
     const std::vector<SessionMuteCandidate>& sessions,
     const SessionMuteRecord& record,
-    const std::unordered_set<std::wstring>& claimed) {
-    const auto match = std::find_if(sessions.begin(), sessions.end(), [&](const SessionMuteCandidate& session) {
-        return session.processId == record.processId && session.pathKey == record.pathKey &&
-               !claimed.contains(sessionKey(session.endpointId, session.instanceId));
-    });
-    return match == sessions.end() ? nullptr : &*match;
+    const std::unordered_set<std::wstring>& claimed,
+    const std::function<bool(uint32_t)>& isProcessAlive) {
+    const auto freeSession = [&](auto predicate) -> const SessionMuteCandidate* {
+        const auto match = std::find_if(sessions.begin(), sessions.end(), [&](const SessionMuteCandidate& session) {
+            return !claimedBy(claimed, session) && predicate(session);
+        });
+        return match == sessions.end() ? nullptr : &*match;
+    };
+    const bool haveLiveness = static_cast<bool>(isProcessAlive);
+    const bool processAlive = !haveLiveness || isProcessAlive(record.processId);
+
+    if (record.instanceId.empty()) {
+        // Legacy record: the durable identity is all it has.
+        if (const auto* session = freeSession([&](const SessionMuteCandidate& session) {
+                return session.processId == record.processId && session.pathKey == record.pathKey;
+            })) {
+            return {session, false};
+        }
+        return {nullptr, !processAlive};
+    }
+
+    if (const auto* session = freeSession([&](const SessionMuteCandidate& session) {
+            return session.processId == record.processId &&
+                   session.pathKey == record.pathKey &&
+                   session.endpointId == record.endpointId &&
+                   session.instanceId == record.instanceId;
+        })) {
+        return {session, false};
+    }
+    if (!haveLiveness) {
+        // Cannot tell a dead process from a recreated session here, so keep the
+        // obligation instead of guessing.
+        return {nullptr, false};
+    }
+    if (processAlive) {
+        // The exact instance is gone and its process lives: Windows keeps a
+        // mute per session, so the mute died with the session. Falling back to
+        // another session of the same process would unmute the user's own
+        // mute instead.
+        return {nullptr, true};
+    }
+    // The process is gone. A session it restarted into can inherit the
+    // persisted mute, so pair by the durable identity and let the caller check
+    // that session's mute state.
+    if (const auto* session = freeSession([&](const SessionMuteCandidate& session) {
+            return session.pathKey == record.pathKey &&
+                   (record.endpointId.empty() || session.endpointId == record.endpointId);
+        })) {
+        return {session, false};
+    }
+    // Nothing live carries the path: the app is not running, so nothing can be
+    // muted by it. A path still live but claimed by another record is kept for
+    // a later retry.
+    const bool pathLive = std::any_of(sessions.begin(), sessions.end(),
+        [&](const SessionMuteCandidate& session) { return session.pathKey == record.pathKey; });
+    return {nullptr, !pathLive};
 }
 
 } // namespace
@@ -57,6 +121,10 @@ std::string SessionMuteStore::serialize(const std::vector<SessionMuteRecord>& re
         content += record.previousMute ? '1' : '0';
         content += '\t';
         content += wideToUtf8(record.pathKey);
+        content += '\t';
+        content += wideToUtf8(record.endpointId);
+        content += '\t';
+        content += wideToUtf8(record.instanceId);
         content += '\n';
     }
     return content;
@@ -75,16 +143,29 @@ std::vector<SessionMuteRecord> SessionMuteStore::parse(const std::string& conten
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
-        const auto firstTab = line.find('\t');
-        const auto secondTab =
-            firstTab == std::string::npos ? std::string::npos : line.find('\t', firstTab + 1);
-        if (firstTab == std::string::npos || secondTab == std::string::npos) {
+        // Columns: pid, previousMute, pathKey, then the optional live identity
+        // (endpoint id, session instance id). Anything past them is ignored.
+        std::string fields[5];
+        size_t columnBegin = 0;
+        int columns = 0;
+        while (columns < 5) {
+            const size_t tab = line.find('\t', columnBegin);
+            fields[columns++] = line.substr(columnBegin,
+                tab == std::string::npos ? std::string::npos : tab - columnBegin);
+            if (tab == std::string::npos) {
+                break;
+            }
+            columnBegin = tab + 1;
+        }
+        if (columns < 3) {
             continue;
         }
         SessionMuteRecord record;
         record.processId = static_cast<uint32_t>(_strtoui64(line.c_str(), nullptr, 10));
-        record.previousMute = line[firstTab + 1] == '1';
-        record.pathKey = utf8ToWide(line.substr(secondTab + 1));
+        record.previousMute = fields[1].size() == 1 && fields[1][0] == '1';
+        record.pathKey = utf8ToWide(fields[2]);
+        record.endpointId = utf8ToWide(fields[3]);
+        record.instanceId = utf8ToWide(fields[4]);
         if (record.processId != 0 && !record.pathKey.empty()) {
             records.push_back(std::move(record));
         }
@@ -119,25 +200,10 @@ bool SessionMuteStore::writeJournalLocked(const std::string& content) {
     if (error) {
         return false;
     }
-    const std::filesystem::path tempPath = std::filesystem::path(journalPath_.wstring() + L".tmp");
-    {
-        std::ofstream stream(tempPath, std::ios::out | std::ios::binary | std::ios::trunc);
-        if (!stream.is_open()) {
-            return false;
-        }
-        stream.write(content.data(), static_cast<std::streamsize>(content.size()));
-        stream.flush();
-        if (!stream) {
-            stream.close();
-            std::filesystem::remove(tempPath, error);
-            return false;
-        }
-    }
-    // Atomic replace so a crash mid-write never leaves a torn journal behind.
-    std::filesystem::rename(tempPath, journalPath_, error);
-    if (error) {
-        std::error_code cleanup;
-        std::filesystem::remove(tempPath, cleanup);
+    // A uniquely named staging file renamed into place: a fixed "<journal>.tmp"
+    // name is a name another process can pre-create or hard-link to, and the
+    // rename would replace that file instead of ours.
+    if (atomicWriteSibling(journalPath_, content)) {
         return false;
     }
     journalPresent_ = true;
@@ -205,28 +271,26 @@ uint32_t SessionMuteStore::restoreOrphanRecordsLocked(
     std::unordered_set<std::wstring>& claimed) {
     uint32_t restored = 0;
     for (auto it = orphans_.begin(); it != orphans_.end();) {
-        const SessionMuteCandidate* session = findSessionForRecord(sessions, *it, claimed);
-        if (!session) {
-            if (isProcessAlive && !isProcessAlive(it->processId)) {
-                it = orphans_.erase(it);
-            } else {
-                ++it;
-            }
-            continue;
-        }
-        if (!session->muteStateKnown) {
-            ++it;
-            continue;
-        }
-        if (!session->muted) {
+        const RecordMatch match = findSessionForRecord(sessions, *it, claimed, isProcessAlive);
+        if (match.retire) {
             it = orphans_.erase(it);
             continue;
         }
-        if (!session->setMute || !session->setMute(it->previousMute)) {
+        if (!match.session || !match.session->muteStateKnown) {
             ++it;
             continue;
         }
-        claimed.insert(sessionKey(session->endpointId, session->instanceId));
+        if (!match.session->muted) {
+            // Live and unmuted: the persisted mute did not survive, so nothing
+            // is left to restore.
+            it = orphans_.erase(it);
+            continue;
+        }
+        if (!match.session->setMute || !match.session->setMute(it->previousMute)) {
+            ++it;
+            continue;
+        }
+        claimed.insert(sessionKey(match.session->endpointId, match.session->instanceId));
         ++restored;
         it = orphans_.erase(it);
     }
@@ -266,14 +330,15 @@ SessionMuteApplyResult SessionMuteStore::apply(const std::vector<std::wstring>& 
     // for later.
     auto claimed = claimedSessionsLocked();
     for (auto it = orphans_.begin(); it != orphans_.end();) {
-        const SessionMuteCandidate* session = findSessionForRecord(sessions, *it, claimed);
+        const RecordMatch match = findSessionForRecord(sessions, *it, claimed, isProcessAlive);
+        if (match.retire) {
+            // No live session can still carry this obligation.
+            it = orphans_.erase(it);
+            continue;
+        }
+        const SessionMuteCandidate* session = match.session;
         if (!session) {
-            if (isProcessAlive && !isProcessAlive(it->processId)) {
-                // The process is gone, and its sessions and their mutes with it.
-                it = orphans_.erase(it);
-            } else {
-                ++it;
-            }
+            ++it;
             continue;
         }
         if (!session->muteStateKnown) {
@@ -290,6 +355,8 @@ SessionMuteApplyResult SessionMuteStore::apply(const std::vector<std::wstring>& 
         if (wanted.contains(it->pathKey)) {
             AppliedMute adopted;
             adopted.record = *it;
+            adopted.record.endpointId = session->endpointId;
+            adopted.record.instanceId = session->instanceId;
             adopted.endpointId = session->endpointId;
             adopted.instanceId = session->instanceId;
             if (!adopted.instanceId.empty() && !adopted.endpointId.empty()) {
@@ -366,6 +433,8 @@ SessionMuteApplyResult SessionMuteStore::apply(const std::vector<std::wstring>& 
         mute.record.processId = session.processId;
         mute.record.pathKey = session.pathKey;
         mute.record.previousMute = session.muted;
+        mute.record.endpointId = session.endpointId;
+        mute.record.instanceId = session.instanceId;
         mute.endpointId = session.endpointId;
         mute.instanceId = session.instanceId;
         mutes_.push_back(mute);

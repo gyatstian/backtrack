@@ -219,9 +219,10 @@ bool configureAudioStream(IMFSinkWriter* writer, const WavInfo& wav, DWORD& stre
 }
 
 // Presentation delay of the first video sample caused by B-frame reordering:
-// the stream starts decoding this long before its first frame is displayed.
-// Audio must be delayed equally so tracks stay in sync. Returns 0 for streams
-// without reordering.
+// the stream starts decoding this long before its first frame is displayed, so
+// the picture delay is exactly what audio has to be held back by (finding 11).
+// Not a decode-reordering guess, so it gets no plausibility cap: a capped value
+// desynchronises audio by the excess. Returns 0 for streams without reordering.
 int64_t videoCompositionDelay100ns(const MuxedInputs& inputs) {
     if (inputs.videoSamples.empty()) {
         return 0;
@@ -230,8 +231,7 @@ int64_t videoCompositionDelay100ns(const MuxedInputs& inputs) {
     if (!hasEffectiveDts(first.pts100ns, first.dts100ns, first.hasDts)) {
         return 0;
     }
-    constexpr int64_t kMaxPlausibleDelay = 2 * kHundredNanosecondsPerSecond;
-    return std::min(first.pts100ns - first.dts100ns, kMaxPlausibleDelay);
+    return first.pts100ns - first.dts100ns;
 }
 
 bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInputs& inputs) {
@@ -245,7 +245,6 @@ bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInpu
         return false;
     }
 
-    const int64_t firstPts = inputs.videoSamples.front().pts100ns;
     // Samples are stored in decode order, so presentation times regress within
     // every GOP when B-frames are enabled. The MPEG-4 sink requires a decode
     // timestamp on each sample in that case: stts is built from DTS deltas and
@@ -258,14 +257,23 @@ bool writeVideoSamples(IMFSinkWriter* writer, DWORD streamIndex, const MuxedInpu
             return sample.hasDts && sample.dts100ns != sample.pts100ns;
         });
     // Both timelines must share one origin so composition offsets stay exact.
-    const int64_t timeBase =
-        hasDecodeTimestamps && inputs.videoSamples.front().hasDts
-        ? inputs.videoSamples.front().dts100ns
-        : firstPts;
+    const int64_t timeBase = muxTimeBase100ns(inputs);
 
     for (const auto& videoSample : inputs.videoSamples) {
         if (videoSample.size == 0) {
             continue;
+        }
+        // Recovery reads its timestamps from a file on disk; a span that does
+        // not fit int64 must fail the mux here rather than wrap into a sample
+        // time the sink accepts.
+        const bool spanFits = int64DifferenceFits(videoSample.pts100ns, timeBase) &&
+            (!hasDecodeTimestamps ||
+             int64DifferenceFits(
+                 effectiveDts(videoSample.pts100ns, videoSample.dts100ns, videoSample.hasDts), timeBase));
+        if (!spanFits) {
+            Logger::instance().error(L"mux",
+                L"Native MP4 mux refused a video sample whose timestamp span overflows int64");
+            return false;
         }
 
         ComPtr<IMFMediaBuffer> buffer;
@@ -457,6 +465,13 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     lastError_.clear();
     videoSamples_.clear();
     pendingAudio_.clear();
+    // A new recording starts uncut; a previous stop's cut must not leak into
+    // it, and its held packets belong to the finalized file.
+    cutPts100ns_.reset();
+    cutLatched_ = false;
+    heldPackets_.clear();
+    heldBytes_ = 0;
+    holdOverflowed_ = false;
     lastWrittenVideoPts100ns_ = 0;
     warnedRegressingPts_ = false;
     active_ = true;
@@ -464,8 +479,71 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     return true;
 }
 
+void Mp4Muxer::setCutPts100ns(int64_t pts100ns) {
+    std::scoped_lock lock(mutex_);
+    cutPts100ns_ = pts100ns;
+}
+
 void Mp4Muxer::writeVideoPacket(const EncodedPacket& packet) {
     std::scoped_lock lock(mutex_);
+    if (!active_ || writeFailed_ || packet.bytes.empty()) {
+        return;
+    }
+    if (cutPts100ns_) {
+        // A stream can only be cut at a decode-order prefix, so the first
+        // post-cut packet latches: everything from there on is held (not
+        // dropped) and finalize keeps the prefix that is still decodable.
+        if (cutLatched_ || packet.pts100ns > *cutPts100ns_) {
+            holdVideoPacketLocked(packet);
+            return;
+        }
+    }
+    writeVideoPacketLocked(packet);
+}
+
+void Mp4Muxer::holdVideoPacketLocked(const EncodedPacket& packet) {
+    // Audio keeps flowing on purpose: a track slightly longer than the video is
+    // fine, a video tail referencing a dropped picture is not.
+    cutLatched_ = true;
+    if (holdOverflowed_) {
+        return;
+    }
+    if (heldPackets_.size() >= kMaxHeldVideoPackets ||
+        heldBytes_ + packet.bytes.size() > kMaxHeldVideoBytes) {
+        // Everything already written is at or below the cut, so it ends on a
+        // decodable boundary; a hold restarted after this point could not be
+        // written without the packets dropped here.
+        holdOverflowed_ = true;
+        heldPackets_.clear();
+        heldBytes_ = 0;
+        Logger::instance().warning(L"mux",
+            L"Recording stop held more post-cut video than the bounded hold allows; the clip tail is dropped");
+        return;
+    }
+    heldBytes_ += packet.bytes.size();
+    heldPackets_.push_back(packet);
+}
+
+void Mp4Muxer::flushHeldVideoPacketsLocked() {
+    if (!cutPts100ns_) {
+        heldPackets_.clear();
+        heldBytes_ = 0;
+        return;
+    }
+    size_t keep = heldPackets_.size();
+    while (keep > 0 && heldPackets_[keep - 1].pts100ns > *cutPts100ns_) {
+        --keep;
+    }
+    for (size_t i = 0; i < keep; ++i) {
+        writeVideoPacketLocked(heldPackets_[i]);
+    }
+    heldPackets_.clear();
+    heldBytes_ = 0;
+    cutLatched_ = false;
+    holdOverflowed_ = false;
+}
+
+void Mp4Muxer::writeVideoPacketLocked(const EncodedPacket& packet) {
     if (!active_ || writeFailed_ || !videoStream_.is_open() || packet.bytes.empty()) {
         return;
     }
@@ -583,6 +661,10 @@ std::filesystem::path Mp4Muxer::finalize() {
             return {};
         }
 
+        // The cut's held packets are the recording's decodable tail: write the
+        // prefix that belongs to the clip before the stream closes, then drop
+        // the rest.
+        flushHeldVideoPacketsLocked();
         videoStream_.close();
         writeFailed_ = writeFailed_ || !videoStream_;
         flushPendingAudioLocked();
@@ -698,6 +780,13 @@ void Mp4Muxer::abort() {
         systemAudio_.writer.close();
         microphoneAudio_.writer.close();
         pendingAudio_.clear();
+        // The hold was the cut's undecided tail; an aborted recording keeps
+        // neither it nor the cut.
+        cutPts100ns_.reset();
+        cutLatched_ = false;
+        heldPackets_.clear();
+        heldBytes_ = 0;
+        holdOverflowed_ = false;
         // Release the per-recording sample table here too so an aborted
         // recording does not pin its memory until the next startRecording().
         videoSamples_.clear();

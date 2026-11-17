@@ -2,7 +2,9 @@
 #include "ui/UiHelpers.h"
 
 #include <chrono>
+#include <algorithm>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
@@ -81,6 +83,118 @@ BOOL WINAPI successfulPlayer(LPCWSTR, HMODULE, DWORD) {
     return TRUE;
 }
 
+std::vector<uint8_t> loadedWav;
+std::vector<uint8_t>* capturedWav = nullptr;
+
+std::vector<uint8_t> fixtureLoader(const std::filesystem::path&) {
+    return loadedWav;
+}
+
+uint32_t readUInt32(const uint8_t* bytes) {
+    return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+        (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+void appendUInt16(std::vector<uint8_t>& out, uint16_t value) {
+    out.push_back(static_cast<uint8_t>(value & 0xff));
+    out.push_back(static_cast<uint8_t>(value >> 8));
+}
+
+void appendUInt32(std::vector<uint8_t>& out, uint32_t value) {
+    appendUInt16(out, static_cast<uint16_t>(value & 0xffff));
+    appendUInt16(out, static_cast<uint16_t>(value >> 16));
+}
+
+void appendFourCc(std::vector<uint8_t>& out, const char* tag) {
+    out.insert(out.end(), tag, tag + 4);
+}
+
+// 44 bytes of header plus the given sample bytes and any chunks that follow the
+// data chunk. Plausibility checks in the loader must accept it.
+std::vector<uint8_t> makeWav(uint16_t formatTag, uint16_t bitsPerSample,
+                             const std::vector<uint8_t>& samples,
+                             const std::vector<uint8_t>& trailing) {
+    std::vector<uint8_t> wav;
+    appendFourCc(wav, "RIFF");
+    appendUInt32(wav, 0);
+    appendFourCc(wav, "WAVE");
+    appendFourCc(wav, "fmt ");
+    appendUInt32(wav, 16);
+    appendUInt16(wav, formatTag);
+    appendUInt16(wav, 1);
+    appendUInt32(wav, 8000);
+    appendUInt32(wav, 8000u * bitsPerSample / 8);
+    appendUInt16(wav, static_cast<uint16_t>(bitsPerSample / 8));
+    appendUInt16(wav, bitsPerSample);
+    appendFourCc(wav, "data");
+    appendUInt32(wav, static_cast<uint32_t>(samples.size()));
+    wav.insert(wav.end(), samples.begin(), samples.end());
+    wav.insert(wav.end(), trailing.begin(), trailing.end());
+    const uint32_t riffSize = static_cast<uint32_t>(wav.size() - 8);
+    wav[4] = static_cast<uint8_t>(riffSize & 0xff);
+    wav[5] = static_cast<uint8_t>((riffSize >> 8) & 0xff);
+    wav[6] = static_cast<uint8_t>((riffSize >> 16) & 0xff);
+    wav[7] = static_cast<uint8_t>((riffSize >> 24) & 0xff);
+    return wav;
+}
+
+// Both buffers production can hand to the platform player are RIFF files whose
+// header states their length, so copy exactly that many bytes.
+BOOL WINAPI capturingPlayer(LPCWSTR sound, HMODULE, DWORD) {
+    if (sound && capturedWav) {
+        uint8_t header[44]{};
+        std::memcpy(header, sound, sizeof(header));
+        std::vector<uint8_t> bytes(8 + readUInt32(header + 4));
+        std::memcpy(bytes.data(), sound, bytes.size());
+        *capturedWav = std::move(bytes);
+    }
+    return TRUE;
+}
+
+void testCustomSoundScalesOnlyItsSampleData() {
+    std::vector<uint8_t> trailing;
+    appendFourCc(trailing, "LIST");
+    appendUInt32(trailing, 8);
+    const uint8_t info[] = {'I', 'N', 'F', 'O', 't', 'e', 's', 't'};
+    trailing.insert(trailing.end(), std::begin(info), std::end(info));
+
+    loadedWav = makeWav(1, 16, {0x10, 0x27, 0xf0, 0xd8}, trailing);
+    std::vector<uint8_t> played;
+    capturedWav = &played;
+    backtrack::playActionIndicator(MB_OK, 50, L"custom.wav", fixtureLoader, capturingPlayer);
+    capturedWav = nullptr;
+    expect(played.size() == loadedWav.size(), "the custom WAV was not played");
+    expect(played[44] == 0x88 && played[45] == 0x13 && played[46] == 0x78 && played[47] == 0xec,
+           "16-bit samples were not scaled by 50%");
+    expect(std::equal(played.end() - trailing.size(), played.end(), trailing.begin()),
+           "a chunk after the sample data was rewritten by volume scaling");
+}
+
+void testCustom8BitSoundScalesFromItsCentre() {
+    loadedWav = makeWav(1, 8, {200, 80, 128, 255, 0}, {});
+    std::vector<uint8_t> played;
+    capturedWav = &played;
+    backtrack::playActionIndicator(MB_OK, 50, L"custom.wav", fixtureLoader, capturingPlayer);
+    capturedWav = nullptr;
+    expect(played.size() == loadedWav.size(), "the 8-bit custom WAV was not played");
+    expect(played[44] == 164 && played[45] == 104 && played[46] == 128 &&
+               played[47] == 192 && played[48] == 64,
+           "8-bit samples were not halved around 128");
+}
+
+void testUnattenuableCustomSoundFallsBackToBuiltIn() {
+    loadedWav = makeWav(3, 32, {0, 0, 0, 0, 0, 0, 0x80, 0x3f}, {});
+    std::vector<uint8_t> builtIn;
+    capturedWav = &builtIn;
+    backtrack::playActionIndicator(MB_OK, 50, {}, nullptr, capturingPlayer);
+    std::vector<uint8_t> played;
+    capturedWav = &played;
+    backtrack::playActionIndicator(MB_OK, 50, L"custom.wav", fixtureLoader, capturingPlayer);
+    capturedWav = nullptr;
+    expect(!builtIn.empty() && played == builtIn,
+           "an unattenuable custom sound did not fall back to the built-in indicator");
+}
+
 void testBusyFeedbackWhileSoundBlocked(bool blockLoad) {
     backtrack::RecorderController controller;
     backtrack::SettingsStore store(std::filesystem::temp_directory_path() / L"backtrack_notification_test.ini");
@@ -145,6 +259,9 @@ int main() {
     try {
         testBusyFeedbackWhileSoundBlocked(true);
         testBusyFeedbackWhileSoundBlocked(false);
+        testCustomSoundScalesOnlyItsSampleData();
+        testCustom8BitSoundScalesFromItsCentre();
+        testUnattenuableCustomSoundFallsBackToBuiltIn();
         std::cout << "MainWindowNotificationTests passed\n";
         return 0;
     } catch (const std::exception& error) {

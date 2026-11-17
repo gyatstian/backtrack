@@ -8,32 +8,32 @@ namespace backtrack {
 // Decides when a recording-stop drain is complete. PTS alone cannot: B-frame
 // reordering lets a post-stop P frame reach the encoder output before a
 // pre-stop B frame, so a highest-PTS comparison would cut the recording early
-// and strand the pre-stop tail (finding 08). The encode thread reports every
-// frame it submits and every packet it publishes; the stop acknowledges once
-// every frame captured at or before the cutoff has been published.
+// and strand the pre-stop tail (finding 08). Nor can a publication quiesce:
+// with deep lookahead the next submission is a frame period away, so "nothing
+// published for 100 ms" can be true while accepted pre-cutoff inputs still sit
+// inside the encoder (finding 04).
 //
-// The acknowledgment needs two independent signals:
-//   - the boundary: the first post-stop frame submitted proves every pre-stop
-//     frame reached the encoder (the queue delivers frames in PTS order), so
-//     the encoder's reorder buffer will flush;
-//   - the quiesce: no pre-stop packet published for the grace period, so a
-//     dropped frame or an in-flight packet cannot stall the stop forever.
-// Both together keep the replay-enabled case correct (capture keeps producing
-// post-stop frames, so the boundary alone would acknowledge while pre-stop
-// frames still sat in the queue).
+// The acknowledgment is real completion accounting over three encode-thread
+// signals:
+//   - submissions: the first post-stop frame submitted latches the boundary
+//     (the queue delivers frames in PTS order, so every pre-stop frame has
+//     reached the encoder by then); every submission at or below the cutoff
+//     increments the pending count;
+//   - publications: a packet at or below the cutoff decrements it;
+//   - drops: an encoder-side drop of a submitted input decrements it too, so a
+//     frame that will never be published cannot stall the stop.
+// The stop acknowledges once the boundary latched and nothing is pending.
 //
 // Header-only so a unit suite can compile it standalone, like
 // VideoTimelineScheduler.h and PendingDurationTracker.h.
 class RecordingCutoffTracker {
 public:
     // Starts a stop drain for `cutoffPts100ns`; returns the generation the
-    // caller waits on. `now100ns` seeds the publication quiesce so a stop with
-    // no pre-stop frame left in flight still acknowledges after the grace
-    // period.
-    uint64_t beginStop(int64_t cutoffPts100ns, int64_t now100ns) {
+    // caller waits on.
+    uint64_t beginStop(int64_t cutoffPts100ns) {
         cutoffPts100ns_.store(cutoffPts100ns, std::memory_order_release);
         allSubmitted_.store(false, std::memory_order_release);
-        lastPreCutoffPublishAt100ns_.store(now100ns, std::memory_order_release);
+        pendingInputs_.store(0, std::memory_order_release);
         return generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
     }
 
@@ -48,45 +48,67 @@ public:
         generation_.store(0, std::memory_order_release);
         ackedGeneration_.store(0, std::memory_order_release);
         allSubmitted_.store(false, std::memory_order_release);
-        lastPreCutoffPublishAt100ns_.store(0, std::memory_order_release);
+        pendingInputs_.store(0, std::memory_order_release);
     }
 
     bool stopping() const {
         return cutoffPts100ns_.load(std::memory_order_acquire) >= 0;
     }
 
-    // PTS gate for the muxer while a stop is pending: only packets at or
-    // below the cutoff belong in the recording.
-    bool shouldPublishToMuxer(int64_t pts100ns) const {
-        const int64_t cutoff = cutoffPts100ns_.load(std::memory_order_acquire);
-        return cutoff < 0 || pts100ns <= cutoff;
-    }
-
     // Called for every frame the encode thread submits. Latches the boundary
-    // on the first post-stop submission.
+    // on the first post-stop submission and counts the pre-stop ones that are
+    // still owed a publication.
     void noteFrameSubmitted(int64_t pts100ns) {
         const int64_t cutoff = cutoffPts100ns_.load(std::memory_order_acquire);
-        if (cutoff >= 0 && pts100ns > cutoff) {
-            allSubmitted_.store(true, std::memory_order_release);
+        if (cutoff < 0) {
+            return;
         }
+        if (pts100ns > cutoff) {
+            allSubmitted_.store(true, std::memory_order_release);
+            return;
+        }
+        pendingInputs_.fetch_add(1, std::memory_order_acq_rel);
     }
 
     // Called for every packet the encode thread publishes. Returns true when
     // this publication completed the drain (the caller wakes the stop wait).
-    bool notePacketPublished(int64_t pts100ns, int64_t now100ns) {
+    bool notePacketPublished(int64_t pts100ns) {
+        const int64_t cutoff = cutoffPts100ns_.load(std::memory_order_acquire);
+        if (cutoff < 0) {
+            return false;
+        }
+        if (pts100ns <= cutoff) {
+            // Saturating: a packet from a submission made before beginStop has
+            // no matching increment.
+            decrementPending();
+        }
+        return acknowledgeIfDrained();
+    }
+
+    // An input the encoder accepted and then abandoned produces no packet, so
+    // it has to leave the pending count here or the stop waits out its timeout.
+    void noteInputDropped() {
+        if (!stopping()) {
+            return;
+        }
+        decrementPending();
+    }
+
+    // Escape for a drain whose encoder is gone: nothing in flight can ever be
+    // published, so the outstanding inputs are written off and the boundary is
+    // taken as reached (no further submission is possible either).
+    bool abandonPending() {
         if (!stopping()) {
             return false;
         }
-        if (pts100ns <= cutoffPts100ns_.load(std::memory_order_acquire)) {
-            lastPreCutoffPublishAt100ns_.store(now100ns, std::memory_order_release);
-            return acknowledgeIfDrained(now100ns);
-        }
-        return false;
+        pendingInputs_.store(0, std::memory_order_release);
+        allSubmitted_.store(true, std::memory_order_release);
+        return acknowledgeIfDrained();
     }
 
     // Polled by the encode loop and by stopRecording's wait. Fires once per
     // stop.
-    bool acknowledgeIfDrained(int64_t now100ns) {
+    bool acknowledgeIfDrained() {
         if (!stopping() ||
             ackedGeneration_.load(std::memory_order_acquire) >=
                 generation_.load(std::memory_order_acquire)) {
@@ -95,8 +117,7 @@ public:
         if (!allSubmitted_.load(std::memory_order_acquire)) {
             return false;
         }
-        const int64_t last = lastPreCutoffPublishAt100ns_.load(std::memory_order_acquire);
-        if (now100ns < last || now100ns - last < kQuiesce100ns) {
+        if (pendingInputs_.load(std::memory_order_acquire) != 0) {
             return false;
         }
         ackedGeneration_.store(generation_.load(std::memory_order_acquire), std::memory_order_release);
@@ -116,16 +137,22 @@ public:
     }
 
 private:
-    // A pre-stop publication can lag the boundary by a reorder depth of a few
-    // frames; 100 ms covers that plus dropped-frame jitter without stretching
-    // the stop into the seconds the old PTS wait could take.
-    static constexpr int64_t kQuiesce100ns = 100 * 10'000;
+    void decrementPending() {
+        uint64_t pending = pendingInputs_.load(std::memory_order_acquire);
+        while (pending > 0 &&
+               !pendingInputs_.compare_exchange_weak(
+                   pending,
+                   pending - 1,
+                   std::memory_order_acq_rel,
+                   std::memory_order_acquire)) {
+        }
+    }
 
     std::atomic<int64_t> cutoffPts100ns_{-1};
     std::atomic<uint64_t> generation_{0};
     std::atomic<uint64_t> ackedGeneration_{0};
     std::atomic<bool> allSubmitted_{false};
-    std::atomic<int64_t> lastPreCutoffPublishAt100ns_{0};
+    std::atomic<uint64_t> pendingInputs_{0};
 };
 
 } // namespace backtrack

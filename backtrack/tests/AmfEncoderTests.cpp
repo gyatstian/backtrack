@@ -18,15 +18,20 @@ namespace backtrack {
 struct AmfEncoderTestAccess {
     static void attach(AmfEncoder& owner, amf::AMFComponent* component,
                        amf::AMFContext* context, amf::AMFFactory* factory,
-                       const VideoSettings& settings) {
+                       const VideoSettings& settings, bool available = true) {
         auto& impl = *owner.impl_;
         impl.settings = settings;
         impl.encoder = component;
         impl.context = context;
         impl.factory = factory;
-        impl.caps.available = true;
-        impl.publishAvailability(true);
+        if (available) {
+            impl.caps.available = true;
+            impl.publishAvailability(true);
+        }
     }
+
+    // The production success step: the only place availability may be raised.
+    static void publishSession(AmfEncoder& owner) { owner.impl_->publishSessionActive(); }
 
     static void updateCaps(AmfEncoder& owner) { owner.impl_->updateCapabilities(L"fake"); }
     static bool configure(AmfEncoder& owner, const EncoderEffectiveSettings& effective) {
@@ -491,13 +496,21 @@ void testComponentCreationFailureDetailsAndCallerLogging() {
                 (codec == VideoCodec::H264 ? L"AVC" : L"HEVC") + L") failed: " +
                 (result == AMF_OK ? L"AMF_OK" : L"AMF_NOT_SUPPORTED");
             Logger::instance().info(L"encoder-test", L"before component creation");
-            const auto before = Logger::instance().recentLines(200);
             expect(!AmfEncoderTestAccess::createComponent(encoder) && encoder.capabilities().detail == detail,
                 "component creation lost the codec-specific status detail or accepted a null component");
-            expect(Logger::instance().recentLines(200) == before,
+            // Contract, not a line-by-line diff: an abandoned drain thread from an
+            // earlier case can append a line at any moment, so the assertion is
+            // that the helper itself produced nothing.
+            const auto after = Logger::instance().recentLines(200);
+            const bool helperLogged = std::any_of(
+                after.begin(), after.end(),
+                [&](const std::wstring& line) { return line.find(detail) != std::wstring::npos; });
+            expect(!helperLogged,
                 "the component helper logged instead of leaving logging to its caller");
             AmfEncoderTestAccess::attach(encoder, &oldComponent, &context, &factory, requestedSettings(codec));
             expect(!AmfEncoderTestAccess::switchFormat(encoder), "the failed component replacement succeeded");
+            expect(!encoder.encoderAvailable() && !encoder.capabilities().available,
+                "a failed component re-creation still reported a live session");
             const auto lines = Logger::instance().recentLines(1);
             expect(factory.creates == 2 && factory.lastComponentId ==
                    (codec == VideoCodec::H264 ? AMFVideoEncoderVCE_AVC : AMFVideoEncoder_HEVC) &&
@@ -750,6 +763,8 @@ void testInputRetentionBudgetMatchesPinnedLeases() {
     expect(component.submits == static_cast<int>(budget) && encoder.stats().droppedFrames == 1 &&
            encoder.encoderAvailable(),
         "a full backlog submitted anyway or faulted the session");
+    expect(encoder.droppedInputs() == 1,
+        "a shed input was not mirrored on the lock-free abandoned-input counter");
     expect(encoder.inputRetentionBudget() == budget, "the retention budget changed without a session change");
     for (const auto& lease : leases) {
         expect(!lease.expired(), "a retained AMF input lost its lease");
@@ -810,6 +825,83 @@ void testAgedBacklogFaultsAtDeadline() {
     }
 }
 
+// AMF has neither a lossless mode nor a separate ultra high quality usage: both
+// requests are programmed as the transcoding (high quality) configuration, so
+// that is what the effective settings and the detail must report.
+void testLosslessAndUltraHighQualityReportTheProgrammedConfiguration() {
+    for (const auto codec : {VideoCodec::H264, VideoCodec::Hevc}) {
+        for (const auto mode : {EncoderMode::Lossless, EncoderMode::UltraHighQuality}) {
+            FakeComponent component;
+            FakeContext context;
+            FakeFactory factory;
+            AmfEncoder encoder;
+            auto settings = requestedSettings(codec);
+            settings.encoderMode = mode;
+            setCaps(component, true, true);
+            AmfEncoderTestAccess::attach(encoder, &component, &context, &factory, settings);
+            AmfEncoderTestAccess::updateCaps(encoder);
+            expect(AmfEncoderTestAccess::configure(encoder), "the requested mode failed to configure");
+
+            const auto caps = encoder.capabilities();
+            expect(caps.effective.mode == EncoderMode::HighQuality,
+                "AMF echoed a fidelity mode it does not program");
+            const wchar_t* usage = codec == VideoCodec::Hevc ? AMF_VIDEO_ENCODER_HEVC_USAGE
+                                                            : AMF_VIDEO_ENCODER_USAGE;
+            const int expectedUsage = codec == VideoCodec::Hevc
+                ? AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING : AMF_VIDEO_ENCODER_USAGE_TRANSCODING;
+            const auto appliedUsage = component.properties.find(usage);
+            expect(appliedUsage != component.properties.end() &&
+                   appliedUsage->second.ToInt64() == expectedUsage,
+                "the reported mode did not match the programmed usage");
+            const wchar_t* reason = mode == EncoderMode::Lossless
+                ? L"AMF has no lossless mode" : L"AMF has no ultra high quality mode";
+            // The active-session detail is what Diagnostics shows; it is set
+            // after configuration completes.
+            AmfEncoderTestAccess::updateDetail(encoder, effectiveSettingsFor(settings));
+            expect(encoder.capabilities().detail.find(reason) != std::wstring::npos,
+                "the active-session detail dropped the mode fallback");
+        }
+    }
+}
+
+// The capability query must not publish availability: a failure while
+// configuring the component used to leave a torn-down backend reporting
+// available, and RecorderController then kept capturing without an encoder.
+void testInitializationFailureNeverReportsAvailable() {
+    for (const auto codec : {VideoCodec::H264, VideoCodec::Hevc}) {
+        for (const bool failing : {false, true}) {
+            FakeComponent component;
+            FakeContext context;
+            FakeFactory factory;
+            AmfEncoder encoder;
+            setCaps(component, true, true);
+            if (failing) {
+                component.rejectWrites.insert(codec == VideoCodec::Hevc
+                    ? AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE : AMF_VIDEO_ENCODER_TARGET_BITRATE);
+            }
+            AmfEncoderTestAccess::attach(encoder, &component, &context, &factory,
+                                         requestedSettings(codec), false);
+            AmfEncoderTestAccess::updateCaps(encoder);
+            expect(!encoder.encoderAvailable() && !encoder.capabilities().available,
+                "the capability query published a session that is not configured yet");
+            expect(AmfEncoderTestAccess::configure(encoder) == !failing,
+                "the configuration result disagreed with the injected failure");
+            const auto caps = encoder.capabilities();
+            if (failing) {
+                expect(!encoder.encoderAvailable() && !caps.available,
+                    "a session that failed while configuring still reported available");
+                expect(!caps.detail.empty(), "the failed session lost its reason");
+            } else {
+                AmfEncoderTestAccess::publishSession(encoder);
+                expect(encoder.encoderAvailable() && encoder.capabilities().available,
+                    "the successful configuration did not publish availability");
+                expect(encoder.stats().encoderAvailable,
+                    "the stats snapshot was not published with the session");
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -825,6 +917,8 @@ int main() {
         testSwitchEnablingReorderingFaultsForPipelineRecreation();
         testInputRetentionBudgetMatchesPinnedLeases();
         testAgedBacklogFaultsAtDeadline();
+        testLosslessAndUltraHighQualityReportTheProgrammedConfiguration();
+        testInitializationFailureNeverReportsAvailable();
         std::cout << "AmfEncoder tests passed\n";
         return 0;
     } catch (const std::exception& error) {

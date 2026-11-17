@@ -1,5 +1,6 @@
 #include "app/AudioDrain.h"
 #include "app/AudioWriter.h"
+#include "app/VideoDrain.h"
 #include "core/SpscQueue.h"
 #include "core/Types.h"
 
@@ -23,6 +24,36 @@ void expect(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+// The encode loop may only leave once the capture worker finished too. The
+// interleaving this pins (audit finding 10): the capture worker computes its
+// final frame, then pauses inside the push; the encode loop sees
+// stopRequested_ with an empty queue and no duration update pending and exits;
+// the push then lands in a queue nobody drains, and teardown clears it - the
+// last captured frame is silently lost. captureFinished_ is what rules that
+// out, because a single-producer queue can only prove "no more pushes" from
+// the producer side.
+void testVideoEncodeLoopDone() {
+    using backtrack::videoEncodeLoopDone;
+    expect(!videoEncodeLoopDone(false, false, true, false), "a running pipeline never exits");
+    expect(!videoEncodeLoopDone(true, true, false, false), "a queued frame must drain first");
+    expect(!videoEncodeLoopDone(true, true, true, true), "a pending duration update must apply first");
+    // The regression: stop requested, queue empty, nothing pending, but the
+    // capture worker has not returned yet (paused before its final push).
+    expect(!videoEncodeLoopDone(true, false, true, false),
+           "a paused capture worker must keep the encode loop alive");
+    expect(videoEncodeLoopDone(true, true, true, false),
+           "every condition together ends the loop");
+    // The same sequence the worker runs: pop, see the flag, find the queue
+    // empty, then the capture side finishes and signals the event.
+    bool captureFinished = false;
+    bool queueEmpty = true;
+    expect(!videoEncodeLoopDone(true, captureFinished, queueEmpty, false),
+           "the loop stays alive until the capture worker publishes its exit");
+    captureFinished = true; // captureLoop's last act
+    expect(videoEncodeLoopDone(true, captureFinished, queueEmpty, false),
+           "a finished capture worker with an empty queue ends the loop");
 }
 
 void testBlockRms() {
@@ -250,6 +281,7 @@ void testConsumerDrainsBeforeExit() {
 
 int main() {
     try {
+        testVideoEncodeLoopDone();
         testBlockRms();
         testMicrophoneAgcUsesBlockRms();
         testLatePacketConsumed();

@@ -293,10 +293,11 @@ private:
     void audioLoopImpl();
     void handleAudioPacket(AudioPacket&& packet);
     void writeAudioPacket(AudioPacket&& packet);
-    // Single publication path for encoded packets: the muxer PTS gate, the
-    // recording keyframe gate, the replay buffer, and the recording-cutoff
-    // acknowledgement. Shared by the encode loop and the recreate drain so a
-    // mid-recording pipeline rebuild cannot strand the reorder tail.
+    // Single publication path for encoded packets: the recording keyframe
+    // gate, the replay buffer, and the recording-cutoff acknowledgement. The
+    // muxer owns the cut itself (setCutPts100ns), so no PTS gate lives here.
+    // Shared by the encode loop and the recreate drain so a mid-recording
+    // pipeline rebuild cannot strand the reorder tail.
     void publishVideoPacket(EncodedPacket packet);
     void notifyRecordingCutoffAcked();
     // mutedKeys is precomputed by the caller: it depends only on the settings
@@ -395,6 +396,10 @@ private:
 
     std::atomic<bool> pipelineRunning_{false};
     std::atomic<bool> stopRequested_{false};
+    // Set by the capture worker as its last act (normal exit and crash path),
+    // so the encode loop can tell a stop without a dead producer from a stop
+    // that could still receive one last push. Reset in ensurePipeline.
+    std::atomic<bool> captureFinished_{false};
     // Separated from stopRequested_ so the audio writer drains every packet
     // enqueued before the WASAPI producers stop. stopPipeline sets this only
     // after joining both producer threads, then signals the writer to exit.
@@ -411,6 +416,13 @@ private:
     // emitted frame by idleCoalescingAllowed without touching pipelineGpuMutex_
     // or copying EncoderCapabilities.
     std::atomic<bool> encoderZeroReorderDelay_{false};
+    // Whether a same-size WGC frame may alias the source texture for this
+    // pipeline run. The alias bypasses the scaler's encoder-feeding pool and
+    // pins a source-side slot, so a deep-lookahead encoder that retains more
+    // inputs than the source side can pin gets owned copies instead. Decided
+    // once per run in recreateGpuPipeline, where the encoder format and
+    // retention are known.
+    std::atomic<bool> encoderAliasFitsRetention_{true};
     std::atomic<uint32_t> audioOutputVolumePercent_{100};
     std::atomic<uint32_t> audioInputVolumePercent_{100};
     std::atomic<bool> audioInputAutoGain_{false};

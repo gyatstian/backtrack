@@ -127,6 +127,14 @@ share.
   renders that, not the request. A setting the backend never configures must be
   reported off there rather than echoed back as requested (AMF reports lookahead,
   temporal AQ, multipass, and adaptive I/B-frames off, and B-frames off for HEVC).
+  AMF has no lossless and no ultra-high-quality mode: both requests program the
+  transcoding usage, so `effective.mode` reports high quality and the detail
+  names the fallback. The same rule covers a tier that cannot honor a request
+  (the 11.1 tier has no ultra-high-quality tuning). Never report a mode or rate
+  control the driver config does not carry: a labelled lossless CBR stream is
+  the failure this rule exists to prevent, and true NVENC lossless needs
+  4:4:4-predictive input the capture path cannot produce, so NVENC reports high
+  quality for a lossless request instead.
   AMF disables pre-analysis before `Init`; pre-encode-assisted rate control is
   not lookahead. Configuration fails if pre-analysis remains active or a
   rejected disable cannot be verified and the hardware capability is not known
@@ -135,7 +143,12 @@ share.
   AMF also fails `initialize` for an unsupported size or bitrate / GOP /
   framerate that do not read back after `Init`.
 - `IEncoder::encoderAvailable()` is polled by the capture loop and must be
-  lock-free. Do not implement it in terms of `stats()`. `stats()` and
+  lock-free. Do not implement it in terms of `stats()`. It becomes true only
+  after the whole initialize (session, configuration, buffers) succeeded, and
+  every failed initialize, failed component re-creation, or fault clears it
+  while keeping the reason in `capabilities().detail`: a destroyed backend that
+  still reports available makes the controller choose source-only recovery and
+  keep capturing with no encoder. `stats()` and
   `capabilities()` serve a snapshot when the state mutex is held across a
   driver call instead of waiting, so diagnostics never block the encode.
 - AMF output VUI is pinned BT.709 (transfer, primaries, matrix, studio range
@@ -149,9 +162,13 @@ share.
   packet and take DTS from `DecodeOrderTimestamps`, which equals PTS when
   nothing reorders. Never treat a zero or negative timestamp as "absent".
 - `DecodeOrderTimestamps.h` is the reordering helper both backends share. Reset
-  it on every initialize and component re-creation with the established pipeline
-  depth: NVENC uses its B-frame count plus configured lookahead; AMF uses the
-  established AVC B-frame pattern and no lookahead. It assigns decode slots from
+  it on every initialize and component re-creation with the picture-reorder
+  depth only: the B-frame count (2), never the lookahead depth. Lookahead
+  buffers inputs without changing decode order, so counting it in shifts every
+  DTS backwards by the lookahead window (3.1 s at depth 31) and desynchronises
+  the tracks. `reorderDelayFrames()` keeps the lookahead term for the
+  pending-output and retention heuristics; `pictureReorderFrames()` is what the
+  timestamps take. It assigns decode slots from
   submitted timestamps in FIFO order, and its extrapolated slots before the first
   submission use the earliest submission's duration, never the arriving packet's,
   so a cadence collapse cannot run early decode timestamps backwards. In-flight
@@ -182,6 +199,11 @@ share.
   erased still owns that mapping and lease. A lock-status fault must not take the
   mapping-fault path - the session can still retire its inputs, which is what
   lets `recreateGpuPipeline` release them instead of aborting.
+- `IEncoder::droppedInputs()` is the lock-free mirror of inputs the backend
+  accepted and then abandoned without an output (a rejected submission, an
+  empty payload). The recording-stop drain subtracts the delta from the
+  submissions it is still waiting for, so every new silent drop path must bump
+  it or a stop stalls until its timeout.
 - A wedged or TDR'd session escalates by publishing `encoderAvailable = false`
   and shutting the encoder down. That is the only signal
   `RecorderController`'s pipeline-recreate path uses, so never leave a broken

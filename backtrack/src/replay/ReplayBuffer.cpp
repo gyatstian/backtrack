@@ -76,7 +76,15 @@ int64_t gopTolerance100ns(uint32_t gopSeconds) {
 
 template <typename Meta>
 int64_t videoPresentationEnd(const Meta& meta) {
-    return meta.pts100ns + (std::max<int64_t>)(clampSingleVideoDuration100ns(meta.duration100ns), 0);
+    const int64_t duration100ns =
+        (std::max<int64_t>)(clampSingleVideoDuration100ns(meta.duration100ns), 0);
+    // Saturating add: pts values here come from the encoder, but this end time
+    // feeds the save window, the muxed sample and the written manifest, so an
+    // endpoint value must not wrap it into the opposite sign on the way out.
+    if (meta.pts100ns > (std::numeric_limits<int64_t>::max)() - duration100ns) {
+        return (std::numeric_limits<int64_t>::max)();
+    }
+    return meta.pts100ns + duration100ns;
 }
 
 template <typename Packet, typename GetMeta>
@@ -675,6 +683,40 @@ bool ReplayBuffer::saveTo(
     bool diskMode = false;
     bool diskAudioMode = false;
     uint64_t videoBytes = 0;
+    // Releases the pin on every path (early returns included) once the ring
+    // bytes have been consumed; also performs a ring close that the pin had
+    // deferred, then resumes age-based trimming of the disk backends.
+    struct PinRelease {
+        ReplayBuffer* self;
+        ~PinRelease() {
+            {
+                std::scoped_lock lock(self->mutex_);
+                --self->savePinsRefs_;
+                if (self->savePinsRefs_ > 0) {
+                    return; // Another save still holds the pin.
+                }
+                const bool closedVideo = self->ringPendingClose_;
+                if (closedVideo) {
+                    self->closeRingNowLocked();
+                }
+                const bool closedAudio = self->audioRingPendingClose_;
+                if (closedAudio) {
+                    self->closeAudioRingNowLocked();
+                }
+                if (!closedVideo && !closedAudio &&
+                    (self->videoBackend_ == VideoBackend::Disk ||
+                     self->audioBackend_ == AudioBackend::Disk)) {
+                    self->trimLocked();
+                }
+            }
+            self->ringSpace_.notify_all();
+        }
+    };
+    // Declared (and emplaced, which is a placement-new, not an allocation)
+    // in the same scope region as the pin increment below: no allocating call
+    // may sit between the two, or a bad_alloc throws before the guard exists,
+    // leaks the pin, and every later producer waits on ring space forever.
+    std::optional<PinRelease> pinRelease;
     // Read under the same lock as the packet snapshot: a concurrent configure
     // can replace the ring files, and the pin release below may close them too.
     std::filesystem::path ringPath;
@@ -722,6 +764,7 @@ bool ReplayBuffer::saveTo(
         // packet of this save is not mistaken for a consumed one.
         if (diskMode || diskAudioMode) {
             ++savePinsRefs_;
+            pinRelease.emplace(this);
             if (diskMode) {
                 videoRing_.resetSaveConsumed();
             }
@@ -737,39 +780,6 @@ bool ReplayBuffer::saveTo(
         L" audio packets buffered (" +
         (diskMode ? L"disk" : L"RAM") + L" video, " +
         (diskAudioMode ? L"disk" : L"RAM") + L" audio)");
-    // Releases the pin on every path (early returns included) once the ring
-    // bytes have been consumed; also performs a ring close that the pin had
-    // deferred, then resumes age-based trimming of the disk backends.
-    struct PinRelease {
-        ReplayBuffer* self;
-        ~PinRelease() {
-            {
-                std::scoped_lock lock(self->mutex_);
-                --self->savePinsRefs_;
-                if (self->savePinsRefs_ > 0) {
-                    return; // Another save still holds the pin.
-                }
-                const bool closedVideo = self->ringPendingClose_;
-                if (closedVideo) {
-                    self->closeRingNowLocked();
-                }
-                const bool closedAudio = self->audioRingPendingClose_;
-                if (closedAudio) {
-                    self->closeAudioRingNowLocked();
-                }
-                if (!closedVideo && !closedAudio &&
-                    (self->videoBackend_ == VideoBackend::Disk ||
-                     self->audioBackend_ == AudioBackend::Disk)) {
-                    self->trimLocked();
-                }
-            }
-            self->ringSpace_.notify_all();
-        }
-    };
-    std::optional<PinRelease> pinRelease;
-    if (diskMode || diskAudioMode) {
-        pinRelease.emplace(this);
-    }
 
     if (video.empty()) {
         return fail(L"replay video buffer is empty");

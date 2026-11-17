@@ -134,23 +134,22 @@ std::optional<AudioSessionAppInfo> MainWindow::matchingAutoRecordApp(
 void MainWindow::startRecordingForAutoRecord(const std::wstring& appName) {
     ControllerAction action;
     action.kind = ControllerActionKind::ToggleRecording;
+    action.automatic = true;
+    // Ownership is taken on completion, not here: the action can fail, and a
+    // manual action completing in between must not inherit it.
     if (queueControllerAction(std::move(action), L"Recorder is busy; auto record start ignored")) {
-        autoRecordOwnsRecording_ = true;
         Logger::instance().info(L"ui", L"Auto record: starting recording for " + appName);
         setStatus(L"Auto record: starting recording (" + appName + L")");
     }
 }
 
 void MainWindow::stopRecordingForAutoRecord() {
-    const bool ownsRecording = autoRecordOwnsRecording_;
-    // Clear ownership up front so the completion poll cannot mistake this stop
-    // for a user-initiated one and suppress the next launch.
-    autoRecordOwnsRecording_ = false;
     ControllerAction action;
     action.kind = ControllerActionKind::ToggleRecording;
+    action.automatic = true;
+    // A rejected stop keeps ownership and the next tick retries it; a completion
+    // clears it and must not suppress the next launch.
     if (!queueControllerAction(std::move(action), L"Recorder is busy; auto record stop ignored")) {
-        // Keep ownership so the next tick retries the stop.
-        autoRecordOwnsRecording_ = ownsRecording;
         return;
     }
     Logger::instance().info(L"ui", L"Auto record: app closed; stopping recording");
@@ -197,11 +196,12 @@ void MainWindow::pollAutoRecord(const std::vector<AudioSessionAppInfo>* openApps
         autoRecordSuppressStart_ = false;
     }
 
-    // Recording ended without auto record stopping it (hotkey or failure):
-    // drop ownership and hold off restarting while the app stays open. Suppress
-    // only applies while a selected app is actually running; if the app also
-    // exited this tick, the re-arm above must survive (the next launch should
-    // trigger even though the user stopped the recording).
+    // Fallback for a recording that ended without a ToggleRecording completion
+    // (pipeline failure, or a stop the queue rejected and never retried): drop
+    // ownership and hold off restarting while the app stays open. Suppress only
+    // applies while a selected app is actually running; if the app also exited
+    // this tick, the re-arm above must survive (the next launch should trigger
+    // even though the user stopped the recording).
     if (autoRecordOwnsRecording_ && !controller_.isRecording()) {
         autoRecordOwnsRecording_ = false;
         autoRecordSuppressStart_ = running;

@@ -151,6 +151,37 @@ void testScalerSideClampKeepsFeedingCeiling() {
         "the feeding ceiling keeps the shared floor");
 }
 
+// Finding 03: a same-size, same-format WGC frame aliases the source texture, so
+// it pins a source-side slot (zero-copy lease or capture pool) and never touches
+// the encoder-feeding pool negotiated above. The alias capacity therefore has to
+// cover the encoder's retention, or the alias starves the one pool it does use.
+void testWgcAliasCapacityCoversTheSourceSide() {
+    // queue limit 4: WGC frame pool = 4 + 2 = 6 -> 5 zero-copy leases, plus the
+    // queue-derived texture pool (4 + 4 = 8), so 13 inputs.
+    expect(wgcFramePoolSizeForQueueLimit(4) == 6, "queue limit 4 gets a 6-frame WGC pool");
+    expect(wgcMaxZeroCopyLeases(6) == 5, "one WGC pool slot stays free for FrameArrived");
+    expect(texturePoolSizeForQueueLimit(4) == 8, "the source texture pool is queue + 4");
+    expect(wgcAliasInputCapacity(4) == 13, "the alias path can pin 5 leases + 8 textures");
+
+    // A lookahead-24 NVENC budget negotiates a 33-slot feeding pool. Aliasing
+    // would pin source-side slots instead and run out, so the controller must
+    // take the owned path for that pipeline run.
+    expect(encoderFeedingPoolSizeFor(4, 28) == 33, "lookahead-24 budget negotiates 33 feeding slots");
+    expect(encoderAliasFitsRetention(13, 4), "a shallow retention fits the source side");
+    expect(!encoderAliasFitsRetention(13, 33), "a deep retention must not alias");
+
+    // queue limit 8: WGC frame pool clamps to 8 -> 7 leases, and the texture
+    // pool is 8 + 4 = 12 (still under the intermediate ceiling of 16), so 19.
+    expect(wgcFramePoolSizeForQueueLimit(8) == 8, "the WGC frame pool clamps at 8");
+    expect(texturePoolSizeForQueueLimit(8) == 12, "the source texture pool is queue + 4");
+    expect(wgcAliasInputCapacity(8) == 7 + 12, "queue limit 8 pins 7 leases + 12 textures");
+    expect(encoderAliasFitsRetention(19, 19), "the boundary case fits");
+    expect(!encoderAliasFitsRetention(19, 20), "one input over the alias capacity must not alias");
+    // The alias path never grows with the encoder, unlike the feeding pool.
+    expect(wgcAliasInputCapacity(8) < encoderFeedingPoolSizeFor(8, 40),
+        "the source side stays smaller than a deep-lookahead feeding pool");
+}
+
 void testNoRetentionStillServesQueueBacklog() {
     // AMF-style encoder (copies inputs, retains nothing, budget 0): the
     // feeding pool still covers a full queue plus the next in-flight scale.
@@ -182,6 +213,7 @@ int main() {
         testDeepLookaheadReachesFirstOutputWithoutEarlierRelease();
         testNegotiationBounds();
         testScalerSideClampKeepsFeedingCeiling();
+        testWgcAliasCapacityCoversTheSourceSide();
         testNoRetentionStillServesQueueBacklog();
         return 0;
     } catch (const std::exception& error) {

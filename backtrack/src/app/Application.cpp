@@ -80,6 +80,11 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
         CloseHandle(instanceMutex);
         return 0;
     }
+    // This process owns the journal and the live session mutes from here on:
+    // either it holds the mutex, or no mutex exists and no other session can be
+    // running. A rejected launch returned above and stays disowned, so its
+    // controller teardown restores nothing of the live instance's.
+    WasapiCapture::setSessionMuteOwnership(true);
 
     SettingsStore::LoadStatus settingsStatus;
     auto settings = settingsStore_.load(&settingsStatus);
@@ -144,6 +149,9 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
         if (SUCCEEDED(com)) {
             OleUninitialize();
         }
+        // Drop ownership before the mutex goes: a process that no longer holds
+        // it must not restore or rewrite the journal a new instance now owns.
+        WasapiCapture::setSessionMuteOwnership(false);
         if (instanceMutex) {
             ReleaseMutex(instanceMutex);
             CloseHandle(instanceMutex);
@@ -152,7 +160,12 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
     }
 
     const int result = window.runMessageLoop();
+    // shutdown() restores the mutes while this process still owns them.
     controller_.shutdown();
+    // Ownership ends here, before the mutex is released: a new instance may
+    // start sweeping as soon as the mutex is free, and this process's remaining
+    // teardown must not touch the journal it then owns.
+    WasapiCapture::setSessionMuteOwnership(false);
     Logger::instance().info(L"Backtrack exiting");
     Logger::instance().writeFooter();
 

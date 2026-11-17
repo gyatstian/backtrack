@@ -17,7 +17,7 @@ i dont use amd, some features might not work. dont expect much
 - customization of the gpu/encoding settings
 - multi-monitor support
 - library
-- sound separation (you can disable sound from specific apps)
+- sound separation (mutes the audio of selected apps while recording; best effort, an app can slip in a moment of audio)
 - cool icon
 - game integrations (only lol)
 - discord rpc

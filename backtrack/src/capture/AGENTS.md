@@ -164,6 +164,11 @@ GPU scaler that converts frames to whatever the active encoder wants.
   grows; the queue-derived capture and source pools are intermediate and stay
   capped at 16. `app` re-negotiates it after encoder initialize and on every
   handoff.
+  A same-size WGC alias bypasses that pool: the encoder's lease pins a source
+  texture instead, so the alias shares the source-side capacity
+  (`wgcAliasInputCapacity`: zero-copy leases plus copy-path slots, 13 at a
+  queue limit of 4). `encoderAliasFitsRetention` is the gate `app` uses - the
+  alias is only eligible when that capacity covers the whole retention window.
 - Every pool teardown invalidates any GPU registration the consumer still holds
   for those textures, so `releaseResources()` bumps `poolGeneration()` and the
   caller must drop its registrations when that value changes across a call. The

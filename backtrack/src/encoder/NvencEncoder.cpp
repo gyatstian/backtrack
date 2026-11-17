@@ -172,4 +172,8 @@ uint32_t NvencEncoder::inputRetentionBudget() const {
     return inner_->inputRetentionBudget();
 }
 
+uint64_t NvencEncoder::droppedInputs() const noexcept {
+    return inner_->droppedInputs();
+}
+
 } // namespace backtrack

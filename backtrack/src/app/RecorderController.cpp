@@ -3,6 +3,7 @@
 #include "app/CaptureFrameHandoff.h"
 #include "app/PendingDurationTracker.h"
 #include "app/RecorderController.h"
+#include "app/VideoDrain.h"
 #include "app/VideoTimelineScheduler.h"
 
 #include "audio/AudioConvert.h"
@@ -530,7 +531,12 @@ std::filesystem::path RecorderController::stopRecording() {
     }
 
     const int64_t stopPts100ns = steadyNow100ns();
-    const uint64_t cutoffGeneration = recordingCutoff_.beginStop(stopPts100ns, steadyNow100ns());
+    const uint64_t cutoffGeneration = recordingCutoff_.beginStop(stopPts100ns);
+    // The muxer keeps everything at or below the cut and holds the rest, so the
+    // clip ends on a decode-order prefix even when a post-stop packet completes
+    // before a pre-stop B picture (finding 04). Set next to the cutoff latch so
+    // the two agree on one boundary.
+    muxer_.setCutPts100ns(stopPts100ns);
 
     // Mirror, not settings(): this path needs one bool, not a whole struct
     // copy with paths and vectors.
@@ -713,6 +719,20 @@ std::filesystem::path RecorderController::saveReplay() {
         setLastRecordingError(L"could not reserve a replay output name");
         return {};
     }
+    // A reservation is a hidden empty file that holds the name. saveTo can fail
+    // or throw before the muxer consumes it, which would leave an empty clip and
+    // a blocked name behind; the guard releases it unless the save published.
+    // removeEmptyOutputReservation only ever deletes a hidden zero-byte file, so
+    // a published clip is never at risk.
+    struct OutputReservationGuard {
+        const std::filesystem::path& path;
+        bool dismissed = false;
+        ~OutputReservationGuard() {
+            if (!dismissed) {
+                removeEmptyOutputReservation(path);
+            }
+        }
+    } reservation{output};
     VideoSettings videoSettings;
     {
         std::scoped_lock lock(stateMutex_);
@@ -723,6 +743,9 @@ std::filesystem::path RecorderController::saveReplay() {
     const auto saveStart = SteadyClock::now();
     std::wstring saveDetail;
     const bool saved = replay_.saveTo(output, videoSettings, &saveDetail);
+    if (saved) {
+        reservation.dismissed = true;
+    }
     // A replay save muxes already-compressed streams; longer than twice the
     // window (or 30 s, whichever is larger) means a slow disk is stalling the save.
     const auto saveBudgetMs = std::max<int64_t>(30000,
@@ -749,6 +772,11 @@ void RecorderController::shutdown() {
         stopRecording();
     }
     stopPipeline();
+    // Unconditional, and here rather than only in the destructor: the
+    // single-instance mutex is still held on this path, so a restore that needs
+    // to look at the running instance does not race a second launch. The
+    // destructor's call stays as the last-resort guard (idempotent).
+    restoreSessionMutes(L"for the next launch");
 }
 
 RecordingStats RecorderController::stats() const {
@@ -977,6 +1005,7 @@ bool RecorderController::ensurePipeline() {
 
     replay_.configure(snapshot.replay, replayRingDirectoryFor(snapshot), replayRingCapacityBytesFor(snapshot), replayAudioRingCapacityBytesFor(snapshot));
     stopRequested_ = false;
+    captureFinished_ = false;
     audioProducersFinished_ = false;
     discardQueuedFrames_ = false;
     recordingCutoff_.reset();
@@ -1068,6 +1097,11 @@ void RecorderController::stopPipeline() {
     // apply to a thread that must not be left running, so the info line above is
     // the diagnostic: a real hang ends the log at "Waiting for <worker>".
     if (encodeThread_.joinable()) {
+        // The capture worker has been joined above, so it can no longer push; a
+        // worker that never started (thread creation failed) would otherwise
+        // leave the encode loop waiting on a producer that does not exist, and
+        // these joins have no timeout.
+        captureFinished_.store(true, std::memory_order_release);
         Logger::instance().info(L"recorder", L"Waiting for encode worker to stop");
         encodeThread_.join();
         Logger::instance().info(L"recorder", L"Encode worker stopped");
@@ -1321,6 +1355,21 @@ bool RecorderController::recreateGpuPipeline(
     scaler_.setPoolSize(encoderFeedingPoolSizeFor(
         activeFrameQueueLimit(gpuSettings),
         encoder_->inputRetentionBudget()));
+    // A same-size WGC frame aliases the source texture instead of a scaler
+    // output, so it pins a source-side slot and never reaches the feeding pool
+    // above. Decide once per run, where the encoder's retention is known: an
+    // encoder holding more inputs than the source side can pin gets owned
+    // copies for the whole run (finding 03).
+    const uint32_t aliasCapacity = wgcAliasInputCapacity(activeFrameQueueLimit(gpuSettings));
+    const uint32_t encoderRetention = encoder_->inputRetentionBudget();
+    const bool aliasFits = encoderAliasFitsRetention(aliasCapacity, encoderRetention);
+    encoderAliasFitsRetention_.store(aliasFits, std::memory_order_relaxed);
+    if (!aliasFits) {
+        Logger::instance().info(L"recorder",
+            L"WGC zero-copy aliasing disabled for this pipeline: encoder retains " +
+            std::to_wstring(encoderRetention) + L" inputs but the source side can pin only " +
+            std::to_wstring(aliasCapacity) + L"; frames are copied into the encoder-feeding pool");
+    }
     Logger::instance().info(L"recorder",
         L"GPU pipeline ready: capture=" + std::to_wstring(sourceWidth) + L"x" + std::to_wstring(sourceHeight) +
         L", encode=" + std::to_wstring(videoSettings.width) + L"x" + std::to_wstring(videoSettings.height) +
@@ -1600,6 +1649,14 @@ void RecorderController::captureLoop() {
         captureBackendActive_ = false;
         captureBackendStatus_ += L"; capture worker stopped after an internal error";
     }
+    // Last act of the worker, on every exit path: a single-threaded SPSC queue
+    // has exactly one producer, so this flag (not a queue-size check) is what
+    // proves no further frame can be pushed. The wakeup covers the case where
+    // the encode loop is already waiting with an empty queue.
+    captureFinished_.store(true, std::memory_order_release);
+    if (frameEvent_) {
+        SetEvent(frameEvent_);
+    }
 }
 
 void RecorderController::captureLoopImpl() {
@@ -1829,11 +1886,15 @@ void RecorderController::captureLoopImpl() {
             //
             // lastFrame pins the WGC lease until a newer source frame replaces it.
             // Non-BGRA encoders may not release raw inputs on registration reset.
+            // encoderAliasFitsRetention_ is the per-run verdict from
+            // recreateGpuPipeline: an alias pins a source-side slot, so it is only
+            // safe while the source side can hold what the encoder retains.
             const bool wgcZeroCopyEligible =
                 capture_ &&
                 capture_->backend() == CaptureBackend::WindowsGraphicsCapture &&
                 gpuSettings.wgcZeroCopy &&
-                encoderInputFormat == DXGI_FORMAT_B8G8R8A8_UNORM;
+                encoderInputFormat == DXGI_FORMAT_B8G8R8A8_UNORM &&
+                encoderAliasFitsRetention_.load(std::memory_order_relaxed);
             const bool forceOwnedTexture =
                 !wgcZeroCopyEligible ||
                 (captureSettings.multiMonitorSupport && gpuSettings.stableMultimonitorFrames);
@@ -2984,8 +3045,11 @@ void RecorderController::encodeLoopImpl() {
     // Hoisted out of the frame loop: encodeFrame clears it, so the previous
     // frame's capacity is reused instead of freed and re-grown every frame.
     std::vector<EncodedPacket> ready;
-    while (!stopRequested_ || frameQueue_.size() > 0 ||
-           durationUpdatePending_.load(std::memory_order_acquire)) {
+    while (!videoEncodeLoopDone(
+        stopRequested_.load(std::memory_order_acquire),
+        captureFinished_.load(std::memory_order_acquire),
+        frameQueue_.size() == 0,
+        durationUpdatePending_.load(std::memory_order_acquire))) {
         // Periodic health probe: averageEncodeMs is already measured per frame
         // (EncoderCommon EMA) as submit->output latency, whose healthy floor is
         // about one frame period; see encoderBehindBudget for why the probe is
@@ -3022,8 +3086,18 @@ void RecorderController::encodeLoopImpl() {
         }
 
         consumeDurationUpdate();
-        if (recordingCutoff_.acknowledgeIfDrained(steadyNow100ns())) {
+        if (recordingCutoff_.acknowledgeIfDrained()) {
             notifyRecordingCutoffAcked();
+        } else if (recordingCutoff_.stopping()) {
+            // A faulted or absent encoder can never publish the pending inputs,
+            // so a draining stop must write them off instead of waiting out its
+            // timeout. Same try_to_lock read as the health probe: a recreate
+            // holds the GPU lock, and its own drain publishes the tail.
+            std::unique_lock probeLock(pipelineGpuMutex_, std::try_to_lock);
+            if (probeLock.owns_lock() && pipelineEncoderFaulted(encoder_.get()) &&
+                recordingCutoff_.abandonPending()) {
+                notifyRecordingCutoffAcked();
+            }
         }
 
         GpuFrame frame;
@@ -3054,7 +3128,14 @@ void RecorderController::encodeLoopImpl() {
         {
             std::scoped_lock gpuLock(pipelineGpuMutex_);
             if (encoder_) {
+                // A dropped input produces no packet, so the completion
+                // accounting for a pending recording stop has to learn about it
+                // here; otherwise the stop waits out its timeout.
+                const uint64_t droppedBefore = encoder_->droppedInputs();
                 encoder_->encodeFrame(frame, ready);
+                if (encoder_->droppedInputs() != droppedBefore) {
+                    recordingCutoff_.noteInputDropped();
+                }
             }
         }
         for (auto& packet : ready) {
@@ -3083,11 +3164,11 @@ void RecorderController::publishVideoPacket(EncodedPacket packet) {
     const int64_t pts100ns = packet.pts100ns;
     lastEncodedVideoPts100ns_.store(pts100ns, std::memory_order_release);
 
-    // The PTS gate keeps delayed pre-stop output (the reorder tail) in the
-    // recording and keeps post-stop frames out of it once a stop is pending;
-    // recording_ alone cannot because it is cleared only after the drain.
-    if (recording_ && muxer_.active() &&
-        recordingCutoff_.shouldPublishToMuxer(pts100ns)) {
+    // The muxer owns the recording cut (muxer_.setCutPts100ns): it writes the
+    // packets at or below the cut and holds the rest, so a stop keeps a
+    // decode-order prefix (finding 04). recording_ alone cannot gate this
+    // because it is cleared only after the drain.
+    if (recording_ && muxer_.active()) {
         if (waitingForRecordingKeyFrame_) {
             if (packet.keyFrame) {
                 waitingForRecordingKeyFrame_ = false;
@@ -3098,7 +3179,10 @@ void RecorderController::publishVideoPacket(EncodedPacket packet) {
         }
     }
     replay_.pushVideo(std::move(packet));
-    if (recordingCutoff_.notePacketPublished(pts100ns, steadyNow100ns())) {
+    // Every arriving packet - including the held post-cutoff ones - has to
+    // settle the completion accounting, or the stop could not tell a slow
+    // reorder tail from a lost one.
+    if (recordingCutoff_.notePacketPublished(pts100ns)) {
         notifyRecordingCutoffAcked();
     }
 }

@@ -107,18 +107,34 @@ bool alwaysAlive(uint32_t) {
 
 void testSerializeParseRoundTrip() {
     const std::vector<SessionMuteRecord> records = {
-        {1234, L"c:\\apps\\game.exe", false},
-        {5678, L"c:\\apps\\music player.exe", true},
+        {1234, L"c:\\apps\\game.exe", false, L"{endpoint-0}", L"{session-a}"},
+        {5678, L"c:\\apps\\music player.exe", true, L"{endpoint-1}", L"{session-b}"},
     };
     const std::string content = SessionMuteStore::serialize(records);
-    expect(content == "1234\t0\tc:\\apps\\game.exe\n5678\t1\tc:\\apps\\music player.exe\n",
+    expect(content ==
+            "1234\t0\tc:\\apps\\game.exe\t{endpoint-0}\t{session-a}\n"
+            "5678\t1\tc:\\apps\\music player.exe\t{endpoint-1}\t{session-b}\n",
         "journal line format changed");
     const auto parsed = SessionMuteStore::parse(content);
     expect(parsed.size() == 2, "round trip lost a record");
     expect(parsed[0].processId == 1234 && !parsed[0].previousMute && parsed[0].pathKey == L"c:\\apps\\game.exe",
         "round trip corrupted record 0");
+    expect(parsed[0].endpointId == L"{endpoint-0}" && parsed[0].instanceId == L"{session-a}",
+        "round trip lost record 0's live identity");
     expect(parsed[1].processId == 5678 && parsed[1].previousMute && parsed[1].pathKey == L"c:\\apps\\music player.exe",
         "round trip corrupted record 1");
+    expect(parsed[1].endpointId == L"{endpoint-1}" && parsed[1].instanceId == L"{session-b}",
+        "round trip lost record 1's live identity");
+
+    // Legacy 3-column lines still load, with no live identity, and unknown
+    // extra columns are ignored.
+    const auto legacy = SessionMuteStore::parse("77\t1\tc:\\apps\\old.exe\n78\t0\tc:\\apps\\new.exe\t{ep}\t{id}\tignored\n");
+    expect(legacy.size() == 2, "legacy and extended lines must both parse");
+    expect(legacy[0].previousMute && legacy[0].pathKey == L"c:\\apps\\old.exe" &&
+           legacy[0].endpointId.empty() && legacy[0].instanceId.empty(),
+        "a 3-column line must parse with an empty live identity");
+    expect(legacy[1].endpointId == L"{ep}" && legacy[1].instanceId == L"{id}",
+        "the two known extra columns must parse and later ones must be ignored");
 }
 
 void testParseSkipsMalformedLines() {
@@ -154,6 +170,8 @@ void testApplyMutesWantedAndJournals() {
     const auto journaled = readJournal(journal);
     expect(journaled.size() == 1 && journaled[0].processId == 111 && !journaled[0].previousMute,
         "journal must hold the applied mute with its previous state");
+    expect(journaled[0].endpointId == L"{endpoint-0}" && journaled[0].instanceId == L"{session-a}",
+        "the journal must record which session instance was muted");
     expect(!std::filesystem::exists(dir / L"audio-session-mutes.txt.tmp"), "no torn journal temp may be left");
 }
 
@@ -559,7 +577,9 @@ void testSweepRetiresDeadProcess() {
     const auto journal = dir / L"audio-session-mutes.txt";
     {
         std::ofstream stream(journal, std::ios::binary);
-        stream << "333\t1\tc:\\apps\\gone.exe\n";
+        // Live identity recorded, but neither the process nor a replacement
+        // session survives it.
+        stream << "333\t1\tc:\\apps\\gone.exe\t{endpoint-0}\t{session-gone}\n";
     }
     SessionMuteStore store(journal);
     const auto result = store.sweepOrphans(
@@ -567,6 +587,144 @@ void testSweepRetiresDeadProcess() {
         [](uint32_t) { return false; });
     expect(result.has_value() && result->unmatched == 0, "a dead process's record is retired");
     expect(!std::filesystem::exists(journal), "the obsolete journal is deleted");
+}
+
+void testClearRestoresTheJournaledSessionOnly() {
+    // One process, two render sessions: A muted by the user, B muted by
+    // Backtrack. Recovery must unmute B, not the first session with that pid
+    // and path.
+    const auto dir = testDir("two-sessions");
+    const auto journal = dir / L"audio-session-mutes.txt";
+    {
+        std::ofstream stream(journal, std::ios::binary);
+        stream << "111\t0\tc:\\apps\\game.exe\t{endpoint-0}\t{session-b}\n";
+    }
+    SessionMuteStore store(journal);
+    std::vector<bool> callsA;
+    std::vector<bool> callsB;
+    std::vector<FakeSession> sessions(2);
+    sessions[0].pid = 111;
+    sessions[0].key = L"c:\\apps\\game.exe";
+    sessions[0].instance = L"{session-a}";
+    sessions[0].muted = true;
+    sessions[0].calls = &callsA;
+    sessions[1].pid = 111;
+    sessions[1].key = L"c:\\apps\\game.exe";
+    sessions[1].instance = L"{session-b}";
+    sessions[1].muted = true;
+    sessions[1].calls = &callsB;
+
+    const auto result = store.clear(enumeratorFor(sessions), alwaysAlive);
+    expect(result.restored == 1 && result.unresolved == 0, "the journaled session is restored");
+    expect(callsB == std::vector<bool>{false}, "the session Backtrack muted is unmuted");
+    expect(callsA.empty() && sessions[0].muted, "the user's own mute must stay untouched");
+    expect(!std::filesystem::exists(journal), "a verified restore retires the journal");
+}
+
+void testSweepRestoresInheritedMuteAfterRestart() {
+    // The recorded process is gone; its replacement restarted into the same
+    // path on the same endpoint and inherited the persisted mute.
+    const auto dir = testDir("restart");
+    const auto journal = dir / L"audio-session-mutes.txt";
+    {
+        std::ofstream stream(journal, std::ios::binary);
+        stream << "999\t0\tc:\\apps\\game.exe\t{endpoint-0}\t{session-old}\n";
+    }
+    SessionMuteStore store(journal);
+    std::vector<bool> calls;
+    std::vector<FakeSession> sessions(1);
+    sessions[0].pid = 111;
+    sessions[0].key = L"c:\\apps\\game.exe";
+    sessions[0].instance = L"{session-new}";
+    sessions[0].muted = true;
+    sessions[0].calls = &calls;
+
+    const auto result = store.sweepOrphans(enumeratorFor(sessions),
+        [](uint32_t processId) { return processId != 999; });
+    expect(result.has_value() && result->restored == 1, "the replacement session inherits the restore");
+    expect(result->unmatched == 0, "the record is retired with the restore");
+    expect(calls == std::vector<bool>{false}, "the inherited mute is restored to the recorded state");
+    expect(!std::filesystem::exists(journal), "the retired journal is deleted");
+}
+
+void testSweepReleasesRecordWhenItsInstanceVanished() {
+    // The process lives on with a sibling session, but the exact instance the
+    // record names is gone. Windows keeps a mute per session, so the record is
+    // retired instead of unmuting whichever session the pid and path match.
+    const auto dir = testDir("instance-gone");
+    const auto journal = dir / L"audio-session-mutes.txt";
+    {
+        std::ofstream stream(journal, std::ios::binary);
+        stream << "111\t0\tc:\\apps\\game.exe\t{endpoint-0}\t{session-gone}\n";
+    }
+    SessionMuteStore store(journal);
+    std::vector<bool> calls;
+    std::vector<FakeSession> sessions(1);
+    sessions[0].pid = 111;
+    sessions[0].key = L"c:\\apps\\game.exe";
+    sessions[0].instance = L"{session-sibling}";
+    sessions[0].muted = true;
+    sessions[0].calls = &calls;
+
+    const auto result = store.clear(enumeratorFor(sessions), alwaysAlive);
+    expect(result.restored == 0 && result.unresolved == 0, "a vanished instance releases its record");
+    expect(calls.empty() && sessions[0].muted, "a sibling session must not be unmuted");
+    expect(!std::filesystem::exists(journal), "the released record is deleted");
+}
+
+void testLegacyJournalPairsExactlyOnce() {
+    const auto dir = testDir("legacy-record");
+    const auto journal = dir / L"audio-session-mutes.txt";
+    {
+        std::ofstream stream(journal, std::ios::binary);
+        stream << "111\t0\tc:\\apps\\game.exe\n";
+    }
+    SessionMuteStore store(journal);
+    std::vector<bool> callsA;
+    std::vector<bool> callsB;
+    std::vector<FakeSession> sessions(2);
+    for (auto& session : sessions) {
+        session.pid = 111;
+        session.key = L"c:\\apps\\game.exe";
+        session.muted = true;
+    }
+    sessions[0].instance = L"{session-a}";
+    sessions[1].instance = L"{session-b}";
+    sessions[0].calls = &callsA;
+    sessions[1].calls = &callsB;
+
+    const auto result = store.sweepOrphans(enumeratorFor(sessions), alwaysAlive);
+    expect(result.has_value() && result->restored == 1 && result->unmatched == 0,
+        "a legacy record restores one session and retires itself");
+    expect(callsA == std::vector<bool>{false} && callsB.empty(),
+        "a legacy record must claim exactly one session");
+}
+
+void testJournalWriteKeepsForeignFileAtLegacyTempName() {
+    const auto dir = testDir("temp-name");
+    const auto journal = dir / L"audio-session-mutes.txt";
+    const auto legacyTemp = dir / L"audio-session-mutes.txt.tmp";
+    const auto linked = dir / L"unrelated.txt";
+    {
+        std::ofstream stream(legacyTemp, std::ios::binary);
+        stream << "another file's contents";
+    }
+    std::error_code linkError;
+    std::filesystem::create_hard_link(legacyTemp, linked, linkError);
+    expect(!linkError, "test setup must create the hard link");
+    const std::string legacyBytes = readFile(legacyTemp);
+    const std::string linkedBytes = readFile(linked);
+
+    SessionMuteStore store(journal);
+    std::vector<FakeSession> sessions(1);
+    sessions[0].pid = 111;
+    sessions[0].key = L"c:\\apps\\game.exe";
+    sessions[0].instance = L"{session-a}";
+    const auto result = store.apply({L"c:\\apps\\game.exe"}, enumeratorFor(sessions), alwaysAlive);
+    expect(result.exclusionEstablished(), "setup must write the journal");
+    expect(!readFile(journal).empty(), "the journal was written");
+    expect(readFile(legacyTemp) == legacyBytes && readFile(linked) == linkedBytes,
+        "a file (or its hard link) at the old .tmp name must survive a journal write");
 }
 
 void testSweepWithoutJournalIsNoop() {
@@ -878,6 +1036,11 @@ int main() {
         testCompleteSweepRetiresJournalAndFreshStore();
         testSweepRestoresOnlyStillMuted();
         testSweepRetiresDeadProcess();
+        testClearRestoresTheJournaledSessionOnly();
+        testSweepRestoresInheritedMuteAfterRestart();
+        testSweepReleasesRecordWhenItsInstanceVanished();
+        testLegacyJournalPairsExactlyOnce();
+        testJournalWriteKeepsForeignFileAtLegacyTempName();
         testSweepWithoutJournalIsNoop();
         testSweepEnumerationFailureKeepsJournal();
         testApplyEnumerationFailureLeavesEverything();

@@ -574,6 +574,44 @@ void testAutoRecordUsesAppliedSettings() {
            "applied auto-record edits were not used");
 }
 
+void testAutoRecordOwnershipReconciliation() {
+    const AutoRecordOwnership idle{};
+    const AutoRecordOwnership owned{true, false};
+
+    // An automatic start takes ownership; a failed one claims nothing so the
+    // next poll retries.
+    AutoRecordOwnership state = reconcileAutoRecordOwnership(idle, true, true, false, true);
+    expect(state.owns && !state.suppressStart, "an automatic start did not take ownership");
+    const auto failed = reconcileAutoRecordOwnership(idle, true, false, false, true);
+    expect(!failed.owns && !failed.suppressStart, "a failed automatic start claimed ownership");
+
+    // (a) a restart-class settings change stops the auto-owned recording and
+    // ApplySettings completes: no suppression, so the next poll restarts it.
+    state = reconcileAutoRecordAfterSettings(state, false);
+    expect(!state.owns && !state.suppressStart,
+           "a settings restart suppressed the next auto start");
+    expect(reconcileAutoRecordAfterSettings(owned, true).owns,
+           "settings that kept the recording running dropped ownership");
+
+    // (c) an automatic stop is not a user override.
+    state = reconcileAutoRecordOwnership(owned, true, false, true, true);
+    expect(!state.owns && !state.suppressStart,
+           "an automatic stop was treated as a user override");
+
+    // (d) a manual stop blocks the restart only while the app stays open.
+    state = reconcileAutoRecordOwnership(owned, false, false, true, true);
+    expect(!state.owns && state.suppressStart,
+           "a manual stop did not suppress the auto restart");
+    const auto manualStopAfterExit = reconcileAutoRecordOwnership(owned, false, false, true, false);
+    expect(!manualStopAfterExit.owns && !manualStopAfterExit.suppressStart,
+           "a manual stop after the app exited suppressed the next launch");
+
+    // (b) a manual start between polls never claims ownership and lifts the
+    // suppression, so a later target exit leaves the user's recording alone.
+    state = reconcileAutoRecordOwnership(state, false, true, false, true);
+    expect(!state.owns && !state.suppressStart, "a manual start claimed auto ownership");
+}
+
 } // namespace
 
 int main() {
@@ -583,6 +621,7 @@ int main() {
         testFailedStartupReadNeverOverwritesFile();
         testImmediatePreferencesPreserveDraftsAndSavedValues();
         testAutoRecordUsesAppliedSettings();
+        testAutoRecordOwnershipReconciliation();
         testMissingCheckboxesPreserveSettings();
         testEnumCombosPreserveFallbacks();
         testUnavailableAudioDeviceSurvivesUnrelatedSave();

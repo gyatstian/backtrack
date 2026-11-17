@@ -495,11 +495,13 @@ void MainWindow::controllerWorkerLoop() {
                     L"ui",
                     std::wstring(L"Recorder action failed unexpectedly: ") + utf8ToWide(error.what()));
                 outcome.kind = action.kind;
+                outcome.automatic = action.automatic;
                 outcome.ok = false;
                 outcome.status = L"Action failed unexpectedly; see the diagnostics log";
             } catch (...) {
                 Logger::instance().error(L"ui", L"Recorder action failed unexpectedly: unknown exception");
                 outcome.kind = action.kind;
+                outcome.automatic = action.automatic;
                 outcome.ok = false;
                 outcome.status = L"Action failed unexpectedly; see the diagnostics log";
             }
@@ -545,6 +547,7 @@ void MainWindow::controllerWorkerLoop() {
 MainWindow::ControllerActionResult MainWindow::executeControllerAction(const ControllerAction& action) {
     ControllerActionResult result;
     result.kind = action.kind;
+    result.automatic = action.automatic;
 
     switch (action.kind) {
     case ControllerActionKind::Startup:
@@ -642,12 +645,24 @@ void MainWindow::handleControllerActionComplete(const ControllerActionResult& re
     clearControllerBusyTimer();
     controllerActionPending_ = false;
     if (result.kind == ControllerActionKind::Startup || result.kind == ControllerActionKind::ApplySettings) {
+        // A pipeline restart ends an auto-owned recording without a
+        // ToggleRecording completion of its own; reconcile before the next poll
+        // reads it as a user stop.
+        const AutoRecordOwnership ownership = reconcileAutoRecordAfterSettings(
+            {autoRecordOwnsRecording_, autoRecordSuppressStart_}, controller_.isRecording());
+        autoRecordOwnsRecording_ = ownership.owns;
+        autoRecordSuppressStart_ = ownership.suppressStart;
         updateGameIntegrations();
     }
     if (!result.status.empty()) {
         setStatus(result.status);
     }
     if (result.kind == ControllerActionKind::ToggleRecording) {
+        const AutoRecordOwnership ownership = reconcileAutoRecordOwnership(
+            {autoRecordOwnsRecording_, autoRecordSuppressStart_}, result.automatic,
+            result.startedRecording, result.stoppedRecording, autoRecordAppRunning_);
+        autoRecordOwnsRecording_ = ownership.owns;
+        autoRecordSuppressStart_ = ownership.suppressStart;
         if (page_ == Page::Capture) {
             HWND button = startStopButton_ ? startStopButton_ : GetDlgItem(pageHost_, kStartStopButtonId);
             setText(button, controller_.isRecording() ? L"Stop Recording" : L"Start Recording");

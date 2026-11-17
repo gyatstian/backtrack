@@ -64,6 +64,12 @@ public:
     // backend that retains inputs reports its real count whether or not a
     // session exists.
     virtual uint32_t inputRetentionBudget() const { return 0; }
+
+    // Inputs the encoder accepted and then abandoned before producing an output
+    // (a dropped or rejected submission). Lock-free: the recording-stop drain
+    // subtracts these from the submissions it is still waiting for, so a drop
+    // cannot stall a recording cut. 0 for a backend that never drops silently.
+    [[nodiscard]] virtual uint64_t droppedInputs() const noexcept { return 0; }
 };
 
 } // namespace backtrack

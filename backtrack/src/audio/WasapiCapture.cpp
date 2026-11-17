@@ -436,16 +436,32 @@ SessionMuteStore& sessionMuteStore() {
     return store;
 }
 
-// Collects every live foreign render session. False when the endpoint
-// enumeration itself failed, in which case the caller leaves everything
-// untouched. Only the sweep logs that failure; the mute path stays silent.
-// COM is initialized by the caller and stays initialized for the whole store
-// call: the candidates' callbacks hold ISimpleAudioVolume, so they must be
-// invoked and released before that apartment goes away.
+// Set by the process that won the single-instance mutex. A rejected second
+// launch leaves it false so its controller teardown restores nothing.
+std::atomic<bool> sessionMuteOwnership{false};
+
+// Empty in production; the test seam fills it. A function reference cannot be
+// a static member, so the storage lives here and the private accessor returns
+// it.
+std::function<HRESULT(IMMDeviceEnumerator**)>& sessionMuteEnumeratorFactoryStorage() {
+    static std::function<HRESULT(IMMDeviceEnumerator**)> factory;
+    return factory;
+}
+
+// Collects every live foreign render session. False when the enumeration itself
+// failed or could not read an endpoint or session, in which case the caller
+// leaves everything untouched. Only the sweep logs an unavailable enumerator or
+// endpoint list; the mute path stays silent there. COM is initialized by the
+// caller and stays initialized for the whole store call: the candidates'
+// callbacks hold ISimpleAudioVolume, so they must be invoked and released
+// before that apartment goes away.
 bool enumerateForeignRenderSessions(
     DWORD currentProcessId, std::vector<SessionMuteCandidate>& out, bool logFailures) {
     Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
-    HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
+    auto& createEnumerator = sessionMuteEnumeratorFactoryStorage();
+    HRESULT hr = createEnumerator
+        ? createEnumerator(enumerator.GetAddressOf())
+        : CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
     if (FAILED(hr) || !enumerator) {
         if (logFailures) {
             Logger::instance().warning(L"audio",
@@ -466,31 +482,40 @@ bool enumerateForeignRenderSessions(
 
     UINT endpointCount = 0;
     endpoints->GetCount(&endpointCount);
-    // Skips across the endpoint/session loops: a session we cannot read is
-    // not muted, so excluded audio can leak. One rate-limited line per call.
+    // Two different things, kept apart on purpose. `skipped` counts intentional
+    // exclusions (system sounds, own process, pid 0) and per-session reads the
+    // store already handles conservatively: an unknown mute state is never
+    // muted, and a wanted session without a live identity counts as a mute
+    // failure. `incomplete` counts endpoints or sessions this pass could not
+    // read at all - those sessions are invisible to the store, so a wanted one
+    // would contribute no mute failure and exclusion would look established
+    // while its audio still reaches the recording. Do not merge them.
     uint32_t skipped = 0;
+    uint32_t incomplete = 0;
     for (UINT endpointIndex = 0; endpointIndex < endpointCount; ++endpointIndex) {
         Microsoft::WRL::ComPtr<IMMDevice> endpoint;
         if (FAILED(endpoints->Item(endpointIndex, &endpoint)) || !endpoint) {
-            ++skipped;
+            ++incomplete;
             continue;
         }
 
         LPWSTR endpointIdRaw = nullptr;
-        const std::wstring endpointId = SUCCEEDED(endpoint->GetId(&endpointIdRaw))
-            ? takeCoTaskMemString(endpointIdRaw)
-            : std::wstring();
+        if (FAILED(endpoint->GetId(&endpointIdRaw)) || !endpointIdRaw) {
+            ++incomplete;
+            continue;
+        }
+        const std::wstring endpointId = takeCoTaskMemString(endpointIdRaw);
 
         Microsoft::WRL::ComPtr<IAudioSessionManager2> sessionManager;
         if (FAILED(endpoint->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, &sessionManager)) ||
             !sessionManager) {
-            ++skipped;
+            ++incomplete;
             continue;
         }
 
         Microsoft::WRL::ComPtr<IAudioSessionEnumerator> sessions;
         if (FAILED(sessionManager->GetSessionEnumerator(&sessions)) || !sessions) {
-            ++skipped;
+            ++incomplete;
             continue;
         }
 
@@ -499,13 +524,16 @@ bool enumerateForeignRenderSessions(
         for (int sessionIndex = 0; sessionIndex < sessionCount; ++sessionIndex) {
             Microsoft::WRL::ComPtr<IAudioSessionControl> session;
             if (FAILED(sessions->GetSession(sessionIndex, &session)) || !session) {
-                ++skipped;
+                ++incomplete;
                 continue;
             }
 
             Microsoft::WRL::ComPtr<IAudioSessionControl2> session2;
             if (FAILED(session.As(&session2)) || !session2) {
-                ++skipped;
+                // Without the control2 interface the session has no pid and no
+                // instance, so the store cannot judge it at all: as invisible
+                // as a failed GetSession.
+                ++incomplete;
                 continue;
             }
             if (session2->IsSystemSoundsSession() == S_OK) {
@@ -558,6 +586,15 @@ bool enumerateForeignRenderSessions(
             });
         }
     }
+    if (incomplete > 0) {
+        // Never silent: a partial snapshot is indistinguishable from a clean one
+        // to the caller, which would then keep recording excluded audio. The
+        // logger's own rate limit keeps the 2 s poll to a few lines.
+        Logger::instance().warning(L"audio",
+            L"Session-mute enumeration was incomplete (" + std::to_wstring(incomplete) +
+            L" endpoint/session read(s) failed); excluded audio may reach the recording");
+        return false;
+    }
     if (skipped > 0 && logFailures) {
         Logger::instance().warning(L"audio",
             L"Session-mute enumeration skipped " + std::to_wstring(skipped) +
@@ -602,7 +639,16 @@ void ensureAudioPacketPool() {
     });
 }
 
+void WasapiCapture::setSessionMuteOwnership(bool owned) noexcept {
+    sessionMuteOwnership.store(owned, std::memory_order_release);
+}
+
 void WasapiCapture::emergencyRestoreSessionMutes() noexcept {
+    if (!sessionMuteOwnership.load(std::memory_order_acquire)) {
+        // Not the owner: the live instance's mutes are its own to restore, and
+        // this process must not touch the journal or touch COM on a crash path.
+        return;
+    }
     try {
         // COM must be initialized on this thread for the whole store call, and
         // the call releases every interface it created before it returns. The
@@ -621,9 +667,10 @@ void WasapiCapture::emergencyRestoreSessionMutes() noexcept {
 
 void WasapiCapture::restoreOrphanedSessionMutes() {
     // Startup sweep for mutes applied by a previous crashed session. Runs
-    // under the single-instance mutex, so no concurrent session can apply
-    // fresh mutes while sweeping. COM is initialized here and balanced again
-    // before Application's OleInitialize runs.
+    // under the single-instance mutex, after Application has taken session-mute
+    // ownership, so no rejected second launch and no concurrent session can
+    // sweep or re-mute while this runs. COM is initialized here and balanced
+    // again before Application's OleInitialize runs.
     ScopedComInitialization com(COINIT_MULTITHREADED);
     const DWORD currentProcessId = GetCurrentProcessId();
     const auto result = sessionMuteStore().sweepOrphans(
@@ -662,6 +709,13 @@ SessionMuteApplyResult WasapiCapture::applySessionMutesForExecutables(
 }
 
 SessionMuteRestoreResult WasapiCapture::clearSessionMutes() {
+    if (!sessionMuteOwnership.load(std::memory_order_acquire)) {
+        // A rejected second launch reaches here through its controller teardown.
+        // Its enumeration does not distinguish the owner's journal from work a
+        // crashed process left behind, so touching anything would undo the live
+        // instance's exclusions.
+        return {};
+    }
     ScopedComInitialization com(COINIT_MULTITHREADED);
     const DWORD currentProcessId = GetCurrentProcessId();
     return sessionMuteStore().clear(
@@ -669,6 +723,10 @@ SessionMuteRestoreResult WasapiCapture::clearSessionMutes() {
             return enumerateForeignRenderSessions(currentProcessId, sessions, false);
         },
         isProcessAlive);
+}
+
+std::function<HRESULT(IMMDeviceEnumerator**)>& WasapiCapture::sessionMuteEnumeratorFactory() {
+    return sessionMuteEnumeratorFactoryStorage();
 }
 
 std::vector<AudioSessionAppInfo> WasapiCapture::enumerateOpenApps() {

@@ -78,6 +78,10 @@ struct FakeState {
 struct FakeIo {
     std::shared_ptr<FakeState> state;
     std::shared_ptr<int> lease;
+    // Cleanup-setup injection: the retain box allocated before submit and the
+    // threadpool wait created after cancellation.
+    bool failRetain = false;
+    bool failWait = false;
 
     BOOL submit(HANDLE file, bool, void* data, DWORD size, DWORD*, OVERLAPPED* overlapped) const {
         state->file = file;
@@ -116,6 +120,13 @@ struct FakeIo {
         state->cancellations.fetch_add(1, std::memory_order_relaxed);
         SetLastError(ERROR_NOT_FOUND);
     }
+    template <typename Operation>
+    std::unique_ptr<std::shared_ptr<Operation>> retain(const std::shared_ptr<Operation>& operation) const {
+        return failRetain ? nullptr : std::make_unique<std::shared_ptr<Operation>>(operation);
+    }
+    PTP_WAIT createWait(PTP_WAIT_CALLBACK callback, void* context) const {
+        return failWait ? nullptr : CreateThreadpoolWait(callback, context, nullptr);
+    }
 };
 
 struct PartialIo {
@@ -132,6 +143,11 @@ struct PartialIo {
     }
     BOOL result(HANDLE, OVERLAPPED*, DWORD*) const { return FALSE; }
     void cancel(HANDLE, OVERLAPPED*) const {}
+    template <typename Operation>
+    std::unique_ptr<std::shared_ptr<Operation>> retain(const std::shared_ptr<Operation>& operation) const {
+        return std::make_unique<std::shared_ptr<Operation>>(operation);
+    }
+    PTP_WAIT createWait(PTP_WAIT_CALLBACK, void*) const { return nullptr; }
 };
 
 template <typename Predicate>
@@ -338,6 +354,51 @@ void testRealPendingRead() {
            "real pending read did not time out safely");
 }
 
+void testRetentionAllocationFailureFailsBeforeSubmit() {
+    // The owner that keeps a pending operation alive must exist before the
+    // transfer is submitted: an allocation failure afterwards would free the
+    // buffer, handle and OVERLAPPED under the kernel.
+    TestRoot root;
+    RingFile ring;
+    expect(ring.open(root.path, L"ring.bin", 16), "open failed");
+    auto state = std::make_shared<FakeState>();
+    FakeIo io{state, std::make_shared<int>(1), true, false};
+    std::array<uint8_t, 4> output{1, 2, 3, 4};
+    expect(!RingFileTestAccess::read(ring, 0, output.data(), 4, io, 30) &&
+           GetLastError() == ERROR_NOT_ENOUGH_MEMORY, "retention allocation failure was not reported");
+    expect(!state->submitted.load(std::memory_order_acquire) && state->cancellations.load() == 0,
+           "retention allocation failure submitted the transfer anyway");
+    expect(output == std::array<uint8_t, 4>{1, 2, 3, 4}, "failed retention changed caller bytes");
+    ring.closeNow();
+}
+
+void testWaitCreationFailureBlocksOnPendingIo() {
+    // A threadpool wait that cannot be created must not drop a transfer that is
+    // already in flight: the fallback blocks past the deadline until the kernel
+    // reports completion instead of freeing the buffer under it.
+    TestRoot root;
+    RingFile ring;
+    expect(ring.open(root.path, L"ring.bin", 16), "open failed");
+    auto state = std::make_shared<FakeState>();
+    FakeIo io{state, std::make_shared<int>(1), false, true};
+    std::array<uint8_t, 4> output{1, 2, 3, 4};
+    std::thread completer([&] {
+        if (waitFor([&] { return state->cancellations.load() != 0; })) {
+            std::this_thread::sleep_for(200ms);
+            complete(*state);
+        }
+    });
+    const auto start = std::chrono::steady_clock::now();
+    const bool ok = RingFileTestAccess::read(ring, 0, output.data(), 4, io, 30);
+    const DWORD error = GetLastError();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    completer.join();
+    expect(!ok && error == ERROR_READ_FAULT, "blocked fallback did not report the transfer fault");
+    expect(elapsed >= 150ms, "blocked fallback returned before the pending transfer completed");
+    expect(state->cancellations.load() == 1, "blocked fallback skipped the cancellation request");
+    expect(output == std::array<uint8_t, 4>{1, 2, 3, 4}, "blocked fallback copied an unfinished read");
+}
+
 void testPendingReadCannotOverwriteCaller() {
     TestRoot root;
     RingFile ring;
@@ -370,6 +431,8 @@ int main() {
         testPendingWriteSurvivesStopAndCannotOverwrite();
         testRealPendingRead();
         testPendingReadCannotOverwriteCaller();
+        testRetentionAllocationFailureFailsBeforeSubmit();
+        testWaitCreationFailureBlocksOnPendingIo();
         std::cout << "RingFile tests passed\n";
         return 0;
     } catch (const std::exception& error) {

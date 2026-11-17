@@ -2,8 +2,10 @@
 
 #include "core/Types.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <vector>
 
 namespace backtrack {
@@ -66,6 +68,35 @@ inline int64_t clampSingleVideoDuration100ns(int64_t duration100ns) {
 // unclamped tail the other would have cut.
 inline int64_t coalesceVideoDuration100ns(int64_t current100ns, int64_t incoming100ns) {
     return clampSingleVideoDuration100ns(current100ns > incoming100ns ? current100ns : incoming100ns);
+}
+
+// True when a - b is representable in int64. A recovery manifest can carry
+// individually valid timestamps whose span does not fit; subtracting them
+// would be undefined, so every such subtraction is checked against this.
+// The magnitude is taken in uint64, which is exact for both signs.
+inline bool int64DifferenceFits(int64_t a, int64_t b) {
+    if (a >= b) {
+        return static_cast<uint64_t>(a) - static_cast<uint64_t>(b) <=
+               static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
+    }
+    return static_cast<uint64_t>(b) - static_cast<uint64_t>(a) <= (uint64_t{1} << 63);
+}
+
+// Mux time origin: both tracks are measured from the first sample's decode time
+// when the stream reorders, otherwise from its presentation time. The muxer and
+// the recovery parser must agree on it, or the span check guards the wrong base.
+inline int64_t muxTimeBase100ns(const MuxedInputs& inputs) {
+    if (inputs.videoSamples.empty()) {
+        return 0;
+    }
+    const bool reorders = std::any_of(
+        inputs.videoSamples.begin(),
+        inputs.videoSamples.end(),
+        [](const MuxedInputs::VideoSample& sample) {
+            return sample.hasDts && sample.dts100ns != sample.pts100ns;
+        });
+    const MuxedInputs::VideoSample& first = inputs.videoSamples.front();
+    return reorders && first.hasDts ? first.dts100ns : first.pts100ns;
 }
 
 } // namespace backtrack

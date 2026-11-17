@@ -37,14 +37,18 @@ struct SessionMuteCandidate {
 };
 
 // Journaled record of one applied foreign-session mute. One line per record:
-// "<pid>\t<previousMute 0|1>\t<pathKey>" with the key as UTF-8. The identity is
-// the durable one: session instance identifiers do not survive an application
-// restart, so a crash sweep matches records to live sessions by process id and
-// image path, one record per still-muted session.
+// "<pid>\t<previousMute 0|1>\t<pathKey>\t<endpointId>\t<instanceId>" with the
+// strings as UTF-8. Process id and path key are the durable identity. The live
+// identity (endpoint id, session instance id) is only a hint: instance ids do
+// not survive an application restart, so a record never requires its exact
+// instance to exist. Three-column lines are the legacy form and still parse;
+// unknown extra columns are ignored.
 struct SessionMuteRecord {
     uint32_t processId = 0;
     std::wstring pathKey;
     bool previousMute = false;
+    std::wstring endpointId;
+    std::wstring instanceId;
 };
 
 struct SessionMuteApplyResult {

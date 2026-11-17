@@ -16,6 +16,7 @@
 #include <iostream>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -556,6 +557,32 @@ std::string manifestSampleText(size_t index, uint64_t offsetOverride) {
     return line;
 }
 
+// Same columns with explicit timestamps, for the arithmetic-bound cases.
+std::string manifestSampleTextWithTimestamps(
+    uint64_t offset,
+    int64_t pts100ns,
+    int64_t duration100ns,
+    int64_t dts100ns,
+    bool hasDts) {
+    std::string line = "sample\t" + std::to_string(offset);
+    line += '\t' + std::to_string(kPacketSize);
+    line += '\t' + std::to_string(pts100ns);
+    line += '\t' + std::to_string(duration100ns);
+    line += '\t' + std::string(offset == 0 ? "1" : "0");
+    line += '\t' + std::to_string(dts100ns);
+    line += '\t' + std::string(hasDts ? "1" : "0");
+    line += '\n';
+    return line;
+}
+
+std::string manifestHeaderText(size_t declaredSamples) {
+    std::string text = "backtrack-recovery-v1\n";
+    text += "codec\th264\nfps\t60\nwidth\t1920\nheight\t1080\nbitrateKbps\t8000\n";
+    text += "video\treplay.h264\n";
+    text += "samples\t" + std::to_string(declaredSamples) + "\n";
+    return text;
+}
+
 void expectRecoveredSamples(
     RecoveryFixture& fixture,
     size_t expectedCount,
@@ -795,6 +822,30 @@ void testRecoveryKeepsPrefixOnTornFinalLine() {
     fixture.dispose();
 }
 
+void testRecoveryStopsAtUnrepresentableTimestampSpan() {
+    // Each timestamp is a legal int64, but the first sample's pts pins the mux
+    // time base at INT64_MIN and the second sample at 0 would then subtract to
+    // 2^63. The mux writes (time - timeBase) for every sample, so the table has
+    // to close at the first sample that cannot be represented.
+    RecoveryFixture fixture = RecoveryFixture::create(L"timespan");
+    writeElementaryStream(fixture.sessionDir / L"replay.h264", 2);
+    const int64_t minPts = (std::numeric_limits<int64_t>::min)();
+    std::string text = manifestHeaderText(2);
+    text += manifestSampleTextWithTimestamps(0, minPts, 333333, minPts, true);
+    text += manifestSampleTextWithTimestamps(kPacketSize, 0, 333333, 0, true);
+    writeTextFile(fixture.sessionDir / backtrack::RecoveryStore::kRecoveryManifestName, text);
+
+    std::wstring detail;
+    const auto recovered =
+        backtrack::RecoveryStore::recoverLatestFailedRecording(fixture.clipsDir, detail);
+    expect(!recovered.empty(), "unrepresentable timestamp span aborted the recovery");
+    const auto& samples = backtrack::g_lastMuxedInputs.videoSamples;
+    expect(samples.size() == 1, "recovery kept a sample whose mux time offset overflows int64");
+    expect(samples.front().pts100ns == minPts,
+        "recovery changed the timestamp of the sample before the damaged span");
+    fixture.dispose();
+}
+
 void testRecoveryRejectsPlausibleNonContiguousTail() {
     // Regression for prefix parsing: a torn number could previously parse as a
     // smaller-but-plausible offset ("4000000" from "40000001") and make the
@@ -829,16 +880,68 @@ void testRecoveryAcceptsFewerLinesThanDeclared() {
     RecoveryFixture fixture = RecoveryFixture::create(L"shorttable");
     writeElementaryStream(fixture.sessionDir / L"replay.h264", kPackets);
 
-    std::string text = "backtrack-recovery-v1\n";
-    text += "codec\th264\nfps\t60\nwidth\t1920\nheight\t1080\nbitrateKbps\t8000\n";
-    text += "video\treplay.h264\n";
-    text += "samples\t" + std::to_string(kPackets + 3) + "\n";
+    std::string text = manifestHeaderText(kPackets + 3);
     for (size_t i = 0; i < kPackets; ++i) {
         text += manifestSampleText(i, i * kPacketSize);
     }
     writeTextFile(fixture.sessionDir / backtrack::RecoveryStore::kRecoveryManifestName, text);
 
     expectRecoveredSamples(fixture, kPackets, "declared-count shortfall");
+    fixture.dispose();
+}
+
+// A declared count is only a shortfall check: it must never size the sample
+// vector, or a tiny manifest claiming ten million samples makes discovery
+// reserve hundreds of MiB per session before any media is validated.
+void testRecoveryDeclaredCountDoesNotSizeSampleTable() {
+    RecoveryFixture fixture = RecoveryFixture::create(L"hugecount");
+    writeElementaryStream(fixture.sessionDir / L"replay.h264", kPackets);
+
+    std::string text = manifestHeaderText(10'000'000);
+    for (size_t i = 0; i < kPackets; ++i) {
+        text += manifestSampleText(i, i * kPacketSize);
+    }
+    writeTextFile(fixture.sessionDir / backtrack::RecoveryStore::kRecoveryManifestName, text);
+
+    expectRecoveredSamples(fixture, kPackets, "oversized declared count");
+    fixture.dispose();
+}
+
+// Individually valid timestamps whose difference is not representable in
+// int64 pass parsing and the offset order, then overflow pts - dts in the mux
+// and in effectiveDts. The line must close the sample table instead.
+void testRecoveryRejectsUnrepresentableDtsDifference() {
+    RecoveryFixture fixture = RecoveryFixture::create(L"dtsdifference");
+    writeElementaryStream(fixture.sessionDir / L"replay.h264", kPackets);
+
+    std::string text = manifestHeaderText(kPackets + 1);
+    for (size_t i = 0; i < kPackets; ++i) {
+        text += manifestSampleText(i, i * kPacketSize);
+    }
+    text += manifestSampleTextWithTimestamps(
+        kPackets * kPacketSize, 0, 333333, (std::numeric_limits<int64_t>::min)(), true);
+    writeTextFile(fixture.sessionDir / backtrack::RecoveryStore::kRecoveryManifestName, text);
+
+    expectRecoveredSamples(fixture, kPackets, "unrepresentable pts-dts");
+    fixture.dispose();
+}
+
+// Same bound for pts + duration: a presentation end past int64 wraps into the
+// negative range downstream.
+void testRecoveryRejectsUnrepresentablePresentationEnd() {
+    RecoveryFixture fixture = RecoveryFixture::create(L"ptsduration");
+    writeElementaryStream(fixture.sessionDir / L"replay.h264", kPackets);
+
+    std::string text = manifestHeaderText(kPackets + 1);
+    const auto maxPts = (std::numeric_limits<int64_t>::max)();
+    for (size_t i = 0; i < kPackets; ++i) {
+        text += manifestSampleTextWithTimestamps(i * kPacketSize, static_cast<int64_t>(i) * 333333,
+            333333, static_cast<int64_t>(i) * 333333, false);
+    }
+    text += manifestSampleTextWithTimestamps(kPackets * kPacketSize, maxPts, 1, maxPts, false);
+    writeTextFile(fixture.sessionDir / backtrack::RecoveryStore::kRecoveryManifestName, text);
+
+    expectRecoveredSamples(fixture, kPackets, "unrepresentable pts+duration");
     fixture.dispose();
 }
 
@@ -2644,8 +2747,12 @@ int main() {
         testStartupRecoversAllValidSessionsAndKeepsFailures();
         testRecoveryTrimsSamplesBeyondStreamEnd();
         testRecoveryKeepsPrefixOnTornFinalLine();
+        testRecoveryStopsAtUnrepresentableTimestampSpan();
         testRecoveryRejectsPlausibleNonContiguousTail();
         testRecoveryAcceptsFewerLinesThanDeclared();
+        testRecoveryDeclaredCountDoesNotSizeSampleTable();
+        testRecoveryRejectsUnrepresentableDtsDifference();
+        testRecoveryRejectsUnrepresentablePresentationEnd();
         testRecoveryStillRejectsDamagedMetadata();
         testDiskBackedRingRoundTripAndWrap();
         testDiskBackedMatchesRamBackend();

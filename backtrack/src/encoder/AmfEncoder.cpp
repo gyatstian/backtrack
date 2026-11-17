@@ -165,6 +165,9 @@ struct AmfEncoder::Impl {
     // per-iteration health probe (IEncoder::encoderAvailable). Written only on
     // paths that already hold mutex, so the pair never disagrees observably.
     std::atomic<bool> availableAtomic{false};
+    // Lock-free mirror of the drop count for IEncoder::droppedInputs, which the
+    // recording-stop drain reads without taking mutex.
+    std::atomic<uint64_t> droppedInputAtomic{0};
     // Lock-free mirror of inFlightCap() for IEncoder::inputRetentionBudget, which
     // the capture loop queries while encode() holds mutex across QueryOutput.
     std::atomic<uint32_t> retentionBudget{0};
@@ -172,6 +175,21 @@ struct AmfEncoder::Impl {
     void publishAvailability(bool available) {
         encoderStats.encoderAvailable = available;
         availableAtomic.store(available, std::memory_order_release);
+    }
+
+    // The session is fully configured and usable. Availability is published
+    // only here: a failure while configuring must never leave the encoder
+    // looking healthy to the capture loop.
+    void publishSessionActive() {
+        caps.available = true;
+        publishAvailability(true);
+    }
+
+    // An input this session left without an output: the drop counter and its
+    // lock-free mirror must move together.
+    void noteDroppedInput() {
+        ++encoderStats.droppedFrames;
+        droppedInputAtomic.fetch_add(1, std::memory_order_relaxed);
     }
 
     // The capture scaler converts frames to NV12 (BT.709 limited) through the
@@ -449,7 +467,8 @@ struct AmfEncoder::Impl {
     }
 
     void updateCapabilities(const std::wstring& adapterName) {
-        caps.available = encoder != nullptr;
+        // Capability values only: availability is published once the whole
+        // component is configured (publishSessionActive).
         caps.adapterName = adapterName;
         caps.backendName = L"AMF";
         caps.h264 = true;
@@ -502,7 +521,6 @@ struct AmfEncoder::Impl {
 
         // Main 8-bit only; Main10 is not configured.
         caps.tenBitHevc = false;
-        publishAvailability(caps.available);
     }
 
     bool encodeSizeSupported() const {
@@ -522,6 +540,13 @@ struct AmfEncoder::Impl {
         effective.multipass = EncoderMultipass::Disabled;
         effective.adaptiveBFrames = false;
         effective.adaptiveIFrames = false;
+        // AMF has no lossless mode and no separate ultra high quality usage:
+        // both map onto the transcoding usage (avcUsage/hevcUsage), which is
+        // the high quality configuration. Report that instead of the request.
+        if (effective.mode == EncoderMode::Lossless ||
+            effective.mode == EncoderMode::UltraHighQuality) {
+            effective.mode = EncoderMode::HighQuality;
+        }
         if (!caps.multipleReferenceFrames) {
             effective.referenceFrames = 1;
         }
@@ -683,6 +708,12 @@ struct AmfEncoder::Impl {
         if (requested.lookahead) {
             caps.detail += L"; lookahead is unsupported by the AMF backend";
         }
+        if (requested.mode == EncoderMode::Lossless) {
+            caps.detail += L"; AMF has no lossless mode, the high quality configuration is used";
+        }
+        if (requested.mode == EncoderMode::UltraHighQuality) {
+            caps.detail += L"; AMF has no ultra high quality mode, the high quality configuration is used";
+        }
         const bool bFramesDropped = requested.bFrames && !requested.zeroReorderDelay && !caps.effective.bFrames;
         if (bFramesDropped) {
             caps.detail += L"; B-frames are unavailable";
@@ -746,7 +777,7 @@ struct AmfEncoder::Impl {
 
         caps.available = true;
         updateActiveDetail(effective);
-        publishAvailability(true);
+        publishSessionActive();
 
         Logger::instance().info(L"encoder",
             std::wstring(L"AMF ") + (isHevc() ? L"HEVC" : L"AVC") +
@@ -809,6 +840,17 @@ struct AmfEncoder::Impl {
     // output yet are dropped, and a forced IDR afterwards restarts the stream
     // from a clean reference state.
     bool switchInputFormat(amf::AMF_SURFACE_FORMAT format) {
+        if (recreateComponentForFormat(format)) {
+            return true;
+        }
+        // A half re-created component must not keep reporting a live session;
+        // the caller escalates to the terminal fault.
+        caps.available = false;
+        publishAvailability(false);
+        return false;
+    }
+
+    bool recreateComponentForFormat(amf::AMF_SURFACE_FORMAT format) {
         if (!factory || !context) {
             return false;
         }
@@ -850,6 +892,7 @@ struct AmfEncoder::Impl {
         decodeTimestamps.reset(reorderDelayFrames());
         cachedParameterSets.clear();
         updateActiveDetail(effective);
+        publishSessionActive();
         consecutiveSubmitFailures = 0;
         forceKeyFrame = true;
         return true;
@@ -988,6 +1031,9 @@ struct AmfEncoder::Impl {
                 encoderStats, pending.submittedAt, packet);
 
             if (!finalized) {
+                // The input produced no usable payload: it is gone without an
+                // output, exactly like a dropped frame.
+                noteDroppedInput();
                 continue;
             }
             readyPackets.push_back(std::move(packet));
@@ -1005,7 +1051,7 @@ struct AmfEncoder::Impl {
         }
         if (frame.width != settings.width || frame.height != settings.height) {
             Logger::instance().warning(L"encoder", L"Frame size changed; dropping frame until capture pipeline is recreated");
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             return popReadyPacket(packet);
         }
 
@@ -1022,8 +1068,8 @@ struct AmfEncoder::Impl {
                 if (encoderFaulted) {
                     return false;
                 }
-                return fail(L"AMF encoder could not follow the capture input-format change; "
-                            L"encoder faulted so the capture pipeline can recreate it");
+                return fail(std::wstring(L"AMF encoder could not follow the capture input-format change (") +
+                            caps.detail + L"); encoder faulted so the capture pipeline can recreate it");
             }
         }
         // Bounded input backlog: before accepting another surface, give the
@@ -1051,7 +1097,7 @@ struct AmfEncoder::Impl {
                 L"s; encoder faulted so the capture pipeline can recreate it");
         }
         if (inFlight.size() >= maxInFlight) {
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             ++inFlightDropCount;
             if (inFlightDropCount == 1 || (inFlightDropCount % 300) == 0) {
                 Logger::instance().warning(L"encoder",
@@ -1081,7 +1127,7 @@ struct AmfEncoder::Impl {
             // Frame lost before reaching the encoder; restart the next GOP so
             // the stream never continues from a broken reference chain.
             forceKeyFrame = true;
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             if (noteSubmitFailure(L"CreateSurfaceFromDX11Native", result)) {
                 return fail(L"AMF CreateSurfaceFromDX11Native failed repeatedly: " + amfResultName(result));
             }
@@ -1122,7 +1168,7 @@ struct AmfEncoder::Impl {
                 // The frame was never accepted; restart the next GOP so the
                 // stream continues from a clean reference state.
                 forceKeyFrame = true;
-                ++encoderStats.droppedFrames;
+                noteDroppedInput();
                 if (result == AMF_INPUT_FULL) {
                     return popReadyPacket(packet);
                 }
@@ -1135,7 +1181,7 @@ struct AmfEncoder::Impl {
             // The frame was never accepted; restart the next GOP so the
             // stream continues from a clean reference state.
             forceKeyFrame = true;
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             if (noteSubmitFailure(L"SubmitInput", result)) {
                 return fail(L"AMF SubmitInput failed repeatedly: " + amfResultName(result));
             }
@@ -1306,6 +1352,7 @@ bool AmfEncoder::initialize(D3DDevice& device, const VideoSettings& settings) {
     impl_->encoderStats = {};
 #if BACKTRACK_HAS_AMF
     impl_->availableAtomic.store(false, std::memory_order_release);
+    impl_->droppedInputAtomic.store(0, std::memory_order_relaxed);
 #endif
     impl_->caps.adapterName = device.adapterName();
     impl_->caps.backendName = L"AMF";
@@ -1406,6 +1453,14 @@ EncoderStats AmfEncoder::stats() const {
 uint32_t AmfEncoder::inputRetentionBudget() const {
 #if BACKTRACK_HAS_AMF
     return impl_->retentionBudget.load(std::memory_order_acquire);
+#else
+    return 0;
+#endif
+}
+
+uint64_t AmfEncoder::droppedInputs() const noexcept {
+#if BACKTRACK_HAS_AMF
+    return impl_->droppedInputAtomic.load(std::memory_order_relaxed);
 #else
     return 0;
 #endif

@@ -207,6 +207,29 @@ bool parseSampleColumns(const std::vector<std::string>& parts, MuxedInputs::Vide
         }
         sample.hasDts = hasDtsFlag != 0;
     }
+
+    // Every column above is an individually valid int64, but the mux and
+    // effectiveDts then compute pts - dts from them, and a pair whose
+    // difference is unrepresentable wraps into the opposite sign there. pts 0
+    // with dts INT64_MIN passes parsing and the order checks and then overflows
+    // every downstream sum. Only the non-negative direction is ever subtracted
+    // (both effectiveDts and the composition offset use a decode timestamp only
+    // when it does not exceed the presentation time), so only that one is
+    // bounded. The difference is taken in uint64 - exact for a non-negative
+    // result - so the check itself cannot overflow.
+    constexpr uint64_t kInt64Max = static_cast<uint64_t>((std::numeric_limits<int64_t>::max)());
+    if (sample.dts100ns <= sample.pts100ns &&
+        static_cast<uint64_t>(sample.pts100ns) - static_cast<uint64_t>(sample.dts100ns) > kInt64Max) {
+        return false;
+    }
+    // Same bound for the sample end: pts + duration must be representable.
+    const int64_t duration100ns = sample.duration100ns;
+    if ((duration100ns > 0 &&
+         sample.pts100ns > (std::numeric_limits<int64_t>::max)() - duration100ns) ||
+        (duration100ns < 0 &&
+         sample.pts100ns < (std::numeric_limits<int64_t>::min)() - duration100ns)) {
+        return false;
+    }
     return true;
 }
 
@@ -281,10 +304,13 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
         } else if (parts[0] == "samples" && parts.size() >= 2) {
             uint64_t count = 0;
             if (parseStrict(parts[1], count)) {
-                constexpr uint64_t kMaxReservedSamples = 10'000'000;
+                // The declared count is only the shortfall check below. It must
+                // not size the vector: a manifest claiming 10,000,000 samples
+                // used to reserve ~534 MiB before a single media byte was
+                // validated, and the startup sweep keeps several manifests
+                // alive at once. Growth follows the sample lines actually
+                // parsed instead.
                 expectedSamples = static_cast<size_t>(count);
-                manifest.inputs.videoSamples.reserve(
-                    static_cast<size_t>(std::min<uint64_t>(count, kMaxReservedSamples)));
             } else {
                 damagedMetadata = true;
             }
@@ -319,6 +345,25 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
     std::error_code videoError;
     if (!std::filesystem::exists(manifest.inputs.videoPath, videoError) || videoError) {
         return false;
+    }
+
+    // The mux writes every sample time as (time - timeBase). A manifest can
+    // carry individually valid timestamps whose span does not fit int64, so
+    // keep the prefix that does and treat the rest as the damaged tail.
+    if (!manifest.inputs.videoSamples.empty()) {
+        const int64_t timeBase = muxTimeBase100ns(manifest.inputs);
+        auto& samples = manifest.inputs.videoSamples;
+        for (size_t index = 0; index < samples.size(); ++index) {
+            const bool fits = int64DifferenceFits(samples[index].pts100ns, timeBase) &&
+                (!samples[index].hasDts || int64DifferenceFits(samples[index].dts100ns, timeBase));
+            if (!fits) {
+                samples.resize(index);
+                Logger::instance().warning(L"mux",
+                    L"Ignoring recovery-manifest samples after an unrepresentable timestamp span in " +
+                    manifestPath.wstring());
+                break;
+            }
+        }
     }
 
     // Flush-desync guard: the incremental manifest is flushed at GOP

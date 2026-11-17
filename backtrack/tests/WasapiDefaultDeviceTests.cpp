@@ -1,6 +1,7 @@
 #include "audio/WasapiCapture.h"
 
 #include <audioclient.h>
+#include <audiopolicy.h>
 #include <combaseapi.h>
 #include <mmdeviceapi.h>
 #include <wrl/client.h>
@@ -10,8 +11,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <memory_resource>
 #include <mutex>
@@ -32,6 +36,9 @@ struct WasapiCaptureTestAccess {
         return capture.start(std::move(options), std::move(callback));
     }
     static bool stopRequested(const WasapiCapture& capture) { return capture.stopRequested_.load(); }
+    static void setSessionMuteEnumerator(std::function<HRESULT(IMMDeviceEnumerator**)> factory) {
+        WasapiCapture::sessionMuteEnumeratorFactory() = std::move(factory);
+    }
 };
 
 std::filesystem::path localAppDataPath() { return {}; }
@@ -582,6 +589,267 @@ void testUnregisterFailureKeepsCallbackSafe() {
     retained->Release(); // release the registration reference retained on failure
 }
 
+// Session-mute enumeration fakes. The seam substitutes only the
+// IMMDeviceEnumerator, so these drive the real adapter in WasapiCapture.cpp.
+class MuteSessionControl final : public IAudioSessionControl2, public ISimpleAudioVolume {
+public:
+    explicit MuteSessionControl(bool systemSounds) : systemSounds_(systemSounds) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** object) override {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IAudioSessionControl)) {
+            *object = static_cast<IAudioSessionControl*>(this);
+        } else if (iid == __uuidof(IAudioSessionControl2)) {
+            *object = static_cast<IAudioSessionControl2*>(this);
+        } else if (iid == __uuidof(ISimpleAudioVolume)) {
+            *object = static_cast<ISimpleAudioVolume*>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG refs = --refs_;
+        if (!refs) delete this;
+        return refs;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetState(AudioSessionState* state) override {
+        if (state) *state = AudioSessionStateActive;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplayName(LPWSTR*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetDisplayName(LPCWSTR, LPCGUID) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetIconPath(LPWSTR*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetIconPath(LPCWSTR, LPCGUID) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetGroupingParam(GUID*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE SetGroupingParam(LPCGUID, LPCGUID) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE RegisterAudioSessionNotification(IAudioSessionEvents*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE UnregisterAudioSessionNotification(IAudioSessionEvents*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetSessionIdentifier(LPWSTR*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetSessionInstanceIdentifier(LPWSTR*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetProcessId(DWORD* processId) override {
+        if (processId) *processId = 4242;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE IsSystemSoundsSession() override { return systemSounds_ ? S_OK : S_FALSE; }
+    HRESULT STDMETHODCALLTYPE SetDuckingPreference(BOOL) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetMasterVolume(float, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetMasterVolume(float* volume) override {
+        if (volume) *volume = 1.0f;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetMute(BOOL, LPCGUID) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetMute(BOOL* muted) override {
+        if (muted) *muted = FALSE;
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> refs_{1};
+    const bool systemSounds_;
+};
+
+class MuteSessionEnumerator final : public FakeCom<MuteSessionEnumerator, IAudioSessionEnumerator> {
+public:
+    explicit MuteSessionEnumerator(bool systemSounds) : systemSounds_(systemSounds) {}
+
+    HRESULT STDMETHODCALLTYPE GetCount(int* count) override {
+        if (count) *count = 1;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetSession(int, IAudioSessionControl** session) override {
+        if (!session) return E_POINTER;
+        *session = static_cast<IAudioSessionControl*>(new MuteSessionControl(systemSounds_));
+        return S_OK;
+    }
+
+private:
+    const bool systemSounds_;
+};
+
+class MuteSessionManager final : public FakeCom<MuteSessionManager, IAudioSessionManager2> {
+public:
+    explicit MuteSessionManager(bool systemSounds) : systemSounds_(systemSounds) {}
+
+    HRESULT STDMETHODCALLTYPE GetAudioSessionControl(LPCGUID, DWORD, IAudioSessionControl**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetSimpleAudioVolume(LPCGUID, DWORD, ISimpleAudioVolume**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetSessionEnumerator(IAudioSessionEnumerator** sessions) override {
+        if (!sessions) return E_POINTER;
+        *sessions = new MuteSessionEnumerator(systemSounds_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RegisterSessionNotification(IAudioSessionNotification*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE UnregisterSessionNotification(IAudioSessionNotification*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE RegisterDuckNotification(LPCWSTR, IAudioVolumeDuckNotification*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE UnregisterDuckNotification(IAudioVolumeDuckNotification*) override { return S_OK; }
+
+private:
+    const bool systemSounds_;
+};
+
+class MuteEndpoint final : public FakeCom<MuteEndpoint, IMMDevice> {
+public:
+    MuteEndpoint(bool failActivate, bool systemSounds) : failActivate_(failActivate), systemSounds_(systemSounds) {}
+
+    HRESULT STDMETHODCALLTYPE Activate(REFIID iid, DWORD, PROPVARIANT*, void** object) override {
+        if (failActivate_) return E_FAIL;
+        if (iid != __uuidof(IAudioSessionManager2)) return E_NOINTERFACE;
+        if (!object) return E_POINTER;
+        *object = static_cast<IAudioSessionManager2*>(new MuteSessionManager(systemSounds_));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OpenPropertyStore(DWORD, IPropertyStore**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetId(LPWSTR* id) override {
+        if (!id) return E_POINTER;
+        static constexpr wchar_t endpointId[] = L"{0.0.0.00000000}.{fake-endpoint}";
+        *id = static_cast<LPWSTR>(CoTaskMemAlloc(sizeof(endpointId)));
+        if (!*id) return E_OUTOFMEMORY;
+        std::memcpy(*id, endpointId, sizeof(endpointId));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetState(DWORD*) override { return E_NOTIMPL; }
+
+private:
+    const bool failActivate_;
+    const bool systemSounds_;
+};
+
+class MuteEndpointCollection final : public FakeCom<MuteEndpointCollection, IMMDeviceCollection> {
+public:
+    MuteEndpointCollection(bool failItems, bool failActivate, bool systemSounds)
+        : failItems_(failItems), failActivate_(failActivate), systemSounds_(systemSounds) {}
+
+    HRESULT STDMETHODCALLTYPE GetCount(UINT* count) override {
+        if (count) *count = 1;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Item(UINT, IMMDevice** device) override {
+        if (failItems_) return E_FAIL;
+        if (!device) return E_POINTER;
+        *device = new MuteEndpoint(failActivate_, systemSounds_);
+        return S_OK;
+    }
+
+private:
+    const bool failItems_;
+    const bool failActivate_;
+    const bool systemSounds_;
+};
+
+class MuteDeviceEnumerator final : public FakeCom<MuteDeviceEnumerator, IMMDeviceEnumerator> {
+public:
+    // failItems hides an endpoint's sessions; failActivate fails the session
+    // manager activation on a readable endpoint.
+    explicit MuteDeviceEnumerator(bool failItems, bool failActivate = false, bool systemSounds = true)
+        : failItems_(failItems), failActivate_(failActivate), systemSounds_(systemSounds) {}
+
+    HRESULT STDMETHODCALLTYPE EnumAudioEndpoints(EDataFlow, DWORD, IMMDeviceCollection** endpoints) override {
+        if (!endpoints) return E_POINTER;
+        *endpoints = new MuteEndpointCollection(failItems_, failActivate_, systemSounds_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDefaultAudioEndpoint(EDataFlow, ERole, IMMDevice** endpoint) override {
+        if (!endpoint) return E_POINTER;
+        *endpoint = new MuteEndpoint(failActivate_, systemSounds_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(LPCWSTR, IMMDevice** endpoint) override {
+        if (!endpoint) return E_POINTER;
+        *endpoint = new MuteEndpoint(failActivate_, systemSounds_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE RegisterEndpointNotificationCallback(IMMNotificationClient*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE UnregisterEndpointNotificationCallback(IMMNotificationClient*) override { return E_NOTIMPL; }
+
+private:
+    const bool failItems_;
+    const bool failActivate_;
+    const bool systemSounds_;
+};
+
+std::string readFileBytes(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+}
+
+std::filesystem::path sessionMuteJournalPath() {
+    // localAppDataPath() is stubbed to an empty path in this suite.
+    return L"audio-session-mutes.txt";
+}
+
+void installMuteEnumerator(bool failItems, bool failActivate = false, bool systemSounds = true) {
+    backtrack::WasapiCaptureTestAccess::setSessionMuteEnumerator(
+        [failItems, failActivate, systemSounds](IMMDeviceEnumerator** enumerator) -> HRESULT {
+            if (!enumerator) return E_POINTER;
+            *enumerator = new MuteDeviceEnumerator(failItems, failActivate, systemSounds);
+            return S_OK;
+        });
+}
+
+void testSessionMuteEnumerationFailureStopsExclusion() {
+    const auto journal = sessionMuteJournalPath();
+    std::error_code error;
+    std::filesystem::remove(journal, error);
+    const std::wstring key = L"c:\\apps\\game.exe";
+
+    // An unreadable endpoint hides its whole session list, so a wanted session
+    // there would contribute no mute failure and exclusion would look
+    // established.
+    installMuteEnumerator(true, false);
+    const auto hiddenEndpoint = backtrack::WasapiCapture::applySessionMutesForExecutables({key});
+    expect(hiddenEndpoint.enumerationFailed, "a failed collection item must fail the enumeration");
+    expect(!hiddenEndpoint.exclusionEstablished(), "a partial snapshot must not establish exclusion");
+
+    installMuteEnumerator(false, true);
+    const auto noManager = backtrack::WasapiCapture::applySessionMutesForExecutables({key});
+    expect(noManager.enumerationFailed, "a failed session-manager activation must fail the enumeration");
+    expect(!noManager.exclusionEstablished(), "an unreadable endpoint's sessions must not establish exclusion");
+
+    // A system-sounds session is an intentional exclusion, not an observation
+    // failure: the snapshot is still complete.
+    installMuteEnumerator(false, false, true);
+    const auto systemSoundsOnly = backtrack::WasapiCapture::applySessionMutesForExecutables({key});
+    expect(!systemSoundsOnly.enumerationFailed, "an intentional skip must not fail the enumeration");
+    expect(systemSoundsOnly.exclusionEstablished(), "a complete snapshot of nothing wanted still establishes exclusion");
+    expect(systemSoundsOnly.muted == 0 && systemSoundsOnly.muteFailures == 0, "nothing was muted");
+
+    backtrack::WasapiCaptureTestAccess::setSessionMuteEnumerator({});
+    std::filesystem::remove(journal, error);
+}
+
+void testClearSessionMutesRequiresOwnership() {
+    const auto journal = sessionMuteJournalPath();
+    std::error_code error;
+    std::filesystem::remove(journal, error);
+    {
+        std::ofstream stream(journal, std::ios::binary);
+        stream << "111\t0\tc:\\apps\\game.exe\n";
+    }
+    const std::string before = readFileBytes(journal);
+
+    // A rejected second launch reaches clearSessionMutes through its controller
+    // teardown and must restore nothing of the live instance's work.
+    backtrack::WasapiCapture::setSessionMuteOwnership(false);
+    const auto disowned = backtrack::WasapiCapture::clearSessionMutes();
+    expect(disowned.restored == 0 && disowned.unresolved == 0 && !disowned.journalFailed,
+        "a non-owner's clear must return an empty result");
+    expect(readFileBytes(journal) == before, "a non-owner's clear must leave the journal byte-for-byte");
+
+    // The owner runs the restore: the journal is consumed or an obligation is
+    // reported, either way not the early return above.
+    backtrack::WasapiCapture::setSessionMuteOwnership(true);
+    const auto owned = backtrack::WasapiCapture::clearSessionMutes();
+    expect(owned.journalFailed || owned.unresolved > 0 || readFileBytes(journal) != before,
+        "an owning clear must run the restore instead of returning early");
+
+    backtrack::WasapiCapture::setSessionMuteOwnership(false);
+    std::filesystem::remove(journal, error);
+}
+
 } // namespace
 
 int main() {
@@ -600,6 +868,11 @@ int main() {
         testCallbacksAcrossStop();
         testUnregisterFailureKeepsCallbackSafe();
         testPooledPayloadSurvivesStop();
+        // The mute-store cases come first: the process-global store reads its
+        // journal once, so the ownership case needs the journal on disk before
+        // anything else enumerates.
+        testClearSessionMutesRequiresOwnership();
+        testSessionMuteEnumerationFailureStopsExclusion();
         std::cout << "WasapiDefaultDeviceTests passed\n";
         return 0;
     } catch (const std::exception& error) {

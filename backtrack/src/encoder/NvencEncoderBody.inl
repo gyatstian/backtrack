@@ -181,6 +181,7 @@ public:
     bool encoderAvailable() const noexcept override;
     DXGI_FORMAT preferredInputFormat() const override;
     uint32_t inputRetentionBudget() const override;
+    uint64_t droppedInputs() const noexcept override;
 
 private:
     // The lifecycle suite includes one tier translation unit directly and
@@ -216,10 +217,20 @@ struct Encoder::Impl {
     // per-iteration health probe (IEncoder::encoderAvailable). Written only on
     // paths that already hold mutex, so the pair never disagrees observably.
     std::atomic<bool> availableAtomic{false};
+    // Lock-free mirror of the drop count for IEncoder::droppedInputs, which the
+    // recording-stop drain reads without taking mutex.
+    std::atomic<uint64_t> droppedInputAtomic{0};
 
     void publishAvailability(bool available) {
         encoderStats.encoderAvailable = available;
         availableAtomic.store(available, std::memory_order_release);
+    }
+
+    // An input this session left without an output: the drop counter and its
+    // lock-free mirror must move together.
+    void noteDroppedInput() {
+        ++encoderStats.droppedFrames;
+        droppedInputAtomic.fetch_add(1, std::memory_order_relaxed);
     }
 
     struct RegisteredResource {
@@ -316,6 +327,12 @@ struct Encoder::Impl {
                (caps.effective.lookahead ? caps.effective.lookaheadDepth : 0u);
     }
 
+    // Picture reorder depth: the only part of reorderDelayFrames() that moves
+    // decode timestamps.
+    uint32_t pictureReorderFrames() const {
+        return caps.effective.bFrames ? 2u : 0u;
+    }
+
     // True when this output must be lockable on request. Two independent
     // bounds, either of which is sufficient: enough later frames entered the
     // encoder to flush its reorder pipeline, or the frame's real-time reorder
@@ -394,7 +411,9 @@ struct Encoder::Impl {
     }
 
     void updateCapabilities(const std::wstring& adapterName) {
-        caps.available = session != nullptr;
+        // Capability values only: availability is published once the whole
+        // session is configured, so a later failure cannot leave a half-built
+        // session looking healthy.
         caps.adapterName = adapterName;
         caps.backendName = L"NVENC";
         caps.h264 = queryCap(NV_ENC_CODEC_H264_GUID, NV_ENC_CAPS_SUPPORTED_RATECONTROL_MODES) != 0;
@@ -405,20 +424,24 @@ struct Encoder::Impl {
         caps.tenBitHevc = queryCap(NV_ENC_CODEC_HEVC_GUID, NV_ENC_CAPS_SUPPORT_10BIT_ENCODE) != 0;
         caps.maxWidth = static_cast<uint32_t>(queryCap(codecGuid(settings.codec), NV_ENC_CAPS_WIDTH_MAX));
         caps.maxHeight = static_cast<uint32_t>(queryCap(codecGuid(settings.codec), NV_ENC_CAPS_HEIGHT_MAX));
-        caps.detail = caps.available ? L"NVENC Direct3D 11 session active" : caps.detail;
-        publishAvailability(caps.available);
     }
 
     bool initializeEncoder(ID3D11Device* device, const std::wstring& adapterName) {
+        // Loading the runtime and opening the session are the only steps that
+        // need the device; the rest configures the opened session.
+        if (!loadApi() || !openSession(device)) {
+            return false;
+        }
+        return configureSession(adapterName);
+    }
+
+    bool configureSession(const std::wstring& adapterName) {
         consecutiveMapFailures = 0;
         consecutiveRegisterFailures = 0;
         consecutiveEncodeFailures = 0;
         sessionFaulted = false;
         inputMappingFaulted = false;
         cachedParameterSets.clear();
-        if (!loadApi() || !openSession(device)) {
-            return false;
-        }
 
         updateCapabilities(adapterName);
         if ((settings.codec == VideoCodec::H264 && !caps.h264) || (settings.codec == VideoCodec::Hevc && !caps.hevc)) {
@@ -445,13 +468,27 @@ struct Encoder::Impl {
         }
         const uint32_t effectiveBFrameCount = caps.effective.bFrames ? 2 : 0;
         caps.effective.lookaheadDepth = std::min<uint32_t>(caps.effective.lookaheadDepth, 31 - effectiveBFrameCount);
-        // Warm up with the full pipeline depth the heuristics below assume:
-        // frameIntervalP holds bFrames + 1 frames before the first output
-        // appears, and enabled lookahead keeps roughly its configured depth
-        // of submissions unharvested in steady state. Resetting with less
-        // would make every output look surplus once the pipeline filled,
-        // tripping the desync watchdog (see DecodeOrderTimestamps).
-        decodeTimestamps.reset(reorderDelayFrames());
+        // Report the tuning the driver will actually run. Lossless needs the
+        // High 4:4:4 Predictive profile plus the transform bypass
+        // (nvEncodeAPI.h h264Config.qpPrimeYZeroTransformBypassFlag) and YUV444
+        // input, which this 8-bit 4:2:0 capture path cannot feed, and the 11.x
+        // tier has no ultra high quality tuning at all.
+        std::wstring modeFallback;
+        if (caps.effective.mode == EncoderMode::Lossless) {
+            caps.effective.mode = EncoderMode::HighQuality;
+            modeFallback += L"; lossless needs 4:4:4 input and the predictive profile, so high quality is used";
+        }
+#if !BACKTRACK_NVENC_API12
+        if (caps.effective.mode == EncoderMode::UltraHighQuality) {
+            caps.effective.mode = EncoderMode::HighQuality;
+            modeFallback += L"; ultra high quality tuning needs NVENC API 12.0, so high quality is used";
+        }
+#endif
+        // Decode order shifts only by the picture reorder depth. Lookahead
+        // buffers submissions without changing the order pictures come out,
+        // so it must not move decode timestamps; reorderDelayFrames() stays the
+        // pipeline delay the output-completeness heuristics use.
+        decodeTimestamps.reset(pictureReorderFrames());
 
         const GUID requestedPreset = presetGuid(caps.effective.preset);
         const NV_ENC_TUNING_INFO requestedTuning = tuningInfo(caps.effective.mode);
@@ -571,6 +608,12 @@ struct Encoder::Impl {
             bitstreamBuffers.push_back(createBuffer.bitstreamBuffer);
             availableBitstreams.push_back(createBuffer.bitstreamBuffer);
         }
+
+        // Every step above succeeded, so this is the only point where the
+        // session may look available to the capture loop.
+        caps.available = true;
+        caps.detail = L"NVENC Direct3D 11 session active" + modeFallback;
+        publishAvailability(true);
 
         Logger::instance().info(L"encoder",
             L"NVENC initialized in D3D11 mode at " +
@@ -860,7 +903,7 @@ struct Encoder::Impl {
                         nvStatusName(status) + L")");
                 }
                 if (status != NV_ENC_SUCCESS) {
-                    ++encoderStats.droppedFrames;
+                    noteDroppedInput();
                     return failEncoder(L"NVENC output lock failed: " + nvStatusName(status));
                 }
                 pending.completed = true;
@@ -900,6 +943,10 @@ struct Encoder::Impl {
                     matched->finalized = true;
                     if (finalized) {
                         readyPackets.push_back(std::move(packet));
+                    } else {
+                        // The input produced no usable payload: it is gone
+                        // without an output, exactly like a dropped frame.
+                        noteDroppedInput();
                     }
                 }
                 const NVENCSTATUS status = api.nvEncUnlockBitstream(session, pending.bitstream);
@@ -936,7 +983,7 @@ struct Encoder::Impl {
         }
         if (frame.width != settings.width || frame.height != settings.height) {
             Logger::instance().warning(L"encoder", L"Frame size changed; dropping frame until capture pipeline is recreated");
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             return popReadyPacket(packet);
         }
 
@@ -950,7 +997,7 @@ struct Encoder::Impl {
             break;
         default:
             Logger::instance().warning(L"encoder", L"Unsupported D3D11 encoder input format; dropping frame");
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             return popReadyPacket(packet);
         }
 
@@ -960,7 +1007,7 @@ struct Encoder::Impl {
         // frame loss must restart the reference chain without stranding harvested output.
         auto dropFrame = [&](const wchar_t* reason) {
             forceKeyFrame = true;
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             if (reason) {
                 Logger::instance().warning(L"encoder", reason);
             }
@@ -1039,7 +1086,7 @@ struct Encoder::Impl {
             if (!entry || status != NV_ENC_SUCCESS) {
                 forceKeyFrame = true;
                 noteMapFailure(status);
-                ++encoderStats.droppedFrames;
+                noteDroppedInput();
                 releaseBitstreamBuffer(bitstream);
                 return popReadyPacket(packet);
             }
@@ -1092,7 +1139,7 @@ struct Encoder::Impl {
             // stream continues from a clean reference state.
             forceKeyFrame = true;
             releaseBitstreamBuffer(bitstream);
-            ++encoderStats.droppedFrames;
+            noteDroppedInput();
             if (api.nvEncUnmapInputResource(session, pendingInput.mapped) != NV_ENC_SUCCESS) {
                 retainedMappings.push_back(
                     {pendingInput.mapped, pendingInput.inputTexture, std::move(pendingInput.lease)});
@@ -1246,6 +1293,7 @@ bool Encoder::initialize(D3DDevice& device, const VideoSettings& settings) {
     }
     std::scoped_lock lock(impl_->mutex);
     impl_->availableAtomic.store(false, std::memory_order_release);
+    impl_->droppedInputAtomic.store(0, std::memory_order_relaxed);
     impl_->settings = settings;
     impl_->forceKeyFrame = true;
     impl_->caps = {};
@@ -1332,6 +1380,10 @@ uint32_t Encoder::inputRetentionBudget() const {
     // the encoder-feeding pool must hold so deep lookahead cannot starve the
     // producer.
     return impl_ ? impl_->desiredBitstreamBufferCount() : 0;
+}
+
+uint64_t Encoder::droppedInputs() const noexcept {
+    return impl_ ? impl_->droppedInputAtomic.load(std::memory_order_relaxed) : 0;
 }
 
 } // namespace BACKTRACK_NVENC_NAMESPACE

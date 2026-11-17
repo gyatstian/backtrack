@@ -112,7 +112,10 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   free enough space (a save reads far faster than encode rate, so in practice
   never). The single pin covers both rings: it is taken when either backend is
   on disk and released once both the video and the audio bytes are consumed,
-  before the audio is written and before muxing. The count is a counter rather
+  before the audio is written and before muxing. The counter is incremented and
+  the `PinRelease` guard constructed with nothing between them that can
+  allocate: a throw in that gap would leak the pin and block every later
+  producer on ring space. The count is a counter rather
   than a bool so a second concurrent save cannot break the protocol silently;
   concurrent saves only over-count the cursor, and every mark still corresponds
   to a real read, so the front is never under-protected. Disk-audio trimming
@@ -147,7 +150,13 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   `RingFile::closeNow` reset the cursor.
 - pending ring transfers wait at most `kRingIoTimeoutMs` per request. on timeout
   or wait failure they request cancellation and return a ring fault; cancellation
-  does not guarantee completion. a thread-pool wait retains the operation's
+  does not guarantee completion. the retained owner (the shared pointer the
+  thread-pool wait context points at) is allocated before submission, never
+  after: once the transfer is in flight, a failed allocation would free the
+  private buffer, the duplicated handle and the `OVERLAPPED` under the kernel.
+  if the completion wait cannot be created either, the transfer falls back to a
+  blocking wait on its event rather than dropping the pending operation. a
+  thread-pool wait retains the operation's
   duplicate file handle, event, `OVERLAPPED` and private buffer until final
   completion, including after ring close. a failed write prevents further writes
   to that ring; a reopened ring is independently created. a pending deletion

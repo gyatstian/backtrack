@@ -832,15 +832,24 @@ std::vector<uint8_t> loadWavFile(const std::filesystem::path& path) {
     return bytes;
 }
 
-size_t findWavPcmDataOffset(const std::vector<uint8_t>& wav, uint16_t& bitsPerSample) {
-    bitsPerSample = 0;
+// The data chunk bounds the attenuation: a WAV may carry chunks after its
+// samples, and those must not be rewritten as if they were audio.
+struct WavPcmExtent {
+    size_t offset = 0;
+    size_t size = 0;
+    uint16_t bitsPerSample = 0;
+};
+
+WavPcmExtent findWavPcmExtent(const std::vector<uint8_t>& wav) {
+    WavPcmExtent extent;
     if (wav.size() < 44) {
-        return 0;
+        return extent;
     }
 
     size_t offset = 12;
     size_t dataOffset = 0;
-    uint32_t dataSize = 0;
+    size_t dataSize = 0;
+    bool pcm = false;
     while (offset + 8 <= wav.size()) {
         const char* chunkId = reinterpret_cast<const char*>(wav.data() + offset);
         const uint32_t chunkSize =
@@ -855,11 +864,9 @@ size_t findWavPcmDataOffset(const std::vector<uint8_t>& wav, uint16_t& bitsPerSa
         if (std::memcmp(chunkId, "fmt ", 4) == 0 && chunkSize >= 16) {
             const uint16_t formatTag =
                 static_cast<uint16_t>(wav[payload]) | (static_cast<uint16_t>(wav[payload + 1]) << 8);
-            bitsPerSample =
+            extent.bitsPerSample =
                 static_cast<uint16_t>(wav[payload + 14]) | (static_cast<uint16_t>(wav[payload + 15]) << 8);
-            if (formatTag != 1 || bitsPerSample != 16) {
-                bitsPerSample = 0;
-            }
+            pcm = formatTag == 1 && (extent.bitsPerSample == 8 || extent.bitsPerSample == 16);
         } else if (std::memcmp(chunkId, "data", 4) == 0) {
             dataOffset = payload;
             dataSize = chunkSize;
@@ -867,29 +874,42 @@ size_t findWavPcmDataOffset(const std::vector<uint8_t>& wav, uint16_t& bitsPerSa
         }
         offset = payload + chunkSize + (chunkSize & 1u);
     }
-    if (dataOffset == 0 || bitsPerSample != 16 || dataOffset + dataSize > wav.size()) {
-        return 0;
+    if (!pcm || dataOffset == 0 || dataOffset + dataSize > wav.size()) {
+        return WavPcmExtent{};
     }
-    return dataOffset;
+    extent.offset = dataOffset;
+    extent.size = dataSize;
+    return extent;
 }
 
-void applyWavVolume(std::vector<uint8_t>& wav, uint32_t volumePercent) {
-    if (volumePercent >= 100 || wav.size() <= 44) {
-        return;
+// Returns false when this buffer cannot be played at the requested volume.
+bool applyWavVolume(std::vector<uint8_t>& wav, uint32_t volumePercent) {
+    if (volumePercent >= 100) {
+        return true;
     }
-    uint16_t bitsPerSample = 0;
-    const size_t dataOffset = findWavPcmDataOffset(wav, bitsPerSample);
-    if (dataOffset == 0) {
-        return;
+    const WavPcmExtent extent = findWavPcmExtent(wav);
+    if (extent.offset == 0) {
+        return false;
     }
     const double gain = static_cast<double>(volumePercent) / 100.0;
-    for (size_t offset = dataOffset; offset + 1 < wav.size(); offset += 2) {
-        const auto sample = static_cast<int16_t>(
-            static_cast<uint16_t>(wav[offset]) | (static_cast<uint16_t>(wav[offset + 1]) << 8));
-        const auto adjusted = static_cast<int16_t>(std::lround(static_cast<double>(sample) * gain));
-        wav[offset] = static_cast<uint8_t>(static_cast<uint16_t>(adjusted) & 0xff);
-        wav[offset + 1] = static_cast<uint8_t>((static_cast<uint16_t>(adjusted) >> 8) & 0xff);
+    if (extent.bitsPerSample == 8) {
+        for (size_t index = 0; index < extent.size; ++index) {
+            const size_t at = extent.offset + index;
+            const long adjusted =
+                std::lround((static_cast<double>(wav[at]) - 128.0) * gain) + 128;
+            wav[at] = static_cast<uint8_t>(std::clamp<long>(adjusted, 0, 255));
+        }
+        return true;
     }
+    for (size_t index = 0; index + 1 < extent.size; index += 2) {
+        const size_t at = extent.offset + index;
+        const auto sample = static_cast<int16_t>(
+            static_cast<uint16_t>(wav[at]) | (static_cast<uint16_t>(wav[at + 1]) << 8));
+        const auto adjusted = static_cast<int16_t>(std::lround(static_cast<double>(sample) * gain));
+        wav[at] = static_cast<uint8_t>(static_cast<uint16_t>(adjusted) & 0xff);
+        wav[at + 1] = static_cast<uint8_t>((static_cast<uint16_t>(adjusted) >> 8) & 0xff);
+    }
+    return true;
 }
 
 void playActionIndicator(
@@ -904,7 +924,11 @@ void playActionIndicator(
     std::vector<uint8_t> customWav;
     if (type == MB_OK && !customSuccessSoundPath.empty()) {
         customWav = (loadWav ? loadWav : loadWavFile)(customSuccessSoundPath);
-        applyWavVolume(customWav, volumePercent);
+        // A custom sound that cannot be attenuated plays at the wrong volume, so
+        // the built-in indicator stands in for it.
+        if (!applyWavVolume(customWav, volumePercent)) {
+            customWav.clear();
+        }
     }
 
     // SND_ASYNC retains the buffer; skip feedback rather than wait for its owner.
@@ -930,8 +954,9 @@ void playActionIndicator(
     const std::vector<uint8_t>* playback = &wav;
     if (volumePercent < 100 && wav.size() > 44) {
         scaled = wav;
-        applyWavVolume(scaled, volumePercent);
-        playback = &scaled;
+        if (applyWavVolume(scaled, volumePercent)) {
+            playback = &scaled;
+        }
     }
 
     if (!playSound(reinterpret_cast<LPCWSTR>(playback->data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT)) {

@@ -64,19 +64,24 @@ build.
     canonical conversion, extensible-format and channel-mask guards,
     `applyMuteGain`, and uniform packets across mid-stream format changes.
   - `SessionMuteStoreTests` - `audio/SessionMuteStore.cpp`, `core/Logger.cpp`.
-    The journal codec, write-after-every-mute with atomic publish, stale
-    pruning, one-to-one live/orphan claims, and retryable crash-path restore.
+    The journal codec (including legacy 3-column lines), write-after-every-mute
+    with atomic publish, stale pruning, one-to-one live/orphan claims, exact
+    instance matching with replacement reconciliation, and retryable crash-path
+    restore.
   - `ReplayBufferTests` - `replay/ReplayBuffer.cpp`, `mux/RecoveryStore.cpp`,
     `audio/AudioConvert.cpp`, `audio/WavReader.cpp`, `mux/WavWriter.cpp`,
     `encoder/BitstreamUtils.cpp`, `core/Logger.cpp`. Both backends, trimming and
-    wrap reassembly, the `RecoveryStore` manifest rules, the audio gap fill
+    wrap reassembly, the `RecoveryStore` manifest rules (including a declared
+    count that must not size the sample vector and a sample table closed at an
+    unrepresentable timestamp span), the audio gap fill
     keeping the real outage duration, the unpatched-WAV fallback, the bitstream
     classifiers (parameter-set completeness and truncated/trailing input),
     and the mux- and ring-read-failure save paths. `Mp4Muxer.cpp`
     stays out (see the stub rule below).
   - `RingFileTests` - `replay/RingFile.h` plus `core/Logger.cpp`: wrap and
-    partial reads, immediate and completed errors, a real pending pipe read, and
-    injected delayed completion after close.
+    partial reads, immediate and completed errors, a real pending pipe read,
+    injected delayed completion after close, and the pre-submission retention
+    of a transfer that has to be cancelled.
   - `SettingsClipGuardTests` - `settings/SettingsStore.cpp`,
     `clips/ClipManager.cpp`, `core/Logger.cpp`, `LIBS propsys`: `sanitizeSettings`
     and `load` fallbacks, `save` on observable disk state, the managed-path
@@ -102,7 +107,8 @@ build.
     RIFF-boundary extent recovery, a real mux round trip reopened through
     `IMFSourceReader` for subtype, size, audio track and duration, the
     `stts`/`ctts` tables checked against the written packet timeline including
-    a decode-ordered B-frame stream, decoding of an OS-encoded H.264 stream
+    a decode-ordered B-frame stream, the recording cut holding and then flushing
+    a decode-order prefix, decoding of an OS-encoded H.264 stream
     when those MFTs are usable (a printed skip otherwise), and the recording
     path's WAV-finalization failure preserving `system.wav` plus its manifest
     with nothing published.
@@ -119,11 +125,14 @@ build.
   - `RecorderControllerCutoffTests`, `RecorderControllerLeaseTests` -
     header-inline controller helpers only (`RecordingCutoffTracker.h`,
     `CaptureFrameHandoff.h`, `pipelineEncoderFaulted`, `EncoderFaultBackoff`,
-    `encoderBehindBudget`), no controller sources.
+    `encoderBehindBudget`), no controller sources. The cutoff tracker's
+    completion accounting is covered here: pending submissions, drops,
+    abandonment, and the boundary latch.
   - `RecorderControllerShutdownOrderingTests` - `app/AudioWriter.cpp`,
-    `audio/AudioConvert.cpp`, `core/Logger.cpp` plus `app/AudioDrain.h`:
-    late system/microphone packets and queue draining before writer exit,
-    block RMS floors, and microphone AGC gain continuity and packet metadata.
+    `audio/AudioConvert.cpp`, `core/Logger.cpp` plus `app/AudioDrain.h` and
+    `app/VideoDrain.h`: late system/microphone packets and queue draining
+    before writer exit, the video encode-loop exit predicate, block RMS floors,
+    and microphone AGC gain continuity and packet metadata.
   - `DesktopDuplicationRotationTests` - `capture/DesktopDuplicationCapture.h`'s
     header-inline rotation helpers and cursor carry, no D3D device.
   - `WgcCopyPoolTests` - `capture/WgcCopyPool.h`, `core/Logger.cpp`,
@@ -134,14 +143,17 @@ build.
     device, and the negotiated 33-slot feeding pool surviving `setPoolSize` and
     the pool build.
   - `EncoderFeedingPoolTests` - `capture/GpuTexturePool.h` with a fake
-    deep-lookahead encoder, `core/Logger.cpp`: the two-argument clamp arithmetic
-    and the negotiation through `GpuTexturePool`, not the scaler itself.
+    deep-lookahead encoder, `core/Logger.cpp`: the two-argument clamp arithmetic,
+    the alias-vs-retention capacity arithmetic, and the negotiation through
+    `GpuTexturePool`, not the scaler itself.
   - `WasapiDefaultDeviceTests` - `audio/WasapiCapture.cpp`,
     `audio/SessionMuteStore.cpp`, `core/Logger.cpp`,
     `LIBS avrt mmdevapi ole32 propsys user32 uuid windowsapp`: default-device
     switches with a fake enumerator, a pinned explicit device, switches during
     resolution and inside the packet callback, setup retries/backoff stop,
-    and registration/stop races.
+    registration/stop races, and the real session-mute adapter driven through
+    an injected session enumerator (incomplete enumeration, intentional skips,
+    and the mute-ownership gate).
   - `DiscordRichPresenceTests` and `LeagueOfLegendsIntegrationTests` - each
     includes its worker `.cpp` directly (to replace the pipe or the HTTP GET), so
     it must not be linked again; `core/Logger.cpp` plus `winhttp` for LoL.
@@ -161,13 +173,19 @@ build.
     input (one bounded harvest before the drop), rejection, reset, lock/unmap
     failure, shutdown retention, and the early
     non-blocking lock statuses (`LOCK_BUSY`/`OUT_OF_MEMORY` retry, a stuck lock
-    still escalates after the deadline).
+    still escalates after the deadline), the submitted configuration for a
+    lossless request, an initialization failure after the capability query
+    leaving the backend unavailable, dropped-input accounting, and a lookahead
+    session keeping DTS equal to PTS.
   - `AmfEncoderTests` - includes `encoder/AmfEncoder.cpp` itself, plus
     `encoder/EncoderCommon.cpp`, `encoder/BitstreamUtils.cpp`, `core/Logger.cpp`,
     `DEFINES BACKTRACK_HAS_AMF=1`, the AMF include path, `LIBS ole32`. Registered
     only when the AMF headers are found. The retention budget is checked against
-    the pinned leases it reports, and an aged backlog faulting at its deadline
-    releases every lease.
+    the pinned leases it reports, an aged backlog faulting at its deadline
+    releases every lease, lossless and ultra-high-quality requests report the
+    programmed high-quality configuration with the reason, an initialization or
+    re-creation failure leaves the backend unavailable, and a shed input counts
+    as a dropped input.
   - `AudioDenoiseTests` - `audio/RnnoiseDenoiser.cpp`, `LIBS rnnoise`. Built
     only when `BACKTRACK_NOISE_SUPPRESSION=ON`; the suite itself has no
     `#ifdef`, the CMake `if` around `add_backtrack_test` is the whole gate.

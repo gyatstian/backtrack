@@ -129,14 +129,6 @@ public:
         lastSubmittedPts100ns_ = 0;
     }
 
-    bool hasSubmittedFrame() const {
-        return haveLastSubmittedFrame_;
-    }
-
-    int64_t lastSubmittedPts100ns() const {
-        return lastSubmittedPts100ns_;
-    }
-
 private:
     int64_t nominalFrameDuration100ns_ = 1;
     bool haveLastSubmittedFrame_ = false;

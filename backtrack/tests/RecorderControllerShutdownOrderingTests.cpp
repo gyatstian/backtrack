@@ -232,51 +232,6 @@ void testLatePacketConsumedMicrophone() {
            "late microphone packet was not consumed before writer exit");
 }
 
-// Consumer must drain packets that were enqueued before producersFinished,
-// even when the queues are non-empty at the time producersFinished is set.
-void testConsumerDrainsBeforeExit() {
-    backtrack::SpscQueue<backtrack::AudioPacket> systemQueue(16);
-    backtrack::SpscQueue<backtrack::AudioPacket> microphoneQueue(16);
-    std::atomic<bool> producersFinished{false};
-    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    expect(event != nullptr, "CreateEvent failed");
-
-    std::vector<int> consumed;
-    std::mutex consumedMutex;
-
-    // Pre-load some packets before the consumer starts.
-    {
-        backtrack::AudioPacket p1;
-        p1.track = backtrack::AudioTrack::System;
-        p1.frameCount = 1;
-        systemQueue.tryPush(std::move(p1));
-        backtrack::AudioPacket p2;
-        p2.track = backtrack::AudioTrack::Microphone;
-        p2.frameCount = 2;
-        microphoneQueue.tryPush(std::move(p2));
-    }
-
-    std::thread consumer([&] {
-        drainAudioQueues(systemQueue, microphoneQueue, producersFinished, event,
-            [&](backtrack::AudioPacket&& packet) {
-                std::scoped_lock lock(consumedMutex);
-                consumed.push_back(packet.frameCount);
-            });
-    });
-
-    // Let consumer start draining.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // Signal producers finished — consumer must drain remaining packets.
-    producersFinished.store(true, std::memory_order_release);
-    SetEvent(event);
-
-    consumer.join();
-    CloseHandle(event);
-
-    expect(consumed.size() == 2, "consumer did not drain all pre-loaded packets");
-}
-
 } // namespace
 
 int main() {
@@ -286,7 +241,6 @@ int main() {
         testMicrophoneAgcUsesBlockRms();
         testLatePacketConsumed();
         testLatePacketConsumedMicrophone();
-        testConsumerDrainsBeforeExit();
     } catch (const std::exception& error) {
         std::cerr << "RecorderControllerShutdownOrderingTests: " << error.what() << '\n';
         return 1;

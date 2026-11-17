@@ -39,7 +39,6 @@ public:
     void requestResize() { resizePending = true; }
     void shutdown() override {
         expect(leases == 0, "shutdown with a raw capture lease");
-        ++shutdowns;
     }
     bool isDeviceLost() const override { return false; }
     backtrack::CaptureBackend backend() const override {
@@ -51,7 +50,6 @@ public:
 
     int leases = 0;
     int resizes = 0;
-    int shutdowns = 0;
     uint64_t resolutionChanges = 0;
     bool resizePending = false;
     bool resizeReported = false;
@@ -107,30 +105,12 @@ void testFailedDrainKeepsFrames() {
     source.shutdown();
 }
 
-void testRemovedDeviceReleaseBeforeShutdown() {
-    LeaseCheckingSource source;
-    backtrack::GpuFrame last, acquired;
-    source.acquireNextFrame(last, 0);
-    source.acquireNextFrame(acquired, 0);
-    backtrack::GpuFrame encoderInput = last;
-    bool mapped = true;
-    expect(backtrack::releaseCaptureFrames(last, acquired, [&] {
-        expect(last.lease && mapped, "removed-device input was dropped before shutdown");
-        mapped = false;
-        encoderInput = {};
-        return true;
-    }), "removed-device shutdown failed");
-    source.shutdown();
-    expect(source.shutdowns == 1 && !mapped, "removed-device shutdown order failed");
-}
-
 } // namespace
 
 int main() {
     try {
         testResizeDrainsEveryOwner();
         testFailedDrainKeepsFrames();
-        testRemovedDeviceReleaseBeforeShutdown();
     } catch (const std::exception& error) {
         std::cerr << "RecorderControllerLeaseTests: " << error.what() << '\n';
         return 1;

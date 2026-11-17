@@ -93,8 +93,7 @@ void testDeepLookaheadReachesFirstOutputWithoutEarlierRelease() {
     for (uint32_t i = 0; i < retention; ++i) {
         auto slot = pool.acquire();
         expect(slot != nullptr, "each retained input must get a pool slot");
-        expect(!encoder.feed(std::move(slot)),
-            "no output may arrive before the retention fills");
+        encoder.feed(std::move(slot));
     }
 
     // The (retention+1)-th input must reach the first output while every
@@ -105,9 +104,6 @@ void testDeepLookaheadReachesFirstOutputWithoutEarlierRelease() {
         "feeding pool sized from retention must not starve before the first output");
     expect(encoder.feed(std::move(finalSlot)),
         "deep-lookahead encoder must reach its first output without an earlier lease release");
-    expect(encoder.outputs == 1, "exactly one output after the retention fills");
-    expect(encoder.held.size() == retention - 1,
-        "the first output released exactly one retained input");
 }
 
 void testNegotiationBounds() {

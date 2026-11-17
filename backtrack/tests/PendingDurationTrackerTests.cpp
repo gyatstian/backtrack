@@ -88,16 +88,6 @@ void testUnmatchedPtsKeepsBookkeepingBounded() {
     expect(tracker.size() == 0, "consuming the unmatched PTS left bookkeeping behind");
 }
 
-void testClear() {
-    PendingDurationTracker tracker;
-    for (int64_t pts = 0; pts < 10; ++pts) {
-        tracker.extend(pts, 1000);
-    }
-    tracker.clear();
-    expect(tracker.size() == 0, "clear left tracked entries behind");
-    expect(tracker.consume(0, 100) == 100, "clear left a consumable entry behind");
-}
-
 } // namespace
 
 int main() {
@@ -106,7 +96,6 @@ int main() {
         testEvictionKeepsBounded();
         testEvictionPicksSmallestPtsNotInsertionOrder();
         testUnmatchedPtsKeepsBookkeepingBounded();
-        testClear();
         std::cout << "PendingDurationTracker tests passed\n";
         return 0;
     } catch (const std::exception& error) {

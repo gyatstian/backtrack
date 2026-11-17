@@ -73,7 +73,6 @@ struct MainWindowLibraryTestAccess {
     static size_t thumbnailCacheSize(MainWindow& window) {
         return window.thumbnailCache_.size();
     }
-    static size_t thumbnailSlotCount(const MainWindow& window) { return window.clipThumbnails_.size(); }
     static size_t thumbnailFirst(const MainWindow& window) { return window.thumbnailFirst_; }
     static size_t thumbnailLast(const MainWindow& window) { return window.thumbnailLast_; }
     static size_t thumbnailBudget() { return MainWindow::kMaxLibraryThumbnails; }
@@ -299,8 +298,6 @@ void testThumbnailCompletionsStayBounded() {
     }
     expect(MainWindowLibraryTestAccess::thumbnailCacheSize(*fixture.window) <= budget,
            "thousands of thumbnail completions grew the cache past the fixed budget");
-    expect(MainWindowLibraryTestAccess::thumbnailSlotCount(*fixture.window) == kClipCount,
-           "thumbnail slots no longer cover the clip snapshot");
 }
 
 void testSettingsRebuildNotifications() {

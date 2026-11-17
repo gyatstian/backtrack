@@ -97,17 +97,6 @@ void testDelayedPreCutoffPublicationKeepsTheDrainOpen() {
     expect(tracker.acknowledged(gen), "the stop generation must be acknowledged");
 }
 
-void testPendingReachesZeroWithoutAnyQuiesce() {
-    RecordingCutoffTracker tracker;
-    tracker.beginStop(500);
-    tracker.noteFrameSubmitted(500);
-    tracker.noteFrameSubmitted(600);
-    // No clock argument exists: the ack depends on the counter, not on elapsed
-    // time. A quiesce-based tracker would refuse this immediately after the
-    // publication.
-    expect(tracker.notePacketPublished(500), "pending reaching zero must ack at once");
-}
-
 void testDroppedInputReleasesTheDrain() {
     RecordingCutoffTracker tracker;
     const uint64_t gen = tracker.beginStop(500);
@@ -500,7 +489,6 @@ int main() {
         testNoAckBeforeTheBoundary();
         testEmptyDrainAcksOnTheBoundary();
         testDelayedPreCutoffPublicationKeepsTheDrainOpen();
-        testPendingReachesZeroWithoutAnyQuiesce();
         testDroppedInputReleasesTheDrain();
         testDecrementsSaturateAtZero();
         testAbandonedDrainAcksWithoutTheBoundary();

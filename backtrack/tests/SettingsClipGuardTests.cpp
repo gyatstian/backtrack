@@ -58,6 +58,18 @@ std::vector<char> readFileBytes(const std::filesystem::path& path) {
                              std::istreambuf_iterator<char>());
 }
 
+// save() publishes through a freshly created staging sibling, so once it returns
+// the folder holds the published file and nothing else.
+void expectOnlyPublishedSettings(const std::filesystem::path& path) {
+    size_t files = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(path.parent_path())) {
+        if (entry.is_regular_file()) {
+            ++files;
+        }
+    }
+    expect(files == 1, "a save left a staging file behind");
+}
+
 // --- SettingsStore::load coverage ---
 // The parse path is the other half of the trust boundary: it is what stands
 // between a hand-edited file and a broken encoder config, and nothing ran it
@@ -339,12 +351,10 @@ void testUtf8RoundTripsThroughSaveAndLoad() {
             loaded.soundSeparationApps[0].name == settings.soundSeparationApps[0].name,
         "a non-ASCII app name did not round trip");
 
-    // A save over an existing file must go through the atomic temp-and-rename
-    // publish: the live file is replaced whole and no staging file is left.
+    // A save over an existing file must go through the atomic sibling publish:
+    // the live file is replaced whole and no staging file is left.
     store.save(settings);
-    const std::filesystem::path tempPath = path.wstring() + L".tmp";
-    expect(!std::filesystem::exists(tempPath),
-        "save left its staging file behind after a second save");
+    expectOnlyPublishedSettings(path);
     expect(store.load().clipDirectory == settings.clipDirectory,
         "a second save over an existing file broke the round trip");
 }
@@ -352,7 +362,7 @@ void testUtf8RoundTripsThroughSaveAndLoad() {
 // The publish rule is what makes save() safe to run against a file another
 // process holds open - a sync client, an antivirus scanner, a second instance.
 // Holding settings.ini with no FILE_SHARE_* denies both write and delete, so the
-// swap fails with ERROR_SHARING_VIOLATION after the temp file was already
+// swap fails with ERROR_ACCESS_DENIED after the temp file was already
 // written. What must survive is the previous file, byte for byte: a save that
 // could not complete may not damage what was already there. save() reports that
 // failure through its return value and through the logger, which this suite does
@@ -385,8 +395,7 @@ void testFailedSavePreservesTheOldFileAndLeavesNoTemp() {
 
     expect(readFileBytes(path) == before,
         "a save that could not swap left the previous settings file damaged");
-    expect(!std::filesystem::exists(path.wstring() + L".tmp"),
-        "a failed save left its staging file behind");
+    expectOnlyPublishedSettings(path);
 
     // The lock is gone, so the same save must now land: the failure above must
     // be the lock's doing and not a broken store or an early return.

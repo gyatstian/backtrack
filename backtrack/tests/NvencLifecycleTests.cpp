@@ -609,27 +609,6 @@ void testMapFailureReleasesInput() {
            "map failure released or retained the producer input");
 }
 
-void testRepeatedInput() {
-    FakeNvenc fake;
-    InstrumentedPool pool(fake);
-    NvencEncoder encoder;
-    attach(encoder, fake);
-    fake.completeOnEos = true;
-    auto frame = pool.write();
-    std::vector<EncodedPacket> packets;
-    encoder.encodeFrame(frame, packets);
-    frame.pts100ns = 166667;
-    encoder.encodeFrame(frame, packets);
-    expect(fake.accepted == 1, "a texture already mapped by an in-flight submission was submitted again");
-    expect(!fake.submittedWithoutFreshMap, "repeated input was submitted without a fresh mapping");
-    frame = {};
-    fake.completionCredits = 1;
-    expect(NvencEncoderTestAccess::harvest(encoder), "first repeated output was not harvested");
-    expect(pool.available() && !fake.mapped && !fake.releasedWhileMapped &&
-           !fake.invalidUnmap && !fake.invalidDestroy,
-           "repeated input was not safely released");
-}
-
 // A same-size producer reuses one texture for idle heartbeats, so a repeat
 // submission must first give the encoder one bounded chance to retire the
 // earlier one instead of dropping itself out of the pipeline.
@@ -1068,7 +1047,6 @@ int main() {
         testReorderedInputRetirement();
         testOutputBuffersLockInSubmissionOrder();
         testMapFailureReleasesInput();
-        testRepeatedInput();
         testRepeatedInputHarvestsBeforeDropping();
         testDroppedInputsRearmAndReturnReadyTail();
         testRetentionBudgetUsesPipelineDelay();

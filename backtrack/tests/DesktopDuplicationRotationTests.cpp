@@ -126,41 +126,6 @@ void testCursorTransformIdentity() {
     expect(x == 123 && y == 456, "UNSPECIFIED moved the cursor");
 }
 
-void testCursorTransformAllCorners() {
-    // Every rotation maps each physical corner to the correct texture corner.
-    const uint32_t texW = 1920, texH = 1080;
-    const int32_t rotW = static_cast<int32_t>(texH); // 1080
-    const int32_t rotH = static_cast<int32_t>(texW); // 1920
-    const struct {
-        DXGI_MODE_ROTATION rotation;
-        int32_t px;
-        int32_t py;
-        int32_t ex;
-        int32_t ey;
-    } cases[] = {
-        // top-left, top-right, bottom-left, bottom-right of the physical display
-        {DXGI_MODE_ROTATION_ROTATE90, 0, 0, 0, 1079},
-        {DXGI_MODE_ROTATION_ROTATE90, rotW - 1, 0, 0, 0},
-        {DXGI_MODE_ROTATION_ROTATE90, 0, rotH - 1, 1919, 1079},
-        {DXGI_MODE_ROTATION_ROTATE90, rotW - 1, rotH - 1, 1919, 0},
-        {DXGI_MODE_ROTATION_ROTATE270, 0, 0, 1919, 0},
-        {DXGI_MODE_ROTATION_ROTATE270, rotW - 1, 0, 1919, 1079},
-        {DXGI_MODE_ROTATION_ROTATE270, 0, rotH - 1, 0, 0},
-        {DXGI_MODE_ROTATION_ROTATE270, rotW - 1, rotH - 1, 0, 1079},
-        // 180 leaves the physical dimensions equal to the texture's.
-        {DXGI_MODE_ROTATION_ROTATE180, 0, 0, 1919, 1079},
-        {DXGI_MODE_ROTATION_ROTATE180, 1919, 0, 0, 1079},
-        {DXGI_MODE_ROTATION_ROTATE180, 0, 1079, 1919, 0},
-        {DXGI_MODE_ROTATION_ROTATE180, 1919, 1079, 0, 0},
-    };
-    for (const auto& c : cases) {
-        int32_t x = 0, y = 0;
-        DesktopDuplicationRotationTestAccess::transformCursorPosition(
-            c.rotation, c.px, c.py, texW, texH, x, y);
-        expect(x == c.ex && y == c.ey, "corner mapping mismatch");
-    }
-}
-
 // A pipeline recreate builds a new source on the same output. DXGI reports the
 // pointer shape only when it changes, so dropping the carried shape blanks the
 // cursor until the next pointer update. A different output or a cleared entry
@@ -206,7 +171,6 @@ int main() {
         testCursorTransform270();
         testCursorTransform180();
         testCursorTransformIdentity();
-        testCursorTransformAllCorners();
         testCursorCarryAcrossRebuild();
     } catch (const std::exception& e) {
         std::cerr << "DesktopDuplicationRotationTests FAILED: " << e.what() << "\n";

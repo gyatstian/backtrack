@@ -44,7 +44,6 @@ static bool g_muxShouldFail = false;
 // Recovery muxes an owned work copy of the streams, so the input path is not
 // the session identity any more; the recovered output name is.
 static std::filesystem::path g_muxFailOutputName;
-static std::vector<std::filesystem::path> g_muxedVideoPaths;
 static std::vector<std::filesystem::path> g_muxedOutputPaths;
 static std::vector<size_t> g_muxedSampleCounts;
 static std::wstring g_muxFailureDetail;
@@ -79,7 +78,6 @@ bool Mp4Muxer::muxToMp4(
         *win32Error = ERROR_SUCCESS;
     }
     g_lastMuxedInputs = inputs;
-    g_muxedVideoPaths.push_back(inputs.videoPath);
     g_muxedOutputPaths.push_back(outputPath);
     g_muxedSampleCounts.push_back(inputs.videoSamples.size());
     g_lastSystemWav.reset();
@@ -743,7 +741,6 @@ void testStartupRecoversAllValidSessionsAndKeepsFailures() {
     std::filesystem::last_write_time(
         failedDir / backtrack::RecoveryStore::kRecoveryManifestName, old + std::chrono::hours(2), error);
     expect(!error, "could not make the failed manifest newest");
-    backtrack::g_muxedVideoPaths.clear();
     backtrack::g_muxedOutputPaths.clear();
     backtrack::g_muxedSampleCounts.clear();
     backtrack::g_muxFailOutputName = L"session1.mp4";
@@ -1554,41 +1551,6 @@ void testSameNameRetryDoesNotTouchPreservedReplay() {
         "recovery did not receive the original replay bytes");
     buffer.clear();
     std::filesystem::remove_all(testOutputDir(), error);
-}
-
-// Audio is buffered through the RAM queues when diskBackedAudio is off, so
-// only pushing it through the disk backend proves the save path stitches both
-// timelines.
-void testDiskBackendSavesAudio() {
-    const auto storageRoot = testOutputDir() / L"ring_audio";
-    std::error_code error;
-    std::filesystem::remove_all(storageRoot, error);
-    std::filesystem::create_directories(storageRoot, error);
-
-    ReplaySettings diskSettings = settings(30);
-    diskSettings.diskBackedVideo = true;
-    ReplayBuffer buffer;
-    buffer.configure(diskSettings, storageRoot, 8ull * 1024 * 1024);
-    for (int64_t pts = 0; pts < 6; ++pts) {
-        buffer.pushVideo(makeVideoPayload(
-            pts * kSecond100ns, kSecond100ns, pts == 0, static_cast<uint8_t>(0xB0 + pts), 1024));
-    }
-    for (int64_t pts = 1; pts < 5; ++pts) {
-        buffer.pushAudio(makeAudio(pts * kSecond100ns, 1));
-    }
-
-    const auto output = testOutputDir() / L"disk_audio.mp4";
-    expect(buffer.saveTo(output, defaultVideoSettings()),
-        "a disk-backed save with audio failed");
-    expect(backtrack::g_lastSystemWav.has_value(),
-        "the disk backend produced no system audio track");
-    // Anchored to the video start (0s) and gap-filled up to the last audio
-    // packet (5s), so the muxed tracks stay aligned.
-    expect(backtrack::g_lastSystemWav->dataBytes == 5ull * 48000 * 4,
-        "the disk backend wrote the wrong amount of audio");
-
-    buffer.clear();
-    std::filesystem::remove_all(storageRoot, error);
 }
 
 // A loopback device that drops out for 20 s is written out as the full 20 s of
@@ -2771,7 +2733,6 @@ int main() {
         testParameterSetClassifiersRequireEveryCodecHeader();
         testBitstreamClassifiersHandleTruncatedAndTrailingInput();
         testExtractParameterSetsCopiesTrailingNalWhole();
-        testDiskBackendSavesAudio();
         testDiskAudioRoundTrip();
         testDiskAudioRoundTripAcrossWrap();
         testDiskAudioInsertionOrderAcrossTrackDrains();

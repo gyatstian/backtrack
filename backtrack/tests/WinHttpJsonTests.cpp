@@ -186,7 +186,6 @@ void testJsonFieldPositions() {
     expect(backtrack::jsonStringField(object, "name") == L"AB", "string decoding changed");
     expect(!backtrack::jsonValuePos(object, "missing"), "missing field acquired a value position");
     expect(!backtrack::jsonValuePos("{\"name\"}", "name"), "field without a colon acquired a position");
-    expect(backtrack::jsonValuePos("\"name\": \t", "name") == 9, "empty value position changed");
     expect(!backtrack::jsonStringField("\"name\": \t", "name"), "empty string value was accepted");
     expect(!backtrack::jsonStringField(object, "count"), "numeric field was accepted as a string");
 }

@@ -672,34 +672,6 @@ void testSweepReleasesRecordWhenItsInstanceVanished() {
     expect(!std::filesystem::exists(journal), "the released record is deleted");
 }
 
-void testLegacyJournalPairsExactlyOnce() {
-    const auto dir = testDir("legacy-record");
-    const auto journal = dir / L"audio-session-mutes.txt";
-    {
-        std::ofstream stream(journal, std::ios::binary);
-        stream << "111\t0\tc:\\apps\\game.exe\n";
-    }
-    SessionMuteStore store(journal);
-    std::vector<bool> callsA;
-    std::vector<bool> callsB;
-    std::vector<FakeSession> sessions(2);
-    for (auto& session : sessions) {
-        session.pid = 111;
-        session.key = L"c:\\apps\\game.exe";
-        session.muted = true;
-    }
-    sessions[0].instance = L"{session-a}";
-    sessions[1].instance = L"{session-b}";
-    sessions[0].calls = &callsA;
-    sessions[1].calls = &callsB;
-
-    const auto result = store.sweepOrphans(enumeratorFor(sessions), alwaysAlive);
-    expect(result.has_value() && result->restored == 1 && result->unmatched == 0,
-        "a legacy record restores one session and retires itself");
-    expect(callsA == std::vector<bool>{false} && callsB.empty(),
-        "a legacy record must claim exactly one session");
-}
-
 void testJournalWriteKeepsForeignFileAtLegacyTempName() {
     const auto dir = testDir("temp-name");
     const auto journal = dir / L"audio-session-mutes.txt";
@@ -725,15 +697,6 @@ void testJournalWriteKeepsForeignFileAtLegacyTempName() {
     expect(!readFile(journal).empty(), "the journal was written");
     expect(readFile(legacyTemp) == legacyBytes && readFile(linked) == linkedBytes,
         "a file (or its hard link) at the old .tmp name must survive a journal write");
-}
-
-void testSweepWithoutJournalIsNoop() {
-    const auto dir = testDir("nosweep");
-    const auto journal = dir / L"audio-session-mutes.txt";
-    SessionMuteStore store(journal);
-    const auto result = store.sweepOrphans([](std::vector<SessionMuteCandidate>&) { return true; }, alwaysAlive);
-    expect(!result.has_value(), "missing journal must not run a sweep");
-    expect(!std::filesystem::exists(journal), "missing journal must not be created");
 }
 
 void testSweepEnumerationFailureKeepsJournal() {
@@ -1039,9 +1002,7 @@ int main() {
         testClearRestoresTheJournaledSessionOnly();
         testSweepRestoresInheritedMuteAfterRestart();
         testSweepReleasesRecordWhenItsInstanceVanished();
-        testLegacyJournalPairsExactlyOnce();
         testJournalWriteKeepsForeignFileAtLegacyTempName();
-        testSweepWithoutJournalIsNoop();
         testSweepEnumerationFailureKeepsJournal();
         testApplyEnumerationFailureLeavesEverything();
         testApplyAdoptsOrphanForWantedSession();

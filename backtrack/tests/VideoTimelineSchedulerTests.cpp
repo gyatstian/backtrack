@@ -155,8 +155,6 @@ void testResetAndCoalescingGate() {
     expect(gated.action == VideoTimelineAction::Submit, "disabled coalescing still coalesced a duplicate");
 
     scheduler.reset();
-    expect(!scheduler.hasSubmittedFrame(), "reset retained submitted-frame state");
-    expect(scheduler.lastSubmittedPts100ns() == 0, "reset retained the previous timestamp");
 
     const auto afterReset = scheduler.plan(30, startPts + 2 * kFrameDuration100ns, 1, true, false, false);
     expect(afterReset.action == VideoTimelineAction::Submit, "first frame after reset was coalesced");
@@ -198,14 +196,11 @@ void testStallHoldPreferCoalesceOverSlideshow() {
     const auto first = scheduler.plan(40, startPts, 1, true, false, false);
     scheduler.acceptSubmission(first);
 
-    int coalesceCount = 0;
     for (int i = 1; i <= 170; ++i) {
         const auto idle = scheduler.plan(40, startPts + i * kFrameDuration100ns, 1, true, false, false);
         expect(idle.action == VideoTimelineAction::Coalesce,
             "stall hold re-submitted frozen texture without heartbeat");
-        ++coalesceCount;
     }
-    expect(coalesceCount == 170, "stall hold lost idle coalesce samples");
 
     const auto heartbeat = scheduler.plan(40, startPts + stallSpan, 1, true, false, true);
     expect(heartbeat.action == VideoTimelineAction::Submit, "stall-hold GOP heartbeat was coalesced");

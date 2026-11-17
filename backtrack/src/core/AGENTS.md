@@ -141,8 +141,8 @@ the lock-free queue used between threads, and the app version constant.
 `SpscQueueTests` covers the queue; no suite covers `AppVersion.h` directly.
 `LoggerDiagnosticsTests` (CTest) covers logger rate limiting, pruning, stream
 failure, diagnostics export, the archive fallback that keeps an unarchivable
-previous log, the internal minimum-level gate, and that a `recentLines` poll
-does not end the pending group.
+previous log, the fixed `Trace` minimum level that keeps a trace line in the
+log, and that a `recentLines` poll does not end the pending group.
 existing suites also link `Logger.cpp`.
 
 ## Child DOX Index

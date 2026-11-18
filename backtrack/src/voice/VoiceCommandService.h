@@ -11,6 +11,8 @@
 
 namespace backtrack {
 
+inline constexpr UINT kVoiceCommandMessage = WM_APP + 6;
+
 struct VoiceCommandStats {
     bool enabled = false;
     bool ready = false;

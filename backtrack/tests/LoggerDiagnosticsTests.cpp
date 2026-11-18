@@ -1,7 +1,7 @@
 #include "core/AppVersion.h"
 #include "core/LogContext.h"
 #include "core/Logger.h"
-#include "ui/DiagnosticsLog.h"
+#include "ui_common/DiagnosticsLog.h"
 
 #include <Windows.h>
 

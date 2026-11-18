@@ -36,13 +36,19 @@ recording-stop drain handshake.
      setting is loaded and before any mute is touched; the duplicate path
      returns disowned.
   2. initialize the logger, set the log level, log the session config
-  3. startup registration, then `restoreOrphanedSessionMutes()` (must be after
-     logger init and under the mutex)
-  4. `OleInitialize`, `controller_.initialize(settings)`
-  5. create and run `MainWindow` with the startup settings snapshot and load
-     status, then `controller_.shutdown()` (which restores the session mutes
-     while ownership and the mutex are still held), then `setSessionMuteOwnership(false)`
-     and release the mutex.
+  3. update startup registration, then set DPI awareness and call
+     `OleInitialize` on the UI thread, then create and run `StudioWindow`.
+     its startup worker restores orphaned session mutes, prunes stale
+     microphone consent entries, and initializes the controller before starting
+     capture. accepted startup runs even if the window is closing. if window
+     creation fails before the worker starts, `Application` releases OLE and
+     attempts the orphan restore while it still owns the mute journal and holds
+     the mutex, without pruning or initializing the controller.
+  4. the window receives the startup settings snapshot and load status.
+     its worker calls `controller.shutdown()` before the window joins it.
+     after the window runs, `Application` calls `controller_.shutdown()` under
+     the mutex, giving the worker a final retry if its cleanup failed.
+     then call `setSessionMuteOwnership(false)` and release the mutex.
 - The pipeline runs while replay is enabled; `recording_` only controls whether
   packets are muxed to a file. `startRecording` and `saveReplay` call
   `ensurePipeline()` when it is stopped, and `stopRecording` calls
@@ -156,7 +162,9 @@ recording-stop drain handshake.
   - `startupSweepThread_` runs `RecoveryStore::sweepOrphanedRecoveryData` and
     inspects the legacy ring folder. `startRecording`, `saveReplay`,
     `recoverFailedRecording`, and `shutdown` wait for it first so recovery and
-    new saves cannot overlap.
+    new saves cannot overlap. `hasRecoverableRecording` returns false while
+    recording and otherwise waits before scanning the configured clip roots;
+    call it on the serialized action worker, not the UI thread.
 - The capture loop checks `scaler_.poolGeneration()` around `scale()` under
   `pipelineGpuMutex_` and resets encoder input registrations on change. A failed
   reset faults the encoder; the loop recreates the pipeline instead of trusting
@@ -259,7 +267,7 @@ recording-stop drain handshake.
   HDR stays automatic.
 - `stats()` and `encoderCapabilities()` run on two threads at once - the UI
   thread (diagnostics timer, page refresh) and the controller worker thread
-  `MainWindow` uses for blocking actions - and must never block on
+  the window uses for blocking actions - and must never block on
   `pipelineGpuMutex_`, which a GPU recreate holds for seconds.
   The sanctioned pattern is
   `std::unique_lock(pipelineGpuMutex_, std::try_to_lock)`: publish
@@ -393,8 +401,6 @@ recording-stop drain handshake.
   drained ends it. It also covers `AudioWriter` RMS measurement (signed
   samples, empty/invalid-width blocks, silence) and microphone AGC
   gain/envelope continuity and metadata.
-- `MainWindowSettingsTests.cpp` exercises settings handoff and ui preferences
-  without a capture pipeline.
 - Everything else in this folder is verified by building and by exercising the
   pipeline in the app; the Diagnostics page reports the counters above.
 

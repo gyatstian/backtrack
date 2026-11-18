@@ -461,7 +461,6 @@ void testEverySerializedKeyRoundTrips() {
     original.autoRecordEnabled = true;
     original.autoRecordApps = {{L"Beta", L"C:\\Games\\Beta\\beta.exe"}};
     original.startWithWindowsMinimized = true;
-    original.pruneStaleMicrophoneConsentEntries = true;
     original.exitToTray = true;
     original.checkForUpdates = false;
     original.notificationSoundVolumePercent = 35;

@@ -1,4 +1,4 @@
-#include "ui/UiHelpers.h"
+#include "ui_common/WindowTools.h"
 
 #include "core/Logger.h"
 #include "core/Types.h"
@@ -306,15 +306,13 @@ bool setText(HWND control, const std::wstring& value) {
     return true;
 }
 
-void redrawWindowAndChildren(HWND window, bool updateNow) {
-    if (!window) {
-        return;
-    }
-    UINT flags = RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME;
-    if (updateNow) {
-        flags |= RDW_UPDATENOW;
-    }
-    RedrawWindow(window, nullptr, nullptr, flags);
+void redrawWindowAndChildren(HWND window) {
+    RedrawWindow(window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+}
+
+namespace {
+// Win32 must not copy old child pixels or erase newly exposed areas mid-layout.
+constexpr UINT layoutMoveFlags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS;
 }
 
 bool moveWindowIfChanged(HWND control, int x, int y, int width, int height) {
@@ -343,15 +341,7 @@ bool moveWindowIfChanged(HWND control, int x, int y, int width, int height) {
         y,
         width,
         height,
-        SWP_NOZORDER | SWP_NOACTIVATE);
-    return true;
-}
-
-bool showWindowIfHidden(HWND control) {
-    if (!control || IsWindowVisible(control)) {
-        return false;
-    }
-    ShowWindow(control, SW_SHOWNA);
+        layoutMoveFlags);
     return true;
 }
 
@@ -371,7 +361,7 @@ bool applyWindowMoves(const std::vector<WindowMove>& moves) {
                 move.y,
                 move.width,
                 move.height,
-                SWP_NOZORDER | SWP_NOACTIVATE);
+                layoutMoveFlags);
             if (!defer) {
                 break;
             }
@@ -384,34 +374,25 @@ bool applyWindowMoves(const std::vector<WindowMove>& moves) {
     // Deferring failed (or EndDeferWindowPos failed); moves are idempotent, so
     // reapplying everything directly is always correct.
     for (const auto& move : moves) {
-        SetWindowPos(move.control, nullptr, move.x, move.y, move.width, move.height, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(move.control, nullptr, move.x, move.y, move.width, move.height, layoutMoveFlags);
     }
     return true;
 }
 
-bool setListItemHeightIfChanged(HWND list, int& cachedHeight, int height) {
-    if (!list || cachedHeight == height) {
-        return false;
+std::optional<uint32_t> parseUIntControl(HWND control) {
+    const auto text = trimText(readText(control));
+    if (text.empty()) return std::nullopt;
+    uint64_t value = 0;
+    for (const auto ch : text) {
+        if (ch < L'0' || ch > L'9') return std::nullopt;
+        value = value * 10 + static_cast<unsigned>(ch - L'0');
+        if (value > UINT32_MAX) return std::nullopt;
     }
-    SendMessageW(list, LB_SETITEMHEIGHT, 0, height);
-    cachedHeight = height;
-    return true;
+    return static_cast<uint32_t>(value);
 }
 
 uint32_t readUIntControl(HWND control, uint32_t fallback) {
-    const std::wstring text = trimText(readText(control));
-    if (text.empty() || !std::all_of(text.begin(), text.end(), [](wchar_t ch) { return iswdigit(ch) != 0; })) {
-        return fallback;
-    }
-    try {
-        const auto parsed = std::stoull(text);
-        if (parsed > (std::numeric_limits<uint32_t>::max)()) {
-            return fallback;
-        }
-        return static_cast<uint32_t>(parsed);
-    } catch (...) {
-        return fallback;
-    }
+    return parseUIntControl(control).value_or(fallback);
 }
 
 std::wstring bytesToText(uintmax_t bytes) {
@@ -420,116 +401,6 @@ std::wstring bytesToText(uintmax_t bytes) {
     stream.precision(1);
     stream << std::fixed << mib << L" MiB";
     return stream.str();
-}
-
-bool isButtonId(WPARAM id) {
-    const int controlId = static_cast<int>(id);
-    if ((controlId >= kTabButtonBaseId && controlId < kTabButtonBaseId + kTabCount) ||
-        (controlId >= kSettingsCategoryButtonBaseId && controlId < kSettingsCategoryButtonBaseId + kSettingsCategoryCount) ||
-        isSoundSeparationMuteButtonId(controlId) ||
-        isSoundSeparationRemoveButtonId(controlId) ||
-        isAutoRecordRemoveButtonId(controlId)) {
-        return true;
-    }
-    for (int single : kSingleOwnerDrawButtonIds) {
-        if (controlId == single) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool isSoundSeparationMuteButtonId(int controlId) {
-    return controlId >= kSoundSeparationMuteButtonBaseId &&
-           controlId < kSoundSeparationMuteButtonBaseId + 512;
-}
-
-bool isSoundSeparationRemoveButtonId(int controlId) {
-    return controlId >= kSoundSeparationRemoveButtonBaseId &&
-           controlId < kSoundSeparationRemoveButtonBaseId + 512;
-}
-
-bool isAutoRecordRemoveButtonId(int controlId) {
-    return controlId >= kAutoRecordRemoveButtonBaseId &&
-           controlId < kAutoRecordRemoveButtonBaseId + 512;
-}
-
-size_t soundSeparationIndexFromButtonId(int controlId, int baseId) {
-    return static_cast<size_t>(controlId - baseId);
-}
-
-bool isSettingsControlId(int controlId) {
-    // Deferred-settings controls only. The logging-enabled checkbox and the library view
-    // buttons persist immediately on selection, and the app-picker combos plus
-    // every browse/refresh/manual/action button edit transient state or run an
-    // action, so they stay out: adding one would park (or clear) the Save
-    // button for a value that is already on disk.
-    switch (controlId) {
-    case kFpsEditId:
-    case kResolutionModeComboId:
-    case kWidthEditId:
-    case kHeightEditId:
-    case kSystemAudioCheckId:
-    case kMicrophoneCheckId:
-    case kOutputDeviceComboId:
-    case kInputDeviceComboId:
-    case kOutputVolumeEditId:
-    case kInputVolumeEditId:
-    case kInputAutoGainCheckId:
-#ifdef BACKTRACK_HAS_NOISE_SUPPRESSION
-    case kInputNoiseSuppressionCheckId:
-#endif
-    case kStartWithWindowsCheckId:
-    case kPruneStaleMicrophoneConsentEntriesCheckId:
-    case kExitToTrayCheckId:
-    case kCheckForUpdatesCheckId:
-    case kNotificationSoundVolumeEditId:
-    case kCustomNotificationSoundEditId:
-    case kEncoderPresetComboId:
-    case kEncoderModeComboId:
-    case kEncoderProfileComboId:
-    case kEncoderLookaheadCheckId:
-    case kEncoderLookaheadDepthEditId:
-    case kEncoderSpatialAQCheckId:
-    case kEncoderAQStrengthEditId:
-    case kEncoderTemporalAQCheckId:
-    case kEncoderMultipassComboId:
-    case kEncoderBFramesCheckId:
-    case kEncoderAdaptiveBFramesCheckId:
-    case kBitrateEditId:
-    case kCodecComboId:
-    case kClipFolderEditId:
-    case kOrganizeClipsByGameCheckId:
-    case kRecordHotkeyId:
-    case kEncoderAdaptiveIFramesCheckId:
-    case kEncoderZeroReorderDelayCheckId:
-    case kEncoderGopSecondsEditId:
-    case kEncoderReferenceFramesEditId:
-    case kGpuAdaptiveComboId:
-    case kGpuFrameQueueLimitEditId:
-    case kIdleFrameCoalescingCheckId:
-    case kCaptureMethodComboId:
-    case kMonitorFollowComboId:
-    case kMultiMonitorSupportCheckId:
-    case kCaptureCursorCheckId:
-    case kStableMultimonitorFramesCheckId:
-    case kReplayEnabledId:
-    case kReplaySecondsEditId:
-    case kReplayOverlapSecondsEditId:
-    case kReplayDiskBackedCheckId:
-    case kReplayDiskBackedAudioCheckId:
-    case kReplayRingDirEditId:
-    case kReplayHotkeyId:
-    case kLeagueKillReminderCheckId:
-    case kVoiceCommandComboId:
-    case kDiscordRichPresenceComboId:
-    case kDiscordPresenceTimerComboId:
-    case kSoundSeparationEnabledCheckId:
-    case kAutoRecordEnabledCheckId:
-        return true;
-    default:
-        return false;
-    }
 }
 
 std::wstring durationToText(uint64_t duration100ns) {
@@ -1256,30 +1127,6 @@ void drawBitmapFitCached(
 
     // Cache unavailable or GDI failure: previous behavior, identical output.
     drawBitmapFit(dc, bitmap, target);
-}
-
-int galleryItemHeightForWidth(int listWidth) {
-    constexpr int verticalPadding = 18;
-    constexpr int textHeight = 48;
-    // Same gap the painter (galleryTileRect) and hit test use, so the budgeted
-    // preview height matches the drawn tile instead of drifting a few px.
-    const int tileWidth = std::max(1, (listWidth - kGalleryTileGap * (kGalleryClipColumns + 1)) / kGalleryClipColumns);
-    const int previewHeight = std::max(96, tileWidth * 9 / 16);
-    return std::max(kGalleryClipMinimumItemHeight, verticalPadding + previewHeight + textHeight);
-}
-
-ScopedRedrawLock::ScopedRedrawLock(HWND window)
-    : window_(window) {
-    if (window_) {
-        SendMessageW(window_, WM_SETREDRAW, FALSE, 0);
-    }
-}
-
-ScopedRedrawLock::~ScopedRedrawLock() {
-    if (window_) {
-        SendMessageW(window_, WM_SETREDRAW, TRUE, 0);
-        redrawWindowAndChildren(window_);
-    }
 }
 
 } // namespace backtrack

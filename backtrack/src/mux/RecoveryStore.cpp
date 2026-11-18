@@ -233,6 +233,12 @@ bool parseSampleColumns(const std::vector<std::string>& parts, MuxedInputs::Vide
     return true;
 }
 
+bool isRecoveryInputFile(const std::filesystem::path& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
+}
+
 bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryManifest& manifest) {
     const std::filesystem::path manifestPath = manifestPathFor(tempDirectory);
     std::ifstream stream(manifestPath);
@@ -328,9 +334,8 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
     if (manifest.inputs.videoPath.empty()) {
         manifest.inputs.videoPath = tempDirectory / (manifest.inputs.codec == VideoCodec::H264 ? L"video.h264" : L"video.hevc");
     }
-    // error_code overloads: this parser runs on the UI thread (manual
-    // recovery) and during startup; a throwing std::filesystem call on an
-    // unreadable file would terminate the process.
+    // Missing audio is optional, but a listed stream that cannot be staged
+    // as a regular file must not make the session a recovery candidate.
     std::error_code audioError;
     if (!manifest.inputs.systemAudioPath.empty() &&
         !std::filesystem::exists(manifest.inputs.systemAudioPath, audioError)) {
@@ -342,8 +347,9 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
         manifest.inputs.microphoneAudioPath.clear();
     }
 
-    std::error_code videoError;
-    if (!std::filesystem::exists(manifest.inputs.videoPath, videoError) || videoError) {
+    if (!isRecoveryInputFile(manifest.inputs.videoPath) ||
+        (!manifest.inputs.systemAudioPath.empty() && !isRecoveryInputFile(manifest.inputs.systemAudioPath)) ||
+        (!manifest.inputs.microphoneAudioPath.empty() && !isRecoveryInputFile(manifest.inputs.microphoneAudioPath))) {
         return false;
     }
 
@@ -373,22 +379,23 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
     // fully recoverable session.
     std::error_code sizeError;
     const uint64_t streamBytes = std::filesystem::file_size(manifest.inputs.videoPath, sizeError);
-    if (!sizeError) {
-        auto& samples = manifest.inputs.videoSamples;
-        while (!samples.empty()) {
-            const MuxedInputs::VideoSample& last = samples.back();
-            if (last.offset <= streamBytes &&
-                static_cast<uint64_t>(last.size) <= streamBytes - last.offset) {
-                break;
-            }
-            samples.pop_back();
+    if (sizeError) {
+        return false;
+    }
+    auto& samples = manifest.inputs.videoSamples;
+    while (!samples.empty()) {
+        const MuxedInputs::VideoSample& last = samples.back();
+        if (last.offset <= streamBytes &&
+            static_cast<uint64_t>(last.size) <= streamBytes - last.offset) {
+            break;
         }
+        samples.pop_back();
     }
 
     // A full rewrite interrupted mid-write could leave fewer lines than the
     // declared count even with atomic publish as last line of defense.
-    return !manifest.inputs.videoSamples.empty() &&
-           (expectedSamples == 0 || manifest.inputs.videoSamples.size() <= expectedSamples);
+    return (expectedSamples == 0 || samples.size() <= expectedSamples) &&
+           std::any_of(samples.begin(), samples.end(), [](const auto& sample) { return sample.size != 0; });
 }
 
 } // namespace
@@ -767,7 +774,7 @@ void markRecovered(const LocatedManifest& located, const std::filesystem::path& 
     }
 }
 
-std::vector<LocatedManifest> findManifests(const std::filesystem::path& clipDirectory) {
+std::vector<LocatedManifest> findManifests(const std::filesystem::path& clipDirectory, bool stopAfterFirst = false) {
     std::vector<LocatedManifest> result;
     std::error_code error;
     const auto roots = ClipStorage::clipRoots(clipDirectory, error);
@@ -803,6 +810,9 @@ std::vector<LocatedManifest> findManifests(const std::filesystem::path& clipDire
             located.modified = std::filesystem::last_write_time(manifestPathFor(session), timeError);
             if (!timeError && !alreadyRecovered(located)) {
                 result.push_back(std::move(located));
+                if (stopAfterFirst) {
+                    return result;
+                }
             }
         }
         if (error) {
@@ -817,13 +827,9 @@ bool copyRecoveryInput(const std::filesystem::path& source, const std::filesyste
     if (source.empty()) {
         return true;
     }
-    const DWORD attributes = GetFileAttributesW(source.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES ||
-        (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
-        return false;
-    }
-    return CreateHardLinkW(destination.c_str(), source.c_str(), nullptr) ||
-           CopyFileW(source.c_str(), destination.c_str(), TRUE);
+    return isRecoveryInputFile(source) &&
+           (CreateHardLinkW(destination.c_str(), source.c_str(), nullptr) ||
+            CopyFileW(source.c_str(), destination.c_str(), TRUE));
 }
 
 std::filesystem::path recoverManifest(const LocatedManifest& located, std::wstring& detail) {
@@ -881,6 +887,10 @@ std::filesystem::path recoverManifest(const LocatedManifest& located, std::wstri
 }
 
 } // namespace
+
+bool hasRecoverableRecording(const std::filesystem::path& clipDirectory) {
+    return !findManifests(clipDirectory, /*stopAfterFirst=*/true).empty();
+}
 
 std::filesystem::path recoverLatestFailedRecording(
     const std::filesystem::path& clipDirectory,

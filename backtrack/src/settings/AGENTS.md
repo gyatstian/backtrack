@@ -12,7 +12,7 @@ untrusted values, and the enum name mappings that cross the file boundary.
   (`supportedHotkeyModifiers`, `isSafeBareHotkey`, `isSafeGlobalHotkey`), and
   the `xxxName` / `xxxFromName` pair for every settings enum.
 - Does not own: the field definitions or their defaults (`core/Types.h`), the
-  controls that edit them (`ui`), or the logger's on/off state (`core/Logger.h`).
+  controls that edit them (`studio`), or the logger's on/off state (`core/Logger.h`).
 
 ## Local Contracts
 

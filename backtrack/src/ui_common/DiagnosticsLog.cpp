@@ -1,4 +1,4 @@
-#include "ui/DiagnosticsLog.h"
+#include "ui_common/DiagnosticsLog.h"
 
 #include "core/Logger.h"
 

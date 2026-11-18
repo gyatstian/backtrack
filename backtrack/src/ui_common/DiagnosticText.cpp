@@ -1,39 +1,16 @@
-#include "ui/MainWindow.h"
-#include "ui/DiagnosticsLog.h"
-#include "ui/UiHelpers.h"
-#include "ui/UiIds.h"
+#include "ui_common/DiagnosticText.h"
+#include "ui_common/DiagnosticsLog.h"
+#include "ui_common/WindowTools.h"
 
-#include "audio/WasapiCapture.h"
+#include "app/RecorderController.h"
 #include "core/AppVersion.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
-#include "resource.h"
 #include "settings/SettingsStore.h"
 
-#include <CommCtrl.h>
 #include <commdlg.h>
-#include <dwmapi.h>
-#include <mmsystem.h>
-#include <objbase.h>
-#include <shellapi.h>
-#include <shlobj.h>
-#include <shobjidl.h>
-#include <uxtheme.h>
-#include <wrl/client.h>
-
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cmath>
-#include <cwctype>
-#include <filesystem>
 #include <iomanip>
-#include <limits>
-#include <map>
-#include <memory>
 #include <sstream>
-#include <unordered_set>
-#include <utility>
 
 namespace backtrack {
 
@@ -76,17 +53,15 @@ static std::wstring hdrStatusLine(const RecordingStats& stats) {
     return L"HDR: SDR";
 }
 
-void MainWindow::saveLog() {
+std::wstring exportDiagnostics(HWND window, RecorderController& controller) {
     const auto source = Logger::instance().currentPath();
     if (source.empty()) {
-        setStatus(L"No log file available to save");
-        return;
+        return L"No log file available to save";
     }
 
     std::error_code existsError;
     if (!std::filesystem::exists(source, existsError) || existsError) {
-        setStatus(L"Log file not found");
-        return;
+        return L"Log file not found";
     }
 
     wchar_t fileName[MAX_PATH]{};
@@ -94,7 +69,7 @@ void MainWindow::saveLog() {
 
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = window_;
+    dialog.hwndOwner = window;
     dialog.lpstrFilter = L"Log files (*.txt;*.log)\0*.txt;*.log\0All files (*.*)\0*.*\0";
     dialog.lpstrFile = fileName;
     dialog.nMaxFile = MAX_PATH;
@@ -103,12 +78,12 @@ void MainWindow::saveLog() {
     dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (!GetSaveFileNameW(&dialog)) {
-        return;
+        return {};
     }
 
     // Bug-report attachment: carry the HDR witness with the log (same line
     // updateStats renders).
-    const RecordingStats tailStats = controller_.stats();
+    const RecordingStats tailStats = controller.stats();
     std::wstringstream tail;
     tail << L"\nActive backend: " << activeBackendName(tailStats);
     tail << L"\n" << hdrStatusLine(tailStats) << L"\n";
@@ -132,15 +107,15 @@ void MainWindow::saveLog() {
          << L", mic queue drops: " << tailStats.microphoneAudioQueueDrops << L"\n";
     tail << L"Frame queue depth: " << tailStats.encoder.queueDepth << L"\n";
     if (const auto error = saveDiagnosticsLog(fileName, wideToUtf8(tail.str())); error) {
-        setStatus(L"Could not save log: " + utf8ToWide(error.message()));
-        return;
+        return L"Could not save log: " + utf8ToWide(error.message());
     }
-    setStatus(std::wstring(L"Log saved to ") + fileName);
+    return std::wstring(L"Log saved to ") + fileName;
 }
 
-void MainWindow::updateStats() {
-    const auto stats = controller_.stats();
-    if (statsLabel_) {
+std::array<std::wstring, 3> diagnosticText(RecorderController& controller, const RecordingStats& stats,
+    const VoiceCommandStats& voiceStats, const LeagueIntegrationStats& leagueStats) {
+    std::array<std::wstring, 3> text;
+    {
         std::wstringstream stream;
         // Build identity first: a diagnostics screenshot or "Save Log" copy is
         // useless for triage without it.
@@ -192,29 +167,27 @@ void MainWindow::updateStats() {
         stream << L"Encoded keyframes: " << stats.encoder.keyFrames << L"\r\n";
         stream << L"Replay packets: " << stats.replayVideoPackets << L"\r\n";
         stream << L"Replay keyframes: " << stats.replayKeyFrames << L"\r\n";
-        const auto voiceStats = voiceCommandService_.stats();
         stream << L"Voice command: " << voiceStats.status << L"\r\n";
         stream << L"Voice accepted/rejected: " << voiceStats.accepted << L"/" << voiceStats.rejected << L"\r\n";
-        const auto leagueStats = leagueIntegration_.stats();
         stream << L"League live client: " << (leagueStats.gameAvailable ? L"available" : L"not detected") << L"\r\n";
         if (!leagueStats.lastError.empty()) {
             stream << L"League last error: " << leagueStats.lastError << L"\r\n";
         }
-        if (const std::wstring saveFailure = trimText(controller_.lastRecordingError()); !saveFailure.empty()) {
+        if (const std::wstring saveFailure = trimText(controller.lastRecordingError()); !saveFailure.empty()) {
             stream << L"Last save failure: " << saveFailure << L"\r\n";
         }
         // The disk-ring checkboxes stay checked when a ring cannot be used, so
         // this line is the only place the user learns replay video/audio is
         // really sitting in RAM.
-        if (const std::wstring storageFallback = trimText(controller_.replayStorageFallback()); !storageFallback.empty()) {
+        if (const std::wstring storageFallback = trimText(controller.replayStorageFallback()); !storageFallback.empty()) {
             stream << L"Replay storage: " << storageFallback << L"\r\n";
         }
         stream << L"Average encode: " << stats.encoder.averageEncodeMs << L" ms";
-        setText(statsLabel_, stream.str());
+        text[0] = stream.str();
     }
 
-    if (capsLabel_) {
-        const auto caps = controller_.encoderCapabilities();
+    {
+        const auto caps = controller.encoderCapabilities();
         std::wstringstream stream;
         stream << L"Adapter: " << caps.adapterName << L"\r\n";
         const std::wstring backendName = caps.backendName.empty() ? L"Hardware encoder" : caps.backendName;
@@ -238,12 +211,12 @@ void MainWindow::updateStats() {
                << L" (multiple refs: " << yesNo(caps.multipleReferenceFrames) << L")\r\n";
         stream << L"Zero reorder delay: " << yesNo(caps.effective.zeroReorderDelay) << L"\r\n";
         stream << caps.detail;
-        setText(capsLabel_, stream.str());
+        text[1] = stream.str();
     }
 
-    if (diagnosticLogLabel_) {
+    {
         if (!Logger::instance().enabled()) {
-            setText(diagnosticLogLabel_, L"Logging is disabled");
+            text[2] = L"Logging is disabled";
         } else {
             const auto lines = Logger::instance().recentLines(12);
             std::wstringstream stream;
@@ -280,14 +253,14 @@ void MainWindow::updateStats() {
                     i += count;
                 }
             }
-            setText(diagnosticLogLabel_, stream.str());
+            text[2] = stream.str();
         }
     }
 
-    updateAudioLivenessWarning(stats);
+    return text;
 }
 
-void MainWindow::updateAudioLivenessWarning(const RecordingStats& stats) {
+std::wstring audioLivenessWarning(const RecordingStats& stats) {
     // Live audio-health warning for the status bar. Edge-triggered: the text
     // only changes (and the status bar only repaints) on a transition, so a
     // permanently dead input does not spam. Only enabled inputs are checked,
@@ -302,20 +275,16 @@ void MainWindow::updateAudioLivenessWarning(const RecordingStats& stats) {
             }
             std::wstringstream stream;
             stream << label << L": no audio for " << (silenceMs / 1000)
-                   << L"s — recording may be video-only";
+                   << L"s \u2014 recording may be video-only";
             return stream.str();
         };
         warning = describe(stats.systemAudioActive, stats.systemAudioSilenceMs, L"System audio");
         const std::wstring mic = describe(stats.microphoneAudioActive, stats.microphoneSilenceMs, L"Microphone");
         if (!mic.empty()) {
-            warning = warning.empty() ? mic : warning + L"  ·  " + mic;
+            warning = warning.empty() ? mic : warning + L"  \u00b7  " + mic;
         }
     }
-    if (warning == audioLivenessWarning_) {
-        return;
-    }
-    audioLivenessWarning_ = std::move(warning);
-    applyStatusText(currentStatusDisplayText());
+    return warning;
 }
 
 } // namespace backtrack

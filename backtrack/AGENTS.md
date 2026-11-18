@@ -18,13 +18,13 @@ lives beside the sources. `backtrack.slnx` is the Visual Studio entry point,
   - `CMakeLists.txt` at the repository root: target `Backtrack`, CTest
     registration, option `BACKTRACK_NOISE_SUPPRESSION` (default OFF). The app
     sources compile once into the `BacktrackApp` object library; `Backtrack`
-    links it and so do the UI suites, so an app-only source change must not be
+    links it and so do the window suites, so an app-only source change must not be
     moved out of that library. Every define that changes a header's layout
     (`BACKTRACK_HAS_*`, `UNICODE`, `WIN32_LEAN_AND_MEAN`) is `PUBLIC` on that
     library: the consumers compile their own translation units against the same
     headers, and a define they cannot see is a struct-layout mismatch that
     crashes at run time. `BACKTRACK_HAS_NOISE_SUPPRESSION` moves a member of
-    `ui/MainWindow.h`, which is exactly that case.
+    `app/AudioWriter.h`, which is exactly that case.
   - `backtrack/backtrack.vcxproj` + `.filters`: project property
     `BacktrackNoiseSuppression` (default false).
 - New `.cpp` / `.h` under `src` is picked up automatically by both

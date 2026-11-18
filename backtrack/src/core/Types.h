@@ -239,7 +239,6 @@ struct AppSettings {
     // continuous ring writes off a game HDD, e.g. on an SSD.
     std::filesystem::path replayRingDirectory;
     bool startWithWindowsMinimized = false;
-    bool pruneStaleMicrophoneConsentEntries = false;
     bool exitToTray = false;
     // Asks GitHub for the latest release once per launch. Default on keeps the
     // existing update prompt; turning it off stops the outbound request.

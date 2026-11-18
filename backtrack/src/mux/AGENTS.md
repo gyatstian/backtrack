@@ -93,7 +93,10 @@ recovery store that keeps a killed recording recoverable.
   parsing rejects overflow and unsigned signs; signed timestamps may be negative.
 - `recoverLatestFailedRecording` selects the newest valid manifest across the
   `ClipStorage` roots and publishes to its original output root with an
-  exclusively claimed name. startup attempts every recoverable session once;
+  exclusively claimed name. `hasRecoverableRecording` uses the same discovery,
+  stopping at the first candidate without staging or muxing. candidates need
+  a video sample with bytes on disk and skip already recovered sessions.
+  startup attempts every recoverable session once;
   `RecorderController` serializes the sweep against saves and manual recovery.
   the sweep has no age limit: sessions are never pruned by age, so a failed
   recovery keeps its streams and `ensureFreeDiskSpace` is what protects later
@@ -183,11 +186,11 @@ recovery store that keeps a killed recording recoverable.
 
 ## Verification
 
-- `StorageLayoutTests` (CTest) covers nested recovery and collision
-  preservation: recovery muxes an owned work copy, so the original sessions and
-  their streams are retained, and a completed recovery is marked so the sweep
-  does not repeat it - including after the recovered clip was deleted or
-  renamed, while a session that was never published is still recovered.
+- `StorageLayoutTests` (CTest) covers recovery availability, nested recovery,
+  and collision preservation: recovery muxes an owned work copy, so the
+  original sessions and their streams are retained. a completed recovery is
+  marked so the sweep does not repeat it, even after the recovered clip is
+  deleted or renamed.
 - `ReplayBufferTests` (CTest) links the real `RecoveryStore.cpp` and
   `WavWriter.cpp` and stubs `Mp4Muxer::muxToMp4` at link time. It covers the
   manifest round trip and its atomic publish, the end-of-stream tail trim, a

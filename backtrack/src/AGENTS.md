@@ -78,7 +78,8 @@ from the repository root. Pure-logic changes should come with an
 - `platform` - shared Win32 helpers
 - `replay` - rolling replay buffer
 - `settings` - settings persistence and sanitization
-- `ui` - native Win32 main window
+- `studio` - the native Win32 window
+- `ui_common` - shared window services and Win32 helpers
 - `voice` - SAPI voice commands
 - `Interface` - vendored NVIDIA / AMD SDK headers
 - `third_party` - vendored RNNoise

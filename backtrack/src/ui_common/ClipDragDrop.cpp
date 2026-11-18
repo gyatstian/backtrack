@@ -1,4 +1,4 @@
-#include "ui/UiHelpers.h"
+#include "ui_common/WindowTools.h"
 
 #include <objbase.h>
 

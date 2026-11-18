@@ -34,10 +34,11 @@ build.
   adds the vendor SDK header path for the two lifecycle suites.
 - Nothing links the whole app. A suite lists the implementation files it needs,
   so a new source file under test goes into that suite's `SOURCES` in the same
-  change or the link fails. The UI suites are the exception: they link the
-  `BacktrackApp` object library (every app source including `main.cpp`, whose
-  `wWinMain` is inert in a console binary) because a hand-listed subset of the
-  window code is not maintainable. Object library, not static: every unit has to
+  change or the link fails. The window suites are the exception:
+  `StudioWindowTests` and `ReleaseCheckTests` link the `BacktrackApp` object
+  library (every app source including `main.cpp`, whose `wWinMain` is inert in
+  a console binary) because a hand-listed subset of the window code is not
+  maintainable. Object library, not static: every unit has to
   reach the linker, and the tests only touch a few entry points.
 - Current suites and what they cover:
   - `VideoTimelineSchedulerTests` - `app/VideoTimelineScheduler.h` alone, so the
@@ -114,10 +115,10 @@ build.
     with nothing published.
   - `StorageLayoutTests` - the `ReplayBufferTests` source set plus
     `clips/ClipManager.cpp`, `LIBS propsys`: reservation collisions, the shared
-    root rules, game-root and nested recovery, and that recovery muxes an owned
-    work copy so the original session survives; clear/disable/re-enable ring
+    root rules, game-root and nested recovery, candidate availability, and that
+    recovery muxes an owned work copy so the original session survives; clear/disable/re-enable ring
     lifecycle and stale-audio removal.
-  - `LoggerDiagnosticsTests` - `core/Logger.cpp`, `ui/DiagnosticsLog.cpp`:
+  - `LoggerDiagnosticsTests` - `core/Logger.cpp`, `ui_common/DiagnosticsLog.cpp`:
     rate limiting, pruning, stream failure, diagnostics export, an unarchivable
     previous log left untruncated, and a `recentLines` poll reporting the pending
     group without emitting it.
@@ -189,15 +190,21 @@ build.
   - `AudioDenoiseTests` - `audio/RnnoiseDenoiser.cpp`, `LIBS rnnoise`. Built
     only when `BACKTRACK_NOISE_SUPPRESSION=ON`; the suite itself has no
     `#ifdef`, the CMake `if` around `add_backtrack_test` is the whole gate.
-  - `MainWindowAccessibilityTests`, `MainWindowLibraryTests`,
-    `MainWindowNotificationTests`, `MainWindowSettingsTests`,
-    `MainWindowUpdateCheckTests` - real windows over the `BacktrackApp` object
-    library. Page navigation and shortcuts, the library scan and thumbnail
-    worker, controller-action busy feedback, settings draft/commit/auto-record,
-    and the update check against a loopback HTTP server (`LIBS ws2_32`).
-    `MainWindowLibraryTests` also covers settings rebuild notification filtering,
-    edited values and dirty-state marking, bitmap aspect ratio/pixels, cache
-    replacement, and retaining the cache/source on scaling failure.
+  - `ReleaseCheckTests` - `ui_common/RecorderActions.cpp`'s
+    `fetchReleaseVersion` against a loopback HTTP server (`LIBS ws2_32`):
+    request path, GitHub accept header and build user agent, the total deadline
+    that bounds a slow body, and prompt return once the stop flag is set on a
+    stalled response.
+  - `StudioWindowTests` - off-thread startup preparation, main page navigation
+    and nonblocking close during held startup, and rejection of the diagnostics
+    logging toggle during startup. covers custom frame geometry, caption hit
+    targets, double-click maximize/restore, control placement, footer geometry,
+    settings dependencies and publication (including a normalized no-op save),
+    and immediate default and pinned audio output choices. saving with an
+    invalid, disabled desktop gain field preserves the saved gain and pinned
+    output. also covers recovery visibility, batched live resize and wheel
+    input, height-only resize, clamped scroll no-ops, and gallery geometry and
+    async edits including rename during refresh.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` and
   `StorageLayoutTests` define `Mp4Muxer::muxToMp4` and

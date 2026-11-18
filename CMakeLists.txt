@@ -52,8 +52,8 @@ target_compile_options(BacktrackApp PRIVATE /wd4996)
 target_include_directories(BacktrackApp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/backtrack/src")
 # PUBLIC, not PRIVATE: the UI suites link these objects but compile their own
-# translation units against the same headers, and MainWindow changes layout under
-# BACKTRACK_HAS_NOISE_SUPPRESSION. A define the consumer does not see is a
+# translation units against the same headers, and app/AudioWriter.h changes layout
+# under BACKTRACK_HAS_NOISE_SUPPRESSION. A define the consumer does not see is a
 # struct-layout mismatch, which shows up as heap corruption at run time.
 target_compile_definitions(BacktrackApp PUBLIC
     UNICODE
@@ -356,7 +356,7 @@ add_backtrack_test(LoggerDiagnosticsTests
     SOURCES
         backtrack/tests/LoggerDiagnosticsTests.cpp
         backtrack/src/core/Logger.cpp
-        backtrack/src/ui/DiagnosticsLog.cpp)
+        backtrack/src/ui_common/DiagnosticsLog.cpp)
 
 # --- Audio and mux ---
 
@@ -486,20 +486,15 @@ if (AMF_INCLUDE_DIR)
 endif()
 
 # --- UI ---
-# These create real windows, so they link the app's object library rather than a
-# hand-listed source subset. The library includes main.cpp (wWinMain), which is
-# inert in a console suite whose entry point is main().
-foreach(ui_suite
-    MainWindowAccessibilityTests
-    MainWindowLibraryTests
-    MainWindowNotificationTests
-    MainWindowSettingsTests)
-    add_backtrack_test(${ui_suite}
-        SOURCES backtrack/tests/${ui_suite}.cpp
-        LIBS BacktrackApp)
-endforeach()
+# These link the app's object library rather than a hand-listed source subset:
+# the studio suite creates real windows and the release check runs the shared
+# fetch. The library includes main.cpp (wWinMain), which is inert in a console
+# suite whose entry point is main().
+add_backtrack_test(StudioWindowTests
+    SOURCES backtrack/tests/StudioWindowTests.cpp
+    LIBS BacktrackApp)
 
-# The update check binds a loopback HTTP server, so it needs winsock on top.
-add_backtrack_test(MainWindowUpdateCheckTests
-    SOURCES backtrack/tests/MainWindowUpdateCheckTests.cpp
+# The release check binds a loopback HTTP server, so it needs winsock on top.
+add_backtrack_test(ReleaseCheckTests
+    SOURCES backtrack/tests/ReleaseCheckTests.cpp
     LIBS BacktrackApp ws2_32)

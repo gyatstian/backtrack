@@ -200,6 +200,33 @@ void writeSession(const std::filesystem::path& session) {
     expect(RecoveryStore::writeManifest(makeManifest(session), session), "could not write manifest");
 }
 
+void testRecoveryAvailability() {
+    TestRoot root;
+    const auto session = root.path / L"Game" / L".backtrack_tmp" / L"failed";
+    expect(std::filesystem::create_directories(session), "could not create empty session");
+    expect(!RecoveryStore::hasRecoverableRecording(root.path), "empty session appeared recoverable");
+
+    auto inputs = makeManifest(session);
+    expect(std::filesystem::create_directory(inputs.videoPath), "could not create invalid video path");
+    expect(RecoveryStore::writeManifest(inputs, session), "could not write manifest");
+    expect(!RecoveryStore::hasRecoverableRecording(root.path), "directory appeared to be a video stream");
+    expect(std::filesystem::remove(inputs.videoPath), "could not remove invalid video path");
+    writeFile(inputs.videoPath, "a");
+    expect(!RecoveryStore::hasRecoverableRecording(root.path), "truncated video appeared recoverable");
+    inputs.videoSamples.front().size = 0;
+    expect(RecoveryStore::writeManifest(inputs, session), "could not write zero-size sample manifest");
+    expect(!RecoveryStore::hasRecoverableRecording(root.path), "zero-size sample appeared recoverable");
+
+    writeSession(session);
+    const auto before = muxCalls;
+    expect(RecoveryStore::hasRecoverableRecording(root.path), "valid session was not found");
+    expect(muxCalls == before, "availability query attempted recovery");
+    std::wstring detail;
+    expect(RecoveryStore::recoverLatestFailedRecording(root.path, detail) == root.path / L"Game" / L"failed.mp4",
+           "session did not recover to its unclaimed output");
+    expect(!RecoveryStore::hasRecoverableRecording(root.path), "completed session still appeared recoverable");
+}
+
 void testFailedGameReplayAndDiscovery() {
     TestRoot root;
     const auto game = root.path / L"Game";
@@ -464,6 +491,7 @@ int main() {
     try {
         testOutputReservationPreservesCollisions();
         testClipRootsAndTags();
+        testRecoveryAvailability();
         testFailedGameReplayAndDiscovery();
         testNestedRecoveryAndUnrelatedCleanup();
         testDeletedOrRenamedRecoveryIsNotRepeated();

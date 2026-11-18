@@ -6,7 +6,7 @@ Shared Win32 helpers used by several domains: monitor and DXGI adapter
 enumeration, hardware-encode adapter selection, foreground window and
 application queries, MMCSS thread profiles, high-resolution timing, app paths,
 Windows startup registration, microphone privacy cleanup, the sibling-file
-publication helper, and the constants `app` and `ui` share.
+publication helper, and the constants shared by `app` and the windows.
 
 ## Ownership
 
@@ -72,10 +72,9 @@ publication helper, and the constants `app` and `ui` share.
   calls both once, and the UI calls `updateWindowsStartupRegistration` again
   whenever the setting is saved. Keep them cheap and failure-tolerant: every
   path logs and returns, none throws.
-- `kBacktrackMainWindowClassName` and `backtrackActivationMessage()` are the two
-  symbols both `app` and `ui` depend on. `kBacktrackSingleInstanceMutexName` and
-  `kBacktrackStartupArgument` are `app`'s alone. Changing a shared one is a
-  cross-module change.
+- `kBacktrackMainWindowClassName` and `backtrackActivationMessage()` are
+  shared by `app` and `studio`. `kBacktrackSingleInstanceMutexName` and
+  `kBacktrackStartupArgument` are owned by `app`.
 - `trimText` and `normalizedPathKey` are `inline` in the header, not exported
   from the `.cpp`: `SettingsClipGuardTests` links `SettingsStore.cpp` with
   `defaultClipDirectory()` stubbed precisely so `Win32Util.cpp` (DXGI, avrt,
@@ -88,8 +87,6 @@ publication helper, and the constants `app` and `ui` share.
   is listed, and audio still plays into the recording - with no error and no log
   line. Do not extend what it normalizes (environment expansion, 8.3 short
   names, trimming) without changing every key at once.
-- `ui/UiHelpers.h`'s former `trimText` / `executableKey` are gone; both live
-  here now. `UiHelpers.cpp` includes this header for them.
 
 ## Work Guidance
 

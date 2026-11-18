@@ -11,7 +11,7 @@ League of Legends kill reminder.
   threads, the shared `WinHttpJson.h` GET + JSON helpers, and the protocol
   details of talking to those applications.
 - Does not own: the actions they trigger. Both report through a callback or a
-  posted message; `MainWindowController.cpp` reacts.
+  posted message; `StudioSession.cpp` reacts.
 
 ## Local Contracts
 
@@ -35,7 +35,7 @@ League of Legends kill reminder.
   `std::string` body; `trimText` only ever sees the extracted player names
   inside it, so its erase-from-front cost is bounded by a name, not by the body.
 - `WinHttpJson.h` owns the status-checked, size-capped GET and `\u`-safe JSON
-  string reader for League and the update check in `ui`. both use async
+  string reader for League and the update check in `StudioSession`. both use async
   sessions: stop or the total request deadline closes the request, and the
   callback retains the read buffer and parent handles until handle closing.
   the synchronous overload has only per-stage timeouts. `ignoreCert` is for

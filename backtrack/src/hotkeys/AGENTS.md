@@ -10,7 +10,7 @@ application has focus, including while a game does.
 - Owns: `HotkeyService`, the hotkey ids, the keyboard hook, and the modifier
   tracking that goes with it.
 - Does not own: what recording or saving does. The service only reports which
-  hotkey fired; `MainWindowController.cpp` decides the action.
+  hotkey fired; `StudioSession.cpp` decides the action.
 
 ## Local Contracts
 
@@ -57,7 +57,7 @@ application has focus, including while a game does.
 - Keep the hook proc fast and allocation-free on the hot path; it runs on the
   installing thread and delays input delivery.
 - A new hotkey needs an id constant here, a `HotkeySettings` field, a
-  `sanitizeSettings` rule, and a handler in `MainWindowController.cpp`.
+  `sanitizeSettings` rule, and a handler in `StudioSession.cpp`.
 
 ## Verification
 

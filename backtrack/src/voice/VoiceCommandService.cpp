@@ -3,7 +3,6 @@
 #include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
-#include "ui/UiIds.h"
 
 #include <sapi.h>
 #include <sphelper.h>
@@ -302,7 +301,7 @@ void VoiceCommandService::run(VoiceCommandMode mode) {
                 reportIfDue();
                 continue;
             }
-            if (!PostMessageW(window, ui_ids::kVoiceCommandMessage, 0, 0)) {
+            if (!PostMessageW(window, kVoiceCommandMessage, 0, 0)) {
                 ++rejected_;
                 ++rejectedPostFailed;
                 LogContext::breadcrumb(L"voice command post to window failed");

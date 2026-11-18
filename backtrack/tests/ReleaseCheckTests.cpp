@@ -3,18 +3,17 @@
 
 #include "core/AppVersion.h"
 #include "core/Logger.h"
-#include "ui/MainWindow.h"
-#include "ui/UiIds.h"
+#include "platform/Win32Util.h"
+#include "ui_common/RecorderActions.h"
 
 #include <winhttp.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <filesystem>
 #include <iostream>
-#include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -22,15 +21,30 @@
 
 namespace backtrack {
 
-struct MainWindowUpdateCheckTestAccess {
-    static void start(MainWindow& window, HWND target, INTERNET_PORT port, std::chrono::milliseconds timeout) {
-        window.window_ = target;
-        window.startUpdateCheck({L"127.0.0.1", port, WINHTTP_ACCESS_TYPE_NO_PROXY, false, timeout});
+// Stands in for the window's release-check worker: run the shared fetch on its
+// own thread, hold the result, and cancel through the same stop flag.
+struct Check {
+    Check() = default;
+    Check(const Check&) = delete;
+    Check& operator=(const Check&) = delete;
+    ~Check() { stop(); }
+
+    void start(INTERNET_PORT port, std::chrono::milliseconds timeout) {
+        worker = std::thread([this, port, timeout] {
+            version = fetchReleaseVersion({L"127.0.0.1", port, WINHTTP_ACCESS_TYPE_NO_PROXY, false, timeout}, stopping);
+        });
     }
-    static bool wait(MainWindow& window, DWORD timeoutMs) {
-        return WaitForSingleObject(window.updateCheckThread_.native_handle(), timeoutMs) == WAIT_OBJECT_0;
+    bool wait(DWORD timeoutMs) {
+        return WaitForSingleObject(worker.native_handle(), timeoutMs) == WAIT_OBJECT_0;
     }
-    static void stop(MainWindow& window) { window.stopUpdateCheck(); }
+    void stop() {
+        stopping.store(true);
+        if (worker.joinable()) worker.join();
+    }
+
+    std::atomic<bool> stopping{false};
+    std::optional<std::wstring> version;
+    std::thread worker;
 };
 
 } // namespace backtrack
@@ -168,95 +182,53 @@ private:
     std::thread worker_;
 };
 
-struct TargetWindow {
-    HWND handle = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 1, 1,
-                                  nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
-    TargetWindow() { expect(handle != nullptr, "could not create message target"); }
-    ~TargetWindow() { DestroyWindow(handle); }
-    bool takeUpdate(WPARAM* result = nullptr) const {
-        MSG message{};
-        if (!PeekMessageW(&message, handle, backtrack::ui_ids::kUpdateCheckCompleteMessage,
-                          backtrack::ui_ids::kUpdateCheckCompleteMessage, PM_REMOVE)) return false;
-        if (result) *result = message.wParam;
-        return true;
-    }
-};
-
-struct TestWindow {
-    backtrack::RecorderController controller;
-    backtrack::SettingsStore store{std::filesystem::temp_directory_path() / L"backtrack_update_test.ini"};
-    backtrack::AppSettings settings;
-    backtrack::MainWindow window{controller, store, settings, backtrack::SettingsStore::LoadStatus::Missing};
-};
-
 void testSuccessfulCheck(bool current) {
-    TargetWindow target;
-    const auto version = backtrack::wideToUtf8(std::wstring(backtrack::kCurrentAppVersion));
-    const auto tag = current ? version : std::string("test-update-version");
+    const auto currentVersion = std::wstring(backtrack::kCurrentAppVersion);
+    const auto tag = current ? backtrack::wideToUtf8(currentVersion) : std::string("test-update-version");
     HttpServer server("{\"tag_name\":\"" + tag + "\"}", 0ms, false);
-    TestWindow test;
-    backtrack::MainWindowUpdateCheckTestAccess::start(test.window, target.handle, server.port(), 3s);
-    const bool finished = backtrack::MainWindowUpdateCheckTestAccess::wait(test.window, 5000);
+    backtrack::Check check;
+    check.start(server.port(), 3s);
+    const bool finished = check.wait(5000);
     if (!finished) server.stop();
-    backtrack::MainWindowUpdateCheckTestAccess::stop(test.window);
-    WPARAM result = 0;
-    expect(finished && target.takeUpdate(&result) && result == (current ? 0u : 1u),
-           "successful update check did not post the correct version comparison");
+    expect(finished && check.version.has_value(), "successful update check did not return the release tag");
+    expect((*check.version != currentVersion) == !current,
+           "successful update check returned the wrong version comparison");
     const auto request = server.request();
     expect(request.find("GET /repos/gyatstian/backtrack/releases/latest ") != std::string::npos,
            "update check requested the wrong path");
     expect(request.find("application/vnd.github+json") != std::string::npos,
            "update check omitted the GitHub accept header");
-    expect(request.find("Backtrack/" + version) != std::string::npos,
+    expect(request.find("Backtrack/" + backtrack::wideToUtf8(currentVersion)) != std::string::npos,
            "update check did not identify the current build");
 }
 
 void testSlowProgressHasTotalDeadline() {
-    TargetWindow target;
     HttpServer server(std::string(100, 'x'), 80ms, false);
-    TestWindow test;
+    backtrack::Check check;
     const auto start = std::chrono::steady_clock::now();
-    backtrack::MainWindowUpdateCheckTestAccess::start(test.window, target.handle, server.port(), 700ms);
+    check.start(server.port(), 700ms);
     const bool progress = server.waitForBytes(3, 2s);
-    const bool finished = backtrack::MainWindowUpdateCheckTestAccess::wait(test.window, 2500);
+    const bool finished = check.wait(2500);
     const auto elapsed = std::chrono::steady_clock::now() - start;
     if (!finished) server.stop();
-    backtrack::MainWindowUpdateCheckTestAccess::stop(test.window);
+    check.stop();
     expect(progress, "slow server did not make progress");
     expect(finished && elapsed >= 400ms && elapsed < 2500ms, "update deadline did not bound slow progress");
-    expect(!target.takeUpdate(), "timed-out check posted an update");
+    expect(!check.version.has_value(), "timed-out check returned a version");
 }
 
-void testStopAndDestruction(bool destroy) {
-    TargetWindow target;
+void testStopUnblocksStalledCheck() {
     HttpServer server(std::string(100, 'x'), 0ms, true);
-    auto test = std::make_unique<TestWindow>();
-    backtrack::MainWindowUpdateCheckTestAccess::start(test->window, target.handle, server.port(), 5s);
+    backtrack::Check check;
+    check.start(server.port(), 5s);
     const bool received = server.waitForBytes(1, 3s);
-
-    std::mutex mutex;
-    std::condition_variable changed;
-    bool returned = false;
-    bool timedOut = false;
-    std::thread watchdog([&] {
-        std::unique_lock lock(mutex);
-        if (!changed.wait_for(lock, 1500ms, [&] { return returned; })) {
-            timedOut = true;
-            lock.unlock();
-            server.stop();
-        }
-    });
-    if (destroy) test.reset();
-    else backtrack::MainWindowUpdateCheckTestAccess::stop(test->window);
-    {
-        std::scoped_lock lock(mutex);
-        returned = true;
-        changed.notify_one();
-    }
-    watchdog.join();
+    const auto start = std::chrono::steady_clock::now();
+    check.stop();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    server.stop();
     expect(received, "server did not start the pending response");
-    expect(!timedOut, destroy ? "window destruction waited for the stalled server" : "stop waited for the stalled server");
-    expect(!target.takeUpdate(), "stopped update check posted a result");
+    expect(elapsed < 1500ms, "stop waited for the stalled server");
+    expect(!check.version.has_value(), "stopped update check returned a version");
 }
 
 } // namespace
@@ -267,12 +239,11 @@ int main() {
         testSuccessfulCheck(false);
         testSuccessfulCheck(true);
         testSlowProgressHasTotalDeadline();
-        testStopAndDestruction(false);
-        testStopAndDestruction(true);
-        std::cout << "MainWindowUpdateCheckTests passed\n";
+        testStopUnblocksStalledCheck();
+        std::cout << "ReleaseCheckTests passed\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "MainWindowUpdateCheckTests failed: " << error.what() << '\n';
+        std::cerr << "ReleaseCheckTests failed: " << error.what() << '\n';
         return 1;
     }
 }

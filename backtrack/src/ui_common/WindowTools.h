@@ -1,27 +1,23 @@
 #pragma once
 
 #include "core/Types.h"
-#include "ui/UiIds.h"
 
 #include <Windows.h>
 
 #include <shobjidl.h>
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace backtrack {
 
-using namespace ui_ids;
-
 std::wstring readText(HWND control);
 bool setText(HWND control, const std::wstring& value);
-void redrawWindowAndChildren(HWND window, bool updateNow = false);
+void redrawWindowAndChildren(HWND window);
+// position only; the caller invalidates the parent and its children after layout.
 bool moveWindowIfChanged(HWND control, int x, int y, int width, int height);
-bool showWindowIfHidden(HWND control);
-bool setListItemHeightIfChanged(HWND list, int& cachedHeight, int height);
-
 // One child-window reposition. Used with applyWindowMoves().
 struct WindowMove {
     HWND control = nullptr;
@@ -31,11 +27,9 @@ struct WindowMove {
     int height = 0;
 };
 
-// Applies a batch of moves in one DeferWindowPos sequence so relayouts cost
-// one layout pass instead of one internal layout per SetWindowPos. Falls back
-// to individual SetWindowPos calls if deferring fails; moves are idempotent,
-// so the fallback is always safe.
+// same repaint contract as moveWindowIfChanged; batch siblings when possible.
 bool applyWindowMoves(const std::vector<WindowMove>& moves);
+std::optional<uint32_t> parseUIntControl(HWND control);
 uint32_t readUIntControl(HWND control, uint32_t fallback);
 // One {enum value, display label} row for a settings combo box. The page
 // builders fill from the same table the reader maps back through, so inserting
@@ -144,12 +138,6 @@ bool readEnumCombo(HWND combo, const EnumComboEntry (&entries)[Count], int& valu
 
 // shortcut: bytesToText/durationToText stay UI-local until a non-ui caller needs them (then join captureBackendDisplayName in platform/).
 std::wstring bytesToText(uintmax_t bytes);
-bool isButtonId(WPARAM id);
-bool isSoundSeparationMuteButtonId(int controlId);
-bool isSoundSeparationRemoveButtonId(int controlId);
-bool isAutoRecordRemoveButtonId(int controlId);
-size_t soundSeparationIndexFromButtonId(int controlId, int baseId);
-bool isSettingsControlId(int controlId);
 std::wstring durationToText(uint64_t duration100ns);
 std::wstring tagsToText(const std::vector<std::wstring>& tags);
 int comboIndexForDevice(const std::vector<AudioDeviceInfo>& devices, const std::wstring& selectedId);
@@ -202,19 +190,6 @@ void drawBitmapFitCached(
     int& scaledWidth,
     int& scaledHeight,
     const RECT& target);
-int galleryItemHeightForWidth(int listWidth);
-
-class ScopedRedrawLock {
-public:
-    explicit ScopedRedrawLock(HWND window);
-    ~ScopedRedrawLock();
-    ScopedRedrawLock(const ScopedRedrawLock&) = delete;
-    ScopedRedrawLock& operator=(const ScopedRedrawLock&) = delete;
-
-private:
-    HWND window_ = nullptr;
-};
-
 class ClipFileDropSource final : public IDropSource {
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override;

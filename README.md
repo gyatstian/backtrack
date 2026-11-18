@@ -5,9 +5,14 @@
 # backtrack
 lightweight clipping software that works with both nvidia (nvenc) and amd (amf).<br>
 
-<div align="center">
-  <img src="capture.png" alt="Screenshot" width="500">
-</div>
+## ui
+
+drag the title bar to move the window, or double-click it to maximize or restore.
+
+**Settings** opens a row of categories below the main tabs.
+replay notification sound is under **Settings → Audio**, and monitor options
+are under **Settings → Capture**. **Recover failed recording** appears on
+Capture only when there is a recording to recover. the library is gallery-only.
 
 ## amd
 i dont use amd, some features might not work. dont expect much
@@ -51,7 +56,8 @@ backtrack/src/mux            WAV writing and native MP4 muxing
 backtrack/src/platform       Win32 utility helpers
 backtrack/src/replay         Encoded packet replay ring buffer
 backtrack/src/settings       Lightweight persisted settings
-backtrack/src/ui             Native Windows UI
+backtrack/src/studio         Native Windows window
+backtrack/src/ui_common      Shared window services and Win32 helpers
 backtrack/src/voice          SAPI voice commands
 backtrack/src/Interface      NVENC headers and bundled AMD AMF headers
 backtrack/src/third_party    Vendored RNNoise (optional noise suppression)

@@ -3,12 +3,13 @@
 #include "audio/WasapiCapture.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
-#include "ui/MainWindow.h"
+#include "studio/StudioWindow.h"
 
 #include <objbase.h>
 #include <ole2.h>
 #include <shellapi.h>
 
+#include <optional>
 #include <string>
 
 namespace backtrack {
@@ -59,6 +60,17 @@ bool requestExistingInstanceActivation() {
         Sleep(50);
     }
     return false;
+}
+
+void tryRestoreOrphanedSessionMutes() {
+    // Keep the single-instance mutex held so another session cannot re-mute while sweeping.
+    try {
+        WasapiCapture::restoreOrphanedSessionMutes();
+    } catch (const std::exception& error) {
+        Logger::instance().warning(L"app", std::wstring(L"Orphaned session-mute sweep failed: ") + utf8ToWide(error.what()));
+    } catch (...) {
+        Logger::instance().warning(L"app", L"Orphaned session-mute sweep failed: unknown exception");
+    }
 }
 
 } // namespace
@@ -112,43 +124,33 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
         updateWindowsStartupRegistration(settings.startWithWindowsMinimized);
     }
 
-    // Restore sound-separation session mutes a previous crashed session left
-    // applied system-wide. Runs after logger init and under the single-instance
-    // mutex, so no concurrent session can re-mute while sweeping.
-    try {
-        WasapiCapture::restoreOrphanedSessionMutes();
-    } catch (const std::exception& error) {
-        Logger::instance().warning(L"app", std::wstring(L"Orphaned session-mute sweep failed: ") + utf8ToWide(error.what()));
-    } catch (...) {
-        Logger::instance().warning(L"app", L"Orphaned session-mute sweep failed: unknown exception");
-    }
-
-    if (settings.pruneStaleMicrophoneConsentEntries) {
+    const auto prepareCapture = [] {
+        tryRestoreOrphanedSessionMutes();
         pruneStaleMicrophoneConsentEntries();
-    }
+    };
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     const HRESULT com = OleInitialize(nullptr);
     if (FAILED(com)) {
         Logger::instance().warning(L"app", L"OleInitialize failed (hr=" + hresultToString(com) + L"); clipboard/drag-drop may be unavailable");
     }
 
-    controller_.initialize(settings);
-    // The startup sweep of crash-recovery leftovers (recover newest valid
-    // manifest into a clip, delete older orphaned temporary data) now runs on
-    // a background thread owned by RecorderController so the main window
-    // appears immediately even when a large crashed recording must be
-    // remuxed. RecorderController serializes the sweep against recording,
-    // replay saves, and manual recovery; the single-instance mutex held below
-    // until exit still guarantees no concurrent session.
-
-    MainWindow window(controller_, settingsStore_, settings, settingsStatus);
     const bool startMinimized = settings.startWithWindowsMinimized &&
                                 hasCommandLineArgument(commandLine, kBacktrackStartupArgument);
-    if (!window.create(instance, showCommand, startMinimized)) {
+    const auto runWindow = [&](auto& window) -> std::optional<int> {
+        if (!window.create(instance, showCommand, startMinimized)) return std::nullopt;
+        return window.runMessageLoop();
+    };
+    StudioWindow window(controller_, settingsStore_, settings, settingsStatus, prepareCapture);
+    const auto result = runWindow(window);
+    if (!result) {
         Logger::instance().error(L"Main window creation failed");
         if (SUCCEEDED(com)) {
             OleUninitialize();
         }
+        // The Studio worker never started, so no orphan sweep has run.
+        tryRestoreOrphanedSessionMutes();
         // Drop ownership before the mutex goes: a process that no longer holds
         // it must not restore or rewrite the journal a new instance now owns.
         WasapiCapture::setSessionMuteOwnership(false);
@@ -159,8 +161,7 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
         return 1;
     }
 
-    const int result = window.runMessageLoop();
-    // shutdown() restores the mutes while this process still owns them.
+    // Keep a final retry under the mutex in case Studio's joined worker could not finish cleanup.
     controller_.shutdown();
     // Ownership ends here, before the mutex is released: a new instance may
     // start sweeping as soon as the mutex is free, and this process's remaining
@@ -176,7 +177,7 @@ int Application::run(HINSTANCE instance, PWSTR commandLine, int showCommand) {
         ReleaseMutex(instanceMutex);
         CloseHandle(instanceMutex);
     }
-    return result;
+    return *result;
 }
 
 } // namespace backtrack

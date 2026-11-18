@@ -574,6 +574,14 @@ std::filesystem::path RecorderController::stopRecording() {
     return output;
 }
 
+bool RecorderController::hasRecoverableRecording() {
+    if (isRecording()) {
+        return false;
+    }
+    waitForStartupSweep();
+    return RecoveryStore::hasRecoverableRecording(settings().clipDirectory);
+}
+
 std::filesystem::path RecorderController::recoverFailedRecording() {
     const LogContext::ScopedTask taskContext(L"recoverFailedRecording");
     LogContext::breadcrumb(L"recover requested");

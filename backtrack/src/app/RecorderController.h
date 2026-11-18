@@ -245,6 +245,8 @@ public:
     void setUiPreferences(bool libraryGalleryView, bool loggingEnabled);
     bool startRecording();
     std::filesystem::path stopRecording();
+    // Serialized action worker only: waits for recovery maintenance and reads disk.
+    bool hasRecoverableRecording();
     std::filesystem::path recoverFailedRecording();
     std::filesystem::path saveReplay();
     void shutdown();
@@ -266,10 +268,8 @@ private:
     // Runs RecoveryStore::sweepOrphanedRecoveryData on a worker thread so the
     // main window appears immediately even when a crashed session left a large
     // recording to remux. It also clears a leftover replay ring folder, which
-    // the recovery sweep does not cover. startRecording/saveReplay/
-    // recoverFailedRecording/shutdown wait for it first: the sweep reads and
-    // deletes recovery data, so it must never overlap code that stages new
-    // recovery state or muxes from it.
+    // the recovery sweep does not cover. Wait before reading or staging
+    // recovery data, and before shutdown.
     void beginStartupSweep();
     void waitForStartupSweep();
     bool discardFrameQueueAndWait();

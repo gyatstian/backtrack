@@ -363,8 +363,6 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
                 readString(values, prefix + L"path", {})};
         });
     settings.startWithWindowsMinimized = readBool(values, L"general.startWithWindowsMinimized", settings.startWithWindowsMinimized);
-    settings.pruneStaleMicrophoneConsentEntries =
-        readBool(values, L"general.pruneStaleMicrophoneConsentEntries", settings.pruneStaleMicrophoneConsentEntries);
     settings.exitToTray = readBool(values, L"general.exitToTray", settings.exitToTray);
     settings.checkForUpdates = readBool(values, L"general.checkForUpdates", settings.checkForUpdates);
     settings.loggingEnabled = readBool(values, L"diagnostics.loggingEnabled", settings.loggingEnabled);
@@ -490,7 +488,6 @@ bool SettingsStore::save(const AppSettings& settings) const {
         output << prefix << L"path=" << app.executablePath.wstring() << L"\n";
     }
     output << L"general.startWithWindowsMinimized=" << (normalized.startWithWindowsMinimized ? 1 : 0) << L"\n";
-    output << L"general.pruneStaleMicrophoneConsentEntries=" << (normalized.pruneStaleMicrophoneConsentEntries ? 1 : 0) << L"\n";
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
     output << L"general.checkForUpdates=" << (normalized.checkForUpdates ? 1 : 0) << L"\n";
     output << L"diagnostics.loggingEnabled=" << (normalized.loggingEnabled ? 1 : 0) << L"\n";

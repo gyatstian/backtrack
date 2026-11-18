@@ -193,15 +193,15 @@ RNNoise microphone denoiser.
   cap at the 4 GiB RIFF boundary (WavWriter's large-file form, data size
   clamped to the uint32 maximum) to the real file size, so long recordings mix
   in full.
-  `ui/UiHelpers.cpp` keeps its own minimal loader for notification sounds.
+  `ui_common/WindowTools.cpp` has a separate loader for notification sounds.
 
 ## Work Guidance
 
 - Dropping a packet is the correct response to an unusable format. Padding or
   guessing a rate is not.
-- Device and audio-session enumeration (`enumerateDevices`,
-  `enumerateAudioSessionApps`, `enumerateOpenApps`) is static and called from the
-  UI thread on demand. Keep it side-effect free.
+- keep `enumerateDevices`, `enumerateAudioSessionApps`, and `enumerateOpenApps`
+  side-effect free. studio's auto-record worker calls `enumerateOpenApps`
+  off the UI thread.
 
 ## Verification
 

@@ -72,6 +72,7 @@ std::wstring preservedRecordingDetail(
     const std::filesystem::path& tempDirectory,
     const MuxedInputs& inputs,
     const std::wstring& reason = {});
+bool hasRecoverableRecording(const std::filesystem::path& clipDirectory);
 std::filesystem::path recoverLatestFailedRecording(
     const std::filesystem::path& clipDirectory,
     std::wstring& detail);

@@ -10,9 +10,8 @@ through Windows SAPI and posted back to the main window.
 - Owns: `VoiceCommandService`, the SAPI grammar, the worker thread, and
   `VoiceCommandStats`.
 - Does not own: what the command does. The service posts
-  `kVoiceCommandMessage` and nothing else; `MainWindowController.cpp` answers
-  every one of them with `requestSaveReplay`. `RecordVideo` changes only the
-  recognized phrase, not the action.
+  `kVoiceCommandMessage` from `VoiceCommandService.h`. Both windows respond
+  by requesting a replay. `RecordVideo` changes the phrase, not the action.
 
 ## Local Contracts
 
@@ -48,7 +47,7 @@ through Windows SAPI and posted back to the main window.
 - Audio for recognition comes from the default capture device through SAPI, not
   from the recorder's microphone pipeline. Do not couple the two.
 - A new command needs a `VoiceCommandMode` value in `core/Types.h`, a
-  `phraseFor` entry, a matching combo item in `ui`, and a handler that can tell
+  `phraseFor` entry, a matching combo entry in `ui_common`, and a handler that can tell
   the commands apart: `kVoiceCommandMessage` carries no mode.
 
 ## Verification

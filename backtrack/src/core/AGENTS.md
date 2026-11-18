@@ -26,9 +26,8 @@ the lock-free queue used between threads, and the app version constant.
   SDR, flip count tracks hdr/format flips per pipeline run, format is the last
   observed frame format. The Diagnostics page renders them as one `HDR:` line and `saveLog`
   appends the same chain to the saved copy.
-- Every settings struct has a defaulted `operator==`. The UI dirty check
-  (`MainWindow::computeSettingsDirty`) compares whole structs, so a new
-  non-comparable member silently breaks "unsaved changes" detection.
+- every settings struct has a defaulted `operator==`; both windows compare
+  whole structs to detect unsaved changes.
 - `AudioPacket::bytes` is a `std::pmr::vector` so the WASAPI capture thread
   allocates payloads from a pool instead of the CRT heap. A pmr vector binds its
   resource at construction, so `ensureAudioPacketPool()`
@@ -41,11 +40,10 @@ the lock-free queue used between threads, and the app version constant.
   the audio writer, the other track's capture, or a RAM-backed replay.
 - Defaults live in the struct definition, once. `SettingsStore` reads and writes
   values; it does not carry a second copy of the defaults.
-- Adding a setting is one change across five sites: the field in `Types.h`, the
-  parse branch and the serialize branch in `SettingsStore.cpp`, the id in
-  `ui/UiIds.h`, and the control plus its read in `ui` (`UiHelpers.cpp` also
-  needs the id in `isSettingsControlId` or the page never goes dirty). An
-  enum-valued setting also needs a `Name` / `FromName` pair: the `Name` side for
+- adding a setting requires a field in `Types.h`, parsing and serialization
+  in `SettingsStore.cpp`, and a binding in `studio/StudioSettings.cpp` if
+  user-facing. an enum-valued setting
+  also needs a `Name` / `FromName` pair: the `Name` side for
   codec/preset/mode lives in `core/EncodingNames.h` (shared with the encoders
   and the diagnostics page), the rest and all `FromName` parsing stay in
   `settings/SettingsStore.h`; a value that can be out of range also needs a
@@ -121,11 +119,9 @@ the lock-free queue used between threads, and the app version constant.
   index, so it needs the consumer stopped too. `clear` and `tryPop` assign into a
   default-constructed `T`, so `T` must be default-constructible and move- or
   copy-assignable; `static_assert`s in the header state both.
-- `AppVersion.h`'s `kCurrentAppVersion` is the app's only version string;
-  `MainWindow::startUpdateCheck` compares it against the latest GitHub release.
-  The check is opt-out: `AppSettings::checkForUpdates` (default on) gates it in
-  `MainWindow::create`. Update the version there; do not add a second version
-  string elsewhere.
+- `AppVersion.h`'s `kCurrentAppVersion` is the only version string. both
+  windows compare it against the latest GitHub release at startup when
+  `AppSettings::checkForUpdates` is on.
 
 ## Work Guidance
 

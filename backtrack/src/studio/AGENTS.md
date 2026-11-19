@@ -31,7 +31,18 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 - use one 15-dip Bahnschrift SemiLight font (GDI weight 350). leave gaps
   between buttons in both navigation rows. animate the existing full-width
   neutral underline in each row's bottom band, not a second indicator. use
-  an inset outline for keyboard focus when cues are visible.
+  an inset outline for keyboard focus when cues are visible: owner-drawn
+  controls honour `ODS_NOFOCUSRECT` and the checkbox honours `UISF_HIDEFOCUS`.
+  caption buttons draw a cached glyph alpha mask per DPI, not per-pixel
+  supersampling on every paint.
+- the window remembers its rect and maximized state through
+  `AppSettings::window*`; restore keeps the stored rect only when it still
+  intersects a monitor work area. write the placement on shutdown directly into
+  the saved baseline, never through the settings draft, so closing cannot
+  publish unsaved pages.
+- the footer carries one persistent failure line for the last recorder or
+  hotkey failure. it outlives `statusTimer` and clears only on a later
+  successful action; ordinary status text still expires.
 - controls with an ambiguous effect carry hover help: consequences, defaults,
   units, and what a blank value means. never restate the label or the checkbox
   text, and add no help to a control whose name already says what it does.
@@ -65,7 +76,9 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   so it draws no guide and takes no keyboard focus.
 - apply live resize and form wheel bursts at paint time; finish the last
   resize on drag exit. height changes only reposition form rows if the usable
-  width or scroll position changes. clamped scrolls do nothing.
+  width or scroll position changes. clamped scrolls do nothing. a hidden row
+  takes no scroll height, so a page whose optional rows are hidden may not
+  scroll at all.
 - buffer scrolling pages with their native children. finish positioning before
   queueing repaint; don't blit old child pixels or erase owner-drawn button
   backgrounds separately.
@@ -79,10 +92,17 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   commits only its own field and is blocked while the recorder is busy.
 - the session worker runs pre-capture preparation, initializes and shuts down
   the controller, and serializes recorder actions and integration changes.
+  hotkeys are registered from `registeredHotkeys`, which unbinds the replay
+  chord while replay is disabled, so its key stays usable elsewhere.
   navigation stays available during startup; recorder actions and settings
   writes are blocked while busy. ignore control commands during page rebuild
   or close, and activation requests during close. accept voice replay only
   from an enabled, ready listener outside startup, settings apply, and close.
+- `WM_QUERYENDSESSION` allows shutdown; `WM_ENDSESSION(TRUE)` finalizes an
+  active recording and joins every worker synchronously through `shutdown`,
+  because nothing runs after that message. closing to the tray only hides the
+  window, so it neither prompts nor saves the draft; an exit from the tray
+  restores the window before the unsaved-changes prompt.
 - normal exit stops accepting new work and keeps dispatching messages until
   all workers finish, including the gallery worker. accepted recorder actions
   (including startup) and queued gallery edits drain before destruction.
@@ -91,7 +111,31 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   window handle.
 - publish recorder action completion before probing recovery. show recovery
   only when an eligible session is known and the recorder is idle.
-- the library is gallery-only and leaves the legacy view setting untouched.
+- the library is gallery-only and leaves the legacy view setting untouched. it
+  browses one disk folder at a time through `ClipManager::listContents`: the
+  gallery shows the subfolders of the open folder and the clips directly inside
+  it. the gallery draws thin folder rows above the clip grid, one video tile wide
+  and scrolled with it: a drawn folder glyph, the folder name, and the number of
+  clips below it at any depth, one row per subfolder, alphabetical. rows are
+  recycled owner-drawn buttons in their own pool, drawn like the clip tiles and
+  clicked like them: the folder name is the button text, the count is painted,
+  and the row opens through the ordinary button click. never move a folder row
+  back to view-level hit testing; that path did not receive clicks.
+  the open folder is the top of `Gallery::stack`; clicking a row pushes it,
+  **Back** (left of Refresh, hidden at the root with its slot reserved) pops
+  it, `VK_BACK` does the same, and clicking the Library tab while on the library
+  returns to the root.
+  building the library page also drops the stack, so the tab never resumes a
+  folder. each level change clears the selection, the scroll and the thumbnail
+  window, then rescans through the worker. the viewport slides in over 200ms from
+  the side the navigation came from, through the `librarySlide` motion slot, so
+  it honours the windows animation preference. page-wide pointer input (the wheel
+  and the back side mouse button) goes through `libraryInput` and is called from
+  the viewport, every control, the body and the window: the body's own handlers
+  ran scroll math on every page and swallowed those messages, so only input over
+  a tile reached the gallery. add any new page-wide message there, not per child.
+  the toolbar carries six actions, which is what the minimum window width leaves
+  room for.
   its worker runs scans, edits, and thumbnail decoding. the viewport recycles
   named native tile buttons and limits preview work to visible rows plus one
   overscan row, capped at 48. cancel superseded scans and queued previews,
@@ -101,13 +145,22 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   and clips with its tile, and it is raised above the recycled tiles on every
   placement. Enter in the field commits, Escape cancels, and a selection change
   cancels with it. the field owns its keys, so Delete and Ctrl+R are text there.
+  the clips rename rules check the name on the ui thread before the edit is
+  queued; a rejected or colliding name keeps the field open with its text and a
+  specific status. a successful rename patches the tile in place, no rescan.
+  delete moves the clip to the Recycle Bin, then selects and focuses the nearest
+  remaining tile. Refresh stays enabled without a selection.
+  thumbnails are cached by path and revalidated against size and modified time,
+  so a rescan that shifts indexes keeps them. they decode at the tile width
+  rounded up to 160px steps and re-decode only when that step grows.
 
 ## Verification
 
 see [`StudioWindowTests`](../../tests/StudioWindowTests.cpp) for automated
 coverage. manually check live edge resizing, rapid scrolling, title-bar drag
 and snap, keyboard traversal, mixed-dpi layouts, real thumbnails and drag/drop,
-and capture with real devices. check rapid tab reversals, hide or minimize
+window placement across two monitors and after unplugging one, closing during a
+recording, a Windows shutdown during a recording, and capture with real devices. check rapid tab reversals, hide or minimize
 mid-transition, and toggle windows animation effects while open.
 
 ## Child DOX Index

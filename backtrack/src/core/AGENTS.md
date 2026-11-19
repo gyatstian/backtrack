@@ -28,6 +28,10 @@ the lock-free queue used between threads, and the app version constant.
   appends the same chain to the saved copy.
 - every settings struct has a defaulted `operator==`; both windows compare
   whole structs to detect unsaved changes.
+- `AppSettings::windowLeft/Top/Width/Height/Maximized` is the restored window
+  placement in virtual-screen coordinates. a zero width or height means "no
+  stored placement"; the signed offsets may be negative on displays left of or
+  above the primary. the studio writes it without touching the settings draft.
 - `AudioPacket::bytes` is a `std::pmr::vector` so the WASAPI capture thread
   allocates payloads from a pool instead of the CRT heap. A pmr vector binds its
   resource at construction, so `ensureAudioPacketPool()`

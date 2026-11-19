@@ -549,6 +549,14 @@ void checkStudioPages(HWND window, const SettingsStore& store, const std::filesy
     SendMessageW(overlap, WM_MOUSELEAVE, 0, 0);
 
     click(window, L"Video");
+    // Hidden encoder rows take no scroll space, so the page has to be shorter
+    // than its content before the scroll assertions below can mean anything.
+    {
+        RECT current{};
+        expect(GetWindowRect(window, &current), "the Video page needs window bounds");
+        expect(SetWindowPos(window, nullptr, 0, 0, current.right - current.left, (current.bottom - current.top) * 2 / 3,
+                            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE), "shorten the Video page window");
+    }
     expect(bounds(find(window, L"Resolution")).top < bounds(find(window, L"Adaptive mode")).top &&
            bounds(find(window, L"Adaptive mode")).top < bounds(find(window, L"Codec")).top &&
            bounds(find(window, L"Codec")).top < bounds(find(window, L"Profile")).top &&

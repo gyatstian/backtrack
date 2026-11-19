@@ -29,7 +29,8 @@ untrusted values, and the enum name mappings that cross the file boundary.
   error discards the entire partial input. an empty file is loaded successfully.
   the read excludes concurrent writers. every key falls back to the current
   struct value, so a missing or malformed key is not an error. `readUInt` accepts digits only and
-  rejects anything above `uint32_t`. `readBool` accepts `1/true/yes/on` and
+  rejects anything above `uint32_t`; `readInt` additionally accepts a leading `-` and keeps the
+  value inside `int32_t`, which the signed `ui.window*` placement keys need. `readBool` accepts `1/true/yes/on` and
   `0/false/no/off` in any case, and `library.viewMode` matches `gallery` /
   `list` in any case. Enum reads go through the `xxxFromName` functions, which
   fold the name once, compare lowercase spellings only, name their own default
@@ -52,6 +53,11 @@ untrusted values, and the enum name mappings that cross the file boundary.
     its default lives in `ReplaySettings` and zero requests no intentional overlap
   - input and output volume 0-200 %, notification volume 0-100 %
   - `video.encoderLookaheadDepth` is capped at 31 with no lower bound
+  - `ui.windowWidth`/`ui.windowHeight` are 0 (no stored placement) or 200-20000;
+    a value below 200 clears both plus `ui.windowLeft`/`ui.windowTop`, so a
+    corrupt size cannot restore an unusable window. `ui.windowMaximized` is a
+    plain flag and the offsets are virtual-screen coordinates, so they stay
+    signed and unbounded
   It also masks hotkey modifiers, resolves derived settings (adaptive
   B-frames need B-frames, adaptive I-frames need lookahead, follow-mouse needs
   multi-monitor), caps each executable list at 128 entries,
@@ -60,6 +66,13 @@ untrusted values, and the enum name mappings that cross the file boundary.
   stem, replaces CR/LF in names with spaces, and replaces an empty
   `clipDirectory` with `defaultClipDirectory()`. a new setting needs a clamp
   here if it can be out of range.
+- Folder settings are absolute or unused: a relative `clipDirectory` becomes
+  `defaultClipDirectory()` and a relative `replayRingDirectory` becomes empty
+  (= the clip folder), because the working directory is not stable across
+  launches.
+- `ui.window*` is UI state, not a form field: the window writes it straight into
+  the saved baseline with `SettingsStore::save`, never through the settings
+  draft, so closing never publishes unsaved page edits.
 - `monitorIndex` is the one numeric setting left unclamped on purpose:
   `platform/Win32Util.cpp:monitorFromIndex` warns and falls back to the first
   monitor, so clamping it to 0 would silently move users off their monitor.
@@ -71,7 +84,8 @@ untrusted values, and the enum name mappings that cross the file boundary.
   dimensions but serializes as `1080p`; an unknown name loads as the 1080p preset.
 - an invalid or duplicate `saveReplay` chord falls back to its default, or is
   unbound when that default matches `startStop`. a virtual key of 0 means
-  unbound and is left alone.
+  unbound and is left alone. `isSafeGlobalHotkey` rejects Alt+F4 for any
+  modifier set: it is the Windows close gesture.
 - `save` creates the settings directory when missing and publishes the complete
   serialization through `platform/AtomicWrite.h`. the helper exclusively creates a
   fresh sibling, writes through its held handle, and replaces the destination
@@ -117,8 +131,9 @@ untrusted values, and the enum name mappings that cross the file boundary.
 covers the clamp ranges, resolution presets, enum fallbacks, app-list dedupe,
 and hotkey masking. `backtrack/tests/SettingsStoreTests.cpp` (CTest) adds
 settings-only regressions, including linked destinations, staging collisions,
-a UTF-8 BOM on the first key, an over-long dropped line, and an executable list
-without its `.count` hint. it also covers app-list count bounds and gaps,
+a UTF-8 BOM on the first key, an over-long dropped line, an executable list
+without its `.count` hint, the Alt+F4 rule, relative folder fallbacks, and a
+window-placement round trip with its clamps. it also covers app-list count bounds and gaps,
 default-muted normalization, every persisted resolution preset and legacy
 alias, and replay overlap defaults, malformed input, independent clamping, and
 normalized round trips. symbolic link cases skip when link creation is unavailable.

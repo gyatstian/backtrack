@@ -139,6 +139,8 @@ bool readEnumCombo(HWND combo, const EnumComboEntry (&entries)[Count], int& valu
 // shortcut: bytesToText/durationToText stay UI-local until a non-ui caller needs them (then join captureBackendDisplayName in platform/).
 std::wstring bytesToText(uintmax_t bytes);
 std::wstring durationToText(uint64_t duration100ns);
+// file_time_type ticks are FILETIME on MSVC; empty when the date cannot be formatted.
+std::wstring shortDateText(std::filesystem::file_time_type time);
 std::wstring tagsToText(const std::vector<std::wstring>& tags);
 int comboIndexForDevice(const std::vector<AudioDeviceInfo>& devices, const std::wstring& selectedId);
 std::wstring selectedDeviceId(HWND combo, const std::vector<AudioDeviceInfo>& devices);
@@ -190,16 +192,5 @@ void drawBitmapFitCached(
     int& scaledWidth,
     int& scaledHeight,
     const RECT& target);
-class ClipFileDropSource final : public IDropSource {
-public:
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override;
-    ULONG STDMETHODCALLTYPE AddRef() override;
-    ULONG STDMETHODCALLTYPE Release() override;
-    HRESULT STDMETHODCALLTYPE QueryContinueDrag(BOOL escapePressed, DWORD keyState) override;
-    HRESULT STDMETHODCALLTYPE GiveFeedback(DWORD) override;
-
-private:
-    LONG references_ = 1;
-};
 
 } // namespace backtrack

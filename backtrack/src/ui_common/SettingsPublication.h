@@ -8,15 +8,20 @@
 namespace backtrack {
 
 inline const wchar_t* publishWindowSettings(SettingsStore& store, RecorderController& controller,
-    AppSettings& baseline, const AppSettings& candidate, bool readable) {
+    AppSettings& baseline, const AppSettings& candidate, bool readable, bool* published = nullptr) {
+    if (published) *published = false;
     if (!readable) return L"Settings could not be read at startup; restart after the file becomes readable";
     auto normalized = sanitizeSettings(candidate);
     if (!store.save(normalized)) return L"Settings could not be saved; try again";
     const bool startupChanged = baseline.startWithWindowsMinimized != normalized.startWithWindowsMinimized;
     baseline = std::move(normalized);
-    if (startupChanged) updateWindowsStartupRegistration(baseline.startWithWindowsMinimized);
+    if (published) *published = true;
     Logger::instance().setEnabled(baseline.loggingEnabled);
     controller.setUiPreferences(baseline.libraryGalleryView, baseline.loggingEnabled);
+    // The settings are already published, so this is a warning the caller must
+    // still show rather than a reason to drop the saved state.
+    if (startupChanged && !updateWindowsStartupRegistration(baseline.startWithWindowsMinimized))
+        return L"Settings saved, but the Windows startup entry could not be updated";
     return nullptr;
 }
 

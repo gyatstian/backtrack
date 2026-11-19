@@ -12,6 +12,8 @@
 #include "integrations/LeagueOfLegendsIntegration.h"
 #include "voice/VoiceCommandService.h"
 
+#include <CommCtrl.h>
+
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -23,6 +25,41 @@
 #include <utility>
 
 namespace backtrack {
+
+// A disabled replay must not keep its chord registered: the key then belongs to
+// whatever the user runs instead, while the field keeps its stored binding.
+inline HotkeySettings registeredHotkeys(const AppSettings& settings) {
+    auto keys = settings.hotkeys;
+    if (!settings.replay.enabled) keys.saveReplayModifiers = keys.saveReplayVirtualKey = 0;
+    return keys;
+}
+
+// LoadIcon returns a shared handle that must never be destroyed, so the chrome
+// and tray need owned copies. LoadIconWithScaleDown/LoadIconMetric give the best
+// small glyph, but only comctl32 v6 exports them and this app links the v5 copy
+// unless a common-controls manifest is active, so they are resolved at runtime
+// with LoadImage (which also returns an owned icon) as the fallback.
+inline HICON loadOwnedAppIcon(HINSTANCE instance, int id, int size) {
+    using ScaleDown = HRESULT(WINAPI*)(HINSTANCE, PCWSTR, int, int, HICON*);
+    static const auto scaleDown = [] {
+        const auto library = GetModuleHandleW(L"comctl32.dll");
+        return library ? reinterpret_cast<ScaleDown>(GetProcAddress(library, "LoadIconWithScaleDown")) : nullptr;
+    }();
+    HICON icon = nullptr;
+    if (scaleDown && SUCCEEDED(scaleDown(instance, MAKEINTRESOURCEW(id), size, size, &icon)) && icon) return icon;
+    return static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(id), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+}
+
+inline HICON loadOwnedSmallAppIcon(HINSTANCE instance, int id) {
+    using LoadMetric = HRESULT(WINAPI*)(HINSTANCE, PCWSTR, int, HICON*);
+    static const auto loadMetric = [] {
+        const auto library = GetModuleHandleW(L"comctl32.dll");
+        return library ? reinterpret_cast<LoadMetric>(GetProcAddress(library, "LoadIconMetric")) : nullptr;
+    }();
+    HICON icon = nullptr;
+    if (loadMetric && SUCCEEDED(loadMetric(instance, MAKEINTRESOURCEW(id), LIM_SMALL, &icon)) && icon) return icon;
+    return loadOwnedAppIcon(instance, id, GetSystemMetrics(SM_CXSMICON));
+}
 
 struct StudioWindow::Impl {
     using Page = StudioNavigation::Page;
@@ -37,11 +74,12 @@ struct StudioWindow::Impl {
     enum : UINT_PTR { statusTimer = 1, diagnosticsTimer, autoRecordTimer, shutdownTimer, motionTimer };
 
     enum class ButtonTone { Normal, Primary, Quiet };
-    enum Motion { mainMarker, categoryMarker, recordGlyph, replayCheck, motionCount };
+    enum Motion { mainMarker, categoryMarker, recordGlyph, replayCheck, librarySlide, motionCount };
     enum class Glyph { None, Minimize, Close };
     struct Control {
         ControlEvent event;
         std::wstring help;
+        int margin = 0;
         bool checkbox = false;
         bool combo = false;
         bool pointerMotion = false;
@@ -77,9 +115,13 @@ struct StudioWindow::Impl {
     int px(int dip) const { return MulDiv(dip, static_cast<int>(dpi), 96); }
     int resizeGrip() const { return IsZoomed(window) ? 0 : px(6); }
     void updateFont();
+    void updateAppIcon();
+    void saveWindowPlacement();
+    bool keyboardCuesHidden() const;
+    void buildCaptionGlyphs();
     void layout(bool newPage = false);
     void layoutFooter(const RECT& client);
-    void layoutRows(bool heightOnly = false);
+    void layoutRows(bool heightOnly = false, bool repaint = true);
     void scrollTo(int value, bool onPaint = false);
     void ensureVisible(HWND control);
     void open(Page page, bool pointer);
@@ -90,6 +132,9 @@ struct StudioWindow::Impl {
     void stopMotion();
     void tickMotion();
     void setMotion(Motion slot, float target, bool animate);
+    // Slides the library viewport in from the side the navigation came from.
+    void startGallerySlide(bool forward);
+    int gallerySlide() const;
     void invalidateMotion(Motion slot);
     float motionValue(Motion slot) const;
     void setHovered(HWND control);
@@ -161,6 +206,13 @@ struct StudioWindow::Impl {
     void endRename();
     void editClip(ClipEdit operation);
     void updateGallery();
+    // Page-wide library input (wheel, side mouse buttons); false on other pages.
+    bool libraryInput(UINT message, WPARAM wp);
+    void openFolder(size_t index);
+    void backFolder();
+    // Leaves any open folder for the library root. False when already there.
+    bool libraryToRoot();
+    void showLibraryFolder(std::vector<std::filesystem::path> stack, bool forward);
     void galleryChanged();
     bool galleryShortcut(const MSG& message);
     static LRESULT CALLBACK galleryProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
@@ -216,11 +268,19 @@ struct StudioWindow::Impl {
     std::jthread deviceWorker;
     HWND hovered = nullptr;
     HWND focused = nullptr;
+    HWND lastFocus = nullptr;
+    // Rendered alpha for the two caption glyphs; rebuilt when the DPI changes.
+    std::array<std::vector<BYTE>, 2> captionGlyphAlpha;
+    std::array<SIZE, 2> captionGlyphSize{};
+    unsigned captionGlyphDpi = 0;
     std::optional<HWND> clickOrigin;
     bool motionEnabled = false;
     std::array<StudioMotion, motionCount> motions;
     HWND update = nullptr;
     std::wstring status;
+    // Last recorder or hotkey failure, kept on screen until a later action
+    // succeeds; ordinary status text expires with statusTimer, an error must not.
+    std::wstring persistentWarning;
     bool replaySaved = false;
     RECT replayCheckBox{};
     std::wstring audioWarning;
@@ -253,6 +313,7 @@ struct StudioWindow::Impl {
     bool closing = false;
     bool shuttingDown = false;
     UINT taskbarCreated = 0;
+    HICON trayIcon = nullptr;
     Gallery* gallery = nullptr;
 
     HotkeyService hotkeys;
@@ -281,6 +342,11 @@ struct StudioWindow::Impl {
     bool busy = false;
     bool applyingSettings = false;
     bool actionFromPointer = false;
+    // The encoder report only changes when an action applies settings or a
+    // backend is re-initialized, so it is rebuilt per action revision, not per
+    // diagnostics poll.
+    std::wstring encoderText;
+    uint64_t encoderTextRevision = 0;
 };
 
 } // namespace backtrack

@@ -46,17 +46,35 @@ struct Bitmap {
     ~Bitmap() { if (source) DeleteObject(source); if (scaled) DeleteObject(scaled); }
 };
 
+struct Thumbnail {
+    uintmax_t bytes = 0;
+    std::filesystem::file_time_type modifiedTime{};
+    int width = 0;
+    Bitmap bitmap{nullptr};
+};
+
+// Decode in 160px steps so live resizing does not re-decode on every pixel.
+int thumbnailWidth(int tileWidth) {
+    return ((std::max)(tileWidth, 1) + 159) / 160 * 160;
+}
+
 struct GalleryClip {
     ClipInfo info;
     std::wstring name;
     std::wstring details;
 };
 
+struct GalleryFolder {
+    std::wstring name;
+    std::filesystem::path path;
+    size_t count = 0;
+};
+
 bool sameMedia(const ClipInfo& a, const ClipInfo& b) {
     return a.bytes == b.bytes && a.modifiedTime == b.modifiedTime && a.path == b.path;
 }
 
-bool shellDrag(const std::filesystem::path& path) {
+bool shellDrag(HWND hwnd, const std::filesystem::path& path) {
     PIDLIST_ABSOLUTE absolute = nullptr;
     if (FAILED(SHParseDisplayName(path.c_str(), nullptr, &absolute, 0, nullptr)) || !absolute) return false;
     auto parent = ILCloneFull(absolute);
@@ -67,11 +85,9 @@ bool shellDrag(const std::filesystem::path& path) {
     CoTaskMemFree(parent);
     CoTaskMemFree(absolute);
     if (!object) return false;
-    auto* source = new ClipFileDropSource;
     DWORD effect = DROPEFFECT_NONE;
-    const auto result = DoDragDrop(object.Get(), source, DROPEFFECT_COPY, &effect);
-    source->Release();
-    return SUCCEEDED(result);
+    // The shell's default drop source adds the thumbnail drag image.
+    return SUCCEEDED(SHDoDragDrop(hwnd, object.Get(), nullptr, DROPEFFECT_COPY, &effect));
 }
 } // namespace
 
@@ -83,12 +99,13 @@ struct StudioWindow::Impl::Gallery {
         bool operator==(const Viewport&) const = default;
     };
     struct Scan { uint64_t revision; std::filesystem::path directory; };
-    struct Snapshot { uint64_t revision; std::vector<GalleryClip> clips; bool ok = false; };
+    struct Snapshot { uint64_t revision; std::vector<GalleryClip> clips; std::vector<GalleryFolder> folders; bool ok = false; };
     using PreviewKey = std::pair<uint64_t, size_t>;
     struct Request {
         uint64_t revision;
         size_t index;
-        std::filesystem::path path;
+        ClipInfo info;
+        int width;
         PreviewKey key() const { return {revision, index}; }
     };
     struct Preview { Request request; Bitmap bitmap; };
@@ -173,16 +190,19 @@ struct StudioWindow::Impl::Gallery {
                     try {
                         if (cancelled()) continue;
                         manager.setDirectory(nextScan->directory);
-                        auto listed = manager.listClips(cancelled);
+                        auto contents = manager.listContents(cancelled);
                         if (cancelled()) continue;
-                        result->clips.reserve(listed.size());
-                        for (auto& info : listed) {
+                        result->clips.reserve(contents.clips.size());
+                        for (auto& info : contents.clips) {
                             if (cancelled()) break;
                             auto name = info.path.filename().wstring();
                             auto details = durationToText(info.duration100ns) + L"  \u00b7  " + bytesToText(info.bytes);
+                            if (const auto date = shortDateText(info.modifiedTime); !date.empty()) details += L"  \u00b7  " + date;
                             if (!info.tags.empty()) details += L"  \u00b7  " + tagsToText(info.tags);
                             result->clips.push_back({std::move(info), std::move(name), std::move(details)});
                         }
+                        for (auto& folder : contents.folders)
+                            result->folders.push_back({std::move(folder.name), std::move(folder.path), folder.clips});
                         result->ok = true;
                     } catch (...) { Logger::instance().warning(L"ui", L"Library scan failed unexpectedly"); }
                     std::scoped_lock lock(mutex);
@@ -192,7 +212,7 @@ struct StudioWindow::Impl::Gallery {
                 } else {
                     HBITMAP source = nullptr;
                     if (!stop.stop_requested()) {
-                        try { source = loadShellThumbnail(thumbnail->path, 480, 270); }
+                        try { source = loadShellThumbnail(thumbnail->info.path, thumbnail->width, thumbnail->width * 9 / 16); }
                         catch (...) { Logger::instance().warning(L"ui", L"Thumbnail decode failed unexpectedly"); }
                     }
                     Bitmap bitmap(source);
@@ -213,12 +233,29 @@ struct StudioWindow::Impl::Gallery {
     HWND rename = nullptr;
     bool renaming = false;
     HWND empty = nullptr;
-    std::array<HWND, 5> actions{};
+    std::array<HWND, 6> actions{};
     std::vector<Tile> tiles;
+    std::vector<Tile> folderTiles;
     std::vector<GalleryClip> clips;
-    std::unordered_map<size_t, Bitmap> cache;
+    std::vector<GalleryFolder> folders;
+    int tileWidth = 0;
+    int folderHeight = 0;
+    int slide = 0;
+
+    // Height of the scrolling folder band above the clip grid.
+    int headerHeight() const {
+        if (folders.empty() || grid.columns < 1 || folderHeight <= 0) return 0;
+        return static_cast<int>((folders.size() + grid.columns - 1) / grid.columns) * folderHeight;
+    }
+    // Keyed by path so a rescan that shifts indexes keeps decoded thumbnails.
+    std::unordered_map<std::wstring, Thumbnail> cache;
+    int decodeWidth = 0;
     std::filesystem::path directory;
     std::filesystem::path selectionPath;
+    // Open folder chain below the clip directory; empty shows the library root.
+    std::vector<std::filesystem::path> stack;
+
+    std::filesystem::path currentFolder() const { return stack.empty() ? directory : stack.back(); }
     StudioGalleryLayout grid;
     std::optional<Viewport> viewport;
     size_t selected = noClip;
@@ -256,6 +293,7 @@ void StudioWindow::Impl::buildLibrary() {
     g.actions[2] = button(L"Favorite", [this] { editClip(ClipEdit::Favorite); });
     g.actions[3] = button(L"Refresh", [this] { refreshLibrary(); });
     g.actions[4] = button(L"Delete", [this] { editClip(ClipEdit::Remove); });
+    g.actions[5] = button(L"Back", [this] { backFolder(); });
     g.view = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"Clip gallery",
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, body, nullptr, nullptr, nullptr);
     if (!g.view) return;
@@ -265,13 +303,18 @@ void StudioWindow::Impl::buildLibrary() {
     SetWindowSubclass(g.view, galleryProc, 2, reinterpret_cast<DWORD_PTR>(this));
     SetWindowTheme(g.view, L"DarkMode_Explorer", nullptr);
     g.empty = make(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX, {}, L"", g.view);
-    if (g.rename) SendMessageW(g.rename, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(px(5), px(5)));
+    if (g.rename) {
+        SendMessageW(g.rename, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(px(5), px(5)));
+        SendMessageW(g.rename, EM_LIMITTEXT, 200, 0);
+    }
     if (g.directory != saved.clipDirectory) {
         g.directory = saved.clipDirectory;
         g.clips.clear();
         g.selected = noClip;
         g.scroll = 0;
     }
+    // The Library tab always lands on the root, not on the last open folder.
+    g.stack.clear();
     refreshLibrary();
     g.selectionPath.clear();
     selectClip(g.selected);
@@ -289,8 +332,12 @@ void StudioWindow::Impl::closeLibrary() {
     g.resetPreviews();
     g.cancelDrag();
     g.cache.clear();
+    g.folders.clear();
     g.tiles.clear();
+    g.folderTiles.clear();
     g.viewport.reset();
+    g.slide = 0;
+    motions[librarySlide] = {0.f, 0.f};
     g.view = g.empty = g.rename = nullptr;
     g.actions.fill(nullptr);
     g.wheel = 0;
@@ -318,7 +365,7 @@ void StudioWindow::Impl::refreshLibrary() {
     g.scanning = true;
     {
         std::scoped_lock lock(g.mutex);
-        g.scan = Gallery::Scan{++g.revision, g.directory};
+        g.scan = Gallery::Scan{++g.revision, g.currentFolder()};
     }
     g.cv.notify_one();
     if (g.clips.empty()) setText(g.empty, L"Loading clips\u2026");
@@ -343,6 +390,7 @@ void StudioWindow::Impl::galleryChanged() {
         tile.index = noClip;
     };
     bool layoutChanged = false;
+    bool refocus = false;
     if (edit) {
         g.editing = false;
         if (!edit->ok) setStatus(L"Clip could not be changed. Check that it still exists and is not in use.");
@@ -361,30 +409,35 @@ void StudioWindow::Impl::galleryChanged() {
                 if (it != g.clips.end()) {
                     for (auto& tile : g.tiles) if (tile.index != noClip && tile.index >= index) invalidateTile(tile);
                     g.clips.erase(it);
+                    g.cache.erase(change.path.native());
                     if (index == g.selected) {
-                        g.selected = noClip;
-                        g.selectionPath.clear();
+                        g.selected = g.clips.empty() ? noClip : (std::min)(index, g.clips.size() - 1);
+                        g.selectionPath = g.selected == noClip ? std::filesystem::path{} : g.clips[g.selected].info.path;
+                        const auto focus = GetFocus();
+                        refocus = !focus || focus == g.view || GetParent(focus) == g.view || focus == g.actions[4];
                     } else if (g.selected != noClip && index < g.selected) --g.selected;
-                    std::erase_if(g.cache, [=](const auto& entry) { return entry.first >= index; });
                     layoutChanged = true;
                 }
                 break;
             case ClipEdit::Rename:
+                // The move keeps the modified time, so the list order holds without a rescan.
                 if (it != g.clips.end()) {
-                    it->info.path.replace_filename(change.name + change.path.extension().wstring());
+                    it->info.path = clipRenameTarget(change.path, change.name);
                     it->name = it->info.path.filename().wstring();
                     if (const auto tile = g.tileFor(index)) {
                         if (g.dragTile == tile) g.cancelDrag();
                         setText(tile, it->name);
                     }
                     if (g.selectionPath == change.path) g.selectionPath = it->info.path;
-                    g.cache.erase(index);
+                    if (auto node = g.cache.extract(change.path.native())) {
+                        node.key() = it->info.path.native();
+                        g.cache.insert(std::move(node));
+                    }
                     layoutChanged = true;
                 }
-                if (!g.scanning) refreshLibrary();
                 break;
             }
-            setStatus(change.kind == ClipEdit::Remove ? L"Clip deleted" : change.kind == ClipEdit::Rename ? L"Clip renamed" :
+            setStatus(change.kind == ClipEdit::Remove ? L"Clip moved to the Recycle Bin" : change.kind == ClipEdit::Rename ? L"Clip renamed" :
                       change.favorite ? L"Clip favorited" : L"Favorite removed");
         }
     }
@@ -399,12 +452,9 @@ void StudioWindow::Impl::galleryChanged() {
                 if (i >= snapshot->clips.size() || g.clips[i].info.path != snapshot->clips[i].info.path) invalidateTile(tile);
                 else if (g.dragTile == tile.hwnd && !sameMedia(g.clips[i].info, snapshot->clips[i].info)) g.cancelDrag();
             }
-            std::erase_if(g.cache, [&](const auto& entry) {
-                const auto i = entry.first;
-                return !entry.second.source || i >= snapshot->clips.size() || i >= g.clips.size() ||
-                    !sameMedia(g.clips[i].info, snapshot->clips[i].info);
-            });
+            std::erase_if(g.cache, [](const auto& entry) { return !entry.second.bitmap.source; });
             g.clips = std::move(snapshot->clips);
+            g.folders = std::move(snapshot->folders);
             if (g.selected >= g.clips.size() || g.clips[g.selected].info.path != g.selectionPath) {
                 g.selected = noClip;
                 if (!g.selectionPath.empty()) {
@@ -425,16 +475,101 @@ void StudioWindow::Impl::galleryChanged() {
     }
     for (auto& preview : previews) {
         const auto index = preview.request.index;
-        if (index >= g.clips.size() || g.clips[index].info.path != preview.request.path ||
+        const auto& info = preview.request.info;
+        if (index >= g.clips.size() || !sameMedia(g.clips[index].info, info) ||
             preview.request.revision != g.previewRevision || index < g.first || index >= g.last) continue;
-        const auto [entry, inserted] = g.cache.try_emplace(index, std::move(preview.bitmap));
-        if (inserted && entry->second.source) {
+        auto& entry = g.cache[info.path.native()];
+        // A failed decode keeps an older bitmap and still records the width so it is not requeued.
+        const bool replace = preview.bitmap.source || !entry.bitmap.source || entry.bytes != info.bytes ||
+                             entry.modifiedTime != info.modifiedTime;
+        if (replace) entry.bitmap = std::move(preview.bitmap);
+        entry.bytes = info.bytes;
+        entry.modifiedTime = info.modifiedTime;
+        entry.width = preview.request.width;
+        if (replace && entry.bitmap.source) {
             if (const auto tile = g.tileFor(index)) InvalidateRect(tile, nullptr, FALSE);
         }
     }
     if (edit || scanFinished) selectClip(g.selected);
     if (layoutChanged) updateGallery();
+    if (refocus) selectClip(g.selected, true);
     if (edit || snapshot) g.cv.notify_one();
+}
+
+void StudioWindow::Impl::openFolder(size_t index) {
+    if (closing || shuttingDown || !gallery || !gallery->view || index >= gallery->folders.size()) return;
+    auto next = gallery->stack;
+    next.push_back(gallery->folders[index].path);
+    showLibraryFolder(std::move(next), true);
+}
+
+void StudioWindow::Impl::backFolder() {
+    if (closing || shuttingDown || !gallery || !gallery->view || gallery->stack.empty()) return;
+    auto next = gallery->stack;
+    next.pop_back();
+    showLibraryFolder(std::move(next), false);
+}
+
+bool StudioWindow::Impl::libraryToRoot() {
+    if (!gallery || !gallery->view || gallery->stack.empty()) return false;
+    showLibraryFolder({}, false);
+    return true;
+}
+
+void StudioWindow::Impl::showLibraryFolder(std::vector<std::filesystem::path> stack, bool forward) {
+    auto& g = *gallery;
+    g.stack = std::move(stack);
+    g.clips.clear();
+    g.folders.clear();
+    g.scroll = 0;
+    g.viewport.reset();
+    selectClip(noClip);
+    refreshLibrary();
+    // The new level slides in from the side the navigation came from.
+    startGallerySlide(forward);
+    updateGallery();
+}
+
+void StudioWindow::Impl::startGallerySlide(bool forward) {
+    auto& motion = motions[librarySlide];
+    RECT client{};
+    const int distance = gallery && gallery->view && GetClientRect(gallery->view, &client) ? client.right : 0;
+    const bool animate = motionEnabled && !closing && !sizing && IsWindowEnabled(window) &&
+        IsWindowVisible(window) && !IsIconic(window) && distance > 0;
+    if (!animate) {
+        motion = {0.f, 0.f};
+    } else {
+        motion = {static_cast<float>(forward ? distance : -distance), 0.f, SteadyClock::now(), std::chrono::milliseconds{200}};
+        if (!SetTimer(window, motionTimer, 16, nullptr)) motion = {0.f, 0.f};
+    }
+    invalidateMotion(librarySlide);
+}
+
+int StudioWindow::Impl::gallerySlide() const {
+    return static_cast<int>(std::lround(motionValue(librarySlide)));
+}
+
+
+bool StudioWindow::Impl::libraryInput(UINT msg, WPARAM wp) {
+    if (nav.page != Page::Library || !gallery || !gallery->view) return false;
+    auto& g = *gallery;
+    if (msg == WM_XBUTTONUP) {
+        if (GET_XBUTTON_WPARAM(wp) != XBUTTON1) return false;
+        backFolder();
+        return true;
+    }
+    if (msg != WM_MOUSEWHEEL) return false;
+    g.wheel += GET_WHEEL_DELTA_WPARAM(wp);
+    const auto steps = g.wheel / WHEEL_DELTA;
+    g.wheel %= WHEEL_DELTA;
+    if (steps) {
+        UINT lines = 3;
+        SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+        const int64_t distance = lines == WHEEL_PAGESCROLL ? (g.viewport ? g.viewport->height : 0) :
+            px(25) * static_cast<int>((std::min)(lines, 100U));
+        if (g.scrollTo(g.scroll - steps * distance)) updateGallery();
+    }
+    return true;
 }
 
 void StudioWindow::Impl::layoutGallery() {
@@ -447,11 +582,27 @@ void StudioWindow::Impl::layoutGallery() {
     const int row = px(30), y = px(9), buttonWidth = px(92);
     std::vector<WindowMove> moves;
     for (int i = 0; i < 3; ++i) moves.push_back({g.actions[i], pad + i * (buttonWidth + gap), y, buttonWidth, row});
+    moves.push_back({g.actions[5], pad + width - 3 * buttonWidth - 2 * gap, y, buttonWidth, row});
     moves.push_back({g.actions[3], pad + width - 2 * buttonWidth - gap, y, buttonWidth, row});
     moves.push_back({g.actions[4], pad + width - buttonWidth, y, buttonWidth, row});
-    const int top = y + row + gap;
-    moves.push_back({g.view, 0, top, r.right, (std::max)(0L, r.bottom - top)});
+    const int top = y + row + gap * 2;
+    const int slide = gallerySlide();
+    moves.push_back({g.view, slide, top, r.right, (std::max)(0L, r.bottom - top)});
     applyWindowMoves(moves);
+    if (g.slide != slide) {
+        // The strip the viewport stopped covering belongs to the surface again.
+        const int lo = (std::min)(g.slide, slide), hi = (std::max)(g.slide, slide);
+        if (lo < 0) {
+            RECT strip{r.right + lo, top, r.right, r.bottom};
+            InvalidateRect(body, &strip, FALSE);
+        }
+        if (hi > 0) {
+            RECT strip{0, top, hi, r.bottom};
+            InvalidateRect(body, &strip, FALSE);
+        }
+        g.slide = slide;
+        redrawWindowAndChildren(g.view);
+    }
     updateGallery();
 }
 
@@ -469,8 +620,11 @@ void StudioWindow::Impl::updateGallery() {
     if (g.grid.columns != columns || g.grid.rowHeight != rowHeight)
         position = position / g.grid.rowHeight * g.grid.columns / columns * rowHeight;
     g.grid = {columns, rowHeight};
+    g.tileWidth = tileWidth;
+    g.folderHeight = px(34);
+    const int header = g.headerHeight();
     const auto rowCount = g.grid.rowCount(g.clips.size());
-    const int bottom = static_cast<int>((std::min)(rowCount, static_cast<size_t>(INT_MAX / rowHeight))) * rowHeight;
+    const int bottom = header + static_cast<int>((std::min)(rowCount, static_cast<size_t>(INT_MAX / rowHeight))) * rowHeight;
     g.maxScroll = (std::max)(0, bottom - height);
     g.scrollTo(position);
     const bool placeRename = g.renaming && g.rename && g.selected < g.clips.size();
@@ -478,7 +632,7 @@ void StudioWindow::Impl::updateGallery() {
         const int nameTop = rowHeight - px(4) - px(42);
         SetWindowPos(g.rename, HWND_TOP,
             pad + static_cast<int>(g.selected % g.grid.columns) * (tileWidth + gap) + px(2),
-            static_cast<int>(g.selected / g.grid.columns) * rowHeight - g.scroll + nameTop,
+            header + static_cast<int>(g.selected / g.grid.columns) * rowHeight - g.scroll + nameTop,
             (std::max)(px(30), tileWidth - px(4)), px(21), SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS);
     }
     const Gallery::Viewport viewport{width, height, g.scroll, dpi};
@@ -492,10 +646,13 @@ void StudioWindow::Impl::updateGallery() {
     SetScrollInfo(g.view, SB_VERT, &info, FALSE);
     if (g.clips.empty()) {
         setText(g.empty, g.scanning ? L"Loading clips\u2026" : L"No clips");
-        moveWindowIfChanged(g.empty, 0, 0, r.right, px(52));
+        moveWindowIfChanged(g.empty, 0, (std::max)(0, header - g.scroll), r.right, px(52));
         ShowWindow(g.empty, SW_SHOWNA);
     } else ShowWindow(g.empty, SW_HIDE);
-    const auto [first, drawnEnd] = g.grid.visible(g.clips.size(), g.scroll, height);
+    const int headerShown = std::clamp(header - g.scroll, 0, height);
+    const int clipScroll = (std::max)(0, g.scroll - header);
+    const int clipHeight = (std::max)(0, height - headerShown);
+    const auto [first, drawnEnd] = g.grid.visible(g.clips.size(), clipScroll, clipHeight);
     const auto focus = GetFocus();
     size_t focusClip = noClip;
     for (const auto& tile : g.tiles) if (tile.hwnd == focus) focusClip = tile.index;
@@ -516,6 +673,35 @@ void StudioWindow::Impl::updateGallery() {
         }
     }
     std::vector<WindowMove> moves;
+    // Folder rows are native buttons like the clips, so a click is an ordinary
+    // button click instead of a hit test against hand-painted rects.
+    if (g.folders.size() > g.folderTiles.size()) {
+        while (g.folderTiles.size() < g.folders.size()) {
+            const auto slot = g.folderTiles.size();
+            const auto tile = button(L"", [this, slot] {
+                if (gallery && slot < gallery->folderTiles.size()) openFolder(gallery->folderTiles[slot].index);
+            }, L"", g.view);
+            if (!tile) break;
+            SetWindowLongPtrW(tile, GWLP_USERDATA, slot + 1);
+            SetWindowSubclass(tile, galleryProc, 2, reinterpret_cast<DWORD_PTR>(this));
+            g.folderTiles.push_back({tile});
+        }
+    }
+    const int folderCell = (std::max)(1, g.folderHeight - gap);
+    for (size_t slot = 0; slot < g.folderTiles.size(); ++slot) {
+        auto& tile = g.folderTiles[slot];
+        if (slot >= g.folders.size()) {
+            tile.index = noClip;
+            if (GetWindowLongPtrW(tile.hwnd, GWL_STYLE) & WS_VISIBLE) ShowWindow(tile.hwnd, SW_HIDE);
+            continue;
+        }
+        if (tile.index != slot) {
+            tile.index = slot;
+            setText(tile.hwnd, g.folders[slot].name);
+        }
+        moves.push_back({tile.hwnd, pad + static_cast<int>(slot % columns) * (tileWidth + gap),
+            static_cast<int>(slot / columns) * g.folderHeight - g.scroll, tileWidth, folderCell});
+    }
     const auto count = g.tiles.size();
     moves.reserve(count);
     for (size_t slot = 0; slot < count; ++slot) {
@@ -531,19 +717,34 @@ void StudioWindow::Impl::updateGallery() {
             continue;
         }
         moves.push_back({tile.hwnd, pad + static_cast<int>(index % columns) * (tileWidth + gap),
-            static_cast<int>(index / columns) * rowHeight - g.scroll, tileWidth, rowHeight});
+            header + static_cast<int>(index / columns) * rowHeight - g.scroll, tileWidth, rowHeight});
     }
     applyWindowMoves(moves);
     for (const auto& tile : g.tiles) if (tile.index != noClip && !(GetWindowLongPtrW(tile.hwnd, GWL_STYLE) & WS_VISIBLE))
+        ShowWindow(tile.hwnd, SW_SHOWNA);
+    for (const auto& tile : g.folderTiles) if (tile.index != noClip && !(GetWindowLongPtrW(tile.hwnd, GWL_STYLE) & WS_VISIBLE))
         ShowWindow(tile.hwnd, SW_SHOWNA);
     if (GetFocus() == g.view) {
         if (const auto tile = g.tileFor(focusClip)) SetFocus(tile);
     }
     redrawWindowAndChildren(g.view);
     if (closing) return;
-    const auto last = (std::min)(g.grid.visible(g.clips.size(), g.scroll, height, 1).second, first + thumbnailBudget);
+    const auto decodeWidth = thumbnailWidth(tileWidth);
+    // A larger decode supersedes queued and in-flight smaller ones.
+    if (decodeWidth > g.decodeWidth) g.resetPreviews();
+    g.decodeWidth = decodeWidth;
+    const auto last = (std::min)(g.grid.visible(g.clips.size(), clipScroll, clipHeight, 1).second, first + thumbnailBudget);
     if (first == g.first && last == g.last) return;
-    std::erase_if(g.cache, [&](const auto& item) { return item.first < first || item.first >= last; });
+    {
+        std::unordered_map<std::wstring, Thumbnail> kept;
+        for (auto i = first; i < last; ++i) {
+            const auto& info = g.clips[i].info;
+            if (auto node = g.cache.extract(info.path.native());
+                node && node.mapped().bytes == info.bytes && node.mapped().modifiedTime == info.modifiedTime)
+                kept.insert(std::move(node));
+        }
+        g.cache.swap(kept);
+    }
     {
         std::scoped_lock lock(g.mutex);
         g.first = first;
@@ -555,8 +756,10 @@ void StudioWindow::Impl::updateGallery() {
         if (g.decoding && g.decoding->first == g.previewRevision && inRange(g.decoding->second))
             pending[g.decoding->second - first] = true;
         g.requests.clear();
-        for (auto i = first; i < last; ++i) if (!pending[i - first] && !g.cache.contains(i)) {
-            g.requests.push_back({g.previewRevision, i, g.clips[i].info.path});
+        for (auto i = first; i < last; ++i) {
+            const auto cached = g.cache.find(g.clips[i].info.path.native());
+            if (!pending[i - first] && (cached == g.cache.end() || cached->second.width < decodeWidth))
+                g.requests.push_back({g.previewRevision, i, g.clips[i].info, decodeWidth});
         }
     }
     g.cv.notify_one();
@@ -569,7 +772,12 @@ void StudioWindow::Impl::selectClip(size_t index, bool focus) {
     const bool selected = index < g.clips.size();
     g.selected = selected ? index : noClip;
     if (g.renaming && old != g.selected) endRename();
-    for (const auto i : {0, 1, 2, 3, 4}) EnableWindow(g.actions[i], selected && !g.editing);
+    for (const auto i : {0, 1, 2, 4}) EnableWindow(g.actions[i], selected && !g.editing);
+    EnableWindow(g.actions[3], !g.editing);
+    EnableWindow(g.actions[5], !g.editing);
+    // Back only exists inside a folder; its slot stays reserved so the other
+    // actions do not move.
+    ShowWindow(g.actions[5], g.stack.empty() ? SW_HIDE : SW_SHOWNA);
     setText(g.actions[2], selected && g.clips[index].info.favorite ? L"Unfavorite" : L"Favorite");
     if (selected) {
         const auto& path = g.clips[index].info.path;
@@ -580,7 +788,8 @@ void StudioWindow::Impl::selectClip(size_t index, bool focus) {
     if (focus && selected) {
         RECT r{};
         GetClientRect(g.view, &r);
-        const auto y = static_cast<int64_t>(index / g.grid.columns) * g.grid.rowHeight;
+        const auto y = static_cast<int64_t>(g.headerHeight()) +
+                       static_cast<int64_t>(index / g.grid.columns) * g.grid.rowHeight;
         if (r.bottom > 0) {
             const auto position = y < g.scroll ? y : (std::max)(int64_t{g.scroll}, y + g.grid.rowHeight - r.bottom);
             if (g.scrollTo(position)) updateGallery();
@@ -624,13 +833,21 @@ void StudioWindow::Impl::editClip(ClipEdit kind) {
     const auto& info = g.clips[g.selected].info;
     Gallery::Edit change{kind, g.directory, info.path, {}, !info.favorite};
     if (kind == ClipEdit::Rename) {
-        change.name = trimText(readText(g.rename));
-        if (change.name.empty()) { setStatus(L"Enter a clip name."); return; }
+        // Validate here so a rejected name keeps the field open with the typed text.
+        const auto typed = readText(g.rename);
+        const auto target = clipRenameTarget(info.path, typed);
+        if (target.empty()) {
+            setStatus(trimText(typed).empty() ? L"Enter a clip name." : L"Name contains characters Windows does not allow.");
+            return;
+        }
+        if (target.native() == info.path.native()) { endRename(); return; }
+        if (clipRenameCollides(info.path, target)) { setStatus(L"A clip with that name already exists."); return; }
+        change.name = target.stem().wstring();
         endRename();
     } else if (kind == ClipEdit::Remove) {
         const auto view = g.view;
         const auto target = info;
-        if (MessageBoxW(window, (L"Delete " + target.path.filename().wstring() + L"?").c_str(), L"Delete clip",
+        if (MessageBoxW(window, (L"Move " + target.path.filename().wstring() + L" to the Recycle Bin?").c_str(), L"Delete clip",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return;
         if (closing || shuttingDown || !gallery || gallery->view != view || gallery->directory != change.directory || gallery->editing)
             return;
@@ -665,6 +882,7 @@ bool StudioWindow::Impl::galleryShortcut(const MSG& msg) {
         return true;
     }
     if (msg.wParam == VK_F5 || (isControlDown() && msg.wParam == L'R')) { refreshLibrary(); return true; }
+    if (msg.wParam == VK_BACK && !g.stack.empty()) { backFolder(); return true; }
     if ((isControlDown() && msg.wParam == L'O') || (inGallery && msg.wParam == VK_RETURN)) { openClip(); return true; }
     if (msg.wParam == VK_DELETE) { editClip(ClipEdit::Remove); return true; }
     if (msg.wParam == VK_F2 && g.selected < g.clips.size()) { beginRename(); return true; }
@@ -696,6 +914,9 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, galleryProc, id);
     if (!self.gallery || !self.gallery->view) return DefSubclassProc(hwnd, msg, wp, lp);
     auto& g = *self.gallery;
+    // Wheel and the side mouse buttons belong to the page, not to the child that
+    // happens to sit under the cursor.
+    if (self.libraryInput(msg, wp)) return 0;
     if (hwnd == g.view) {
         switch (msg) {
         case WM_COMMAND: case WM_DRAWITEM: case WM_CTLCOLORSTATIC:
@@ -725,25 +946,21 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
             if (g.scrollTo(scroll)) self.updateGallery();
             return 0;
         }
-        case WM_MOUSEWHEEL: {
-            g.wheel += GET_WHEEL_DELTA_WPARAM(wp);
-            const auto steps = g.wheel / WHEEL_DELTA;
-            g.wheel %= WHEEL_DELTA;
-            if (!steps) return 0;
-            UINT lines = 3;
-            SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
-            const int64_t distance = lines == WHEEL_PAGESCROLL ? (g.viewport ? g.viewport->height : 0) :
-                self.px(25) * static_cast<int>((std::min)(lines, 100U));
-            if (g.scrollTo(g.scroll - steps * distance)) self.updateGallery();
+        case WM_MOUSEWHEEL:
+            self.libraryInput(msg, wp);
             return 0;
-        }
         }
     } else if (hwnd == g.rename) {
         if (msg == WM_KEYDOWN && wp == VK_RETURN) { self.editClip(ClipEdit::Rename); return 0; }
         if (msg == WM_KEYDOWN && wp == VK_ESCAPE) { self.endRename(); return 0; }
     } else {
         const auto slot = static_cast<size_t>(GetWindowLongPtrW(hwnd, GWLP_USERDATA) - 1);
-        const auto index = slot < g.tiles.size() ? g.tiles[slot].index : noClip;
+        const bool folder = slot < g.folderTiles.size() && g.folderTiles[slot].hwnd == hwnd;
+        const auto index = folder ? (slot < g.folderTiles.size() ? g.folderTiles[slot].index : noClip) :
+            (slot < g.tiles.size() ? g.tiles[slot].index : noClip);
+        if (msg == WM_MOUSEWHEEL) return SendMessageW(g.view, msg, wp, lp);
+        // A folder row only needs its own button click; nothing here applies.
+        if (folder) return DefSubclassProc(hwnd, msg, wp, lp);
         if (msg == WM_LBUTTONDOWN && index != noClip) {
             self.selectClip(index);
             g.dragTile = GetCursorPos(&g.dragStart) ? hwnd : nullptr;
@@ -762,7 +979,7 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
                 const auto path = g.clips[index].info.path;
                 g.dragActive = true;
                 g.cancelDrag();
-                const auto success = shellDrag(path);
+                const auto success = shellDrag(hwnd, path);
                 if (self.gallery) self.gallery->dragActive = false;
                 if (!success && self.window) self.setStatus(L"Could not start file drag.");
                 return 0;
@@ -773,10 +990,36 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+
 bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
     if (!gallery || !gallery->view || GetParent(item.hwndItem) != gallery->view) return false;
     auto& g = *gallery;
     const auto slot = static_cast<size_t>(GetWindowLongPtrW(item.hwndItem, GWLP_USERDATA) - 1);
+    if (slot < g.folderTiles.size() && g.folderTiles[slot].hwnd == item.hwndItem) {
+        const auto index = g.folderTiles[slot].index;
+        if (index >= g.folders.size()) return true;
+        auto r = item.rcItem;
+        auto dc = item.hDC;
+        theme::fill(dc, r, hovered == item.hwndItem ? theme::hover : theme::field);
+        theme::frame(dc, r, theme::rule);
+        // Folder glyph: a tab over a body, so no image asset is needed.
+        const int icon = px(16), iconLeft = r.left + px(8), iconTop = (r.top + r.bottom - px(14)) / 2;
+        theme::fill(dc, {iconLeft, iconTop + px(2), iconLeft + px(7), iconTop + px(6)}, theme::muted);
+        theme::fill(dc, {iconLeft, iconTop + px(4), iconLeft + icon, iconTop + px(14)}, theme::muted);
+        const auto count = std::to_wstring(g.folders[index].count) + L" Items";
+        SetBkMode(dc, TRANSPARENT);
+        SelectObject(dc, font);
+        SIZE extent{};
+        GetTextExtentPoint32W(dc, count.c_str(), static_cast<int>(count.size()), &extent);
+        const int nameLeft = iconLeft + icon + px(7);
+        SetTextColor(dc, theme::text);
+        RECT name{nameLeft, r.top, (std::max)(nameLeft, static_cast<int>(r.right) - px(8) - static_cast<int>(extent.cx) - px(8)), r.bottom};
+        DrawTextW(dc, g.folders[index].name.c_str(), -1, &name, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SetTextColor(dc, theme::muted);
+        RECT value{r.left, r.top, r.right - px(8), r.bottom};
+        DrawTextW(dc, count.c_str(), -1, &value, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+        return true;
+    }
     if (slot >= g.tiles.size() || g.tiles[slot].index >= g.clips.size()) return true;
     const auto index = g.tiles[slot].index;
     const auto& clip = g.clips[index];
@@ -787,14 +1030,14 @@ bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
     const int title = line - px(42);
     const RECT image{r.left, r.top + px(5), r.right, title - px(4)};
     theme::fill(dc, image, theme::field);
-    if (auto it = g.cache.find(index); it != g.cache.end()) {
-        auto& bitmap = it->second;
+    if (auto it = g.cache.find(clip.info.path.native());
+        it != g.cache.end() && it->second.bytes == clip.info.bytes && it->second.modifiedTime == clip.info.modifiedTime) {
+        auto& bitmap = it->second.bitmap;
         if (bitmap.source) drawBitmapFitCached(dc, bitmap.source, bitmap.scaled, bitmap.width, bitmap.height, image);
     }
     const auto selected = index == g.selected;
     const bool hasFocus = (item.itemState & ODS_FOCUS) != 0;
     if (selected || hasFocus || hovered == item.hwndItem) theme::frame(dc, image, selected || hasFocus ? theme::accent : theme::rule);
-    theme::fill(dc, {r.left, line, r.right, line + 1}, theme::muted);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, theme::text);
     SelectObject(dc, font);

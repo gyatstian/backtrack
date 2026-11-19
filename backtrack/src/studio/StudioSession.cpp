@@ -5,6 +5,7 @@
 #include "core/LogContext.h"
 #include "core/Logger.h"
 #include "platform/Win32Util.h"
+#include "resource.h"
 #include "ui_common/WindowTools.h"
 
 #include <objbase.h>
@@ -15,7 +16,7 @@
 
 namespace backtrack {
 namespace {
-constexpr UINT trayIcon = 1;
+constexpr UINT trayIconId = 1;
 constexpr UINT trayOpen = 1;
 constexpr UINT trayExit = 2;
 
@@ -29,12 +30,13 @@ void StudioWindow::Impl::startSession() {
     actionWorker = std::jthread([this](std::stop_token stop) { actionLoop(stop); });
     ControllerAction startup;
     startup.settings = saved;
-    startup.hotkeysOk = hotkeys.registerHotkeys(window, saved.hotkeys);
+    startup.hotkeysOk = hotkeys.registerHotkeys(window, registeredHotkeys(saved));
     startup.hotkeyError = hotkeys.lastErrorMessage();
     submit(std::move(startup), L"Starting capture\u2026");
     addTray();
     SetTimer(window, diagnosticsTimer, 1000, nullptr);
-    SetTimer(window, autoRecordTimer, 2000, nullptr);
+    // The probe enumerates audio sessions, so it runs on a slow poll.
+    SetTimer(window, autoRecordTimer, 5000, nullptr);
     if (saved.checkForUpdates) {
         const auto targetWindow = window;
         releaseWorker = std::jthread([this, targetWindow] {
@@ -42,7 +44,8 @@ void StudioWindow::Impl::startSession() {
                 setThreadDescriptionSafe(L"Backtrack update check");
                 LogContext::ScopedTask task(L"update-check");
                 const auto version = fetchReleaseVersion(releaseCheckTarget(), checkStopping);
-                if (version && !checkStopping.load()) PostMessageW(targetWindow, releaseReady, *version != kCurrentAppVersion, 0);
+                if (version && !checkStopping.load())
+                    PostMessageW(targetWindow, releaseReady, isNewerVersion(*version, kCurrentAppVersion) ? TRUE : FALSE, 0);
             } catch (...) {
                 Logger::instance().warning(L"ui", L"Update check failed unexpectedly");
             }
@@ -102,6 +105,7 @@ void StudioWindow::Impl::finishClose() {
 void StudioWindow::Impl::shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
+    saveWindowPlacement();
     requestSessionStop();
     if (window) KillTimer(window, shutdownTimer);
     removeTray();
@@ -290,7 +294,13 @@ void StudioWindow::Impl::completeAction() {
             setMotion(recordGlyph, static_cast<float>(recording), pointer && record);
         if (record) setText(record, recording ? L"Stop recording" : L"Start recording");
         if (!recording) audioWarning.clear();
-        setStatus(result.status == L"Ready" ? std::wstring{} : std::move(result.status), result.savedReplay, pointer);
+        // A failure keeps its line until a later action succeeds; a status line
+        // that expires after nine seconds would hide it.
+        const bool failed = !result.ok || !result.hotkeysOk;
+        if (failed) persistentWarning = result.status;
+        else persistentWarning.clear();
+        setStatus(!failed && result.status != L"Ready" ? std::move(result.status) : std::wstring{},
+                  result.savedReplay, pointer);
         if (result.refreshLibrary && gallery) refreshLibrary();
     }
     if (completion || recovery) syncRecoveryAction();
@@ -346,13 +356,15 @@ void StudioWindow::Impl::configureIntegrations(const AppSettings& applied) {
 
 bool StudioWindow::Impl::addTray() {
     if (tray) return true;
+    // The class icon is shared with every window of the class and must stay
+    // undestroyed, so the tray owns a small copy of its own.
+    if (!trayIcon) trayIcon = loadOwnedSmallAppIcon(reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE)), IDI_APP_ICON);
     NOTIFYICONDATAW data{sizeof(data)};
     data.hWnd = window;
-    data.uID = trayIcon;
+    data.uID = trayIconId;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = trayEvent;
-    data.hIcon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICON));
-    if (!data.hIcon) data.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    data.hIcon = trayIcon ? trayIcon : LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(data.szTip, L"Backtrack");
     tray = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
     return tray;
@@ -362,8 +374,9 @@ void StudioWindow::Impl::removeTray() {
     if (!std::exchange(tray, false)) return;
     NOTIFYICONDATAW data{sizeof(data)};
     data.hWnd = window;
-    data.uID = trayIcon;
+    data.uID = trayIconId;
     Shell_NotifyIconW(NIM_DELETE, &data);
+    if (trayIcon) DestroyIcon(std::exchange(trayIcon, nullptr));
 }
 
 void StudioWindow::Impl::restore() {
@@ -387,7 +400,9 @@ void StudioWindow::Impl::trayMenu() {
 }
 
 void StudioWindow::Impl::close(bool forceExit) {
-    if (closing || shuttingDown || !IsWindowEnabled(window) || !leaveSettings(!forceExit)) return;
+    if (closing || shuttingDown || !IsWindowEnabled(window)) return;
+    // Hiding to the tray keeps the window (and with it an unsaved draft) alive,
+    // so there is nothing to save and no prompt to show.
     if (saved.exitToTray && !forceExit) {
         if (addTray()) ShowWindow(window, SW_HIDE);
         else {
@@ -396,6 +411,10 @@ void StudioWindow::Impl::close(bool forceExit) {
         }
         return;
     }
+    // Exit from the tray runs while the window is hidden; show it first so the
+    // unsaved-changes prompt is visible and focused.
+    if (forceExit) restore();
+    if (!leaveSettings(!forceExit)) return;
     // Arm completion polling before stopping workers so timer failure cannot force a UI-thread join.
     if (!SetTimer(window, shutdownTimer, 50, nullptr)) {
         setStatus(L"Could not start shutdown. Try closing again.");

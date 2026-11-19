@@ -71,6 +71,8 @@ void StudioWindow::Impl::invalidateMotion(Motion slot) {
         InvalidateRect(record, &box, FALSE);
     } else if (slot == replayCheck) {
         InvalidateRect(window, &replayCheckBox, FALSE);
+    } else if (slot == librarySlide) {
+        layoutGallery();
     } else {
         const RECT track = markerTrack(slot);
         InvalidateRect(window, &track, FALSE);

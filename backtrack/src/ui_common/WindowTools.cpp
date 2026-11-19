@@ -11,6 +11,7 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <shobjidl.h>
 #include <wrl/client.h>
 
@@ -396,11 +397,23 @@ uint32_t readUIntControl(HWND control, uint32_t fallback) {
 }
 
 std::wstring bytesToText(uintmax_t bytes) {
-    std::wstringstream stream;
-    const double mib = static_cast<double>(bytes) / (1024.0 * 1024.0);
-    stream.precision(1);
-    stream << std::fixed << mib << L" MiB";
-    return stream.str();
+    wchar_t text[32]{};
+    if (FAILED(StrFormatByteSizeEx(bytes, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, text, ARRAYSIZE(text)))) {
+        return std::to_wstring(bytes) + L" B";
+    }
+    return text;
+}
+
+std::wstring shortDateText(std::filesystem::file_time_type time) {
+    const auto ticks = time.time_since_epoch().count();
+    FILETIME utc{static_cast<DWORD>(ticks), static_cast<DWORD>(static_cast<uint64_t>(ticks) >> 32)};
+    SYSTEMTIME universal{}, local{};
+    wchar_t text[64]{};
+    if (!FileTimeToSystemTime(&utc, &universal) || !SystemTimeToTzSpecificLocalTime(nullptr, &universal, &local) ||
+        !GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, nullptr, text, ARRAYSIZE(text), nullptr)) {
+        return {};
+    }
+    return text;
 }
 
 std::wstring durationToText(uint64_t duration100ns) {

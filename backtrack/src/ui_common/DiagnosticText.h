@@ -9,8 +9,11 @@
 namespace backtrack {
 
 class RecorderController;
-std::array<std::wstring, 3> diagnosticText(RecorderController& controller, const RecordingStats& stats,
+// Runtime and recent-log columns. The encoder column is separate because it only
+// changes when an action re-applies settings, so the window caches it.
+std::array<std::wstring, 2> diagnosticText(RecorderController& controller, const RecordingStats& stats,
     const VoiceCommandStats& voiceStats, const LeagueIntegrationStats& leagueStats);
+std::wstring encoderDiagnosticText(RecorderController& controller);
 std::wstring audioLivenessWarning(const RecordingStats& stats);
 std::wstring exportDiagnostics(HWND window, RecorderController& controller);
 

@@ -253,6 +253,39 @@ void testMixedCaseClipPathsAndStagingNames() {
         "mixed-case rename changed media or lost its sidecar");
 }
 
+void testRenameNameRulesAndOrphanSidecars() {
+    TestRoot root;
+    const auto clip = root.path / L"Clip.mp4";
+    writeFile(clip, "media");
+    const backtrack::ClipManager manager(root.path);
+    expect(manager.renameClip(clip, L"Clip") && readFile(clip) == "media", "same-name rename was not a no-op");
+    expect(backtrack::clipRenameTarget(clip, L"bad\x01name").empty(), "control character was accepted");
+    expect(backtrack::clipRenameTarget(clip, L"named.MP4") == root.path / L"named.mp4", "typed extension was kept");
+    expect(manager.renameClip(clip, L"clip"), "case-only rename was rejected");
+    const auto lower = root.path / L"clip.mp4";
+    bool caseChanged = false;
+    for (const auto& entry : std::filesystem::directory_iterator(root.path)) caseChanged |= entry.path().filename() == L"clip.mp4";
+    expect(caseChanged && readFile(lower) == "media", "case-only rename did not change the name on disk");
+
+    const auto target = root.path / L"next.mp4";
+    writeFile(sidecar(target, L".favorite"), "");
+    writeFile(sidecar(target, L".tags"), "orphan\n");
+    expect(manager.renameClip(lower, L"next.mp4"), "rename with a typed extension failed");
+    expect(readFile(target) == "media" && !std::filesystem::exists(sidecar(target, L".favorite")) &&
+           !std::filesystem::exists(sidecar(target, L".tags")), "renamed clip inherited orphan sidecars");
+
+    const auto other = root.path / L"other.mp4";
+    writeFile(other, "other");
+    expect(backtrack::clipRenameCollides(target, other) && !manager.renameClip(target, L"other"),
+           "rename onto another clip was not refused");
+    expect(manager.setFavorite(other, true) && manager.addTag(other, L"kept"), "could not prepare scan sidecars");
+    const auto clips = manager.listClips();
+    const auto listed = std::find_if(clips.begin(), clips.end(), [&](const auto& info) { return info.path == other; });
+    const auto plain = std::find_if(clips.begin(), clips.end(), [&](const auto& info) { return info.path == target; });
+    expect(clips.size() == 2 && listed != clips.end() && listed->favorite && listed->tags == std::vector<std::wstring>{L"kept"} &&
+           plain != clips.end() && !plain->favorite && plain->tags.empty(), "scan misread sidecars");
+}
+
 void testCancelledScanStopsBeforeReadingClips() {
     TestRoot root;
     const auto library = root.path / L"library";
@@ -278,6 +311,7 @@ int main() {
         testCancelledScanStopsBeforeReadingClips();
         testSidecarRenameFailuresStayNonfatal();
         testMixedCaseClipPathsAndStagingNames();
+        testRenameNameRulesAndOrphanSidecars();
         std::cout << "ClipManagerTests passed\n";
         return 0;
     } catch (const std::exception& error) {

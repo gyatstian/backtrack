@@ -9,7 +9,9 @@
 #include <chrono>
 #include <cwctype>
 #include <fstream>
+#include <thread>
 #include <propsys.h>
+#include <shellapi.h>
 #include <shobjidl.h>
 #include <unordered_set>
 #include <wrl/client.h>
@@ -77,7 +79,8 @@ bool isValidClipStem(const std::wstring& value) {
     if (value.empty() || value.find_first_not_of(L" \t\r\n") == std::wstring::npos) {
         return false;
     }
-    if (value.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) {
+    if (value.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos ||
+        std::any_of(value.begin(), value.end(), [](wchar_t ch) { return ch < 0x20; })) {
         return false;
     }
     if (value.back() == L'.' || iswspace(value.back())) {
@@ -150,7 +153,63 @@ bool isPathInsideDirectory(const std::filesystem::path& path, const std::filesys
            pathText[directoryText.size()] == L'\\';
 }
 
+void sortClips(std::vector<ClipInfo>& clips) {
+    std::sort(clips.begin(), clips.end(), [](const ClipInfo& left, const ClipInfo& right) {
+        if (left.modifiedTime != right.modifiedTime) {
+            return left.modifiedTime > right.modifiedTime;
+        }
+        return left.path.filename().wstring() > right.path.filename().wstring();
+    });
+}
+
+// Recursive count for a folder row. Same clip rules as the level scan: regular,
+// nonempty MP4 files, no reparse points, no legacy staging names.
+size_t countClipsBelow(const std::filesystem::path& root, const std::function<bool()>& cancelled) {
+    size_t count = 0;
+    std::error_code error;
+    std::filesystem::recursive_directory_iterator iterator(
+        root, std::filesystem::directory_options::skip_permission_denied, error);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; !error && iterator != end; iterator.increment(error)) {
+        if (cancelled && cancelled()) break;
+        const auto& entry = *iterator;
+        const auto path = entry.path();
+        if (entry.is_directory(error)) {
+            if (error || (GetFileAttributesW(path.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                iterator.disable_recursion_pending();
+            }
+            error = {};
+            continue;
+        }
+        if (!entry.is_regular_file(error) || error || !hasMp4Extension(path) || isLegacyStagedMp4(path) ||
+            entry.file_size(error) == 0 || error) {
+            error = {};
+            continue;
+        }
+        ++count;
+    }
+    return count;
+}
+
 } // namespace
+
+std::filesystem::path clipRenameTarget(const std::filesystem::path& path, const std::wstring& newStem) {
+    auto stem = trimStem(newStem);
+    // Typing the full name must not produce "name.mp4.mp4".
+    const auto extension = lowercased(path.extension().wstring());
+    if (!extension.empty() && stem.size() > extension.size() &&
+        lowercased(stem.substr(stem.size() - extension.size())) == extension) {
+        stem = trimStem(stem.substr(0, stem.size() - extension.size()));
+    }
+    if (!isValidClipStem(stem)) return {};
+    return path.parent_path() / (stem + path.extension().wstring());
+}
+
+bool clipRenameCollides(const std::filesystem::path& path, const std::filesystem::path& target) {
+    // A case-only rename sees the source itself as the existing target.
+    std::error_code error;
+    return std::filesystem::exists(target, error) && lowercased(target.wstring()) != lowercased(path.wstring());
+}
 
 ClipManager::ClipManager(std::filesystem::path directory)
     : directory_(std::move(directory)) {
@@ -164,7 +223,6 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
     const LogContext::ScopedTask taskContext(L"clips-scan");
     const auto scanStart = std::chrono::steady_clock::now();
     std::vector<ClipInfo> clips;
-    std::unordered_set<std::wstring> liveDurationKeys;
     std::error_code error;
     if (directory_.empty() || !std::filesystem::exists(directory_, error)) {
         if (error) {
@@ -178,76 +236,24 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
     // The root pass also discovers the game folders, so the library root is
     // enumerated once instead of once for discovery and once for its clips.
     std::vector<std::filesystem::path> subRoots;
-    const auto appendDirectoryClips = [&](const std::filesystem::path& scanDirectory,
-                                          std::vector<std::filesystem::path>* discovered) {
-        std::filesystem::directory_iterator iterator(scanDirectory, error);
-        const std::filesystem::directory_iterator end;
-        if (error) {
-            Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + scanDirectory.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-            error = {};
-            return;
-        }
-        for (; iterator != end; iterator.increment(error)) {
-            if (cancelled && cancelled()) return;
-            const auto& entry = *iterator;
-            const auto path = entry.path();
-            if (discovered && ClipStorage::isDirectoryWithoutReparsePoint(path)) {
-                // Same roots ClipStorage::clipRoots yields: each game folder and
-                // its legacy clips child. Deeper levels are not scanned.
-                discovered->push_back(path);
-                const auto legacy = path / L"clips";
-                if (ClipStorage::isDirectoryWithoutReparsePoint(legacy)) {
-                    discovered->push_back(legacy);
-                }
-            }
-            if (!entry.is_regular_file(error) || error || !hasMp4Extension(path) || isLegacyStagedMp4(path)) {
-                error = {};
-                continue;
-            }
-
-            ClipInfo info;
-            info.path = path;
-            info.bytes = entry.file_size(error);
-            if (error) {
-                Logger::instance().warning(L"clips", L"Could not read clip file size: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-                error = {};
-                continue;
-            }
-            info.modifiedTime = entry.last_write_time(error);
-            if (error) {
-                Logger::instance().warning(L"clips", L"Could not read clip modified time: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-                error = {};
-                continue;
-            }
-            // Zero-byte files are transient output-name placeholders that hold
-            // a clip name between selection and MP4 publish; they are not
-            // playable clips and must not appear in the library.
-            if (info.bytes == 0) {
-                continue;
-            }
-            info.duration100ns = cachedMediaDuration(path, info.bytes, info.modifiedTime);
-            info.favorite = std::filesystem::exists(favoriteMarker(path), error);
-            error = {};
-            info.tags = readTags(path);
-            liveDurationKeys.insert(normalizedPathText(path));
-            clips.push_back(std::move(info));
-        }
-        if (error) {
-            Logger::instance().warning(L"clips", L"Could not finish enumerating clips directory: " + scanDirectory.wstring() + L" (" + utf8ToWide(error.message()) + L")");
-            error = {};
-        }
-    };
-
-    appendDirectoryClips(directory_, &subRoots);
+    clips = scanDirectory(directory_, &subRoots, cancelled);
     if (cancelled && cancelled()) return {};
     for (const auto& root : subRoots) {
         if (cancelled && cancelled()) return {};
-        appendDirectoryClips(root, nullptr);
+        // Same roots ClipStorage::clipRoots yields: each game folder and its
+        // legacy clips child. Deeper levels are not scanned.
+        for (const auto& scan : {root, root / L"clips"}) {
+            if (scan != root && !ClipStorage::isDirectoryWithoutReparsePoint(scan)) continue;
+            auto more = scanDirectory(scan, nullptr, cancelled);
+            clips.insert(clips.end(), std::make_move_iterator(more.begin()), std::make_move_iterator(more.end()));
+        }
     }
     if (cancelled && cancelled()) return {};
 
     // Drop cache entries for clips that no longer exist so the cache cannot
     // grow without bound across deletions/renames.
+    std::unordered_set<std::wstring> liveDurationKeys;
+    for (const auto& clip : clips) liveDurationKeys.insert(normalizedPathText(clip.path));
     for (auto it = durationCache_.begin(); it != durationCache_.end();) {
         if (liveDurationKeys.contains(it->first)) {
             ++it;
@@ -256,16 +262,100 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
         }
     }
 
-    std::sort(clips.begin(), clips.end(), [](const ClipInfo& left, const ClipInfo& right) {
-        if (left.modifiedTime != right.modifiedTime) {
-            return left.modifiedTime > right.modifiedTime;
-        }
-        return left.path.filename().wstring() > right.path.filename().wstring();
-    });
+    sortClips(clips);
     const int64_t scanMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - scanStart).count();
     Logger::instance().info(L"clips", L"Library scan complete: " + std::to_wstring(clips.size()) +
         L" clips in " + std::to_wstring(scanMs) + L"ms");
+    return clips;
+}
+
+ClipContents ClipManager::listContents(const std::function<bool()>& cancelled) const {
+    const LogContext::ScopedTask taskContext(L"clips-scan");
+    ClipContents contents;
+    std::error_code error;
+    if (directory_.empty() || !std::filesystem::exists(directory_, error)) {
+        if (error) {
+            Logger::instance().warning(L"clips", L"Could not access clips directory: " + directory_.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        } else {
+            Logger::instance().warning(L"clips", L"Clip directory does not exist: " + directory_.wstring());
+        }
+        return contents;
+    }
+    std::vector<std::filesystem::path> subdirectories;
+    contents.clips = scanDirectory(directory_, &subdirectories, cancelled);
+    if (cancelled && cancelled()) return {};
+    sortClips(contents.clips);
+    for (auto& path : subdirectories) {
+        if (cancelled && cancelled()) return {};
+        contents.folders.push_back({path, path.filename().wstring(), countClipsBelow(path, cancelled)});
+    }
+    std::sort(contents.folders.begin(), contents.folders.end(), [](const ClipFolder& left, const ClipFolder& right) {
+        return lowercased(left.name) < lowercased(right.name);
+    });
+    return contents;
+}
+
+std::vector<ClipInfo> ClipManager::scanDirectory(const std::filesystem::path& scanDirectory,
+                                                 std::vector<std::filesystem::path>* subdirectories,
+                                                 const std::function<bool()>& cancelled) const {
+    std::vector<ClipInfo> clips;
+    std::error_code error;
+    // Sidecars are collected in the same pass instead of probed per clip.
+    std::unordered_set<std::wstring> sidecars;
+    std::filesystem::directory_iterator iterator(scanDirectory, error);
+    const std::filesystem::directory_iterator end;
+    if (error) {
+        Logger::instance().warning(L"clips", L"Could not enumerate clips directory: " + scanDirectory.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+        return clips;
+    }
+    for (; iterator != end; iterator.increment(error)) {
+        if (cancelled && cancelled()) return clips;
+        const auto& entry = *iterator;
+        const auto path = entry.path();
+        if (subdirectories && ClipStorage::isDirectoryWithoutReparsePoint(path)) {
+            subdirectories->push_back(path);
+        }
+        if (auto name = lowercased(path.filename().wstring()); name.ends_with(L".favorite") || name.ends_with(L".tags")) {
+            sidecars.insert(std::move(name));
+            continue;
+        }
+        if (!entry.is_regular_file(error) || error || !hasMp4Extension(path) || isLegacyStagedMp4(path)) {
+            error = {};
+            continue;
+        }
+
+        ClipInfo info;
+        info.path = path;
+        info.bytes = entry.file_size(error);
+        if (error) {
+            Logger::instance().warning(L"clips", L"Could not read clip file size: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            error = {};
+            continue;
+        }
+        info.modifiedTime = entry.last_write_time(error);
+        if (error) {
+            Logger::instance().warning(L"clips", L"Could not read clip modified time: " + path.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+            error = {};
+            continue;
+        }
+        // Zero-byte files are transient output-name placeholders that hold
+        // a clip name between selection and MP4 publish; they are not
+        // playable clips and must not appear in the library.
+        if (info.bytes == 0) {
+            continue;
+        }
+        info.duration100ns = cachedMediaDuration(path, info.bytes, info.modifiedTime);
+        clips.push_back(std::move(info));
+    }
+    for (auto& clip : clips) {
+        const auto name = lowercased(clip.path.filename().wstring());
+        clip.favorite = sidecars.contains(name + L".favorite");
+        if (sidecars.contains(name + L".tags")) clip.tags = readTags(clip.path);
+    }
+    if (error) {
+        Logger::instance().warning(L"clips", L"Could not finish enumerating clips directory: " + scanDirectory.wstring() + L" (" + utf8ToWide(error.message()) + L")");
+    }
     return clips;
 }
 
@@ -290,14 +380,38 @@ bool ClipManager::removeClip(const std::filesystem::path& path) const {
         return false;
     }
 
-    // Delete the media file first and drop favorite/tag sidecars only once the
-    // deletion is confirmed. Removing the markers up front would lose library
+    // Recycle the media file first and drop favorite/tag sidecars only once
+    // that is confirmed. Removing the markers up front would lose library
     // state for a clip that survives a failed delete (locked file, sharing
     // violation, ...).
     std::error_code error;
-    const bool removed = std::filesystem::remove(path, error);
-    if (error || (!removed && std::filesystem::exists(path, error))) {
-        Logger::instance().warning(L"clips", L"Could not delete clip: " + path.wstring() + (error ? L" (" + utf8ToWide(error.message()) + L")" : L""));
+    HRESULT hr = S_OK;
+    // IFileOperation needs a single-threaded apartment, which the caller's thread may not be.
+    std::thread([&] {
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        {
+            Microsoft::WRL::ComPtr<IFileOperation> operation;
+            Microsoft::WRL::ComPtr<IShellItem> item;
+            if (FAILED(com) || FAILED(CoCreateInstance(CLSID_FileOperation, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&operation)))) {
+                // Only a missing shell service falls back to a permanent unlink.
+                std::filesystem::remove(path, error);
+                if (error) hr = HRESULT_FROM_WIN32(static_cast<DWORD>(error.value()));
+            } else {
+                // FOF_WANTNUKEWARNING asks before a drive without a Recycle Bin would delete permanently.
+                hr = operation->SetOperationFlags(FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE | FOF_NOCONFIRMATION |
+                                                  FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING);
+                if (SUCCEEDED(hr)) hr = SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&item));
+                if (SUCCEEDED(hr)) hr = operation->DeleteItem(item.Get(), nullptr);
+                if (SUCCEEDED(hr)) hr = operation->PerformOperations();
+                BOOL aborted = FALSE;
+                if (SUCCEEDED(hr) && SUCCEEDED(operation->GetAnyOperationsAborted(&aborted)) && aborted) hr = E_ABORT;
+            }
+        }
+        if (SUCCEEDED(com)) CoUninitialize();
+    }).join();
+    if (FAILED(hr) || std::filesystem::exists(path, error)) {
+        Logger::instance().warning(L"clips", L"Could not delete clip: " + path.wstring() +
+            (FAILED(hr) ? L" (HRESULT " + std::to_wstring(static_cast<uint32_t>(hr)) + L")" : L""));
         return false;
     }
 
@@ -327,13 +441,15 @@ bool ClipManager::renameClipImpl(const std::filesystem::path& path, const std::w
         return false;
     }
 
-    const std::wstring trimmedStem = trimStem(newStem);
-    if (!isValidClipStem(trimmedStem)) {
+    const auto target = clipRenameTarget(path, newStem);
+    if (target.empty()) {
         return false;
     }
-    auto target = path.parent_path() / (trimmedStem + path.extension().wstring());
+    if (target.filename().native() == path.filename().native()) {
+        return true;
+    }
     std::error_code error;
-    if (std::filesystem::exists(target, error)) {
+    if (clipRenameCollides(path, target)) {
         Logger::instance().warning(L"clips", L"Could not rename clip because the target already exists: " + target.wstring());
         return false;
     }
@@ -348,12 +464,17 @@ bool ClipManager::renameClipImpl(const std::filesystem::path& path, const std::w
     const auto moveSidecar = [&path](const std::filesystem::path& from,
                                       const std::filesystem::path& to, const wchar_t* what) {
         std::error_code sidecarError;
-        if (std::filesystem::exists(from, sidecarError) && !sidecarError) {
-            std::filesystem::rename(from, to, sidecarError);
-            if (sidecarError) {
-                Logger::instance().warning(L"clips", L"Could not rename " + std::wstring(what) +
-                    L" for clip: " + path.wstring() + L" (" + utf8ToWide(sidecarError.message()) + L")");
-            }
+        const bool exists = std::filesystem::exists(from, sidecarError);
+        if (sidecarError) return;
+        if (!exists) {
+            // An orphan left at the target name would otherwise attach to this clip.
+            std::filesystem::remove(to, sidecarError);
+            return;
+        }
+        std::filesystem::rename(from, to, sidecarError);
+        if (sidecarError) {
+            Logger::instance().warning(L"clips", L"Could not rename " + std::wstring(what) +
+                L" for clip: " + path.wstring() + L" (" + utf8ToWide(sidecarError.message()) + L")");
         }
     };
     moveSidecar(favoriteMarker(path), favoriteMarker(target), L"favorite marker");

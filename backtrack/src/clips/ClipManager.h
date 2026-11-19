@@ -17,12 +17,33 @@ struct ClipInfo {
     std::vector<std::wstring> tags;
 };
 
+struct ClipFolder {
+    std::filesystem::path path;
+    std::wstring name;
+    // Clips below the folder at any depth; a folder row shows this count.
+    size_t clips = 0;
+};
+
+// One library level: its immediate folders and the clips directly inside it.
+struct ClipContents {
+    std::vector<ClipFolder> folders;
+    std::vector<ClipInfo> clips;
+};
+
+// The target renameClip would use, or empty when the name is invalid. A
+// trailing source extension in newStem is dropped.
+std::filesystem::path clipRenameTarget(const std::filesystem::path& path, const std::wstring& newStem);
+// True when target exists and is not path itself (a case-only rename).
+bool clipRenameCollides(const std::filesystem::path& path, const std::filesystem::path& target);
+
 class ClipManager {
 public:
     explicit ClipManager(std::filesystem::path directory = {});
 
     void setDirectory(std::filesystem::path directory);
     std::vector<ClipInfo> listClips(const std::function<bool()>& cancelled = {}) const;
+    // The current directory as one library level, for folder-by-folder browsing.
+    ClipContents listContents(const std::function<bool()>& cancelled = {}) const;
     bool removeClip(const std::filesystem::path& path) const;
     bool renameClip(const std::filesystem::path& path, const std::wstring& newStem) const;
     bool setFavorite(const std::filesystem::path& path, bool favorite) const;
@@ -38,6 +59,11 @@ private:
     };
 
     bool isManagedClipPath(const std::filesystem::path& path) const;
+    // Clips directly inside one directory. Subdirectories that are not reparse
+    // points are appended to `subdirectories` in the same pass.
+    std::vector<ClipInfo> scanDirectory(const std::filesystem::path& directory,
+                                        std::vector<std::filesystem::path>* subdirectories,
+                                        const std::function<bool()>& cancelled) const;
     bool renameClipImpl(const std::filesystem::path& path, const std::wstring& newStem,
                         void (*beforeMove)(const std::filesystem::path&)) const;
     std::filesystem::path favoriteMarker(const std::filesystem::path& path) const;

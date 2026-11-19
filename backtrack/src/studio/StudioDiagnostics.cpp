@@ -17,6 +17,8 @@ void StudioWindow::Impl::buildDiagnostics() {
     const auto output = [this](const wchar_t* help) {
         auto edit = make(L"EDIT", L"", WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
                          {}, help);
+        // The margin is in pixels, so updateFont reapplies it on a DPI change.
+        if (edit) controls.at(edit).margin = 6;
         SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(px(6), px(6)));
         return edit;
     };
@@ -98,12 +100,20 @@ void StudioWindow::Impl::updateDiagnostics() {
     }
     if (nav.page != Page::Diagnostics) return;
     const auto text = diagnosticText(controller, stats, voice.stats(), league.stats());
+    // The encoder column only changes when an action applies settings or the
+    // backend is re-initialized, both of which bump the action revision; building
+    // it on every poll would spend the tick on unchanged text.
+    if (encoderText.empty() || encoderTextRevision != actionRevision) {
+        encoderText = encoderDiagnosticText(controller);
+        encoderTextRevision = actionRevision;
+    }
+    const std::array<const std::wstring*, 3> columns{&text[0], &encoderText, &text[1]};
     const auto focusedField = GetFocus();
     std::wstring current;
-    for (size_t i = 0; i < text.size(); ++i) {
+    for (size_t i = 0; i < columns.size(); ++i) {
         const auto field = diagnostics[i];
         if (!field || field == focusedField) continue;
-        const auto& next = text[i];
+        const auto& next = *columns[i];
         const auto length = SendMessageW(field, WM_GETTEXTLENGTH, 0, 0);
         if (static_cast<size_t>(length) == next.size()) {
             current.resize(next.size() + 1);

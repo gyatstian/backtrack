@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <sstream>
+#include <string_view>
 #include <unordered_set>
 
 namespace backtrack {
@@ -51,6 +52,28 @@ uint32_t readUInt(const std::map<std::wstring, std::wstring>& values, const std:
             return fallback;
         }
         return static_cast<uint32_t>(parsed);
+    } catch (...) {
+        return fallback;
+    }
+}
+
+int32_t readInt(const std::map<std::wstring, std::wstring>& values, const std::wstring& key, int32_t fallback) {
+    const auto it = values.find(key);
+    if (it == values.end()) {
+        return fallback;
+    }
+    const auto& text = it->second;
+    const bool negative = !text.empty() && text.front() == L'-';
+    const auto digits = std::wstring_view(text).substr(negative ? 1 : 0);
+    if (digits.empty() || !std::all_of(digits.begin(), digits.end(), [](wchar_t ch) { return iswdigit(ch) != 0; })) {
+        return fallback;
+    }
+    try {
+        const auto parsed = std::stoll(text);
+        if (parsed < (std::numeric_limits<int32_t>::min)() || parsed > (std::numeric_limits<int32_t>::max)()) {
+            return fallback;
+        }
+        return static_cast<int32_t>(parsed);
     } catch (...) {
         return fallback;
     }
@@ -183,6 +206,11 @@ bool isSafeGlobalHotkey(uint32_t modifiers, uint32_t virtualKey) {
         return false;
     }
     modifiers = supportedHotkeyModifiers(modifiers);
+    // Alt+F4 is the system close gesture; registering it would steal closing
+    // from every application instead of binding a capture shortcut.
+    if (virtualKey == VK_F4 && (modifiers & MOD_ALT) != 0) {
+        return false;
+    }
     if (modifiers == 0) {
         return isSafeBareHotkey(virtualKey);
     }
@@ -363,6 +391,11 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
                 readString(values, prefix + L"path", {})};
         });
     settings.startWithWindowsMinimized = readBool(values, L"general.startWithWindowsMinimized", settings.startWithWindowsMinimized);
+    settings.windowLeft = readInt(values, L"ui.windowLeft", settings.windowLeft);
+    settings.windowTop = readInt(values, L"ui.windowTop", settings.windowTop);
+    settings.windowWidth = readInt(values, L"ui.windowWidth", settings.windowWidth);
+    settings.windowHeight = readInt(values, L"ui.windowHeight", settings.windowHeight);
+    settings.windowMaximized = readBool(values, L"ui.windowMaximized", settings.windowMaximized);
     settings.exitToTray = readBool(values, L"general.exitToTray", settings.exitToTray);
     settings.checkForUpdates = readBool(values, L"general.checkForUpdates", settings.checkForUpdates);
     settings.loggingEnabled = readBool(values, L"diagnostics.loggingEnabled", settings.loggingEnabled);
@@ -488,6 +521,11 @@ bool SettingsStore::save(const AppSettings& settings) const {
         output << prefix << L"path=" << app.executablePath.wstring() << L"\n";
     }
     output << L"general.startWithWindowsMinimized=" << (normalized.startWithWindowsMinimized ? 1 : 0) << L"\n";
+    output << L"ui.windowLeft=" << normalized.windowLeft << L"\n";
+    output << L"ui.windowTop=" << normalized.windowTop << L"\n";
+    output << L"ui.windowWidth=" << normalized.windowWidth << L"\n";
+    output << L"ui.windowHeight=" << normalized.windowHeight << L"\n";
+    output << L"ui.windowMaximized=" << (normalized.windowMaximized ? 1 : 0) << L"\n";
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
     output << L"general.checkForUpdates=" << (normalized.checkForUpdates ? 1 : 0) << L"\n";
     output << L"diagnostics.loggingEnabled=" << (normalized.loggingEnabled ? 1 : 0) << L"\n";
@@ -582,6 +620,22 @@ AppSettings sanitizeSettings(AppSettings settings) {
     }
     if (settings.clipDirectory.empty()) {
         settings.clipDirectory = defaultClipDirectory();
+    }
+    // A relative folder would resolve against the working directory, which is
+    // not stable across launches; fall back to the documented default instead.
+    if (!settings.clipDirectory.is_absolute()) {
+        settings.clipDirectory = defaultClipDirectory();
+    }
+    if (!settings.replayRingDirectory.empty() && !settings.replayRingDirectory.is_absolute()) {
+        settings.replayRingDirectory.clear();
+    }
+    // 200 px is the smallest window the layout stays usable at; the upper cap
+    // keeps a corrupted value from producing an unusable off-screen placement.
+    if (settings.windowWidth < 200 || settings.windowHeight < 200) {
+        settings.windowWidth = settings.windowHeight = 0;
+    } else {
+        settings.windowWidth = (std::min)(settings.windowWidth, 20000);
+        settings.windowHeight = (std::min)(settings.windowHeight, 20000);
     }
     return settings;
 }

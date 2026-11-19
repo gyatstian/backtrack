@@ -56,6 +56,7 @@ StudioWindow::Impl::~Impl() {
     DeleteObject(fieldBrush);
     DeleteObject(activeBrush);
     if (appIcon) DestroyIcon(appIcon);
+    if (trayIcon) DestroyIcon(trayIcon);
 }
 
 bool StudioWindow::Impl::create(HINSTANCE instance, int showCommand, bool startMinimized) {
@@ -75,9 +76,21 @@ bool StudioWindow::Impl::create(HINSTANCE instance, int showCommand, bool startM
     wc.hIcon = nullptr;
     if (!registerWindowClass(wc)) return false;
     dpi = GetDpiForSystem();
+    int x = CW_USEDEFAULT, y = CW_USEDEFAULT, width = px(870), height = px(660);
+    if (saved.windowWidth > 0) {
+        const RECT candidate{saved.windowLeft, saved.windowTop,
+                             saved.windowLeft + saved.windowWidth, saved.windowTop + saved.windowHeight};
+        // A display that is gone must not leave the window off-screen.
+        if (MonitorFromRect(&candidate, MONITOR_DEFAULTTONULL)) {
+            x = saved.windowLeft;
+            y = saved.windowTop;
+            width = saved.windowWidth;
+            height = saved.windowHeight;
+        }
+    }
     // Keep native move, snap and maximize behavior without drawing a native caption.
     if (!CreateWindowExW(0, kBacktrackMainWindowClassName, L"Backtrack", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                         CW_USEDEFAULT, CW_USEDEFAULT, px(870), px(660), nullptr, nullptr, instance, this)) return false;
+                         x, y, width, height, nullptr, nullptr, instance, this)) return false;
     const BOOL dark = TRUE;
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
     SetWindowPos(window, nullptr, 0, 0, 0, 0,
@@ -87,7 +100,7 @@ bool StudioWindow::Impl::create(HINSTANCE instance, int showCommand, bool startM
     startSession();
     if (showCommand == SW_HIDE || showCommand == SW_SHOWDEFAULT || showCommand == SW_SHOWMINIMIZED ||
         showCommand == SW_SHOWMINNOACTIVE || showCommand == SW_MINIMIZE) showCommand = SW_SHOWNORMAL;
-    ShowWindow(window, startMinimized ? SW_SHOWMINIMIZED : showCommand);
+    ShowWindow(window, startMinimized ? SW_SHOWMINIMIZED : saved.windowMaximized ? SW_SHOWMAXIMIZED : showCommand);
     return true;
 }
 
@@ -168,8 +181,7 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         updateMotionPreference();
         dpi = GetDpiForWindow(window);
         updateFont();
-        appIcon = LoadIconW(reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE)),
-                            MAKEINTRESOURCEW(IDI_APP_ICON));
+        updateAppIcon();
         titleMinimize = captionButton(Glyph::Minimize, [this] { ShowWindow(window, SW_MINIMIZE); });
         titleClose = captionButton(Glyph::Close, [this] { PostMessageW(window, WM_CLOSE, 0, 0); });
         if (!titleMinimize || !titleClose) return -1;
@@ -234,17 +246,39 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_GETMINMAXINFO: {
         auto& info = *reinterpret_cast<MINMAXINFO*>(lp);
-        info.ptMinTrackSize = {px(570), px(390 + theme::titleBarHeight)};
+        info.ptMinTrackSize = {px(640), px(390 + theme::titleBarHeight)};
         return 0;
     }
     case WM_DPICHANGED: {
         dpi = LOWORD(wp);
         updateFont();
+        updateAppIcon();
         const auto& r = *reinterpret_cast<RECT*>(lp);
         SetWindowPos(window, nullptr, r.left, r.top, extent(r.left, r.right), extent(r.top, r.bottom), SWP_NOZORDER | SWP_NOACTIVATE);
         layout();
         return 0;
     }
+    case WM_ACTIVATE: {
+        if (LOWORD(wp) == WA_INACTIVE) {
+            const auto focus = GetFocus();
+            if (focus && (focus == window || IsChild(window, focus))) lastFocus = focus;
+        } else if (!closing && lastFocus && IsWindow(lastFocus) && IsWindowVisible(lastFocus)) {
+            SetFocus(lastFocus);
+        }
+        return 0;
+    }
+    case WM_QUERYENDSESSION: return TRUE;
+    case WM_ENDSESSION:
+        // Windows terminates the process after this message, so the recording
+        // has to be finalized and every worker joined here: the timer-driven
+        // close path would never run.
+        if (wp && !shuttingDown) {
+            closing = true;
+            EnableWindow(window, FALSE);
+            shutdown();
+            PostQuitMessage(0);
+        }
+        return 0;
     case WM_ENTERSIZEMOVE:
         sizing = true;
         stopMotion();
@@ -268,6 +302,10 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_SETTINGCHANGE:
         updateMotionPreference();
+        break;
+    case WM_MOUSEWHEEL:
+    case WM_XBUTTONUP:
+        if (libraryInput(msg, wp)) return 0;
         break;
     case WM_ENABLE:
         if (!wp) stopMotion();
@@ -462,8 +500,13 @@ LRESULT StudioWindow::Impl::bodyMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         scrollTo(y);
         return 0;
     }
+    case WM_XBUTTONUP:
+        if (hwnd == body && libraryInput(msg, wp)) return 0;
+        break;
     case WM_MOUSEWHEEL: {
         if (hwnd != body) break;
+        // The library scrolls its gallery wherever the wheel is on the page.
+        if (libraryInput(msg, wp)) return 0;
         UINT lines = 3;
         SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
         RECT r{};
@@ -534,6 +577,9 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
         self.clickOrigin = previous;
         return result;
     }
+    case WM_XBUTTONUP:
+        if (self.libraryInput(msg, wp)) return 0;
+        break;
     case WM_SETFOCUS:
         self.ensureVisible(hwnd);
         [[fallthrough]];
@@ -543,6 +589,7 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
         break;
     case WM_MOUSEWHEEL:
         if (!it->second.combo || !SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0)) {
+            if (self.libraryInput(msg, wp)) return 0;
             const bool library = self.nav.page == Page::Library;
             auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             if (!library && GetParent(hwnd) == self.body && !(style & WS_VSCROLL && style & ES_MULTILINE))
@@ -575,6 +622,7 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
     case WM_NCDESTROY:
         if (self.hovered == hwnd) self.hovered = nullptr;
         if (self.focused == hwnd) self.focused = nullptr;
+        if (self.lastFocus == hwnd) self.lastFocus = nullptr;
         if (self.save == hwnd) self.save = nullptr;
         self.controls.erase(it);
         RemoveWindowSubclass(hwnd, controlProc, id);
@@ -584,7 +632,11 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
 }
 
 void StudioWindow::Impl::open(Page page, bool pointer) {
-    if (nav.page == page && body) return;
+    if (nav.page == page && body) {
+        // Library is also the way out of an open folder.
+        if (page == Page::Library) libraryToRoot();
+        return;
+    }
     if (nav.page != page && !leaveSettings(false)) return;
     buildPage({page, nav.category});
     syncNav(pointer);
@@ -661,12 +713,50 @@ void StudioWindow::Impl::updateFont() {
                     DEFAULT_PITCH, L"Bahnschrift SemiLight"));
     for (const auto& [hwnd, control] : controls) {
         SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        // Edit margins are in pixels, so they need the new DPI scale.
+        if (control.margin)
+            SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                         MAKELPARAM(px(control.margin), px(control.margin)));
         if (control.combo) {
             SendMessageW(hwnd, CB_SETITEMHEIGHT, -1, px(21));
             SendMessageW(hwnd, CB_SETITEMHEIGHT, 0, px(22));
         }
     }
     DeleteObject(previousFont);
+}
+
+void StudioWindow::Impl::updateAppIcon() {
+    if (appIcon) DestroyIcon(appIcon);
+    appIcon = loadOwnedAppIcon(reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE)),
+                               IDI_APP_ICON, px(16));
+}
+
+void StudioWindow::Impl::saveWindowPlacement() {
+    if (!window || !readable) return;
+    WINDOWPLACEMENT placement{sizeof(placement)};
+    if (!GetWindowPlacement(window, &placement)) return;
+    const auto& normal = placement.rcNormalPosition;
+    auto updated = saved;
+    updated.windowLeft = normal.left;
+    updated.windowTop = normal.top;
+    updated.windowWidth = normal.right - normal.left;
+    updated.windowHeight = normal.bottom - normal.top;
+    updated.windowMaximized = placement.showCmd == SW_SHOWMAXIMIZED;
+    if (updated == saved) return;
+    // Placement is not a draft field: publish the saved baseline with the new
+    // geometry, never the unsaved page edits, and keep the draft in step so a
+    // pending edit stays the only dirty difference.
+    if (!store.save(updated)) return;
+    saved = std::move(updated);
+    draft.windowLeft = saved.windowLeft;
+    draft.windowTop = saved.windowTop;
+    draft.windowWidth = saved.windowWidth;
+    draft.windowHeight = saved.windowHeight;
+    draft.windowMaximized = saved.windowMaximized;
+}
+
+bool StudioWindow::Impl::keyboardCuesHidden() const {
+    return (SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS) != 0;
 }
 
 void StudioWindow::Impl::layout(bool newPage) {
@@ -709,7 +799,9 @@ void StudioWindow::Impl::layout(bool newPage) {
                             (std::max)(0, static_cast<int>(rect.bottom) - bodyTop - px(theme::footerHeight)));
         if (nav.page == Page::Library) layoutGallery();
         else if (nav.page == Page::Diagnostics) layoutDiagnostics();
-        else layoutRows(!newPage && !tabsChanged);
+        // layout() repaints the window and all children once it has positioned
+        // everything, so the row pass must not queue its own.
+        else layoutRows(!newPage && !tabsChanged, false);
     }
     layoutFooter(rect);
     redrawWindowAndChildren(window);
@@ -744,13 +836,15 @@ void StudioWindow::Impl::section(const wchar_t* title) {
     rows.push_back({{}, title, 38});
 }
 
-void StudioWindow::Impl::layoutRows(bool heightOnly) {
+void StudioWindow::Impl::layoutRows(bool heightOnly, bool repaint) {
     if (!body || arranging) return;
     arranging = true;
     RECT r{};
     GetClientRect(body, &r);
     int content = px(8);
-    for (const auto& item : rows) content += px(item.height);
+    for (const auto& item : rows) {
+        if (!item.hidden) content += px(item.height);
+    }
     const int previousScroll = scroll;
     SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS, 0, content - 1,
                     static_cast<UINT>(r.bottom), scroll};
@@ -793,7 +887,7 @@ void StudioWindow::Impl::layoutRows(bool heightOnly) {
         y += height;
     }
     applyWindowMoves(moves);
-    redrawWindowAndChildren(body);
+    if (repaint) redrawWindowAndChildren(body);
     arranging = false;
 }
 
@@ -852,6 +946,58 @@ void StudioWindow::Impl::paintTitleBar(HDC dc, int width) {
     theme::fill(dc, {0, height - 1, width, height}, theme::rule);
 }
 
+void StudioWindow::Impl::buildCaptionGlyphs() {
+    captionGlyphDpi = dpi;
+    const double scale = dpi / 96.0;
+    constexpr int samples = 8;
+    for (const auto glyph : {Glyph::Minimize, Glyph::Close}) {
+        const bool close = glyph == Glyph::Close;
+        const double halfWidth = (close ? 5.0 : 5.5) * scale, halfHeight = close ? 4.0 * scale : 0.0;
+        const double lengthSquared = halfWidth * halfWidth + halfHeight * halfHeight;
+        // Even extents keep the mask centered on the caption button's center:
+        // an odd span would shift one side of the glyph by half a pixel.
+        const int rawWidth = static_cast<int>(std::ceil(2 * (halfWidth + scale)));
+        const int rawHeight = static_cast<int>(std::ceil(2 * (halfHeight + scale)));
+        const int width = (std::max)(2, rawWidth + (rawWidth & 1));
+        const int height = (std::max)(2, rawHeight + (rawHeight & 1));
+        const size_t index = static_cast<size_t>(glyph) - 1;
+        captionGlyphSize[index] = {width, height};
+        auto& alpha = captionGlyphAlpha[index];
+        alpha.assign(static_cast<size_t>(width) * height, 0);
+        const double cx = width / 2.0, cy = height / 2.0;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                int covered = 0;
+                for (int sy = 0; sy < samples; ++sy) {
+                    for (int sx = 0; sx < samples; ++sx) {
+                        const double u = std::abs(x - cx + (sx + 0.5) / samples);
+                        const double v = std::abs(y - cy + (sy + 0.5) / samples);
+                        if (!close) {
+                            covered += u < halfWidth && v < scale;
+                            continue;
+                        }
+                        const double t = (std::min)(1.0, (u * halfWidth + v * halfHeight) / lengthSquared);
+                        const double dx = u - t * halfWidth, dy = v - t * halfHeight;
+                        covered += dx * dx + dy * dy < scale * scale;
+                    }
+                }
+                alpha[static_cast<size_t>(y) * width + x] = static_cast<BYTE>(covered * 255 / (samples * samples));
+            }
+        }
+        // The sample grid is anchored on the pixel corner, so mirror the drawn
+        // half instead of relying on the coverage arithmetic to be symmetric.
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width / 2; ++x) {
+                alpha[static_cast<size_t>(y) * width + (width - 1 - x)] = alpha[static_cast<size_t>(y) * width + x];
+            }
+        }
+        for (int y = 0; y < height / 2; ++y) {
+            std::copy_n(alpha.begin() + static_cast<std::ptrdiff_t>(y) * width, width,
+                        alpha.begin() + static_cast<std::ptrdiff_t>(height - 1 - y) * width);
+        }
+    }
+}
+
 void StudioWindow::Impl::paintCaptionButton(const DRAWITEMSTRUCT& item, Glyph glyph) {
     const bool down = (item.itemState & ODS_SELECTED) != 0;
     const bool hot = hovered == item.hwndItem;
@@ -862,34 +1008,23 @@ void StudioWindow::Impl::paintCaptionButton(const DRAWITEMSTRUCT& item, Glyph gl
     theme::fill(item.hDC, r, background);
     if (!down && !hot) theme::fill(item.hDC, {r.left, r.bottom - 1, r.right, r.bottom}, theme::rule);
 
-    const double cx = (r.left + r.right) / 2.0, cy = (r.top + r.bottom) / 2.0;
-    const double scale = dpi / 96.0;
-    const double halfWidth = (close ? 5.0 : 5.5) * scale, halfHeight = close ? 4.0 * scale : 0.0;
-    const double lengthSquared = halfWidth * halfWidth + halfHeight * halfHeight;
     const auto ink = hot || down ? theme::text : theme::muted;
-    constexpr int samples = 8;
-    // Sample pixel area around the exact button center, including between pixels.
-    for (int y = static_cast<int>(std::floor(cy - halfHeight - scale)); y < cy + halfHeight + scale; ++y) {
-        for (int x = static_cast<int>(std::floor(cx - halfWidth - scale)); x < cx + halfWidth + scale; ++x) {
-            int covered = 0;
-            for (int sy = 0; sy < samples; ++sy) {
-                for (int sx = 0; sx < samples; ++sx) {
-                    const double u = std::abs(x - cx + (sx + 0.5) / samples);
-                    const double v = std::abs(y - cy + (sy + 0.5) / samples);
-                    if (!close) {
-                        covered += u < halfWidth && v < scale;
-                        continue;
-                    }
-                    const double t = (std::min)(1.0, (u * halfWidth + v * halfHeight) / lengthSquared);
-                    const double dx = u - t * halfWidth, dy = v - t * halfHeight;
-                    covered += dx * dx + dy * dy < scale * scale;
-                }
-            }
+    if (!captionGlyphSize[0].cx || captionGlyphDpi != dpi) buildCaptionGlyphs();
+    const size_t index = static_cast<size_t>(glyph) - 1;
+    const auto& alpha = captionGlyphAlpha[index];
+    const auto size = captionGlyphSize[index];
+    if (alpha.empty()) return;
+    const int left = (r.left + r.right) / 2 - size.cx / 2;
+    const int top = (r.top + r.bottom) / 2 - size.cy / 2;
+    const auto mix = [](int bg, int fg, int covered) { return bg + (covered * (fg - bg) + 127) / 255; };
+    for (int y = 0; y < size.cy; ++y) {
+        for (int x = 0; x < size.cx; ++x) {
+            const int covered = alpha[static_cast<size_t>(y) * size.cx + x];
             if (!covered) continue;
-            const auto mix = [&](int bg, int fg) { return bg + (covered * (fg - bg) + samples * samples / 2) / (samples * samples); };
-            SetPixelV(item.hDC, x, y, RGB(mix(GetRValue(background), GetRValue(ink)),
-                                         mix(GetGValue(background), GetGValue(ink)),
-                                         mix(GetBValue(background), GetBValue(ink))));
+            SetPixelV(item.hDC, left + x, top + y,
+                      RGB(mix(GetRValue(background), GetRValue(ink), covered),
+                          mix(GetGValue(background), GetGValue(ink), covered),
+                          mix(GetBValue(background), GetBValue(ink), covered)));
         }
     }
 }
@@ -914,16 +1049,20 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
     const bool quiet = tone == ButtonTone::Quiet;
     const auto base = selected || tone == ButtonTone::Primary ? theme::active : navigation || quiet ? theme::surface : theme::field;
     theme::fill(dc, r, !navigation && down ? theme::press : !navigation && hot ? theme::hover : base);
+    // Windows reports a suppressed focus rectangle through ODS_NOFOCUSRECT
+    // (pointer-driven focus, or cues hidden); the theme outline follows the same
+    // rule as the native one.
+    const bool focusCue = (item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS;
     if (navigation) {
-        if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) {
+        if (focusCue) {
             RECT focus = r;
             InflateRect(&focus, -px(3), -px(1));
-            DrawFocusRect(dc, &focus);
+            theme::frame(dc, focus, theme::accent);
         }
         r.bottom += px(theme::navUnderlineBand);
     } else {
         if (!quiet) theme::frame(dc, r, disabled ? theme::rule : theme::border);
-        if (item.itemState & ODS_FOCUS) {
+        if (focusCue) {
             RECT focus = r;
             InflateRect(&focus, -px(3), -px(3));
             theme::frame(dc, focus, theme::accent);
@@ -963,7 +1102,7 @@ void StudioWindow::Impl::paintCheckbox(HWND hwnd, HDC dc) {
         SelectObject(dc, old);
         DeleteObject(pen);
     }
-    if (GetFocus() == hwnd) theme::frame(dc, r, theme::accent);
+    if (GetFocus() == hwnd && !keyboardCuesHidden()) theme::frame(dc, r, theme::accent);
     r.left += px(24);
     if (!RectVisible(dc, &r)) return;
     SetBkMode(dc, TRANSPARENT);
@@ -985,7 +1124,7 @@ void StudioWindow::Impl::paintCombo(const DRAWITEMSTRUCT& item) {
     SetBkMode(item.hDC, TRANSPARENT);
     SetTextColor(item.hDC, (item.itemState & ODS_DISABLED) ? theme::disabled : theme::text);
     SelectObject(item.hDC, font);
-    if (item.itemState & ODS_FOCUS) theme::frame(item.hDC, r, theme::accent);
+    if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) theme::frame(item.hDC, r, theme::accent);
     InflateRect(&r, -px(6), 0);
     DrawTextW(item.hDC, label.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 }
@@ -1012,6 +1151,7 @@ void StudioWindow::Impl::paintFooter(bool animateCheck) {
         text.append(line);
     };
     append(hint);
+    append(persistentWarning);
     append(audioWarning);
     if (motions[replayCheck].to != static_cast<float>(replaySaved))
         setMotion(replayCheck, static_cast<float>(replaySaved), replaySaved && animateCheck);
@@ -1037,6 +1177,15 @@ bool StudioWindow::Impl::editHotkey(HWND field, uint32_t modifiers, uint32_t key
     if (key == VK_DELETE || key == VK_BACK) modifiers = key = 0;
     modifiers = supportedHotkeyModifiers(modifiers);
     if (!isSafeGlobalHotkey(modifiers, key)) { setStatus(L"Hotkeys for normal keys need Ctrl or Alt"); return true; }
+    const bool startStop = it->second.first == &draft.hotkeys.startStopModifiers;
+    const uint32_t otherModifiers = startStop ? draft.hotkeys.saveReplayModifiers : draft.hotkeys.startStopModifiers;
+    const uint32_t otherKey = startStop ? draft.hotkeys.saveReplayVirtualKey : draft.hotkeys.startStopVirtualKey;
+    // Letting sanitizeSettings resolve a duplicate would silently reset the
+    // replay binding; refuse the edit while both fields are still on screen.
+    if (key && key == otherKey && modifiers == otherModifiers) {
+        setStatus(startStop ? L"That shortcut already saves a replay." : L"That shortcut already starts and stops recording.");
+        return true;
+    }
     *it->second.first = modifiers;
     *it->second.second = key;
     setText(field, hotkeyDisplay(modifiers, key));

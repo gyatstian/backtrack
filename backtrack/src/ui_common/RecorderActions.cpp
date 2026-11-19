@@ -64,6 +64,7 @@ ControllerActionResult executeRecorderAction(RecorderController& controller, con
     switch (action.kind) {
     case ControllerActionKind::Startup:
         result.ok = controller.updateSettings(action.settings);
+        result.hotkeysOk = action.hotkeysOk;
         result.status = result.ok
             ? L"Ready"
             : actionFailureStatus(L"Capture could not start", controller.encoderCapabilities(), controller.stats());
@@ -71,6 +72,7 @@ ControllerActionResult executeRecorderAction(RecorderController& controller, con
         break;
     case ControllerActionKind::ApplySettings:
         result.ok = controller.updateSettings(action.settings);
+        result.hotkeysOk = action.hotkeysOk;
         result.status = result.ok
             ? L"Settings saved"
             : actionFailureStatus(L"Settings saved, but capture could not restart", controller.encoderCapabilities(), controller.stats());

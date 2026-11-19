@@ -233,9 +233,22 @@ void testStopUnblocksStalledCheck() {
 
 } // namespace
 
+void testVersionComparison() {
+    using backtrack::isNewerVersion;
+    const auto current = backtrack::kCurrentAppVersion;
+    expect(isNewerVersion(L"v1.98", current), "a later release was not detected as newer");
+    expect(!isNewerVersion(current, current), "the running version read as newer than itself");
+    expect(!isNewerVersion(L"v1.9", L"v1.97"), "1.9 must not compare as newer than 1.97");
+    expect(isNewerVersion(L"1.97.1", L"v1.97"), "a patch release was not detected as newer");
+    expect(!isNewerVersion(L"v0.9", L"v1.97"), "an older release compared as newer");
+    expect(isNewerVersion(L"V2", L"v1.97"), "an uppercase prefix or missing parts broke the comparison");
+    expect(!isNewerVersion(L"test-update-version", L"v1.97"), "a non-numeric tag compared as newer");
+}
+
 int main() {
     try {
         Winsock winsock;
+        testVersionComparison();
         testSuccessfulCheck(false);
         testSuccessfulCheck(true);
         testSlowProgressHasTotalDeadline();

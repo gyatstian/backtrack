@@ -91,10 +91,12 @@ build.
     hard/symbolic linked settings files, staging-shaped destinations, load
     statuses, chunked parsing, failed-save retry, app-name injection, a
     BOM-prefixed first key, an over-long line dropped, and app lists surviving a
-    missing or short `.count`.
+    missing or short `.count`. also the Alt+F4 hotkey rule, relative folder
+    fallbacks, and the window-placement keys with their clamps and round trip.
   - `ClipManagerTests` - `clips/ClipManager.cpp`, `core/Logger.cpp`,
-    `LIBS propsys`: linked sidecars, failed tag publication, a rename race, the
-    supported clip roots, and scan cancellation.
+    `LIBS propsys`: linked sidecars, failed tag publication, a rename race, rename
+    name rules and orphan sidecars, scan sidecar flags, the supported clip
+    roots, and scan cancellation.
   - `AudioPersistenceTests` - `audio/AudioMix.cpp`, `audio/WavReader.cpp`,
     `mux/WavWriter.cpp`, `core/Logger.cpp`: the mix source policy (read-denied
     and locked WAVs fail, absent or empty tracks stay video-only), the full-gap
@@ -193,8 +195,9 @@ build.
   - `ReleaseCheckTests` - `ui_common/RecorderActions.cpp`'s
     `fetchReleaseVersion` against a loopback HTTP server (`LIBS ws2_32`):
     request path, GitHub accept header and build user agent, the total deadline
-    that bounds a slow body, and prompt return once the stop flag is set on a
-    stalled response.
+    that bounds a slow body, prompt return once the stop flag is set on a
+    stalled response, and the numeric version comparison behind the update
+    notice.
   - `StudioWindowTests` - off-thread startup preparation, main page navigation
     and nonblocking close during held startup, and rejection of the diagnostics
     logging toggle during startup. covers custom frame geometry, caption hit
@@ -204,8 +207,9 @@ build.
     invalid, disabled desktop gain field preserves the saved gain and pinned
     output. also covers recovery visibility, batched live resize and wheel
     input, height-only resize, clamped scroll no-ops, and gallery geometry and
-    async edits including rename during refresh. checks marker paint, immediate
-    keyboard selection, and elapsed-time motion and reversal.
+    async edits including rename during refresh. checks narrow windows scroll
+    only by their visible rows. checks marker paint, immediate keyboard
+    selection, and elapsed-time motion and reversal.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` and
   `StorageLayoutTests` define `Mp4Muxer::muxToMp4` and

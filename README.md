@@ -8,16 +8,24 @@ lightweight clipping software that works with both nvidia (nvenc) and amd (amf).
 ## ui
 
 drag the title bar to move the window, or double-click it to maximize or restore.
+the window reopens at the position, size, and maximized state it was closed with, unless that spot is on a display that is gone.
+
+with **Close to the tray** on, closing the window only hides it, so unsaved
+settings stay in the window; **Exit** on the tray menu quits and asks about them.
+a recorder or hotkey failure stays in the footer until a later action succeeds.
 
 **Settings** opens a row of categories below the main tabs.
 replay notification sound is under **Settings → Audio**, and monitor options
 are under **Settings → Capture**. **Recover failed recording** appears on
-Capture only when there is a recording to recover. the library is gallery-only.
+Capture only when there is a recording to recover. the library is gallery-only,
+and deleting a clip moves it to the Recycle Bin. the library browses folder by
+folder: clicking a folder opens it, **Back** returns to the folder before it, and
+the **Library** tab always returns to the top of the library.
 
 with Windows animation effects enabled, the underline slides between clicked
-tabs, the record icon changes shape after recording starts or stops, and a
-checkmark draws after a replay saves. keyboard and hotkey actions stay
-immediate.
+tabs, the record icon changes shape after recording starts or stops, opening a
+folder slides the library in, and a checkmark draws after a replay saves.
+keyboard and hotkey actions stay immediate.
 
 ## amd
 i dont use amd, some features might not work. dont expect much
@@ -143,7 +151,7 @@ ctest --test-dir build -C Release
 
 34 suites always build. `NvencLifecycleTests` and `AmfEncoderTests` are added when the NVENC and AMF headers are found (both are vendored), and `AudioDenoiseTests` when noise suppression is enabled. What each suite covers is listed in `backtrack/tests/AGENTS.md`.
 
-The recording and replay hotkeys are configurable in Settings. The clip folder is configurable in the Capture settings. Audio devices, sound separation, resolution, encoder tuning, GPU protection, and game integrations are all configured in the Settings page.
+The recording and replay hotkeys are configurable in Settings. A hotkey needs Ctrl or Alt unless it is a function or media key, Alt+F4 is refused, and the replay shortcut cannot repeat the recording one. The replay shortcut is registered only while replay is enabled, so its key stays available to other apps otherwise. Settings that Windows clamps (for example an out-of-range frame rate) are saved at the nearest allowed value, and the footer says so. The clip folder is configurable in the Capture settings. Audio devices, sound separation, resolution, encoder tuning, GPU protection, and game integrations are all configured in the Settings page.
 
 clip overlap is configurable as the last setting in Settings → Capture. it defaults to 3 seconds: consecutive saves include new footage plus overlap from the previous clip, aligned to a keyframe. 0 removes intentional overlap; it does not force full-length replays.
 

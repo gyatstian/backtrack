@@ -22,6 +22,8 @@ constexpr auto hotkeyHelp = L"Focus this field and press a shortcut. Press Delet
 
 HWND StudioWindow::Impl::editField(const std::wstring& value, DWORD style, ControlEvent onChange, const wchar_t* help) {
     const auto field = make(L"EDIT", value.c_str(), WS_TABSTOP | WS_VISIBLE | WS_BORDER | style, std::move(onChange), help);
+    // The margin is in pixels, so updateFont reapplies it on a DPI change.
+    if (field) controls.at(field).margin = 5;
     SendMessageW(field, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(px(5), px(5)));
     return field;
 }
@@ -247,12 +249,15 @@ void StudioWindow::Impl::changed() {
 bool StudioWindow::Impl::saveSettings(bool refreshPage) {
     if (const auto invalid = invalidNumber()) {
         SetFocus(invalid);
-        setStatus(L"Enter a whole number between 0 and 4,294,967,295.");
+        setStatus(L"Enter a whole number.");
         return false;
     }
     if (busy || shuttingDown) { setStatus(L"Recorder is busy. Try saving again when it finishes."); return false; }
     if (!readable) { setStatus(L"Settings could not be read at startup. Restart after the file becomes readable."); return false; }
     const auto candidate = sanitizeSettings(draft);
+    // sanitizeSettings clamps on save, so a difference here means a value the
+    // user typed was adjusted rather than stored as written.
+    const bool adjusted = candidate != draft;
     if (candidate != saved) {
         const auto ensure = [this](const std::filesystem::path& directory, const wchar_t* label) {
             if (directory.empty()) return true;
@@ -266,16 +271,23 @@ bool StudioWindow::Impl::saveSettings(bool refreshPage) {
         if ((candidate.replay.diskBackedVideo || candidate.replay.diskBackedAudio) &&
             candidate.replayRingDirectory != candidate.clipDirectory &&
             !ensure(candidate.replayRingDirectory, L"Replay folder")) return false;
-        if (const auto error = publishWindowSettings(store, controller, saved, candidate, readable)) {
-            setStatus(error);
+        bool published = false;
+        const auto warning = publishWindowSettings(store, controller, saved, candidate, readable, &published);
+        if (!published) {
+            setStatus(warning);
             return false;
         }
         ControllerAction settings;
         settings.kind = ControllerActionKind::ApplySettings;
         settings.settings = saved;
-        settings.hotkeysOk = hotkeys.registerHotkeys(window, saved.hotkeys);
+        settings.hotkeysOk = hotkeys.registerHotkeys(window, registeredHotkeys(saved));
         settings.hotkeyError = hotkeys.lastErrorMessage();
-        submit(std::move(settings), L"Settings saved. Applying capture changes\u2026");
+        // The startup-entry warning outranks the clamp notice: it names
+        // something the user has to act on.
+        const std::wstring applied = warning ? warning
+            : adjusted ? L"Saved; some values were adjusted to their allowed range"
+                       : L"Settings saved. Applying capture changes\u2026";
+        submit(std::move(settings), applied.c_str());
     }
     const bool normalized = draft != saved;
     if (normalized) draft = saved;

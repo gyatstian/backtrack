@@ -253,6 +253,13 @@ struct AppSettings {
     bool followMouseMonitor = false;
     bool captureCursor = true;
     bool loggingEnabled = true;
+    // Restored window placement in virtual-screen coordinates. A zero size
+    // means "no stored placement" and the window opens at the default size.
+    int32_t windowLeft = 0;
+    int32_t windowTop = 0;
+    int32_t windowWidth = 0;
+    int32_t windowHeight = 0;
+    bool windowMaximized = false;
     bool operator==(const AppSettings&) const = default;
 };
 

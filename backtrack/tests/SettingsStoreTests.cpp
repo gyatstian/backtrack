@@ -544,6 +544,83 @@ void testBomAndOverlongLine() {
         "an over-long settings line swallowed the key after it");
 }
 
+void testHotkeySafety() {
+    using backtrack::isSafeGlobalHotkey;
+    expect(!isSafeGlobalHotkey(MOD_ALT, VK_F4), "Alt+F4 must be rejected as a global hotkey");
+    expect(!isSafeGlobalHotkey(MOD_ALT | MOD_CONTROL | MOD_SHIFT, VK_F4),
+        "Alt+F4 with extra modifiers must be rejected");
+    expect(isSafeGlobalHotkey(MOD_CONTROL, VK_F4), "Ctrl+F4 is a valid hotkey");
+    expect(isSafeGlobalHotkey(0, VK_F4), "a bare function key is a valid hotkey");
+    expect(isSafeGlobalHotkey(0, 0), "an unbound hotkey is valid");
+
+    AppSettings settings;
+    settings.hotkeys.startStopModifiers = MOD_ALT;
+    settings.hotkeys.startStopVirtualKey = VK_F4;
+    const AppSettings defaults;
+    const auto normalized = backtrack::sanitizeSettings(settings);
+    expect(normalized.hotkeys.startStopVirtualKey == defaults.hotkeys.startStopVirtualKey &&
+           normalized.hotkeys.startStopModifiers == defaults.hotkeys.startStopModifiers,
+        "an Alt+F4 start/stop binding was not reset to the default");
+}
+
+void testRelativeFolderFallbacks() {
+    const auto fallback = backtrack::defaultClipDirectory();
+    AppSettings settings;
+    settings.clipDirectory = L"relative\\clips";
+    settings.replayRingDirectory = L"relative\\ring";
+    auto normalized = backtrack::sanitizeSettings(settings);
+    expect(normalized.clipDirectory == fallback, "a relative clip folder was kept");
+    expect(normalized.replayRingDirectory.empty(), "a relative buffer folder was kept");
+
+    settings.clipDirectory = fallback;
+    settings.replayRingDirectory = L"ring";
+    normalized = backtrack::sanitizeSettings(settings);
+    expect(normalized.clipDirectory == fallback && normalized.replayRingDirectory.empty(),
+        "a relative buffer folder was not replaced by the clip folder default");
+
+    settings.replayRingDirectory = L"D:\\Ring";
+    normalized = backtrack::sanitizeSettings(settings);
+    expect(normalized.replayRingDirectory == L"D:\\Ring", "an absolute buffer folder was replaced");
+}
+
+void testWindowPlacementPersistence() {
+    const auto path = testRoot() / L"placement" / L"settings.ini";
+    const SettingsStore store(path);
+    expect(AppSettings{}.windowWidth == 0, "the default window size no longer means unset");
+
+    AppSettings settings;
+    settings.windowLeft = -1200;
+    settings.windowTop = 40;
+    settings.windowWidth = 1280;
+    settings.windowHeight = 900;
+    settings.windowMaximized = true;
+    expect(store.save(settings), "could not save a window placement");
+    const auto loaded = store.load();
+    expect(loaded.windowLeft == -1200 && loaded.windowTop == 40 && loaded.windowWidth == 1280 &&
+           loaded.windowHeight == 900 && loaded.windowMaximized,
+        "the window placement did not round trip");
+
+    AppSettings degenerate;
+    degenerate.windowLeft = 5;
+    degenerate.windowWidth = 10;
+    degenerate.windowHeight = 10;
+    auto normalized = backtrack::sanitizeSettings(degenerate);
+    expect(normalized.windowWidth == 0 && normalized.windowHeight == 0,
+        "a degenerate window size was kept as a placement");
+
+    writeBytes(path, "ui.windowLeft=-8\nui.windowTop=7\nui.windowWidth=99999\nui.windowHeight=400\n"
+                     "ui.windowMaximized=1\n");
+    const auto capped = store.load();
+    expect(capped.windowLeft == -8 && capped.windowTop == 7 && capped.windowWidth == 20000 &&
+           capped.windowHeight == 400 && capped.windowMaximized,
+        "a stored window size was not capped");
+
+    writeBytes(path, "ui.windowWidth=bad\nui.windowHeight=-400\n");
+    const auto malformed = store.load();
+    expect(malformed.windowWidth == 0 && malformed.windowHeight == 0,
+        "a malformed window size was not treated as unset");
+}
+
 } // namespace
 
 int main() {
@@ -563,6 +640,9 @@ int main() {
         testAppListCountBoundsAndGaps();
         testResolutionPersistence();
         testReplayOverlapPersistence();
+        testHotkeySafety();
+        testRelativeFolderFallbacks();
+        testWindowPlacementPersistence();
         std::filesystem::remove_all(testRoot());
         std::cout << "SettingsStoreTests passed\n";
         return 0;

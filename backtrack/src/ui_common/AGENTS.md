@@ -13,7 +13,7 @@ shared services and Win32 helpers for the studio window.
   or applying startup registration and UI preferences.
 - `DiagnosticText` formats runtime and encoder reports; `DiagnosticsLog`
   exports a bounded snapshot without replacing or aliasing the live log.
-- `WindowTools` and `ClipDragDrop` own control, picker, media-thumbnail, and
+- `WindowTools` owns control, picker, media-thumbnail, size and date text, and
   notification helpers. window-specific navigation and layout stay out.
 
 ## Local Contracts

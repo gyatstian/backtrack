@@ -19,7 +19,8 @@ delete, favorite, and tag operations the UI offers.
   empty file whose existence means favorite) and `<name>.mp4.tags` (one
   normalized tag per line). Neither carries the hidden attribute; only the
   muxer's output reservation does. `renameClip` attempts to move both sidecars
-  with the media.
+  with the media. `listClips` reads sidecar presence from the same directory
+  pass and opens only `.tags` files that exist.
 - `isManagedClipPath` gates every operation that touches disk, not just
   `removeClip` and `renameClip`: `setFavorite` and `addTag` go through it too.
   A path passes only when it is non-empty, ends in `.mp4` (case-insensitive),
@@ -42,6 +43,13 @@ delete, favorite, and tag operations the UI offers.
   are dropped. it accepts a cancellation predicate, checked before each
   directory entry, root, and final result; a cancelled scan returns empty.
   cancellation cannot interrupt a shell property read already in progress.
+- `listContents()` is the folder-browsing view of the same rules: the clips
+  directly inside the current directory plus one `ClipFolder` per immediate
+  subdirectory, sorted by name. each folder's `clips` is a recursive count of
+  the clips below it, so a folder row can say how much it holds without
+  listing it. `scanDirectory` is the shared pass behind both; the legacy
+  `clips` child is only folded in by `listClips`, never by `listContents`, so a
+  folder row never points at a legacy child of another row.
 - Durations come from the shell `System.Media.Duration` property, which opens a
   COM handler per file and parses the MP4 `moov` atom. The read is
   `GPS_BESTEFFORT` on purpose: `GPS_FASTPROPERTIESONLY` skips the MP4 handler
@@ -51,18 +59,23 @@ delete, favorite, and tag operations the UI offers.
 - The cache is not locked: calls on one `ClipManager` instance must be
   serialized. The UI scan worker owns its own instance; `setDirectory` and
   `listClips` on the window's instance stay on the UI thread.
-- `removeClip` deletes the media file first and only removes the sidecars once
-  the deletion is confirmed, so a clip that survives a failed delete (locked
-  file, sharing violation) keeps its favorite and tags. The delete is a
-  permanent unlink; there is no Recycle Bin and no confirmation inside
-  `ClipManager`.
-- `renameClip` validates the new stem before touching anything: it rejects an
-  empty or whitespace-only stem, `\ / : * ? " < > |`, a trailing dot or space,
-  and the reserved device names `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`,
-  `LPT1`-`LPT9`. it keeps the source extension and moves the media with an atomic
-  fail-if-exists operation; sidecars move only after the media succeeds. a
-  sidecar that fails to move is logged, not rolled back; the media rename still
-  reports success. existing destination sidecars may be replaced.
+- `removeClip` sends the media file to the Recycle Bin (`IFileOperation` on a
+  short-lived sta thread) and only removes the sidecars, permanently, once the
+  media is gone, so a clip that survives a failed delete (locked file, sharing
+  violation) keeps its favorite and tags. a drive without a Recycle Bin gets the
+  shell's permanent-delete warning; declining it is a failure. only an
+  unavailable `IFileOperation` falls back to a permanent unlink.
+- `clipRenameTarget` and `clipRenameCollides` are the rename rules; the ui
+  validates with them before queueing a rename. a stem is rejected when empty
+  or whitespace-only, containing `\ / : * ? " < > |` or a control character,
+  ending in a dot or space, or naming a reserved device (`CON`, `PRN`, `AUX`,
+  `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`). a trailing source extension is dropped
+  and the source extension kept. the same name is a successful no-op; a
+  case-only change is not a collision. the media moves with an atomic
+  fail-if-exists operation; sidecars move only after it succeeds. a sidecar
+  that fails to move is logged, not rolled back; the media rename still reports
+  success. existing destination sidecars may be replaced, and an orphan
+  destination sidecar is removed when the source has none.
 - `setFavorite` creates an empty marker exclusively or leaves an existing file
   untouched. `addTag` trims, strips control characters, caps the tag at 64
   characters, drops empties, and replaces the whole tag entry through an
@@ -91,7 +104,9 @@ conditions change.
 `ClipManagerTests` (CTest) covers linked sidecars and staging collisions, failed
 tag publication, a destination created between rename precheck and move, normal
 rename, nonfatal failures of either sidecar move, mixed-case clip and staging
-names, supported clip roots, and scan cancellation. symbolic link cases skip
+names, supported clip roots, scan cancellation, rename name rules (no-op,
+case-only, typed extension, control characters, orphan sidecars), and scan
+sidecar flags. symbolic link cases skip
 when link creation is unavailable. `StorageLayoutTests` (CTest) covers the
 shared root rules, and `SettingsClipGuardTests` covers the listing rules.
 legacy clip names matching `.publish[.n].mp4` directly in `.backtrack_tmp` are
@@ -101,7 +116,7 @@ The rest is manual: record a clip, then exercise list, gallery, rename (with
 favorite and tags intact), favorite toggle, and delete against both an empty and
 a populated clip directory, including one containing files Backtrack did not
 create and clips in per-game subfolders (with the game-folders setting on) and
-the `clips` subdirectory.
+the `clips` subdirectory. check that delete lands in the Recycle Bin.
 
 ## Child DOX Index
 

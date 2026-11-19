@@ -112,9 +112,37 @@ std::wstring exportDiagnostics(HWND window, RecorderController& controller) {
     return std::wstring(L"Log saved to ") + fileName;
 }
 
-std::array<std::wstring, 3> diagnosticText(RecorderController& controller, const RecordingStats& stats,
+std::wstring encoderDiagnosticText(RecorderController& controller) {
+    const auto caps = controller.encoderCapabilities();
+    std::wstringstream stream;
+    stream << L"Adapter: " << caps.adapterName << L"\r\n";
+    const std::wstring backendName = caps.backendName.empty() ? L"Hardware encoder" : caps.backendName;
+    stream << backendName << L": " << (caps.available ? L"available" : L"unavailable") << L"\r\n";
+    stream << L"H.264: " << (caps.h264 ? L"yes" : L"no") << L"\r\n";
+    stream << L"HEVC: " << (caps.hevc ? L"yes" : L"no") << L"\r\n";
+    stream << L"Max size: " << caps.maxWidth << L"x" << caps.maxHeight << L"\r\n";
+    stream << L"Profile: " << encoderProfileName(caps.effective.profile) << L"\r\n";
+    stream << L"Preset/mode: " << encoderPresetName(caps.effective.preset)
+           << L" / " << encoderModeName(caps.effective.mode) << L"\r\n";
+    stream << L"Lookahead: " << yesNo(caps.effective.lookahead)
+           << L" depth " << caps.effective.lookaheadDepth << L"\r\n";
+    stream << L"Spatial AQ: " << yesNo(caps.effective.spatialAQ)
+           << L" strength " << caps.effective.aqStrength << L"\r\n";
+    stream << L"Temporal AQ: " << yesNo(caps.effective.temporalAQ) << L"\r\n";
+    stream << L"Multipass: " << encoderMultipassName(caps.effective.multipass) << L"\r\n";
+    stream << L"B-frames: " << yesNo(caps.effective.bFrames)
+           << L", adaptive B: " << yesNo(caps.effective.adaptiveBFrames)
+           << L", adaptive I: " << yesNo(caps.effective.adaptiveIFrames) << L"\r\n";
+    stream << L"Reference frames: " << caps.effective.referenceFrames
+           << L" (multiple refs: " << yesNo(caps.multipleReferenceFrames) << L")\r\n";
+    stream << L"Zero reorder delay: " << yesNo(caps.effective.zeroReorderDelay) << L"\r\n";
+    stream << caps.detail;
+    return stream.str();
+}
+
+std::array<std::wstring, 2> diagnosticText(RecorderController& controller, const RecordingStats& stats,
     const VoiceCommandStats& voiceStats, const LeagueIntegrationStats& leagueStats) {
-    std::array<std::wstring, 3> text;
+    std::array<std::wstring, 2> text;
     {
         std::wstringstream stream;
         // Build identity first: a diagnostics screenshot or "Save Log" copy is
@@ -186,37 +214,10 @@ std::array<std::wstring, 3> diagnosticText(RecorderController& controller, const
         text[0] = stream.str();
     }
 
-    {
-        const auto caps = controller.encoderCapabilities();
-        std::wstringstream stream;
-        stream << L"Adapter: " << caps.adapterName << L"\r\n";
-        const std::wstring backendName = caps.backendName.empty() ? L"Hardware encoder" : caps.backendName;
-        stream << backendName << L": " << (caps.available ? L"available" : L"unavailable") << L"\r\n";
-        stream << L"H.264: " << (caps.h264 ? L"yes" : L"no") << L"\r\n";
-        stream << L"HEVC: " << (caps.hevc ? L"yes" : L"no") << L"\r\n";
-        stream << L"Max size: " << caps.maxWidth << L"x" << caps.maxHeight << L"\r\n";
-        stream << L"Profile: " << encoderProfileName(caps.effective.profile) << L"\r\n";
-        stream << L"Preset/mode: " << encoderPresetName(caps.effective.preset)
-               << L" / " << encoderModeName(caps.effective.mode) << L"\r\n";
-        stream << L"Lookahead: " << yesNo(caps.effective.lookahead)
-               << L" depth " << caps.effective.lookaheadDepth << L"\r\n";
-        stream << L"Spatial AQ: " << yesNo(caps.effective.spatialAQ)
-               << L" strength " << caps.effective.aqStrength << L"\r\n";
-        stream << L"Temporal AQ: " << yesNo(caps.effective.temporalAQ) << L"\r\n";
-        stream << L"Multipass: " << encoderMultipassName(caps.effective.multipass) << L"\r\n";
-        stream << L"B-frames: " << yesNo(caps.effective.bFrames)
-               << L", adaptive B: " << yesNo(caps.effective.adaptiveBFrames)
-               << L", adaptive I: " << yesNo(caps.effective.adaptiveIFrames) << L"\r\n";
-        stream << L"Reference frames: " << caps.effective.referenceFrames
-               << L" (multiple refs: " << yesNo(caps.multipleReferenceFrames) << L")\r\n";
-        stream << L"Zero reorder delay: " << yesNo(caps.effective.zeroReorderDelay) << L"\r\n";
-        stream << caps.detail;
-        text[1] = stream.str();
-    }
 
     {
         if (!Logger::instance().enabled()) {
-            text[2] = L"Logging is disabled";
+            text[1] = L"Logging is disabled";
         } else {
             const auto lines = Logger::instance().recentLines(12);
             std::wstringstream stream;
@@ -253,7 +254,7 @@ std::array<std::wstring, 3> diagnosticText(RecorderController& controller, const
                     i += count;
                 }
             }
-            text[2] = stream.str();
+            text[1] = stream.str();
         }
     }
 

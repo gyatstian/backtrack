@@ -200,8 +200,7 @@ build.
     notice.
   - `StudioWindowTests` - off-thread startup preparation, main page navigation
     and nonblocking close during held startup, and rejection of the diagnostics
-    logging toggle during startup. covers custom frame geometry, caption hit
-    targets, double-click maximize/restore, control placement, footer geometry,
+    logging toggle during startup. covers control placement, footer geometry,
     settings dependencies and publication (including a normalized no-op save),
     and immediate default and pinned audio output choices. saving with an
     invalid, disabled desktop gain field preserves the saved gain and pinned
@@ -209,7 +208,16 @@ build.
     input, height-only resize, clamped scroll no-ops, and gallery geometry and
     async edits including rename during refresh. checks narrow windows scroll
     only by their visible rows. checks marker paint, immediate keyboard
-    selection, and elapsed-time motion and reversal.
+    selection, and elapsed-time motion and reversal. covers the UI scale math
+    (default-window anchor, shrink and cap, wheel zoom cap), a stored zoom on
+    the created window, Ctrl+Scroll zooming it, that zoom surviving a page save
+    and the window closing, the text scaling up and back down with the window
+    width, and the pinned gallery column count wrapping the grid, surviving a
+    save, and reverting to automatic columns when the field is blank. checks the
+    thumbnail fit by tile height: one column fitted stops at the fixed row
+    height, unfitted grows to the frame's shape. checks a separate library scale
+    by font size: Ctrl+Scroll on the library changes the tile font and leaves the
+    navigation font alone, and the library zoom is written with the placement.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` and
   `StorageLayoutTests` define `Mp4Muxer::muxToMp4` and

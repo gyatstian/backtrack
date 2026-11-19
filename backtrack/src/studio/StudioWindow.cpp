@@ -46,16 +46,26 @@ StudioWindow::Impl::Impl(RecorderController& controller, SettingsStore& store, c
                          SettingsStore::LoadStatus loadStatus, Action prepareCapture)
     : controller(controller), store(store), prepareCapture(std::move(prepareCapture)), draft(initial), saved(initial),
       readable(loadStatus != SettingsStore::LoadStatus::Failed),
-      league([this] { PostMessageW(window, leagueKill, 0, 0); }) {}
+      league([this] { PostMessageW(window, leagueKill, 0, 0); }) {
+    uiZoom = std::clamp(static_cast<int>(initial.uiZoomPercent), theme::minUiZoom, theme::maxUiZoom);
+    libraryZoom = std::clamp(static_cast<int>(initial.libraryZoomPercent), theme::minUiZoom, theme::maxUiZoom);
+    // A persisted zoom also sizes the first window, so it opens readable instead
+    // of cramped; the window factor then measures the unzoomed default width.
+    if (!initial.uiScaleWithWindow) {
+        uiScale = studio_theme::uiScalePercent(uiZoom, 0, 0, false);
+        galleryScale = initial.libraryOwnScale
+            ? studio_theme::uiScalePercent(libraryZoom, 0, 0, false) : uiScale;
+    }
+}
 
 StudioWindow::Impl::~Impl() {
     if (window) DestroyWindow(window);
     shutdown();
     DeleteObject(font);
+    if (libraryFont) DeleteObject(libraryFont);
     DeleteObject(surfaceBrush);
     DeleteObject(fieldBrush);
     DeleteObject(activeBrush);
-    if (appIcon) DestroyIcon(appIcon);
     if (trayIcon) DestroyIcon(trayIcon);
 }
 
@@ -88,8 +98,10 @@ bool StudioWindow::Impl::create(HINSTANCE instance, int showCommand, bool startM
             height = saved.windowHeight;
         }
     }
-    // Keep native move, snap and maximize behavior without drawing a native caption.
-    if (!CreateWindowExW(0, kBacktrackMainWindowClassName, L"Backtrack", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+    // Native frame: no maximize box, so no maximize button, snap maximize, or
+    // double-click maximize to restore out of.
+    if (!CreateWindowExW(0, kBacktrackMainWindowClassName, L"Backtrack",
+                         (WS_OVERLAPPEDWINDOW & ~WS_MAXIMIZEBOX) | WS_CLIPCHILDREN,
                          x, y, width, height, nullptr, nullptr, instance, this)) return false;
     const BOOL dark = TRUE;
     DwmSetWindowAttribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
@@ -99,8 +111,9 @@ bool StudioWindow::Impl::create(HINSTANCE instance, int showCommand, bool startM
     Logger::instance().info(L"ui", std::wstring(L"Backtrack ") + std::wstring(kCurrentAppVersion));
     startSession();
     if (showCommand == SW_HIDE || showCommand == SW_SHOWDEFAULT || showCommand == SW_SHOWMINIMIZED ||
-        showCommand == SW_SHOWMINNOACTIVE || showCommand == SW_MINIMIZE) showCommand = SW_SHOWNORMAL;
-    ShowWindow(window, startMinimized ? SW_SHOWMINIMIZED : saved.windowMaximized ? SW_SHOWMAXIMIZED : showCommand);
+        showCommand == SW_SHOWMINNOACTIVE || showCommand == SW_MINIMIZE || showCommand == SW_SHOWMAXIMIZED)
+        showCommand = SW_SHOWNORMAL;
+    ShowWindow(window, startMinimized ? SW_SHOWMINIMIZED : showCommand);
     return true;
 }
 
@@ -111,7 +124,7 @@ int StudioWindow::Impl::run() {
         if (closing) {
             if ((msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST) ||
                 (msg.message >= WM_MOUSEFIRST && msg.message <= WM_MOUSELAST)) continue;
-        } else if (handleShortcut(msg) || IsDialogMessageW(window, &msg)) continue;
+        } else if (zoomInput(msg.message, msg.wParam) || handleShortcut(msg) || IsDialogMessageW(window, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -176,15 +189,12 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         if (!closing && !addTray() && !IsWindowVisible(window)) ShowWindow(window, SW_SHOWNA);
         return 0;
     }
+    if (msg == WM_MOUSEWHEEL && zoomInput(msg, wp)) return 0;
     switch (msg) {
     case WM_CREATE: {
         updateMotionPreference();
         dpi = GetDpiForWindow(window);
         updateFont();
-        updateAppIcon();
-        titleMinimize = captionButton(Glyph::Minimize, [this] { ShowWindow(window, SW_MINIMIZE); });
-        titleClose = captionButton(Glyph::Close, [this] { PostMessageW(window, WM_CLOSE, 0, 0); });
-        if (!titleMinimize || !titleClose) return -1;
         for (size_t i = 0; i < pageButtons.size(); ++i) {
             pageButtons[i] = button(mainLabels[i], [this, i] {
                 open(static_cast<Page>(i), clickOrigin == pageButtons[i]);
@@ -215,44 +225,16 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         syncNav(false);
         return 0;
     }
-    case WM_NCCALCSIZE: {
-        auto& client = wp ? reinterpret_cast<NCCALCSIZE_PARAMS*>(lp)->rgrc[0] : *reinterpret_cast<RECT*>(lp);
-        if (IsZoomed(window)) {
-            // The maximized sizing frame extends beyond the monitor work area.
-            const auto windowDpi = GetDpiForWindow(window);
-            const int padding = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, windowDpi);
-            InflateRect(&client, -GetSystemMetricsForDpi(SM_CXSIZEFRAME, windowDpi) - padding,
-                        -GetSystemMetricsForDpi(SM_CYSIZEFRAME, windowDpi) - padding);
-        }
-        return 0;
-    }
-    case WM_NCHITTEST: {
-        POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        ScreenToClient(window, &point);
-        RECT client{};
-        GetClientRect(window, &client);
-        if (!PtInRect(&client, point)) return HTNOWHERE;
-        if (const int grip = resizeGrip()) {
-            const bool left = point.x < grip, right = point.x >= client.right - grip;
-            const bool top = point.y < grip, bottom = point.y >= client.bottom - grip;
-            if (top) return left ? HTTOPLEFT : right ? HTTOPRIGHT : HTTOP;
-            if (bottom) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
-            if (left) return HTLEFT;
-            if (right) return HTRIGHT;
-        }
-        if (point.y < px(theme::titleBarHeight) && ChildWindowFromPointEx(window, point, CWP_SKIPINVISIBLE) == window)
-            return HTCAPTION;
-        return HTCLIENT;
-    }
     case WM_GETMINMAXINFO: {
         auto& info = *reinterpret_cast<MINMAXINFO*>(lp);
-        info.ptMinTrackSize = {px(640), px(390 + theme::titleBarHeight)};
+        // DPI size, not the zoomed one: a large UI zoom must not leave the window
+        // unshrinkable.
+        info.ptMinTrackSize = {dpiPx(640), dpiPx(390)};
         return 0;
     }
     case WM_DPICHANGED: {
         dpi = LOWORD(wp);
         updateFont();
-        updateAppIcon();
         const auto& r = *reinterpret_cast<RECT*>(lp);
         SetWindowPos(window, nullptr, r.left, r.top, extent(r.left, r.right), extent(r.top, r.bottom), SWP_NOZORDER | SWP_NOACTIVATE);
         layout();
@@ -531,7 +513,8 @@ HWND StudioWindow::Impl::make(const wchar_t* type, const wchar_t* label, DWORD s
                                      parent ? parent : body, nullptr, nullptr, nullptr);
     if (!hwnd) return nullptr;
     controls.emplace(hwnd, Control{std::move(callback), help});
-    SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+    const bool chrome = (parent ? parent : body) == window;
+    SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(chrome ? font : pageFont()), FALSE);
     SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
     SetWindowSubclass(hwnd, controlProc, 1, reinterpret_cast<DWORD_PTR>(this));
     return hwnd;
@@ -544,13 +527,6 @@ HWND StudioWindow::Impl::button(const wchar_t* label, Action click, const wchar_
     return hwnd;
 }
 
-// Caption buttons are not tab stops, matching the native ones.
-HWND StudioWindow::Impl::captionButton(Glyph glyph, Action click) {
-    const auto hwnd = make(L"BUTTON", glyph == Glyph::Close ? L"Close" : L"Minimize", BS_OWNERDRAW | WS_VISIBLE,
-                           [click = std::move(click)](HWND, UINT code) { if (code == BN_CLICKED) click(); }, L"", window);
-    if (hwnd) controls.at(hwnd).glyph = glyph;
-    return hwnd;
-}
 
 LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR data) {
     auto& self = *reinterpret_cast<Impl*>(data);
@@ -707,16 +683,26 @@ void StudioWindow::Impl::buildPage(StudioNavigation next) {
 
 void StudioWindow::Impl::updateFont() {
     // GDI maps the base Bahnschrift face to regular even at weight 350.
-    const auto previousFont = std::exchange(font,
-        CreateFontW(-px(15), 0, 0, 0, 350, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-                    DEFAULT_PITCH, L"Bahnschrift SemiLight"));
+    const auto make = [this](int height) {
+        return CreateFontW(-height, 0, 0, 0, 350, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH, L"Bahnschrift SemiLight");
+    };
+    const auto previousFont = std::exchange(font, make(px(15)));
+    if (libraryFont) {
+        DeleteObject(libraryFont);
+        libraryFont = nullptr;
+    }
+    if (galleryScale != uiScale) libraryFont = make(libraryPx(15));
     for (const auto& [hwnd, control] : controls) {
-        SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        // Chrome keeps the app font; the library page's own controls follow its
+        // scale.
+        const bool chrome = GetParent(hwnd) == window;
+        SendMessageW(hwnd, WM_SETFONT, reinterpret_cast<WPARAM>(chrome ? font : pageFont()), TRUE);
         // Edit margins are in pixels, so they need the new DPI scale.
         if (control.margin)
             SendMessageW(hwnd, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                         MAKELPARAM(px(control.margin), px(control.margin)));
+                         MAKELPARAM(pagePx(control.margin), pagePx(control.margin)));
         if (control.combo) {
             SendMessageW(hwnd, CB_SETITEMHEIGHT, -1, px(21));
             SendMessageW(hwnd, CB_SETITEMHEIGHT, 0, px(22));
@@ -725,13 +711,7 @@ void StudioWindow::Impl::updateFont() {
     DeleteObject(previousFont);
 }
 
-void StudioWindow::Impl::updateAppIcon() {
-    if (appIcon) DestroyIcon(appIcon);
-    appIcon = loadOwnedAppIcon(reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE)),
-                               IDI_APP_ICON, px(16));
-}
-
-void StudioWindow::Impl::saveWindowPlacement() {
+void StudioWindow::Impl::saveUiState() {
     if (!window || !readable) return;
     WINDOWPLACEMENT placement{sizeof(placement)};
     if (!GetWindowPlacement(window, &placement)) return;
@@ -741,11 +721,14 @@ void StudioWindow::Impl::saveWindowPlacement() {
     updated.windowTop = normal.top;
     updated.windowWidth = normal.right - normal.left;
     updated.windowHeight = normal.bottom - normal.top;
-    updated.windowMaximized = placement.showCmd == SW_SHOWMAXIMIZED;
+    // The window has no maximize box, so the stored flag stays clear.
+    updated.windowMaximized = false;
+    updated.uiZoomPercent = static_cast<uint32_t>(uiZoom);
+    updated.libraryZoomPercent = static_cast<uint32_t>(libraryZoom);
     if (updated == saved) return;
-    // Placement is not a draft field: publish the saved baseline with the new
-    // geometry, never the unsaved page edits, and keep the draft in step so a
-    // pending edit stays the only dirty difference.
+    // Placement and zoom are not draft fields: publish the saved baseline with
+    // them, never the unsaved page edits, and keep the draft in step so a pending
+    // edit stays the only dirty difference.
     if (!store.save(updated)) return;
     saved = std::move(updated);
     draft.windowLeft = saved.windowLeft;
@@ -753,6 +736,8 @@ void StudioWindow::Impl::saveWindowPlacement() {
     draft.windowWidth = saved.windowWidth;
     draft.windowHeight = saved.windowHeight;
     draft.windowMaximized = saved.windowMaximized;
+    draft.uiZoomPercent = saved.uiZoomPercent;
+    draft.libraryZoomPercent = saved.libraryZoomPercent;
 }
 
 bool StudioWindow::Impl::keyboardCuesHidden() const {
@@ -763,39 +748,45 @@ void StudioWindow::Impl::layout(bool newPage) {
     if (!footer || shuttingDown) return;
     RECT rect{};
     if (!GetClientRect(window, &rect)) return;
-    const int grip = resizeGrip();
-    const bool tabsChanged = rect.right != layoutSize.cx || grip != layoutGrip || dpi != layoutDpi;
+    // Rescale before measuring anything: the default window width is the 100%
+    // anchor, so the layout keeps its density at the size the app opens with.
+    const int scale = studio_theme::uiScalePercent(uiZoom, rect.right, dpiPx(870), saved.uiScaleWithWindow);
+    const int libraryScale = studio_theme::uiScalePercent(saved.libraryOwnScale ? libraryZoom : uiZoom,
+                                                          rect.right, dpiPx(870), saved.uiScaleWithWindow);
+    if (scale != uiScale || libraryScale != galleryScale) {
+        uiScale = scale;
+        galleryScale = libraryScale;
+        updateFont();
+    }
+    const bool tabsChanged = rect.right != layoutSize.cx || dpi != layoutDpi || scale != layoutScale ||
+        libraryScale != layoutLibraryScale;
     if (!newPage && !tabsChanged && rect.bottom == layoutSize.cy) return;
     layoutSize = {rect.right, rect.bottom};
-    layoutGrip = grip;
     layoutDpi = dpi;
+    layoutScale = scale;
+    layoutLibraryScale = libraryScale;
 
-    // Leave the resize strip to the parent, even beside buttons and scrollbars.
-    const int width = (std::max)(0, static_cast<int>(rect.right) - 2 * grip);
-    const int titleHeight = px(theme::titleBarHeight);
+    const int width = static_cast<int>(rect.right);
     const int navHeight = px(theme::navHeight);
     const int tabHeight = navHeight - px(theme::navUnderlineBand);
-    const int captionWidth = px(36), captionRight = rect.right - grip;
-    moveWindowIfChanged(titleClose, captionRight - captionWidth, grip, captionWidth, titleHeight - grip);
-    moveWindowIfChanged(titleMinimize, captionRight - 2 * captionWidth, grip, captionWidth, titleHeight - grip);
     if (tabsChanged) {
         std::vector<WindowMove> moves;
         moves.reserve(pageButtons.size() + categoryButtons.size());
         const auto placeTabs = [&](const auto& buttons, int y) {
             const int count = static_cast<int>(buttons.size());
-            const RECT row{grip, y, grip + width, y + tabHeight};
+            const RECT row{0, y, width, y + tabHeight};
             for (int i = 0; i < count; ++i) {
                 const auto tab = theme::tabBounds(row, i, count, px(theme::gap));
                 moves.push_back({buttons[i], tab.left, y, tab.right - tab.left, tabHeight});
             }
         };
-        placeTabs(pageButtons, titleHeight);
-        placeTabs(categoryButtons, titleHeight + navHeight);
+        placeTabs(pageButtons, 0);
+        placeTabs(categoryButtons, navHeight);
         applyWindowMoves(moves);
     }
-    const int bodyTop = titleHeight + (nav.page == Page::Settings ? 2 : 1) * navHeight;
+    const int bodyTop = (nav.page == Page::Settings ? 2 : 1) * navHeight;
     if (body) {
-        moveWindowIfChanged(body, grip, bodyTop, width,
+        moveWindowIfChanged(body, 0, bodyTop, width,
                             (std::max)(0, static_cast<int>(rect.bottom) - bodyTop - px(theme::footerHeight)));
         if (nav.page == Page::Library) layoutGallery();
         else if (nav.page == Page::Diagnostics) layoutDiagnostics();
@@ -822,7 +813,7 @@ void StudioWindow::Impl::layoutFooter(const RECT& client) {
         moveWindowIfChanged(update, footerRight - updateWidth, actionTop, updateWidth, actionHeight);
         footerRight -= updateWidth + px(theme::gap);
     }
-    const int textTop = footerTop + px(5), bottomGap = (std::max)(px(3), resizeGrip());
+    const int textTop = footerTop + px(5), bottomGap = px(3);
     replayCheckBox = {footerLeft, textTop, footerLeft + px(26), textTop + px(22)};
     footerLeft = replayCheckBox.right;
     moveWindowIfChanged(footer, footerLeft, textTop, (std::max)(0, footerRight - footerLeft), client.bottom - bottomGap - textTop);
@@ -925,7 +916,6 @@ void StudioWindow::Impl::paintFrame(HDC dc, const RECT& dirty) {
     theme::fill(dc, dirty, theme::surface);
     RECT r{};
     GetClientRect(window, &r);
-    if (dirty.top < px(theme::titleBarHeight)) paintTitleBar(dc, r.right);
     paintTabMarker(dc, mainMarker);
     if (nav.page == Page::Settings) paintTabMarker(dc, categoryMarker);
     r.top = r.bottom - px(theme::footerHeight);
@@ -936,105 +926,11 @@ void StudioWindow::Impl::paintFrame(HDC dc, const RECT& dirty) {
     }
 }
 
-void StudioWindow::Impl::paintTitleBar(HDC dc, int width) {
-    const int height = px(theme::titleBarHeight);
-    const RECT bar{0, 0, width, height};
-    theme::fill(dc, bar, theme::active);
-    const int iconSize = px(16);
-    if (appIcon) DrawIconEx(dc, px(theme::gap), (resizeGrip() + height - iconSize) / 2,
-                           appIcon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
-    theme::fill(dc, {0, height - 1, width, height}, theme::rule);
-}
-
-void StudioWindow::Impl::buildCaptionGlyphs() {
-    captionGlyphDpi = dpi;
-    const double scale = dpi / 96.0;
-    constexpr int samples = 8;
-    for (const auto glyph : {Glyph::Minimize, Glyph::Close}) {
-        const bool close = glyph == Glyph::Close;
-        const double halfWidth = (close ? 5.0 : 5.5) * scale, halfHeight = close ? 4.0 * scale : 0.0;
-        const double lengthSquared = halfWidth * halfWidth + halfHeight * halfHeight;
-        // Even extents keep the mask centered on the caption button's center:
-        // an odd span would shift one side of the glyph by half a pixel.
-        const int rawWidth = static_cast<int>(std::ceil(2 * (halfWidth + scale)));
-        const int rawHeight = static_cast<int>(std::ceil(2 * (halfHeight + scale)));
-        const int width = (std::max)(2, rawWidth + (rawWidth & 1));
-        const int height = (std::max)(2, rawHeight + (rawHeight & 1));
-        const size_t index = static_cast<size_t>(glyph) - 1;
-        captionGlyphSize[index] = {width, height};
-        auto& alpha = captionGlyphAlpha[index];
-        alpha.assign(static_cast<size_t>(width) * height, 0);
-        const double cx = width / 2.0, cy = height / 2.0;
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width; ++x) {
-                int covered = 0;
-                for (int sy = 0; sy < samples; ++sy) {
-                    for (int sx = 0; sx < samples; ++sx) {
-                        const double u = std::abs(x - cx + (sx + 0.5) / samples);
-                        const double v = std::abs(y - cy + (sy + 0.5) / samples);
-                        if (!close) {
-                            covered += u < halfWidth && v < scale;
-                            continue;
-                        }
-                        const double t = (std::min)(1.0, (u * halfWidth + v * halfHeight) / lengthSquared);
-                        const double dx = u - t * halfWidth, dy = v - t * halfHeight;
-                        covered += dx * dx + dy * dy < scale * scale;
-                    }
-                }
-                alpha[static_cast<size_t>(y) * width + x] = static_cast<BYTE>(covered * 255 / (samples * samples));
-            }
-        }
-        // The sample grid is anchored on the pixel corner, so mirror the drawn
-        // half instead of relying on the coverage arithmetic to be symmetric.
-        for (int y = 0; y < height; ++y) {
-            for (int x = 0; x < width / 2; ++x) {
-                alpha[static_cast<size_t>(y) * width + (width - 1 - x)] = alpha[static_cast<size_t>(y) * width + x];
-            }
-        }
-        for (int y = 0; y < height / 2; ++y) {
-            std::copy_n(alpha.begin() + static_cast<std::ptrdiff_t>(y) * width, width,
-                        alpha.begin() + static_cast<std::ptrdiff_t>(height - 1 - y) * width);
-        }
-    }
-}
-
-void StudioWindow::Impl::paintCaptionButton(const DRAWITEMSTRUCT& item, Glyph glyph) {
-    const bool down = (item.itemState & ODS_SELECTED) != 0;
-    const bool hot = hovered == item.hwndItem;
-    const bool close = glyph == Glyph::Close;
-    const auto& r = item.rcItem;
-    const auto background = down ? (close ? theme::closePress : theme::press)
-                                 : hot ? (close ? theme::closeHover : theme::hover) : theme::active;
-    theme::fill(item.hDC, r, background);
-    if (!down && !hot) theme::fill(item.hDC, {r.left, r.bottom - 1, r.right, r.bottom}, theme::rule);
-
-    const auto ink = hot || down ? theme::text : theme::muted;
-    if (!captionGlyphSize[0].cx || captionGlyphDpi != dpi) buildCaptionGlyphs();
-    const size_t index = static_cast<size_t>(glyph) - 1;
-    const auto& alpha = captionGlyphAlpha[index];
-    const auto size = captionGlyphSize[index];
-    if (alpha.empty()) return;
-    const int left = (r.left + r.right) / 2 - size.cx / 2;
-    const int top = (r.top + r.bottom) / 2 - size.cy / 2;
-    const auto mix = [](int bg, int fg, int covered) { return bg + (covered * (fg - bg) + 127) / 255; };
-    for (int y = 0; y < size.cy; ++y) {
-        for (int x = 0; x < size.cx; ++x) {
-            const int covered = alpha[static_cast<size_t>(y) * size.cx + x];
-            if (!covered) continue;
-            SetPixelV(item.hDC, left + x, top + y,
-                      RGB(mix(GetRValue(background), GetRValue(ink), covered),
-                          mix(GetGValue(background), GetGValue(ink), covered),
-                          mix(GetBValue(background), GetBValue(ink), covered)));
-        }
-    }
-}
-
 void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
     const auto found = controls.find(item.hwndItem);
-    if (found != controls.end() && found->second.glyph != Glyph::None) {
-        paintCaptionButton(item, found->second.glyph);
-        return;
-    }
+    // Chrome keeps the app scale even while the library page carries its own.
+    const bool chrome = GetParent(item.hwndItem) == window;
+    const auto inset = [&](int dip) { return chrome ? px(dip) : pagePx(dip); };
     auto dc = item.hDC;
     auto r = item.rcItem;
     const auto page = std::find(pageButtons.begin(), pageButtons.end(), item.hwndItem);
@@ -1056,15 +952,15 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
     if (navigation) {
         if (focusCue) {
             RECT focus = r;
-            InflateRect(&focus, -px(3), -px(1));
+            InflateRect(&focus, -inset(3), -inset(1));
             theme::frame(dc, focus, theme::accent);
         }
-        r.bottom += px(theme::navUnderlineBand);
+        r.bottom += inset(theme::navUnderlineBand);
     } else {
         if (!quiet) theme::frame(dc, r, disabled ? theme::rule : theme::border);
         if (focusCue) {
             RECT focus = r;
-            InflateRect(&focus, -px(3), -px(3));
+            InflateRect(&focus, -inset(3), -inset(3));
             theme::frame(dc, focus, theme::accent);
         }
     }
@@ -1073,11 +969,11 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
         paintRecordingGlyph(dc, box, disabled);
         r.left = box.right;
     }
-    InflateRect(&r, -px(6), 0);
+    InflateRect(&r, -inset(6), 0);
     if (!RectVisible(dc, &r)) return;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, disabled ? theme::disabled : quiet && !hot ? theme::muted : theme::text);
-    SelectObject(dc, font);
+    SelectObject(dc, chrome ? font : pageFont());
     const auto label = readText(item.hwndItem);
     DrawTextW(dc, label.c_str(), -1, &r, (quiet ? DT_LEFT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 }
@@ -1153,6 +1049,9 @@ void StudioWindow::Impl::paintFooter(bool animateCheck) {
     append(hint);
     append(persistentWarning);
     append(audioWarning);
+    // The zoom gesture has no control of its own, so an idle footer names it
+    // without crowding a status or a hover hint.
+    if (text.empty()) text = L"Ctrl+Scroll scales the font";
     if (motions[replayCheck].to != static_cast<float>(replaySaved))
         setMotion(replayCheck, static_cast<float>(replaySaved), replaySaved && animateCheck);
     const bool showing = (GetWindowLongPtrW(footer, GWL_STYLE) & WS_VISIBLE) != 0;
@@ -1190,6 +1089,30 @@ bool StudioWindow::Impl::editHotkey(HWND field, uint32_t modifiers, uint32_t key
     *it->second.second = key;
     setText(field, hotkeyDisplay(modifiers, key));
     changed();
+    return true;
+}
+
+bool StudioWindow::Impl::zoomInput(UINT message, WPARAM wheel) {
+    // Ctrl+Scroll is taken in the message loop, so it rescales from any page and
+    // over any child control instead of reaching that control's own wheel path.
+    // The modifier comes from the message: it is the state the wheel was turned
+    // with, and a test can send it. `message` also asks, so a wheel message that
+    // reaches the window directly still zooms.
+    if (message != WM_MOUSEWHEEL || (GET_KEYSTATE_WPARAM(wheel) & MK_CONTROL) == 0) return false;
+    const int delta = GET_WHEEL_DELTA_WPARAM(wheel);
+    if (!delta) return true;
+    // The gesture scales whatever the current page shows: the library carries its
+    // own zoom while the separate scale is on.
+    const bool libraryPage = nav.page == Page::Library && saved.libraryOwnScale;
+    int& current = libraryPage ? libraryZoom : uiZoom;
+    const int zoom = std::clamp(current + (delta > 0 ? 10 : -10), theme::minUiZoom, theme::maxUiZoom);
+    if (zoom != current) {
+        current = zoom;
+        layout();
+        // Persist on the notch, not on exit: closing to the tray or an abnormal
+        // end would otherwise drop the scale the user just set.
+        saveUiState();
+    }
     return true;
 }
 

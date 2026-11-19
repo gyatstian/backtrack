@@ -304,7 +304,7 @@ void StudioWindow::Impl::buildLibrary() {
     SetWindowTheme(g.view, L"DarkMode_Explorer", nullptr);
     g.empty = make(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX, {}, L"", g.view);
     if (g.rename) {
-        SendMessageW(g.rename, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(px(5), px(5)));
+        SendMessageW(g.rename, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(libraryPx(5), libraryPx(5)));
         SendMessageW(g.rename, EM_LIMITTEXT, 200, 0);
     }
     if (g.directory != saved.clipDirectory) {
@@ -566,7 +566,7 @@ bool StudioWindow::Impl::libraryInput(UINT msg, WPARAM wp) {
         UINT lines = 3;
         SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
         const int64_t distance = lines == WHEEL_PAGESCROLL ? (g.viewport ? g.viewport->height : 0) :
-            px(25) * static_cast<int>((std::min)(lines, 100U));
+            libraryPx(25) * static_cast<int>((std::min)(lines, 100U));
         if (g.scrollTo(g.scroll - steps * distance)) updateGallery();
     }
     return true;
@@ -577,9 +577,9 @@ void StudioWindow::Impl::layoutGallery() {
     auto& g = *gallery;
     RECT r{};
     GetClientRect(body, &r);
-    const int pad = px(theme::inset), gap = px(theme::gap);
+    const int pad = libraryPx(theme::inset), gap = libraryPx(theme::gap);
     const int width = (std::max)(0L, r.right - pad * 2);
-    const int row = px(30), y = px(9), buttonWidth = px(92);
+    const int row = libraryPx(30), y = libraryPx(9), buttonWidth = libraryPx(92);
     std::vector<WindowMove> moves;
     for (int i = 0; i < 3; ++i) moves.push_back({g.actions[i], pad + i * (buttonWidth + gap), y, buttonWidth, row});
     moves.push_back({g.actions[5], pad + width - 3 * buttonWidth - 2 * gap, y, buttonWidth, row});
@@ -612,16 +612,24 @@ void StudioWindow::Impl::updateGallery() {
     RECT r{};
     GetClientRect(g.view, &r);
     const int width = r.right, height = r.bottom;
-    const int pad = px(theme::inset), gap = px(theme::gap);
-    const int columns = std::clamp((width + GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) - pad * 2 + gap) / px(210), 1, 5);
+    const int pad = libraryPx(theme::inset), gap = libraryPx(theme::gap);
+    const int fitted = std::clamp((width + GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) - pad * 2 + gap) / libraryPx(210), 1, 5);
+    // The gap arithmetic is int, so an unusable count still has to stay below it.
+    const int columns = saved.libraryColumns ? static_cast<int>((std::min)(saved.libraryColumns, 10000u)) : fitted;
     const int tileWidth = (std::max)(1, (width - pad * 2 - (columns - 1) * gap) / columns);
-    const int rowHeight = (std::min)(px(250), tileWidth * 9 / 16 + px(59));
+    // Fitting fills the tile: the row takes the frame's 16:9 shape, so the
+    // thumbnail has no bars and nothing is cropped away. Unfitted keeps one tile
+    // height and scales the frame into it, so a wide tile shows bars.
+    const int naturalHeight = tileWidth * 9 / 16 + libraryPx(59);
+    const int rowHeight = saved.libraryFitThumbnails
+        ? (std::min)(naturalHeight, (std::max)(height, libraryPx(250)))
+        : (std::min)(libraryPx(250), naturalHeight);
     int64_t position = g.scroll;
     if (g.grid.columns != columns || g.grid.rowHeight != rowHeight)
         position = position / g.grid.rowHeight * g.grid.columns / columns * rowHeight;
     g.grid = {columns, rowHeight};
     g.tileWidth = tileWidth;
-    g.folderHeight = px(34);
+    g.folderHeight = libraryPx(34);
     const int header = g.headerHeight();
     const auto rowCount = g.grid.rowCount(g.clips.size());
     const int bottom = header + static_cast<int>((std::min)(rowCount, static_cast<size_t>(INT_MAX / rowHeight))) * rowHeight;
@@ -629,11 +637,11 @@ void StudioWindow::Impl::updateGallery() {
     g.scrollTo(position);
     const bool placeRename = g.renaming && g.rename && g.selected < g.clips.size();
     if (placeRename) {
-        const int nameTop = rowHeight - px(4) - px(42);
+        const int nameTop = rowHeight - libraryPx(4) - libraryPx(42);
         SetWindowPos(g.rename, HWND_TOP,
-            pad + static_cast<int>(g.selected % g.grid.columns) * (tileWidth + gap) + px(2),
+            pad + static_cast<int>(g.selected % g.grid.columns) * (tileWidth + gap) + libraryPx(2),
             header + static_cast<int>(g.selected / g.grid.columns) * rowHeight - g.scroll + nameTop,
-            (std::max)(px(30), tileWidth - px(4)), px(21), SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS);
+            (std::max)(libraryPx(30), tileWidth - libraryPx(4)), libraryPx(21), SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOCOPYBITS);
     }
     const Gallery::Viewport viewport{width, height, g.scroll, dpi};
     if (g.viewport == viewport) {
@@ -646,7 +654,7 @@ void StudioWindow::Impl::updateGallery() {
     SetScrollInfo(g.view, SB_VERT, &info, FALSE);
     if (g.clips.empty()) {
         setText(g.empty, g.scanning ? L"Loading clips\u2026" : L"No clips");
-        moveWindowIfChanged(g.empty, 0, (std::max)(0, header - g.scroll), r.right, px(52));
+        moveWindowIfChanged(g.empty, 0, (std::max)(0, header - g.scroll), r.right, libraryPx(52));
         ShowWindow(g.empty, SW_SHOWNA);
     } else ShowWindow(g.empty, SW_HIDE);
     const int headerShown = std::clamp(header - g.scroll, 0, height);
@@ -935,8 +943,8 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
             int64_t scroll = g.scroll;
             switch (LOWORD(wp)) {
             case SB_THUMBTRACK: scroll = info.nTrackPos; break;
-            case SB_LINEUP: scroll -= self.px(34); break;
-            case SB_LINEDOWN: scroll += self.px(34); break;
+            case SB_LINEUP: scroll -= self.libraryPx(34); break;
+            case SB_LINEDOWN: scroll += self.libraryPx(34); break;
             case SB_PAGEUP: scroll -= info.nPage; break;
             case SB_PAGEDOWN: scroll += info.nPage; break;
             case SB_TOP: scroll = 0; break;
@@ -1003,20 +1011,20 @@ bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
         theme::fill(dc, r, hovered == item.hwndItem ? theme::hover : theme::field);
         theme::frame(dc, r, theme::rule);
         // Folder glyph: a tab over a body, so no image asset is needed.
-        const int icon = px(16), iconLeft = r.left + px(8), iconTop = (r.top + r.bottom - px(14)) / 2;
-        theme::fill(dc, {iconLeft, iconTop + px(2), iconLeft + px(7), iconTop + px(6)}, theme::muted);
-        theme::fill(dc, {iconLeft, iconTop + px(4), iconLeft + icon, iconTop + px(14)}, theme::muted);
+        const int icon = libraryPx(16), iconLeft = r.left + libraryPx(8), iconTop = (r.top + r.bottom - libraryPx(14)) / 2;
+        theme::fill(dc, {iconLeft, iconTop + libraryPx(2), iconLeft + libraryPx(7), iconTop + libraryPx(6)}, theme::muted);
+        theme::fill(dc, {iconLeft, iconTop + libraryPx(4), iconLeft + icon, iconTop + libraryPx(14)}, theme::muted);
         const auto count = std::to_wstring(g.folders[index].count) + L" Items";
         SetBkMode(dc, TRANSPARENT);
-        SelectObject(dc, font);
+        SelectObject(dc, pageFont());
         SIZE extent{};
         GetTextExtentPoint32W(dc, count.c_str(), static_cast<int>(count.size()), &extent);
-        const int nameLeft = iconLeft + icon + px(7);
+        const int nameLeft = iconLeft + icon + libraryPx(7);
         SetTextColor(dc, theme::text);
-        RECT name{nameLeft, r.top, (std::max)(nameLeft, static_cast<int>(r.right) - px(8) - static_cast<int>(extent.cx) - px(8)), r.bottom};
+        RECT name{nameLeft, r.top, (std::max)(nameLeft, static_cast<int>(r.right) - libraryPx(8) - static_cast<int>(extent.cx) - libraryPx(8)), r.bottom};
         DrawTextW(dc, g.folders[index].name.c_str(), -1, &name, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         SetTextColor(dc, theme::muted);
-        RECT value{r.left, r.top, r.right - px(8), r.bottom};
+        RECT value{r.left, r.top, r.right - libraryPx(8), r.bottom};
         DrawTextW(dc, count.c_str(), -1, &value, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
         return true;
     }
@@ -1026,9 +1034,9 @@ bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
     auto r = item.rcItem;
     auto dc = item.hDC;
     theme::fill(dc, r, theme::surface);
-    const int line = r.bottom - px(4);
-    const int title = line - px(42);
-    const RECT image{r.left, r.top + px(5), r.right, title - px(4)};
+    const int line = r.bottom - libraryPx(4);
+    const int title = line - libraryPx(42);
+    const RECT image{r.left, r.top + libraryPx(5), r.right, title - libraryPx(4)};
     theme::fill(dc, image, theme::field);
     if (auto it = g.cache.find(clip.info.path.native());
         it != g.cache.end() && it->second.bytes == clip.info.bytes && it->second.modifiedTime == clip.info.modifiedTime) {
@@ -1040,8 +1048,8 @@ bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
     if (selected || hasFocus || hovered == item.hwndItem) theme::frame(dc, image, selected || hasFocus ? theme::accent : theme::rule);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, theme::text);
-    SelectObject(dc, font);
-    RECT name{r.left + px(2), title, r.right - (clip.info.favorite ? px(21) : px(2)), title + px(21)};
+    SelectObject(dc, pageFont());
+    RECT name{r.left + libraryPx(2), title, r.right - (clip.info.favorite ? libraryPx(21) : libraryPx(2)), title + libraryPx(21)};
     DrawTextW(dc, clip.name.c_str(), -1, &name, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     if (clip.info.favorite) {
         RECT star{name.right, name.top, r.right, name.bottom};
@@ -1049,7 +1057,7 @@ bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
         DrawTextW(dc, L"\u2605", -1, &star, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
     SetTextColor(dc, theme::muted);
-    RECT details{name.left, name.bottom, r.right - px(2), line};
+    RECT details{name.left, name.bottom, r.right - libraryPx(2), line};
     DrawTextW(dc, clip.details.c_str(), -1, &details, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     return true;
 }

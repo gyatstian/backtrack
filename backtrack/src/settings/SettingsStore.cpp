@@ -396,6 +396,8 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     settings.windowWidth = readInt(values, L"ui.windowWidth", settings.windowWidth);
     settings.windowHeight = readInt(values, L"ui.windowHeight", settings.windowHeight);
     settings.windowMaximized = readBool(values, L"ui.windowMaximized", settings.windowMaximized);
+    settings.uiZoomPercent = readUInt(values, L"ui.zoomPercent", settings.uiZoomPercent);
+    settings.uiScaleWithWindow = readBool(values, L"ui.scaleWithWindow", settings.uiScaleWithWindow);
     settings.exitToTray = readBool(values, L"general.exitToTray", settings.exitToTray);
     settings.checkForUpdates = readBool(values, L"general.checkForUpdates", settings.checkForUpdates);
     settings.loggingEnabled = readBool(values, L"diagnostics.loggingEnabled", settings.loggingEnabled);
@@ -412,6 +414,10 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     settings.clipDirectory = readString(values, L"clips.directory", settings.clipDirectory.wstring());
     settings.organizeClipsByGame = readBool(values, L"clips.organizeByGame", settings.organizeClipsByGame);
     settings.libraryGalleryView = readLibraryGalleryView(values, settings.libraryGalleryView);
+    settings.libraryColumns = readUInt(values, L"library.columns", settings.libraryColumns);
+    settings.libraryFitThumbnails = readBool(values, L"library.fitThumbnails", settings.libraryFitThumbnails);
+    settings.libraryZoomPercent = readUInt(values, L"library.zoomPercent", settings.libraryZoomPercent);
+    settings.libraryOwnScale = readBool(values, L"library.ownScale", settings.libraryOwnScale);
     settings.hotkeys.startStopModifiers = readUInt(values, L"hotkeys.startStop.modifiers", settings.hotkeys.startStopModifiers);
     settings.hotkeys.startStopVirtualKey = readUInt(values, L"hotkeys.startStop.vk", settings.hotkeys.startStopVirtualKey);
     settings.hotkeys.saveReplayModifiers = readUInt(values, L"hotkeys.saveReplay.modifiers", settings.hotkeys.saveReplayModifiers);
@@ -526,6 +532,8 @@ bool SettingsStore::save(const AppSettings& settings) const {
     output << L"ui.windowWidth=" << normalized.windowWidth << L"\n";
     output << L"ui.windowHeight=" << normalized.windowHeight << L"\n";
     output << L"ui.windowMaximized=" << (normalized.windowMaximized ? 1 : 0) << L"\n";
+    output << L"ui.zoomPercent=" << normalized.uiZoomPercent << L"\n";
+    output << L"ui.scaleWithWindow=" << (normalized.uiScaleWithWindow ? 1 : 0) << L"\n";
     output << L"general.exitToTray=" << (normalized.exitToTray ? 1 : 0) << L"\n";
     output << L"general.checkForUpdates=" << (normalized.checkForUpdates ? 1 : 0) << L"\n";
     output << L"diagnostics.loggingEnabled=" << (normalized.loggingEnabled ? 1 : 0) << L"\n";
@@ -539,6 +547,10 @@ bool SettingsStore::save(const AppSettings& settings) const {
     output << L"clips.directory=" << normalized.clipDirectory.wstring() << L"\n";
     output << L"clips.organizeByGame=" << (normalized.organizeClipsByGame ? 1 : 0) << L"\n";
     output << L"library.viewMode=" << (normalized.libraryGalleryView ? L"gallery" : L"list") << L"\n";
+    output << L"library.columns=" << normalized.libraryColumns << L"\n";
+    output << L"library.fitThumbnails=" << (normalized.libraryFitThumbnails ? 1 : 0) << L"\n";
+    output << L"library.zoomPercent=" << normalized.libraryZoomPercent << L"\n";
+    output << L"library.ownScale=" << (normalized.libraryOwnScale ? 1 : 0) << L"\n";
     output << L"hotkeys.startStop.modifiers=" << normalized.hotkeys.startStopModifiers << L"\n";
     output << L"hotkeys.startStop.vk=" << normalized.hotkeys.startStopVirtualKey << L"\n";
     output << L"hotkeys.saveReplay.modifiers=" << normalized.hotkeys.saveReplayModifiers << L"\n";
@@ -594,6 +606,8 @@ AppSettings sanitizeSettings(AppSettings settings) {
     settings.audioInputVolumePercent = std::clamp<uint32_t>(settings.audioInputVolumePercent, 0, 200);
     settings.audioOutputVolumePercent = std::clamp<uint32_t>(settings.audioOutputVolumePercent, 0, 200);
     settings.notificationSoundVolumePercent = std::clamp<uint32_t>(settings.notificationSoundVolumePercent, 0, 100);
+    settings.uiZoomPercent = std::clamp<uint32_t>(settings.uiZoomPercent, 60, 300);
+    settings.libraryZoomPercent = std::clamp<uint32_t>(settings.libraryZoomPercent, 60, 300);
     dedupeNamedExecutableApps(settings.soundSeparationApps);
     dedupeNamedExecutableApps(settings.autoRecordApps);
     settings.hotkeys.startStopModifiers = supportedHotkeyModifiers(settings.hotkeys.startStopModifiers);

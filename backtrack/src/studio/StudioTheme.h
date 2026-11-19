@@ -2,6 +2,8 @@
 
 #include <Windows.h>
 
+#include <algorithm>
+
 namespace backtrack::studio_theme {
 
 inline constexpr COLORREF surface = RGB(13, 14, 16);
@@ -21,7 +23,6 @@ inline constexpr COLORREF accent = RGB(152, 201, 253);
 inline constexpr COLORREF recording = RGB(250, 112, 122);
 inline constexpr COLORREF success = RGB(122, 223, 166);
 
-inline constexpr int titleBarHeight = 26;
 inline constexpr int navHeight = 24;
 inline constexpr int navUnderlineBand = 3;
 inline constexpr int footerHeight = 60;
@@ -30,6 +31,21 @@ inline constexpr int inset = 14;
 inline constexpr int sectionInset = 25;
 inline constexpr int dependencyIndent = 12;
 inline constexpr int gap = 8;
+
+// UI scale = DPI scale * zoom * window factor. The window factor follows the
+// content width against the default window size in both directions, so the layout
+// keeps its density at any size; the product clamp keeps text legible and stops
+// one huge window from swallowing a whole page.
+inline constexpr int minUiScale = 60;
+inline constexpr int maxUiScale = 400;
+inline constexpr int minUiZoom = 60;
+inline constexpr int maxUiZoom = 300;
+
+inline int uiScalePercent(int zoomPercent, int windowWidth, int baseWidth, bool followWindow) {
+    const int follow = followWindow && windowWidth > 0 && baseWidth > 0
+        ? (std::max)(1, MulDiv(windowWidth, 100, baseWidth)) : 100;
+    return std::clamp(MulDiv(zoomPercent, follow, 100), minUiScale, maxUiScale);
+}
 
 inline RECT tabBounds(const RECT& row, int index, int count, int gap) {
     const int width = row.right - row.left;

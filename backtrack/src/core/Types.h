@@ -247,6 +247,15 @@ struct AppSettings {
     // Empty = built-in success tone. Used when a replay saves successfully.
     std::filesystem::path customNotificationSoundPath;
     bool libraryGalleryView = false;
+    // Gallery columns. 0 fits as many as the window allows; any other value is
+    // the pinned count, deliberately unbounded.
+    uint32_t libraryColumns = 0;
+    // Fit the whole frame into a tile instead of filling it and cropping.
+    bool libraryFitThumbnails = true;
+    // Library-only UI scale: the gallery keeps its own Ctrl+Scroll zoom while
+    // `libraryOwnScale` is set, and rides the UI zoom otherwise.
+    uint32_t libraryZoomPercent = 100;
+    bool libraryOwnScale = false;
     uint32_t monitorIndex = 0;
     bool multiMonitorSupport = false;
     // Multi-monitor on with this set follows the cursor instead of the focused window.
@@ -260,6 +269,12 @@ struct AppSettings {
     int32_t windowWidth = 0;
     int32_t windowHeight = 0;
     bool windowMaximized = false;
+    // Live UI state like the placement above: written straight into the saved
+    // baseline, never through the settings draft. Percent on top of the DPI
+    // scale; Ctrl+Scroll edits it.
+    uint32_t uiZoomPercent = 100;
+    // Clamps and measures the UI with the window size as well as the DPI.
+    bool uiScaleWithWindow = false;
     bool operator==(const AppSettings&) const = default;
 };
 

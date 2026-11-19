@@ -7,9 +7,9 @@ lightweight clipping software that works with both nvidia (nvenc) and amd (amf).
 
 ## ui
 
-drag the title bar to move the window, or double-click it to maximize or restore.
-the window reopens at the position, size, and maximized state it was closed with, unless that spot is on a display that is gone.
+the window uses the normal Windows title bar, resized and moved natively. it has no maximize button, so it cannot be maximized by double-click or by dragging to the top edge. it reopens at the position and size it was closed with, unless that spot is on a display that is gone.
 
+**Ctrl+Scroll** scales the whole UI and the footer names it while idle. **Scale UI with app** under Settings → App also fits the UI to the window size, in both directions; Ctrl+Scroll keeps working in both modes.
 with **Close to the tray** on, closing the window only hides it, so unsaved
 settings stay in the window; **Exit** on the tray menu quits and asks about them.
 a recorder or hotkey failure stays in the footer until a later action succeeds.
@@ -20,7 +20,12 @@ are under **Settings → Capture**. **Recover failed recording** appears on
 Capture only when there is a recording to recover. the library is gallery-only,
 and deleting a clip moves it to the Recycle Bin. the library browses folder by
 folder: clicking a folder opens it, **Back** returns to the folder before it, and
-the **Library** tab always returns to the top of the library.
+the **Library** tab always returns to the top of the library. **Columns** under
+Settings → App pins the gallery grid; blank or 0 fits it to the window instead.
+**Fit thumbnails** gives the tile the frame's 16:9 shape, so the thumbnail fills
+it; off keeps one tile height and shows bars on wide tiles. The frame is never
+cropped. **Separate library scale** gives the gallery its own Ctrl+Scroll
+scale, so tiles can be bigger or smaller than the rest of the window.
 
 with Windows animation effects enabled, the underline slides between clicked
 tabs, the record icon changes shape after recording starts or stops, opening a

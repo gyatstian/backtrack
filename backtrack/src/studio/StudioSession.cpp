@@ -105,7 +105,7 @@ void StudioWindow::Impl::finishClose() {
 void StudioWindow::Impl::shutdown() {
     if (shuttingDown) return;
     shuttingDown = true;
-    saveWindowPlacement();
+    saveUiState();
     requestSessionStop();
     if (window) KillTimer(window, shutdownTimer);
     removeTray();

@@ -34,8 +34,8 @@ inline HotkeySettings registeredHotkeys(const AppSettings& settings) {
     return keys;
 }
 
-// LoadIcon returns a shared handle that must never be destroyed, so the chrome
-// and tray need owned copies. LoadIconWithScaleDown/LoadIconMetric give the best
+// LoadIcon returns a shared handle that must never be destroyed, so the tray
+// needs an owned copy. LoadIconWithScaleDown/LoadIconMetric give the best
 // small glyph, but only comctl32 v6 exports them and this app links the v5 copy
 // unless a common-controls manifest is active, so they are resolved at runtime
 // with LoadImage (which also returns an owned icon) as the fallback.
@@ -75,7 +75,6 @@ struct StudioWindow::Impl {
 
     enum class ButtonTone { Normal, Primary, Quiet };
     enum Motion { mainMarker, categoryMarker, recordGlyph, replayCheck, librarySlide, motionCount };
-    enum class Glyph { None, Minimize, Close };
     struct Control {
         ControlEvent event;
         std::wstring help;
@@ -84,7 +83,6 @@ struct StudioWindow::Impl {
         bool combo = false;
         bool pointerMotion = false;
         ButtonTone tone = ButtonTone::Normal;
-        Glyph glyph = Glyph::None;
     };
     struct Row {
         std::vector<HWND> cells;
@@ -112,13 +110,16 @@ struct StudioWindow::Impl {
     LRESULT message(UINT, WPARAM, LPARAM);
     LRESULT bodyMessage(HWND, UINT, WPARAM, LPARAM);
 
-    int px(int dip) const { return MulDiv(dip, static_cast<int>(dpi), 96); }
-    int resizeGrip() const { return IsZoomed(window) ? 0 : px(6); }
+    int dpiPx(int dip) const { return MulDiv(dip, static_cast<int>(dpi), 96); }
+    int px(int dip) const { return MulDiv(dpiPx(dip), uiScale, 100); }
+    // Library content uses its own scale when the setting is on; everything
+    // else, including the navigation and footer, keeps the UI scale.
+    int libraryPx(int dip) const { return MulDiv(dpiPx(dip), galleryScale, 100); }
+    int pagePx(int dip) const { return nav.page == Page::Library ? libraryPx(dip) : px(dip); }
+    HFONT pageFont() const { return nav.page == Page::Library && libraryFont ? libraryFont : font; }
     void updateFont();
-    void updateAppIcon();
-    void saveWindowPlacement();
+    void saveUiState();
     bool keyboardCuesHidden() const;
-    void buildCaptionGlyphs();
     void layout(bool newPage = false);
     void layoutFooter(const RECT& client);
     void layoutRows(bool heightOnly = false, bool repaint = true);
@@ -144,21 +145,19 @@ struct StudioWindow::Impl {
     void paintRecordingGlyph(HDC dc, const RECT& box, bool disabled);
     void paintReplayCheck(HDC dc);
     void paintFrame(HDC dc, const RECT& dirty);
-    void paintTitleBar(HDC dc, int width);
-    void paintCaptionButton(const DRAWITEMSTRUCT& item, Glyph glyph);
     void paintButton(const DRAWITEMSTRUCT& item);
     void paintCheckbox(HWND control, HDC dc);
     void paintCombo(const DRAWITEMSTRUCT& item);
     void setStatus(std::wstring value, bool replaySaved = false, bool pointer = false);
     void paintFooter(bool animateCheck = false);
     bool handleShortcut(const MSG& message);
+    bool zoomInput(UINT message, WPARAM wheel);
     bool editHotkey(HWND field, uint32_t modifiers, uint32_t key);
 
     HWND make(const wchar_t* type, const wchar_t* label, DWORD style, ControlEvent event = {},
               const wchar_t* help = L"", HWND parent = nullptr);
     HWND button(const wchar_t* label, Action click, const wchar_t* help = L"", HWND parent = nullptr,
                 ButtonTone tone = ButtonTone::Normal);
-    HWND captionButton(Glyph glyph, Action click);
     HWND editField(const std::wstring& value, DWORD style, ControlEvent onChange, const wchar_t* help);
     HWND edit(const wchar_t* label, const std::wstring& value, DWORD style, ControlEvent onChange,
               const wchar_t* help = L"");
@@ -244,9 +243,6 @@ struct StudioWindow::Impl {
     StudioNavigation nav;
     HWND window = nullptr;
     HWND body = nullptr;
-    HWND titleMinimize = nullptr;
-    HWND titleClose = nullptr;
-    HICON appIcon = nullptr;
     HWND footer = nullptr;
     HWND save = nullptr;
     HWND record = nullptr;
@@ -269,10 +265,6 @@ struct StudioWindow::Impl {
     HWND hovered = nullptr;
     HWND focused = nullptr;
     HWND lastFocus = nullptr;
-    // Rendered alpha for the two caption glyphs; rebuilt when the DPI changes.
-    std::array<std::vector<BYTE>, 2> captionGlyphAlpha;
-    std::array<SIZE, 2> captionGlyphSize{};
-    unsigned captionGlyphDpi = 0;
     std::optional<HWND> clickOrigin;
     bool motionEnabled = false;
     std::array<StudioMotion, motionCount> motions;
@@ -294,10 +286,20 @@ struct StudioWindow::Impl {
     std::vector<std::pair<size_t, std::function<bool()>>> conditions;
     std::vector<std::pair<HWND, std::function<bool()>>> visibility;
     unsigned dpi = 96;
+    // Ctrl+Scroll zoom in percent, and the effective scale px() applies: zoom
+    // times the window factor. Both live so a relayout can rescale in place.
+    int uiZoom = 100;
+    int uiScale = 100;
+    int layoutScale = 0;
+    // Library zoom, effective library scale, and the scale the last layout used.
+    int libraryZoom = 100;
+    int galleryScale = 100;
+    int layoutLibraryScale = 0;
     SIZE layoutSize{};
-    int layoutGrip = 0;
     unsigned layoutDpi = 0;
     HFONT font = nullptr;
+    // Built only while the library scale differs from the UI scale.
+    HFONT libraryFont = nullptr;
     HBRUSH surfaceBrush = nullptr;
     HBRUSH fieldBrush = nullptr;
     HBRUSH activeBrush = nullptr;

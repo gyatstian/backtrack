@@ -17,6 +17,7 @@ namespace {
 constexpr auto settingsHelp = L"Save changes before they affect capture.";
 constexpr auto secondsHelp = L"Longer replay buffers retain more footage and take more disk or memory space.";
 constexpr auto hotkeyHelp = L"Focus this field and press a shortcut. Press Delete or Backspace to clear it.";
+constexpr auto columnsHelp = L"Gallery columns. Blank or 0 fits as many as the window allows; a larger count leaves the tiles smaller.";
 
 } // namespace
 
@@ -277,6 +278,9 @@ bool StudioWindow::Impl::saveSettings(bool refreshPage) {
             setStatus(warning);
             return false;
         }
+        // The zoom mode applies to the live window, which no page rebuild covers
+        // when it is the only edit.
+        layout();
         ControllerAction settings;
         settings.kind = ControllerActionKind::ApplySettings;
         settings.settings = saved;
@@ -385,13 +389,41 @@ void StudioWindow::Impl::buildSettings() {
     auto& video = draft.video;
     auto& game = draft.gameIntegrations;
     switch (nav.category) {
-    case Category::App:
+    case Category::App: {
         section(L"Application");
         check(L"Start minimized with Windows", draft.startWithWindowsMinimized,
               L"Adds Backtrack to Windows startup. It starts minimized only when Windows launches it.");
         check(L"Close to the tray", draft.exitToTray, L"Closing the window leaves Backtrack running. Use Exit on the tray icon to quit.");
         check(L"Check for updates at startup", draft.checkForUpdates, L"Asks GitHub for a new release once per launch.");
+        check(L"Scale UI with app", draft.uiScaleWithWindow,
+              L"Fits the UI to the window size. Ctrl+Scroll scales it either way.");
+
+        section(L"Library");
+        const auto columns = make(L"STATIC", L"Columns", SS_CENTERIMAGE | SS_NOTIFY | SS_NOPREFIX | WS_VISIBLE, {},
+                                  columnsHelp);
+        // A raw count, not numberField: blank means auto, so an empty field is a
+        // value rather than an invalid edit.
+        const auto field = editField(draft.libraryColumns ? std::to_wstring(draft.libraryColumns) : std::wstring(),
+            ES_NUMBER | ES_AUTOHSCROLL,
+            [this](HWND hwnd, UINT event) {
+                if (event != EN_CHANGE) return;
+                const uint32_t value = readText(hwnd).empty() ? 0
+                    : parseUIntControl(hwnd).value_or(draft.libraryColumns);
+                if (std::exchange(draft.libraryColumns, value) != value) changed();
+            }, columnsHelp);
+        row({columns, field}, true);
+        rows.back().inset = studio_theme::sectionInset;
+        rows.back().widths = {152, 92};
+        check(L"Fit thumbnails", draft.libraryFitThumbnails,
+              L"Gives the tile the frame's shape, so the thumbnail fills it. Off keeps one tile height and shows bars on wide tiles.");
+        rows.back().inset = studio_theme::sectionInset;
+        rows.back().widths = {232};
+        check(L"Separate library scale", draft.libraryOwnScale,
+              L"Gives the gallery its own Ctrl+Scroll scale instead of the app's.");
+        rows.back().inset = studio_theme::sectionInset;
+        rows.back().widths = {252};
         break;
+    }
     case Category::Capture: {
         constexpr int labelWidth = 152;
         constexpr int controlInset = studio_theme::sectionInset + labelWidth + studio_theme::gap;

@@ -619,6 +619,34 @@ void testWindowPlacementPersistence() {
     const auto malformed = store.load();
     expect(malformed.windowWidth == 0 && malformed.windowHeight == 0,
         "a malformed window size was not treated as unset");
+
+    AppSettings zoomed;
+    zoomed.uiZoomPercent = 175;
+    zoomed.uiScaleWithWindow = true;
+    expect(store.save(zoomed), "could not save the UI zoom");
+    const auto reloaded = store.load();
+    expect(reloaded.uiZoomPercent == 175 && reloaded.uiScaleWithWindow, "the UI zoom did not round trip");
+    writeBytes(path, "ui.zoomPercent=5\n");
+    expect(store.load().uiZoomPercent == 60, "an out-of-range UI zoom was not clamped");
+
+    AppSettings columns;
+    columns.libraryColumns = 7;
+    expect(store.save(columns), "could not save the gallery columns");
+    expect(store.load().libraryColumns == 7, "the gallery columns did not round trip");
+    columns.libraryFitThumbnails = false;
+    expect(store.save(columns), "could not save the thumbnail fit");
+    expect(!store.load().libraryFitThumbnails, "the thumbnail fit did not round trip");
+    columns.libraryOwnScale = true;
+    columns.libraryZoomPercent = 180;
+    expect(store.save(columns), "could not save the library scale");
+    const auto scaled = store.load();
+    expect(scaled.libraryOwnScale && scaled.libraryZoomPercent == 180, "the library scale did not round trip");
+    writeBytes(path, "library.zoomPercent=3\n");
+    expect(store.load().libraryZoomPercent == 60, "an out-of-range library zoom was not clamped");
+    writeBytes(path, "library.columns=4294967295\n");
+    expect(store.load().libraryColumns == 4294967295u, "the gallery columns must stay unbounded");
+    writeBytes(path, "library.columns=two\n");
+    expect(store.load().libraryColumns == 0, "a malformed gallery column count should mean automatic");
 }
 
 } // namespace

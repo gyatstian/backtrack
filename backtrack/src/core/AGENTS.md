@@ -31,7 +31,12 @@ the lock-free queue used between threads, and the app version constant.
 - `AppSettings::windowLeft/Top/Width/Height/Maximized` is the restored window
   placement in virtual-screen coordinates. a zero width or height means "no
   stored placement"; the signed offsets may be negative on displays left of or
-  above the primary. the studio writes it without touching the settings draft.
+  above the primary. the studio writes it without touching the settings draft,
+  and never restores the maximized flags since the window cannot maximize.
+  `uiZoomPercent` and `uiScaleWithWindow` are the UI scale: the zoom is live
+  Ctrl+Scroll state written with the placement, the flag is an ordinary saved
+  form field that makes the scale follow the window size. `libraryZoomPercent`
+  and `libraryOwnScale` are the same pair for the gallery alone.
 - `AudioPacket::bytes` is a `std::pmr::vector` so the WASAPI capture thread
   allocates payloads from a pool instead of the CRT heap. A pmr vector binds its
   resource at construction, so `ensureAudioPacketPool()`

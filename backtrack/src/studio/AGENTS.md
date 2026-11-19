@@ -15,16 +15,11 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 
 ## Local Contracts
 
-- keep the overlapped window styles for native drag, snap, and double-click
-  maximize/restore. `WM_NCCALCSIZE` replaces the native frame with the client
-  title bar and keeps maximized content inside the work area. `WM_NCHITTEST`
-  enables resize grips only when restored. layout keeps child windows out of
-  those strips so the parent receives edge mouse input.
-  the compact bar shows the app icon without title text. named minimize/close
-  buttons blend into the bar at rest and are not tab stops. center their
-  antialiased 2-dip strokes on the button bounds. the close mark is slightly
-  wider than it is tall, with red hover and press fills.
-- the main navigation bar touches the title bar and stays visible on every
+- the window keeps the native frame: no `WM_NCCALCSIZE`/`WM_NCHITTEST`
+  handling, no client title bar, no caption buttons. `WS_MAXIMIZEBOX` is
+  removed, so there is no maximize button, snap maximize, or double-click
+  maximize/restore. the dark title bar comes from `DWMWA_USE_IMMERSIVE_DARK_MODE`.
+  the navigation starts at the client top and stays visible on every
   page. the settings page shows a second row of category tabs below it. the
   bars and page share one surface; selected navigation and the contextual
   footer share a fill. sections use inset labels in divider lines.
@@ -33,13 +28,13 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   neutral underline in each row's bottom band, not a second indicator. use
   an inset outline for keyboard focus when cues are visible: owner-drawn
   controls honour `ODS_NOFOCUSRECT` and the checkbox honours `UISF_HIDEFOCUS`.
-  caption buttons draw a cached glyph alpha mask per DPI, not per-pixel
-  supersampling on every paint.
-- the window remembers its rect and maximized state through
-  `AppSettings::window*`; restore keeps the stored rect only when it still
-  intersects a monitor work area. write the placement on shutdown directly into
-  the saved baseline, never through the settings draft, so closing cannot
-  publish unsaved pages.
+- the window remembers its rect through `AppSettings::window*`; restore keeps the
+  stored rect only when it still intersects a monitor work area, and the stored
+  maximized flag is written false because the window cannot maximize.
+  `saveUiState` writes the placement and both zooms into the saved baseline, never
+  through the settings draft, so it cannot publish unsaved pages. it runs on
+  shutdown and on every Ctrl+Scroll notch: a zoom that waited for exit was lost
+  whenever the app closed to the tray or ended abnormally.
 - the footer carries one persistent failure line for the last recorder or
   hotkey failure. it outlives `statusTimer` and clears only on a later
   successful action; ordinary status text still expires.
@@ -49,6 +44,24 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 - layout uses dpi-scaled units. the footer occupies a stable reserved area;
   showing help or status must not reflow or overlay the page. keep it readable
   with keyboard focus as well as hover.
+- every layout unit goes through `px()`, which multiplies the DPI scale by the
+  effective UI scale: the Ctrl+Scroll zoom times the window factor of
+  `studio_theme::uiScalePercent`. the factor follows the content width against
+  the default window size in both directions, and the product is clamped to
+  60-400% so a small window stays legible and a huge one cannot swallow a whole
+  page. the message loop takes Ctrl+Scroll before dispatch so the gesture
+  reaches no child's own wheel handler, and a scale change rebuilds the font
+  before positioning anything. the
+  window factor is applied from the saved baseline (`ui.scaleWithWindow`), not
+  the draft, so the checkbox takes effect on save. the zoom is live state that
+  also goes into the draft and the baseline on every change, so a page save
+  keeps it instead of publishing the stale draft value. a footer with nothing
+  else to show names the gesture. `library.ownScale` gives the library page its
+  own zoom: gallery content is measured with `libraryPx`/`pageFont` (the
+  `galleryScale`) while chrome, navigation and footer keep `px`/`font`, so
+  Ctrl+Scroll on the library moves the tiles and leaves the tabs alone. a scale
+  change rebuilds both fonts; the library font exists only while the two scales
+  differ.
 - make pointer motion visible through travel or a shape change, not just a
   color fade. the tab marker travels after navigation, the record glyph morphs
   on confirmed state changes, and the footer check draws on replay success.
@@ -153,6 +166,14 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   thumbnails are cached by path and revalidated against size and modified time,
   so a rescan that shifts indexes keeps them. they decode at the tile width
   rounded up to 160px steps and re-decode only when that step grows.
+  the grid fits as many 210-dip tiles as the viewport holds (max five) unless
+  `library.columns` pins a count, which makes the tiles grow with the window and
+  the UI scale instead of adding columns. that field is a raw count, not
+  `numberField`: blank means automatic, so an empty field is a value and never
+  blocks a save. `library.fitThumbnails` picks the row height rule: on (default)
+  the row follows the tile width at 16:9 plus the name line, so the thumbnail
+  fills the tile; off keeps every row at `px(250)` and scales the frame into it,
+  so a wide tile shows bars. the frame is never cropped either way.
 
 ## Verification
 

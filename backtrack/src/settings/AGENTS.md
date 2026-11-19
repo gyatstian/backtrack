@@ -56,8 +56,8 @@ untrusted values, and the enum name mappings that cross the file boundary.
   - `ui.windowWidth`/`ui.windowHeight` are 0 (no stored placement) or 200-20000;
     a value below 200 clears both plus `ui.windowLeft`/`ui.windowTop`, so a
     corrupt size cannot restore an unusable window. `ui.windowMaximized` is a
-    plain flag and the offsets are virtual-screen coordinates, so they stay
-    signed and unbounded
+    plain flag the window writes false, because it has no maximize box, and the
+    offsets are virtual-screen coordinates, so they stay signed and unbounded
   It also masks hotkey modifiers, resolves derived settings (adaptive
   B-frames need B-frames, adaptive I-frames need lookahead, follow-mouse needs
   multi-monitor), caps each executable list at 128 entries,
@@ -72,7 +72,16 @@ untrusted values, and the enum name mappings that cross the file boundary.
   launches.
 - `ui.window*` is UI state, not a form field: the window writes it straight into
   the saved baseline with `SettingsStore::save`, never through the settings
-  draft, so closing never publishes unsaved page edits.
+  draft, so closing never publishes unsaved page edits. `ui.zoomPercent` is live
+  Ctrl+Scroll state too, clamped to 60-300 in `sanitizeSettings`, written on every
+  change rather than at exit; the same save keeps it in the draft, because a page
+  save publishes the draft and would otherwise reset the zoom.
+- `library.columns` is unbounded on purpose: 0 or blank fits the gallery to the
+  window, any other count is used as written (the gallery caps only where its int
+  arithmetic would overflow). `sanitizeSettings` leaves it alone.
+  `library.zoomPercent` is the library's own live Ctrl+Scroll zoom, clamped to
+  60-300 like `ui.zoomPercent`, and `library.ownScale` is the saved form field
+  that switches the gallery over to it.
 - `monitorIndex` is the one numeric setting left unclamped on purpose:
   `platform/Win32Util.cpp:monitorFromIndex` warns and falls back to the first
   monitor, so clamping it to 0 would silently move users off their monitor.

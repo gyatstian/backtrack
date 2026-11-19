@@ -85,9 +85,8 @@ float StudioWindow::Impl::motionValue(Motion slot) const {
 }
 
 RECT StudioWindow::Impl::markerTrack(Motion slot) const {
-    const int bottom = px(theme::titleBarHeight) + (slot == categoryMarker ? 2 : 1) * px(theme::navHeight);
-    return {layoutGrip, bottom - px(theme::navUnderlineBand),
-            (std::max)(layoutGrip, static_cast<int>(layoutSize.cx) - layoutGrip), bottom};
+    const int bottom = (slot == categoryMarker ? 2 : 1) * px(theme::navHeight);
+    return {0, bottom - px(theme::navUnderlineBand), static_cast<int>(layoutSize.cx), bottom};
 }
 
 void StudioWindow::Impl::paintTabMarker(HDC dc, Motion slot) {

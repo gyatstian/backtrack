@@ -53,6 +53,22 @@ RECT bounds(HWND hwnd) {
     return rect;
 }
 
+// A save is refused while the recorder action is busy, so keep publishing until
+// the store shows the value.
+template <class Published>
+bool saveUntil(HWND window, Published published) {
+    MSG msg{};
+    const auto deadline = std::chrono::steady_clock::now() + 8s;
+    while (std::chrono::steady_clock::now() < deadline) {
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        if (published()) return true;
+        const auto save = find(window, L"Save settings");
+        if (save && IsWindowEnabled(save)) SendMessageW(save, BM_CLICK, 0, 0);
+        Sleep(10);
+    }
+    return published();
+}
+
 template <class Change>
 void expectDeferredMove(HWND child, Change change, int expectedMoves = 1) {
     struct Observation { int moves = 0; bool deferred = true; } observed;
@@ -197,6 +213,17 @@ void testGalleryGeometry() {
     expect(layout.visible(20, 100, 0, 1) == std::pair<size_t, size_t>{0, 0}, "zero-height viewport should have no tiles or overscan");
 }
 
+void testUiScale() {
+    using studio_theme::uiScalePercent;
+    expect(uiScalePercent(100, 870, 870, false) == 100, "a plain zoom should leave the scale at 100%");
+    expect(uiScalePercent(100, 870, 870, true) == 100, "the default window should scale the UI at 100%");
+    expect(uiScalePercent(100, 1740, 870, true) == 200, "a double-width window should double the UI");
+    expect(uiScalePercent(100, 435, 870, true) == studio_theme::minUiScale, "a narrow window should shrink the UI");
+    expect(uiScalePercent(150, 1740, 870, true) == 300, "window scaling should carry the wheel zoom");
+    expect(uiScalePercent(300, 3480, 870, true) == studio_theme::maxUiScale, "the effective scale should be capped");
+    expect(uiScalePercent(60, 0, 0, true) == 60, "an unknown window size should leave the zoom alone");
+}
+
 template <class Test>
 void withHeldStartup(AppSettings initial, SettingsStore& store, Test test) {
     initial.replay.enabled = false;
@@ -232,99 +259,11 @@ void withHeldStartup(AppSettings initial, SettingsStore& store, Test test) {
     expect(!prepareTimedOut.load(), "the test must open the preparation gate before its watchdog expires");
 }
 
-void checkTitleBar(HWND window) {
-    const auto clientBounds = [&] {
-        RECT rect{};
-        GetClientRect(window, &rect);
-        MapWindowPoints(window, nullptr, reinterpret_cast<POINT*>(&rect), 2);
-        return rect;
-    };
-    const auto titlePoint = [&] {
-        const auto client = clientBounds();
-        return MAKELPARAM((client.left + client.right) / 2, (client.top + bounds(find(window, L"Capture")).top) / 2);
-    };
-    const auto hit = [&](LPARAM point) { return SendMessageW(window, WM_NCHITTEST, 0, point); };
-    const auto original = bounds(window);
-    const auto client = clientBounds();
-    expect(EqualRect(&original, &client), "the custom title bar should replace the native frame on first show");
-    expect(hit(MAKELPARAM(client.left, client.top)) == HTTOPLEFT, "restored window should have resize grips");
-    const auto closeButton = find(window, L"Close");
-    const auto close = bounds(closeButton);
-    expect(hit(MAKELPARAM((close.left + close.right) / 2, (close.top + close.bottom) / 2)) == HTCLIENT,
-           "the close button should not start a window drag");
-    const auto checkGrip = [&](POINT screen, LRESULT expected) {
-        POINT point = screen;
-        ScreenToClient(window, &point);
-        expect(ChildWindowFromPointEx(window, point, CWP_SKIPINVISIBLE) == window,
-               "resize grips must not be covered by child windows");
-        expect(hit(MAKELPARAM(screen.x, screen.y)) == expected, "window edge should hit-test as a resize grip");
-    };
-    const auto navY = bounds(find(window, L"Capture")).top;
-    const auto midY = (client.top + client.bottom) / 2;
-    checkGrip({(close.left + close.right) / 2, client.top}, HTTOP);
-    checkGrip({client.right - 1, client.top}, HTTOPRIGHT);
-    checkGrip({client.left, navY}, HTLEFT);
-    checkGrip({client.right - 1, navY}, HTRIGHT);
-    checkGrip({client.left, midY}, HTLEFT);
-    checkGrip({client.right - 1, midY}, HTRIGHT);
-    checkGrip({(client.left + client.right) / 2, client.bottom - MulDiv(4, GetDpiForWindow(window), 96)}, HTBOTTOM);
-    checkGrip({client.right - 1, client.bottom - 1}, HTBOTTOMRIGHT);
-
-    const LONG w = close.right - close.left, h = close.bottom - close.top;
-    BITMAPINFO bitmap{{sizeof(BITMAPINFOHEADER), w, -h, 1, 32, BI_RGB}};
-    void* pixels = nullptr;
-    const auto dc = CreateCompatibleDC(nullptr);
-    const auto surface = CreateDIBSection(dc, &bitmap, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    const auto previous = dc && surface ? SelectObject(dc, surface) : nullptr;
-    bool smooth = false, centered = false, untouched = false;
-    if (previous) {
-        centered = untouched = true;
-        for (const auto button : {closeButton, find(window, L"Minimize")}) {
-            constexpr auto marker = RGB(1, 2, 3);
-            SetPixelV(dc, w / 2, h / 2, marker);
-            untouched &= SendMessageW(button, WM_ERASEBKGND, reinterpret_cast<WPARAM>(dc), 0) != 0 &&
-                         GetPixel(dc, w / 2, h / 2) == marker;
-            DRAWITEMSTRUCT item{ODT_BUTTON, 0, 0, ODA_DRAWENTIRE, ODS_SELECTED, button, dc, {0, 0, w, h}};
-            SendMessageW(window, WM_DRAWITEM, 0, reinterpret_cast<LPARAM>(&item));
-            const auto background = GetPixel(dc, 0, 0), ink = GetPixel(dc, w / 2, h / 2);
-            centered &= ink != CLR_INVALID && ink != background;
-            for (int y = 0; y < h; ++y) {
-                for (int x = 0; x < w; ++x) {
-                    const auto pixel = GetPixel(dc, x, y);
-                    centered &= pixel == GetPixel(dc, w - 1 - x, y) && pixel == GetPixel(dc, x, h - 1 - y);
-                    if (button == closeButton && pixel != CLR_INVALID && pixel != ink && pixel != background) smooth = true;
-                }
-            }
-        }
-        SelectObject(dc, previous);
-    }
-    if (surface) DeleteObject(surface);
-    if (dc) DeleteDC(dc);
-    expect(smooth, "the close icon should have blended edge pixels");
-    expect(centered, "both caption icons should be centered in their button bounds");
-    expect(untouched, "owner-drawn buttons should not flash a separate background erase");
-    auto point = titlePoint();
-    expect(hit(point) == HTCAPTION, "the title strip should support native dragging");
-    SendMessageW(window, WM_NCLBUTTONDBLCLK, HTCAPTION, point);
-    expect(IsZoomed(window), "double-clicking the title strip should maximize");
-    MONITORINFO monitor{sizeof(monitor)};
-    expect(GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &monitor), "expected monitor work area");
-    const auto maximized = clientBounds();
-    expect(EqualRect(&maximized, &monitor.rcWork), "maximized client area should fit the work area");
-    expect(hit(MAKELPARAM((maximized.left + maximized.right) / 2, maximized.top)) == HTCAPTION,
-           "the maximized title strip should not have a resize grip");
-    point = titlePoint();
-    SendMessageW(window, WM_NCLBUTTONDBLCLK, HTCAPTION, point);
-    const auto restored = bounds(window);
-    expect(!IsZoomed(window) && EqualRect(&original, &restored), "double-clicking again should restore the original bounds");
-}
-
 void testCloseDuringStartup(const std::filesystem::path& temporary) {
     const auto clips = temporary / L"close-clips";
     std::filesystem::create_directories(clips);
     SettingsStore store(temporary / L"close-settings.ini");
     withHeldStartup(AppSettings{.clipDirectory = clips}, store, [&](HWND window, RecorderController&, auto release) {
-        checkTitleBar(window);
         const auto tab = find(window, L"Capture");
         const auto previous = bounds(tab);
         const auto frame = bounds(window);
@@ -660,6 +599,184 @@ void checkAudioDraft(HWND window, const SettingsStore& store, const AppSettings&
     expect(saved.audioOutputDeviceId == initial.audioOutputDeviceId, "save should retain the pinned unavailable output");
 }
 
+HWND firstGalleryTile(HWND window) {
+    HWND hit = nullptr;
+    const auto view = find(window, L"Clip gallery");
+    if (view) {
+        EnumChildWindows(view, [](HWND child, LPARAM arg) -> BOOL {
+            wchar_t cls[8]{};
+            GetClassNameW(child, cls, static_cast<int>(std::size(cls)));
+            if (std::wstring_view(cls) != L"Button" || GetWindowTextLengthW(child) == 0) return TRUE;
+            *reinterpret_cast<HWND*>(arg) = child;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&hit));
+    }
+    return hit;
+}
+
+int fontHeight(HWND control) {
+    if (!control) return 0;
+    const auto font = reinterpret_cast<HFONT>(SendMessageW(control, WM_GETFONT, 0, 0));
+    LOGFONTW log{};
+    return font && GetObjectW(font, sizeof(log), &log) ? std::abs(log.lfHeight) : 0;
+}
+
+int studioTextHeight(HWND window) {
+    const auto tab = find(window, L"Capture");
+    expect(tab != nullptr, "expected the capture tab");
+    const auto font = reinterpret_cast<HFONT>(SendMessageW(tab, WM_GETFONT, 0, 0));
+    LOGFONTW log{};
+    return font && GetObjectW(font, sizeof(log), &log) ? std::abs(log.lfHeight) : 0;
+}
+
+void testUiScaling(const std::filesystem::path& temporary) {
+    const auto clips = temporary / L"clips";
+    SettingsStore store(temporary / L"scale-settings.ini");
+    withHeldStartup({.clipDirectory = clips, .uiZoomPercent = 200}, store,
+                    [&](HWND window, RecorderController&, auto release) {
+        release();
+        const int dpi = static_cast<int>(GetDpiForWindow(window));
+        const auto textAt = [dpi](int scale) { return MulDiv(MulDiv(15, dpi, 96), scale, 100); };
+        expect(studioTextHeight(window) == textAt(200), "a stored 200% zoom should double the UI text");
+        // Ctrl+Scroll only has to reach the scale; the loop path takes the same
+        // message before dispatch, so a plain send exercises the same handler.
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, WHEEL_DELTA), 0);
+        expect(studioTextHeight(window) == textAt(210), "ctrl+scroll should zoom the UI text");
+        expect(store.load().uiZoomPercent == 210, "the wheel zoom should be saved as it changes");
+        // The regression that made the zoom look unsaved: a page save publishes
+        // the draft, which has to carry the zoom. Writes wait for the held
+        // startup action, so the save needs it finished first.
+        click(window, L"Settings");
+        click(window, L"App");
+        click(window, L"Scale UI with app");
+        const auto startupDone = [&] {
+            const auto footer = FindWindowExW(window, nullptr, L"Edit", nullptr);
+            wchar_t text[512]{};
+            GetWindowTextW(footer, text, static_cast<int>(std::size(text)));
+            return !std::wstring_view(text).starts_with(L"Starting capture…");
+        };
+        expect(waitFor(startupDone), "the startup action should finish");
+        expect(saveUntil(window, [&] {
+            const auto now = store.load();
+            return now.uiZoomPercent == 210 && now.uiScaleWithWindow;
+        }), "a settings save must keep the wheel zoom and publish the checkbox");
+        DestroyWindow(window);
+    });
+    const auto stored = store.load();
+    expect(stored.uiZoomPercent == 210, "the zoom should survive the window closing");
+    withHeldStartup({.clipDirectory = clips, .uiScaleWithWindow = true}, store,
+                    [&](HWND window, RecorderController&, auto release) {
+        release();
+        const int base = MulDiv(15, static_cast<int>(GetDpiForWindow(window)), 96);
+        expect(studioTextHeight(window) == base, "the default window should keep the UI at its DPI size");
+        RECT rect{};
+        expect(GetWindowRect(window, &rect), "expected window bounds");
+        const auto width = rect.right - rect.left, height = rect.bottom - rect.top;
+        SetWindowPos(window, nullptr, 0, 0, 2 * width, height, SWP_NOMOVE | SWP_NOZORDER);
+        expect(studioTextHeight(window) > base, "a wider window should scale the UI text up");
+        SetWindowPos(window, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER);
+        expect(studioTextHeight(window) == base, "shrinking the window should scale the UI text back down");
+        DestroyWindow(window);
+    });
+}
+
+std::vector<RECT> galleryTiles(HWND window) {
+    std::vector<RECT> tiles;
+    const auto view = find(window, L"Clip gallery");
+    expect(view != nullptr, "expected the gallery viewport");
+    EnumChildWindows(view, [](HWND child, LPARAM arg) -> BOOL {
+        wchar_t cls[8]{};
+        GetClassNameW(child, cls, static_cast<int>(std::size(cls)));
+        RECT rect{};
+        if (std::wstring_view(cls) == L"Button" && GetWindowTextLengthW(child) > 0 && GetWindowRect(child, &rect))
+            reinterpret_cast<std::vector<RECT>*>(arg)->push_back(rect);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&tiles));
+    return tiles;
+}
+
+int firstRowTiles(HWND window) {
+    const auto tiles = galleryTiles(window);
+    expect(!tiles.empty(), "expected gallery tiles");
+    long top = tiles.front().top;
+    for (const auto& tile : tiles) top = (std::min)(top, static_cast<long>(tile.top));
+    return static_cast<int>(std::count_if(tiles.begin(), tiles.end(), [top](const RECT& r) { return r.top == top; }));
+}
+
+void testLibraryColumns(const std::filesystem::path& temporary) {
+    const auto clips = temporary / L"columns";
+    std::filesystem::create_directories(clips);
+    for (int i = 0; i < 4; ++i) std::ofstream(clips / (L"clip" + std::to_wstring(i) + L".mp4"), std::ios::binary).put('\0');
+    SettingsStore store(temporary / L"columns-settings.ini");
+    withHeldStartup({.clipDirectory = clips}, store, [&](HWND window, RecorderController&, auto release) {
+        release();
+        click(window, L"Settings");
+        expect(find(window, L"Fit thumbnails") != nullptr, "the library section should carry the thumbnail fit checkbox");
+        const auto columnsField = GetWindow(find(window, L"Columns"), GW_HWNDNEXT);
+        expect(columnsField && IsWindowVisible(columnsField), "the library section should carry a columns field");
+        expect(SetWindowTextW(columnsField, L"2"), "the columns field should accept a count");
+        const auto startupDone = [&] {
+            wchar_t text[512]{};
+            GetWindowTextW(FindWindowExW(window, nullptr, L"Edit", nullptr), text, static_cast<int>(std::size(text)));
+            return !std::wstring_view(text).starts_with(L"Starting capture…");
+        };
+        expect(waitFor(startupDone), "the startup action should finish");
+        expect(saveUntil(window, [&] { return store.load().libraryColumns == 2; }),
+               "save should publish the column count");
+        click(window, L"Library");
+        expect(waitFor([&] { return galleryTiles(window).size() == 4; }), "the gallery should show every clip");
+        expect(firstRowTiles(window) == 2, "a pinned column count should wrap after that many tiles");
+
+        // Blank means auto again, which fits more than the pinned two.
+        click(window, L"Settings");
+        const auto resetField = GetWindow(find(window, L"Columns"), GW_HWNDNEXT);
+        expect(SetWindowTextW(resetField, L""), "the columns field should accept a blank");
+        expect(saveUntil(window, [&] { return store.load().libraryColumns == 0; }),
+               "a blank field should save as automatic columns");
+        click(window, L"Library");
+        expect(waitFor([&] { return firstRowTiles(window) > 2; }), "automatic columns should use the window width again");
+
+        // One column: a fitted tile takes the frame's shape and fills it, an
+        // unfitted one stops at the fixed height.
+        click(window, L"Settings");
+        expect(SetWindowTextW(GetWindow(find(window, L"Columns"), GW_HWNDNEXT), L"1"),
+               "the columns field should accept one column");
+        click(window, L"Fit thumbnails");
+        expect(saveUntil(window, [&] { return !store.load().libraryFitThumbnails; }),
+               "save should publish the thumbnail fit");
+        click(window, L"Library");
+        // The scan is only proven by a named tile: unused pool tiles stay blank.
+        expect(waitFor([&] { return !galleryTiles(window).empty(); }), "the gallery should name a tile");
+        const auto bars = galleryTiles(window).front().bottom - galleryTiles(window).front().top;
+        click(window, L"Settings");
+        click(window, L"Fit thumbnails");
+        expect(saveUntil(window, [&] { return store.load().libraryFitThumbnails; }),
+               "save should publish the thumbnail fit");
+        click(window, L"Library");
+        expect(waitFor([&] { return !galleryTiles(window).empty(); }), "the gallery should name a tile");
+        const auto filled = galleryTiles(window).front().bottom - galleryTiles(window).front().top;
+        expect(filled > bars * 3 / 2, "a fitted tile should follow the frame shape instead of the fixed height");
+
+        // A separate library scale moves the gallery alone: the navigation keeps
+        // the app scale.
+        click(window, L"Settings");
+        click(window, L"Separate library scale");
+        expect(saveUntil(window, [&] { return store.load().libraryOwnScale; }),
+               "save should publish the library scale mode");
+        click(window, L"Library");
+        expect(waitFor([&] { return !galleryTiles(window).empty(); }), "the gallery should name a tile");
+        const auto tileFont = [&] { return fontHeight(firstGalleryTile(window)); };
+        const auto navFont = [&] { return fontHeight(find(window, L"Library")); };
+        const auto tileBefore = tileFont(), navBefore = navFont();
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, WHEEL_DELTA), 0);
+        expect(tileBefore > 0 && tileFont() > tileBefore, "Ctrl+Scroll on the library should scale the gallery text");
+        expect(navFont() == navBefore, "the navigation should keep the app scale");
+        expect(store.load().libraryZoomPercent == 110, "the library zoom should be saved as it changes");
+        DestroyWindow(window);
+    });
+    expect(store.load().libraryZoomPercent == 110, "the library zoom should be saved with the window placement");
+}
+
 void testWindow(const std::filesystem::path& temporary) {
     const auto clips = temporary / L"clips";
     std::filesystem::create_directories(clips);
@@ -678,10 +795,12 @@ void testWindow(const std::filesystem::path& temporary) {
             GetWindowTextW(footer, text, static_cast<int>(std::size(text)));
             return IsWindowVisible(footer) && std::wstring_view(text).starts_with(L"Starting capture\u2026");
         };
+        expect((GetWindowLongPtrW(window, GWL_STYLE) & WS_MAXIMIZEBOX) == 0,
+               "the window should not offer a maximize box");
         checkNavigationMotion(window);
         const auto captureTab = find(window, L"Capture");
         click(window, L"Settings");
-        expect(find(window, L"App") && find(window, L"Check for updates at startup"),
+        expect(find(window, L"App") && find(window, L"Check for updates at startup") && find(window, L"Scale UI with app"),
                "Studio should open Settings while capture preparation is blocked");
         SendMessageW(captureTab, BM_CLICK, 0, 0);
         expect(find(window, L"Enable replay") && startupVisible(), "Studio should return to Capture before startup finishes");
@@ -701,8 +820,11 @@ int main() {
     try {
         testStudioMotion();
         testGalleryGeometry();
+        testUiScale();
         testCloseDuringStartup(path);
         testWindow(path);
+        testUiScaling(path);
+        testLibraryColumns(path);
         std::filesystem::remove_all(path, error);
         return 0;
     } catch (const std::exception& errorText) {

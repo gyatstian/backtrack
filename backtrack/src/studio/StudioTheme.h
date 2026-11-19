@@ -18,15 +18,26 @@ inline constexpr COLORREF rule = RGB(44, 47, 52);
 inline constexpr COLORREF divider = RGB(56, 61, 67);
 inline constexpr COLORREF border = RGB(101, 107, 115);
 inline constexpr COLORREF accent = RGB(152, 201, 253);
+inline constexpr COLORREF recording = RGB(250, 112, 122);
+inline constexpr COLORREF success = RGB(122, 223, 166);
 
 inline constexpr int titleBarHeight = 26;
 inline constexpr int navHeight = 24;
+inline constexpr int navUnderlineBand = 3;
 inline constexpr int footerHeight = 60;
 inline constexpr int rowHeight = 34;
 inline constexpr int inset = 14;
 inline constexpr int sectionInset = 25;
 inline constexpr int dependencyIndent = 12;
 inline constexpr int gap = 8;
+
+inline RECT tabBounds(const RECT& row, int index, int count, int gap) {
+    const int width = row.right - row.left;
+    if (gap > width / count) gap = width / count;
+    const int available = width - (count - 1) * gap;
+    const int left = row.left + MulDiv(available, index, count) + index * gap;
+    return {left, row.top, row.left + MulDiv(available, index + 1, count) + index * gap, row.bottom};
+}
 
 inline void fill(HDC dc, const RECT& rect, COLORREF color) {
     SetDCBrushColor(dc, color);

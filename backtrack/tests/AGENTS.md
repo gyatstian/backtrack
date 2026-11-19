@@ -204,7 +204,8 @@ build.
     invalid, disabled desktop gain field preserves the saved gain and pinned
     output. also covers recovery visibility, batched live resize and wheel
     input, height-only resize, clamped scroll no-ops, and gallery geometry and
-    async edits including rename during refresh.
+    async edits including rename during refresh. checks marker paint, immediate
+    keyboard selection, and elapsed-time motion and reversal.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` and
   `StorageLayoutTests` define `Mp4Muxer::muxToMp4` and

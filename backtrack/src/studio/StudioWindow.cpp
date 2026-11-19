@@ -141,7 +141,8 @@ LRESULT CALLBACK StudioWindow::Impl::bodyProc(HWND hwnd, UINT msg, WPARAM wp, LP
             self->deviceCombos = {};
             self->conditions.clear();
             self->visibility.clear();
-            self->record = self->recover = nullptr;
+            self->record = self->replayButton = self->recover = nullptr;
+            self->setMotion(recordGlyph, self->motions[recordGlyph].to, false);
             std::fill(std::begin(self->diagnostics), std::end(self->diagnostics), nullptr);
             self->scroll = self->wheel = 0;
             self->pendingScroll.reset();
@@ -164,6 +165,7 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
     }
     switch (msg) {
     case WM_CREATE: {
+        updateMotionPreference();
         dpi = GetDpiForWindow(window);
         updateFont();
         appIcon = LoadIconW(reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(window, GWLP_HINSTANCE)),
@@ -172,27 +174,33 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         titleClose = captionButton(Glyph::Close, [this] { PostMessageW(window, WM_CLOSE, 0, 0); });
         if (!titleMinimize || !titleClose) return -1;
         for (size_t i = 0; i < pageButtons.size(); ++i) {
-            pageButtons[i] = button(mainLabels[i], [this, i] { open(static_cast<Page>(i)); }, L"", window);
+            pageButtons[i] = button(mainLabels[i], [this, i] {
+                open(static_cast<Page>(i), clickOrigin == pageButtons[i]);
+            }, L"", window);
             if (!pageButtons[i]) return -1;
+            controls.at(pageButtons[i]).pointerMotion = true;
         }
         for (size_t i = 0; i < categoryButtons.size(); ++i) {
-            categoryButtons[i] = button(settingsLabels[i], [this, category = static_cast<Category>(i)] {
+            categoryButtons[i] = button(settingsLabels[i], [this, i, category = static_cast<Category>(i)] {
                 if (nav.page != Page::Settings || (nav.category == category && body)) return;
                 if (auto invalid = invalidNumber()) {
                     SetFocus(invalid);
                     setStatus(L"Enter a valid number before changing settings categories.");
                     return;
                 }
+                const bool pointer = clickOrigin == categoryButtons[i];
                 buildPage({nav.page, category});
-                syncNav();
+                syncNav(pointer);
             }, L"", window);
             if (!categoryButtons[i]) return -1;
+            controls.at(categoryButtons[i]).pointerMotion = true;
         }
         footer = make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, {}, L"", window);
         if (!footer) return -1;
+        setMotion(recordGlyph, static_cast<float>(controller.isRecording()), false);
         buildPage();
         if (!body) return -1;
-        syncNav();
+        syncNav(false);
         return 0;
     }
     case WM_NCCALCSIZE: {
@@ -239,46 +247,44 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_ENTERSIZEMOVE:
         sizing = true;
+        stopMotion();
         return 0;
     case WM_EXITSIZEMOVE:
         sizing = false;
         if (!IsIconic(window)) layout();
         return 0;
     case WM_SIZE:
-        if (wp != SIZE_MINIMIZED) {
-            if (sizing) InvalidateRect(window, nullptr, FALSE);
-            else layout();
-        }
+        if (wp == SIZE_MINIMIZED) {
+            actionFromPointer = false;
+            stopMotion();
+        } else if (sizing) InvalidateRect(window, nullptr, FALSE);
+        else layout();
         return 0;
     case WM_SHOWWINDOW:
-        if (wp && started && !closing) PostMessageW(window, WM_TIMER, diagnosticsTimer, 0);
+        if (!wp) {
+            actionFromPointer = false;
+            stopMotion();
+        } else if (started && !closing) PostMessageW(window, WM_TIMER, diagnosticsTimer, 0);
         return 0;
+    case WM_SETTINGCHANGE:
+        updateMotionPreference();
+        break;
+    case WM_ENABLE:
+        if (!wp) stopMotion();
+        break;
     case WM_PAINT: {
         // Lay out once for the size that will actually be painted during a drag.
         if (sizing && !IsIconic(window)) layout();
         PAINTSTRUCT ps{};
         auto dc = BeginPaint(window, &ps);
-        theme::fill(dc, ps.rcPaint, theme::surface);
-        RECT r{};
-        GetClientRect(window, &r);
-        paintTitleBar(dc, static_cast<int>(r.right));
-        if (IsWindowVisible(footer)) {
-            r.top = r.bottom - px(theme::footerHeight);
-            theme::fill(dc, r, theme::active);
-            r.bottom = r.top + 1;
-            theme::fill(dc, r, theme::rule);
-        }
-        GetClientRect(window, &r);
-        r.top = px(theme::titleBarHeight) + px(theme::navHeight) - 1;
-        r.bottom = r.top + 1;
-        theme::fill(dc, r, theme::rule);
-        if (nav.page == Page::Settings) {
-            // Tabs stop short of the resize strips on both sides.
-            r.top = r.bottom + px(theme::navHeight) - 1;
-            r.bottom = r.top + 1;
-            theme::fill(dc, r, theme::rule);
-        }
+        paintFrame(dc, ps.rcPaint);
         EndPaint(window, &ps);
+        return 0;
+    }
+    case WM_PRINTCLIENT: {
+        RECT client{};
+        GetClientRect(window, &client);
+        paintFrame(reinterpret_cast<HDC>(wp), client);
         return 0;
     }
     case WM_ERASEBKGND: return TRUE;
@@ -325,11 +331,12 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         paintFooter();
         return 0;
     case WM_TIMER:
+        if (wp == motionTimer) { tickMotion(); return 0; }
         if (wp == shutdownTimer) { finishClose(); return 0; }
         if (closing) return 0;
         if (wp == statusTimer) {
             KillTimer(window, statusTimer);
-            if (!busy) { status.clear(); paintFooter(); }
+            if (!busy) setStatus({});
         } else if (wp == diagnosticsTimer) {
             completeDeviceDiscovery();
             if (IsWindowVisible(window) && !IsIconic(window)) updateDiagnostics();
@@ -340,6 +347,9 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp && actionWorkerDone.load()) {
             busy = false;
             applyingSettings = false;
+            actionFromPointer = false;
+            setMotion(recordGlyph, static_cast<float>(controller.isRecording()), false);
+            if (record) setText(record, motions[recordGlyph].to != 0.f ? L"Stop recording" : L"Start recording");
             recoveryAvailable = false;
             syncRecoveryAction();
             setStatus(L"Recorder worker has stopped. Restart Backtrack to capture again.");
@@ -394,6 +404,7 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_CLOSE: close(false); return 0;
     case WM_DESTROY:
+        stopMotion();
         shutdown();
         if (started) PostQuitMessage(0);
         return 0;
@@ -506,17 +517,23 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
     switch (msg) {
     case WM_MOUSEMOVE:
         if (self.hovered != hwnd) {
-            if (self.hovered) InvalidateRect(self.hovered, nullptr, FALSE);
-            self.hovered = hwnd;
             TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&track);
-            InvalidateRect(hwnd, nullptr, FALSE);
-            self.paintFooter();
+            self.setHovered(hwnd);
         }
         break;
     case WM_MOUSELEAVE:
-        if (self.hovered == hwnd) { self.hovered = nullptr; self.paintFooter(); InvalidateRect(hwnd, nullptr, FALSE); }
+        if (self.hovered == hwnd) self.setHovered(nullptr);
         break;
+    case BM_CLICK:
+    case WM_LBUTTONUP: {
+        if (!it->second.pointerMotion || (msg == WM_LBUTTONUP && self.clickOrigin == nullptr)) break;
+        // An engaged null origin suppresses mouse messages synthesized by BM_CLICK.
+        const auto previous = std::exchange(self.clickOrigin, std::optional<HWND>{msg == WM_LBUTTONUP ? hwnd : nullptr});
+        const auto result = DefSubclassProc(hwnd, msg, wp, lp);
+        self.clickOrigin = previous;
+        return result;
+    }
     case WM_SETFOCUS:
         self.ensureVisible(hwnd);
         [[fallthrough]];
@@ -566,22 +583,30 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
-void StudioWindow::Impl::open(Page page) {
+void StudioWindow::Impl::open(Page page, bool pointer) {
     if (nav.page == page && body) return;
     if (nav.page != page && !leaveSettings(false)) return;
     buildPage({page, nav.category});
-    syncNav();
+    syncNav(pointer);
     SetFocus(nav.page == Page::Settings ? categoryButtons[static_cast<size_t>(nav.category)] : pageButtons[static_cast<size_t>(nav.page)]);
 }
 
-void StudioWindow::Impl::syncNav() {
-    const bool settings = nav.page == Page::Settings;
+void StudioWindow::Impl::syncNav(bool pointer) {
+    setMotion(mainMarker, static_cast<float>(nav.page), pointer);
     for (auto tab : pageButtons) InvalidateRect(tab, nullptr, FALSE);
+    const bool settings = nav.page == Page::Settings;
+    const bool wasSettings = (GetWindowLongPtrW(categoryButtons.front(), GWL_STYLE) & WS_VISIBLE) != 0;
+    setMotion(categoryMarker, static_cast<float>(nav.category), pointer && settings && wasSettings);
     for (auto tab : categoryButtons) {
-        if (settings != ((GetWindowLongPtrW(tab, GWL_STYLE) & WS_VISIBLE) != 0))
-            ShowWindow(tab, settings ? SW_SHOWNA : SW_HIDE);
+        if (settings != wasSettings) ShowWindow(tab, settings ? SW_SHOWNA : SW_HIDE);
         if (settings) InvalidateRect(tab, nullptr, FALSE);
     }
+}
+
+void StudioWindow::Impl::setHovered(HWND control) {
+    if (const auto old = std::exchange(hovered, control)) InvalidateRect(old, nullptr, FALSE);
+    if (control) InvalidateRect(control, nullptr, FALSE);
+    paintFooter();
 }
 
 void StudioWindow::Impl::buildPage() { buildPage(nav); }
@@ -659,6 +684,7 @@ void StudioWindow::Impl::layout(bool newPage) {
     const int width = (std::max)(0, static_cast<int>(rect.right) - 2 * grip);
     const int titleHeight = px(theme::titleBarHeight);
     const int navHeight = px(theme::navHeight);
+    const int tabHeight = navHeight - px(theme::navUnderlineBand);
     const int captionWidth = px(36), captionRight = rect.right - grip;
     moveWindowIfChanged(titleClose, captionRight - captionWidth, grip, captionWidth, titleHeight - grip);
     moveWindowIfChanged(titleMinimize, captionRight - 2 * captionWidth, grip, captionWidth, titleHeight - grip);
@@ -667,19 +693,17 @@ void StudioWindow::Impl::layout(bool newPage) {
         moves.reserve(pageButtons.size() + categoryButtons.size());
         const auto placeTabs = [&](const auto& buttons, int y) {
             const int count = static_cast<int>(buttons.size());
-            const int gap = (std::min)(px(theme::gap), width / count);
-            const int available = width - (count - 1) * gap;
+            const RECT row{grip, y, grip + width, y + tabHeight};
             for (int i = 0; i < count; ++i) {
-                const int left = MulDiv(available, i, count) + i * gap;
-                const int right = MulDiv(available, i + 1, count) + i * gap;
-                moves.push_back({buttons[i], grip + left, y, right - left, navHeight});
+                const auto tab = theme::tabBounds(row, i, count, px(theme::gap));
+                moves.push_back({buttons[i], tab.left, y, tab.right - tab.left, tabHeight});
             }
         };
         placeTabs(pageButtons, titleHeight);
         placeTabs(categoryButtons, titleHeight + navHeight);
         applyWindowMoves(moves);
     }
-    const int bodyTop = titleHeight + (nav.page == Page::Settings ? 2 * navHeight : navHeight);
+    const int bodyTop = titleHeight + (nav.page == Page::Settings ? 2 : 1) * navHeight;
     if (body) {
         moveWindowIfChanged(body, grip, bodyTop, width,
                             (std::max)(0, static_cast<int>(rect.bottom) - bodyTop - px(theme::footerHeight)));
@@ -707,6 +731,8 @@ void StudioWindow::Impl::layoutFooter(const RECT& client) {
         footerRight -= updateWidth + px(theme::gap);
     }
     const int textTop = footerTop + px(5), bottomGap = (std::max)(px(3), resizeGrip());
+    replayCheckBox = {footerLeft, textTop, footerLeft + px(26), textTop + px(22)};
+    footerLeft = replayCheckBox.right;
     moveWindowIfChanged(footer, footerLeft, textTop, (std::max)(0, footerRight - footerLeft), client.bottom - bottomGap - textTop);
 }
 
@@ -801,6 +827,21 @@ void StudioWindow::Impl::ensureVisible(HWND control) {
     else if (r.bottom + pad > view.bottom && r.bottom - r.top < view.bottom) scrollTo(scroll + r.bottom + pad - view.bottom);
 }
 
+void StudioWindow::Impl::paintFrame(HDC dc, const RECT& dirty) {
+    theme::fill(dc, dirty, theme::surface);
+    RECT r{};
+    GetClientRect(window, &r);
+    if (dirty.top < px(theme::titleBarHeight)) paintTitleBar(dc, r.right);
+    paintTabMarker(dc, mainMarker);
+    if (nav.page == Page::Settings) paintTabMarker(dc, categoryMarker);
+    r.top = r.bottom - px(theme::footerHeight);
+    if (dirty.bottom > r.top && IsWindowVisible(footer)) {
+        theme::fill(dc, r, theme::active);
+        theme::fill(dc, {r.left, r.top, r.right, r.top + 1}, theme::rule);
+        paintReplayCheck(dc);
+    }
+}
+
 void StudioWindow::Impl::paintTitleBar(HDC dc, int width) {
     const int height = px(theme::titleBarHeight);
     const RECT bar{0, 0, width, height};
@@ -869,16 +910,17 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool down = (item.itemState & ODS_SELECTED) != 0;
     const bool hot = !disabled && hovered == item.hwndItem;
-    const auto control = controls.find(item.hwndItem);
-    const auto tone = control == controls.end() ? ButtonTone::Normal : control->second.tone;
-    const bool primary = tone == ButtonTone::Primary;
+    const auto tone = found == controls.end() ? ButtonTone::Normal : found->second.tone;
     const bool quiet = tone == ButtonTone::Quiet;
-    const auto base = selected || primary ? theme::active : navigation || quiet ? theme::surface : theme::field;
+    const auto base = selected || tone == ButtonTone::Primary ? theme::active : navigation || quiet ? theme::surface : theme::field;
     theme::fill(dc, r, !navigation && down ? theme::press : !navigation && hot ? theme::hover : base);
     if (navigation) {
-        theme::fill(dc, {r.left, r.bottom - 1, r.right, r.bottom}, theme::rule);
-        if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS)
-            theme::fill(dc, {r.left, r.bottom - px(3), r.right, r.bottom - px(1)}, theme::muted);
+        if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) {
+            RECT focus = r;
+            InflateRect(&focus, -px(3), -px(1));
+            DrawFocusRect(dc, &focus);
+        }
+        r.bottom += px(theme::navUnderlineBand);
     } else {
         if (!quiet) theme::frame(dc, r, disabled ? theme::rule : theme::border);
         if (item.itemState & ODS_FOCUS) {
@@ -887,11 +929,17 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
             theme::frame(dc, focus, theme::accent);
         }
     }
+    if (item.hwndItem == record) {
+        const auto box = recordingGlyphBox(r);
+        paintRecordingGlyph(dc, box, disabled);
+        r.left = box.right;
+    }
+    InflateRect(&r, -px(6), 0);
+    if (!RectVisible(dc, &r)) return;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, disabled ? theme::disabled : quiet && !hot ? theme::muted : theme::text);
     SelectObject(dc, font);
     const auto label = readText(item.hwndItem);
-    InflateRect(&r, -px(6), 0);
     DrawTextW(dc, label.c_str(), -1, &r, (quiet ? DT_LEFT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 }
 
@@ -904,8 +952,9 @@ void StudioWindow::Impl::paintCheckbox(HWND hwnd, HDC dc) {
     theme::fill(dc, r, theme::surface);
     const int size = px(15), x = px(1), y = (r.bottom - size) / 2;
     const RECT box{x, y, x + size, y + size};
-    theme::fill(dc, box, checked ? (enabled ? theme::muted : theme::disabled) : down ? theme::press : hovered == hwnd ? theme::hover : theme::field);
-    theme::frame(dc, box, checked ? (enabled ? theme::muted : theme::disabled) : enabled ? theme::border : theme::rule);
+    const auto checkedFill = enabled ? theme::muted : theme::disabled;
+    theme::fill(dc, box, checked ? checkedFill : down ? theme::press : hovered == hwnd ? theme::hover : theme::field);
+    theme::frame(dc, box, checked ? checkedFill : enabled ? theme::border : theme::rule);
     if (checked) {
         const auto pen = CreatePen(PS_SOLID, px(2), theme::surface);
         const auto old = SelectObject(dc, pen);
@@ -915,10 +964,11 @@ void StudioWindow::Impl::paintCheckbox(HWND hwnd, HDC dc) {
         DeleteObject(pen);
     }
     if (GetFocus() == hwnd) theme::frame(dc, r, theme::accent);
+    r.left += px(24);
+    if (!RectVisible(dc, &r)) return;
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, enabled ? theme::text : theme::disabled);
     SelectObject(dc, font);
-    r.left += px(24);
     const auto label = readText(hwnd);
     DrawTextW(dc, label.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 }
@@ -940,13 +990,14 @@ void StudioWindow::Impl::paintCombo(const DRAWITEMSTRUCT& item) {
     DrawTextW(item.hDC, label.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
 }
 
-void StudioWindow::Impl::setStatus(std::wstring value) {
+void StudioWindow::Impl::setStatus(std::wstring value, bool savedReplay, bool pointer) {
     status = std::move(value);
+    replaySaved = savedReplay;
     if (!status.empty()) SetTimer(window, statusTimer, 9000, nullptr);
-    paintFooter();
+    paintFooter(pointer);
 }
 
-void StudioWindow::Impl::paintFooter() {
+void StudioWindow::Impl::paintFooter(bool animateCheck) {
     if (!footer || building || shuttingDown || focused == footer) return;
     auto help = [this](HWND hwnd) -> std::wstring_view {
         const auto it = controls.find(hwnd);
@@ -962,6 +1013,8 @@ void StudioWindow::Impl::paintFooter() {
     };
     append(hint);
     append(audioWarning);
+    if (motions[replayCheck].to != static_cast<float>(replaySaved))
+        setMotion(replayCheck, static_cast<float>(replaySaved), replaySaved && animateCheck);
     const bool showing = (GetWindowLongPtrW(footer, GWL_STYLE) & WS_VISIBLE) != 0;
     if (text.empty()) {
         if (!showing) return;

@@ -2,6 +2,8 @@
 #include "mux/RecoveryStore.h"
 #include "platform/Win32Util.h"
 #include "studio/GalleryLayout.h"
+#include "studio/StudioMotion.h"
+#include "studio/StudioTheme.h"
 #include "studio/StudioWindow.h"
 
 #include <CommCtrl.h>
@@ -100,6 +102,91 @@ bool waitFor(Test test) {
         Sleep(10);
     } while (std::chrono::steady_clock::now() < deadline);
     return false;
+}
+
+void testStudioMotion() {
+    const auto start = SteadyClock::time_point{};
+    StudioMotion motion{0.f, 3.f, start, 200ms};
+    const auto reverse = start + 100ms;
+    const auto current = motion.value(reverse, true);
+    expect(motion.value(start, true) == 0.f && current > 1.f && current < 2.f,
+           "a long navigation hop should cover intermediate tabs rather than crossfade the ends");
+    motion.retarget(0.f, reverse, 200ms, true);
+    expect(motion.value(reverse, true) == current && motion.value(reverse + 16ms, true) < current,
+           "reversing a transition should continue from the current value");
+    expect(!motion.finished(reverse + 199ms) && motion.finished(reverse + 200ms) && motion.value(reverse + 1s, true) == 0.f,
+           "a late frame should settle immediately at the final tab");
+    const StudioMotion confirmation{0.f, 1.f, start, 160ms};
+    expect(confirmation.value(start + 40ms, false) > 0.6f && confirmation.value(start + 160ms, false) == 1.f,
+           "confirmation should respond quickly and finish at the final shape");
+}
+
+COLORREF frameBelowTab(HWND window, HWND tab, bool leftEdge = false) {
+    const auto r = bounds(tab);
+    POINT sample{leftEdge ? r.left : (r.left + r.right) / 2, r.bottom};
+    ScreenToClient(window, &sample);
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), 1, 1, 1, 32, BI_RGB};
+    void* pixels = nullptr;
+    const auto bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    const auto dc = CreateCompatibleDC(nullptr);
+    const auto old = bitmap && dc ? SelectObject(dc, bitmap) : nullptr;
+    COLORREF color = CLR_INVALID;
+    if (old) {
+        SetViewportOrgEx(dc, -sample.x, -sample.y, nullptr);
+        SendMessageW(window, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+        color = GetPixel(dc, sample.x, sample.y);
+        SelectObject(dc, old);
+    }
+    if (dc) DeleteDC(dc);
+    if (bitmap) DeleteObject(bitmap);
+    return color;
+}
+
+void checkNavigationMotion(HWND window) {
+    const auto capture = find(window, L"Capture");
+    const auto settings = find(window, L"Settings");
+    expect(frameBelowTab(window, capture) == studio_theme::muted &&
+           frameBelowTab(window, capture, true) == studio_theme::muted,
+           "Capture should retain the neutral underline across the tab width");
+    BOOL motionEnabled = FALSE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &motionEnabled, 0);
+    auto tab = bounds(settings);
+    POINT trackTop{tab.left, tab.bottom};
+    ScreenToClient(window, &trackTop);
+    struct TrackPaint { int top; int bottom; bool repainted = false; } track{
+        trackTop.y, trackTop.y + MulDiv(studio_theme::navUnderlineBand, GetDpiForWindow(window), 96)};
+    const SUBCLASSPROC observe = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) -> LRESULT {
+        if (msg == WM_PAINT) {
+            auto& track = *reinterpret_cast<TrackPaint*>(data);
+            RECT dirty{};
+            if (GetUpdateRect(hwnd, &dirty, FALSE) && dirty.top >= track.top && dirty.bottom <= track.bottom)
+                track.repainted = true;
+        }
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    };
+    expect(SetWindowSubclass(window, observe, 42, reinterpret_cast<DWORD_PTR>(&track)), "watch navigation strip repaints");
+    const auto clicked = SteadyClock::now();
+    constexpr LPARAM inside = MAKELPARAM(5, 5);
+    SendMessageW(settings, WM_LBUTTONDOWN, MK_LBUTTON, inside);
+    SendMessageW(settings, WM_LBUTTONUP, 0, inside);
+    const bool pageReady = find(window, L"Check for updates at startup") != nullptr;
+    const auto arrival = frameBelowTab(window, settings);
+    const bool early = SteadyClock::now() - clicked < 50ms;
+    const bool arrived = waitFor([&] {
+        return (!motionEnabled || track.repainted) && frameBelowTab(window, settings) == studio_theme::muted;
+    });
+    RemoveWindowSubclass(window, observe, 42);
+    expect(pageReady, "pointer navigation must open the page without waiting for the underline");
+    if (!motionEnabled) expect(arrival == studio_theme::muted, "reduced motion should snap to the new tab");
+    else if (early) expect(arrival == studio_theme::surface, "pointer navigation should travel from the previous tab");
+    expect(arrived, "the underline timer should repaint just its band and reach Settings");
+    expect(frameBelowTab(window, find(window, L"App")) == studio_theme::muted, "Settings should paint an independent category underline");
+    click(window, L"Video");
+    expect(frameBelowTab(window, find(window, L"Video")) == studio_theme::muted, "keyboard-style activation should snap the category underline");
+    click(window, L"App");
+    SendMessageW(capture, BM_CLICK, 0, 0);
+    expect(frameBelowTab(window, capture) == studio_theme::muted, "keyboard-style activation should snap the main underline");
 }
 
 void testGalleryGeometry() {
@@ -384,8 +471,9 @@ void checkStudioPages(HWND window, const SettingsStore& store, const std::filesy
     const auto currentLibraryRect = bounds(libraryTab);
     expect(find(window, L"Library") == libraryTab && EqualRect(&libraryTabRect, &currentLibraryRect),
            "Settings should leave the main tabs visible and in place");
-    expect(appRect.top == libraryTabRect.bottom && appRect.bottom - appRect.top == MulDiv(24, dpi, 96),
-           "settings categories should occupy a second compact row directly below the main tabs");
+    expect(appRect.top - libraryTabRect.top == MulDiv(24, dpi, 96) &&
+           appRect.top - libraryTabRect.bottom == MulDiv(3, dpi, 96),
+           "the underline should sit within the original main navigation row height");
     expect(GetNextDlgTabItem(window, find(window, L"Diagnostics"), FALSE) == app,
            "Tab should move from the last main tab to the first settings category");
 
@@ -582,6 +670,7 @@ void testWindow(const std::filesystem::path& temporary) {
             GetWindowTextW(footer, text, static_cast<int>(std::size(text)));
             return IsWindowVisible(footer) && std::wstring_view(text).starts_with(L"Starting capture\u2026");
         };
+        checkNavigationMotion(window);
         const auto captureTab = find(window, L"Capture");
         click(window, L"Settings");
         expect(find(window, L"App") && find(window, L"Check for updates at startup"),
@@ -602,6 +691,7 @@ int main() {
     const auto path = std::filesystem::temp_directory_path() / (L"BacktrackStudioTest-" + std::to_wstring(GetCurrentProcessId()));
     std::error_code error;
     try {
+        testStudioMotion();
         testGalleryGeometry();
         testCloseDuringStartup(path);
         testWindow(path);

@@ -305,7 +305,7 @@ void StudioWindow::Impl::addUpdateAction() {
 }
 
 void StudioWindow::Impl::buildCapture() {
-    constexpr int actionWidth = 136;
+    constexpr int actionWidth = 160;
     const auto compact = [this](decltype(Row::widths) widths) {
         rows.back().inset = studio_theme::sectionInset;
         rows.back().widths = widths;
@@ -313,9 +313,12 @@ void StudioWindow::Impl::buildCapture() {
 
     section(L"Recording");
     auto& keys = draft.hotkeys;
-    record = button(controller.isRecording() ? L"Stop recording" : L"Start recording", [this] {
-        submit(ControllerActionKind::ToggleRecording, controller.isRecording() ? L"Stopping recording\u2026" : L"Starting recording\u2026");
+    // Rebuilding the page must not expose an action that is still finalizing.
+    record = button(motions[recordGlyph].to != 0.f ? L"Stop recording" : L"Start recording", [this] {
+        submit(ControllerActionKind::ToggleRecording,
+               controller.isRecording() ? L"Stopping recording\u2026" : L"Starting recording\u2026", clickOrigin == record);
     }, L"", nullptr, ButtonTone::Primary);
+    if (record) controls.at(record).pointerMotion = true;
     row({record, hotkeyBox(keys.startStopModifiers, keys.startStopVirtualKey)});
     compact({actionWidth, 164});
 
@@ -332,8 +335,10 @@ void StudioWindow::Impl::buildCapture() {
          hotkeyBox(keys.saveReplayModifiers, keys.saveReplayVirtualKey)});
     compact({136, 164});
     visibleWhen(rows.back().cells[1], [this] { return draft.replay.enabled; });
-    row({button(L"Save", [this] { requestReplay(); }, L"", nullptr, ButtonTone::Primary),
-         make(L"STATIC", L"the last", SS_CENTERIMAGE | WS_VISIBLE),
+    replayButton = button(L"Save", [this] { requestReplay(clickOrigin == replayButton); },
+                          L"", nullptr, ButtonTone::Primary);
+    if (replayButton) controls.at(replayButton).pointerMotion = true;
+    row({replayButton, make(L"STATIC", L"the last", SS_CENTERIMAGE | WS_VISIBLE),
          numberField(draft.replay.seconds, saved.replay.seconds, secondsHelp),
          make(L"STATIC", L"seconds", SS_CENTERIMAGE | WS_VISIBLE)});
     compact({80, 54, 60, 64});

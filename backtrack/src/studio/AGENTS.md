@@ -7,6 +7,7 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 ## Ownership
 
 - `StudioWindow.cpp` owns chrome, layout, input and contextual footer.
+  `StudioMotion` owns the navigation marker and capture confirmation motion.
 - `StudioSettings.cpp`, `StudioGallery.cpp`, and `StudioDiagnostics.cpp` own
   page content. `StudioSession.cpp` owns the session worker, hotkeys, the tray,
   and integration lifetimes.
@@ -28,16 +29,21 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   bars and page share one surface; selected navigation and the contextual
   footer share a fill. sections use inset labels in divider lines.
 - use one 15-dip Bahnschrift SemiLight font (GDI weight 350). leave gaps
-  between buttons in both navigation rows; the parent paints each row's bottom
-  rule at full width so it runs unbroken under the gaps. use fill for selection
-  and a neutral underline across the tab width, sitting on the row rule, for
-  keyboard focus when cues are visible.
+  between buttons in both navigation rows. animate the existing full-width
+  neutral underline in each row's bottom band, not a second indicator. use
+  an inset outline for keyboard focus when cues are visible.
 - controls with an ambiguous effect carry hover help: consequences, defaults,
   units, and what a blank value means. never restate the label or the checkbox
   text, and add no help to a control whose name already says what it does.
 - layout uses dpi-scaled units. the footer occupies a stable reserved area;
   showing help or status must not reflow or overlay the page. keep it readable
-  with keyboard focus as well as hover. no custom animations.
+  with keyboard focus as well as hover.
+- make pointer motion visible through travel or a shape change, not just a
+  color fade. the tab marker travels after navigation, the record glyph morphs
+  on confirmed state changes, and the footer check draws on replay success.
+  use windows' animation preference; keyboard and hotkey actions settle
+  immediately. no frame work for idle, hidden, or minimized windows, and no
+  per-frame layout or gallery repaint.
 - controls have native roles and keyboard behavior. keep labels concise,
   spacing compact, and controls square unless rounding has a purpose.
   size page actions for their labels, not the full row.
@@ -101,7 +107,8 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 see [`StudioWindowTests`](../../tests/StudioWindowTests.cpp) for automated
 coverage. manually check live edge resizing, rapid scrolling, title-bar drag
 and snap, keyboard traversal, mixed-dpi layouts, real thumbnails and drag/drop,
-and capture with real devices.
+and capture with real devices. check rapid tab reversals, hide or minimize
+mid-transition, and toggle windows animation effects while open.
 
 ## Child DOX Index
 

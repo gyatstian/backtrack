@@ -14,6 +14,11 @@ replay notification sound is under **Settings → Audio**, and monitor options
 are under **Settings → Capture**. **Recover failed recording** appears on
 Capture only when there is a recording to recover. the library is gallery-only.
 
+with Windows animation effects enabled, the underline slides between clicked
+tabs, the record icon changes shape after recording starts or stops, and a
+checkmark draws after a replay saves. keyboard and hotkey actions stay
+immediate.
+
 ## amd
 i dont use amd, some features might not work. dont expect much
 

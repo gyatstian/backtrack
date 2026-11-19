@@ -2,6 +2,7 @@
 
 #include "studio/StudioWindow.h"
 #include "studio/Navigation.h"
+#include "studio/StudioMotion.h"
 #include "ui_common/RecorderActions.h"
 
 #include "app/RecorderController.h"
@@ -33,15 +34,17 @@ struct StudioWindow::Impl {
         actionReady = WM_APP + 1, trayEvent, galleryReady, leagueKill, releaseReady,
         voiceReplay = kVoiceCommandMessage, syncHelp, sessionStopped, devicesReady
     };
-    enum : UINT_PTR { statusTimer = 1, diagnosticsTimer, autoRecordTimer, shutdownTimer };
+    enum : UINT_PTR { statusTimer = 1, diagnosticsTimer, autoRecordTimer, shutdownTimer, motionTimer };
 
     enum class ButtonTone { Normal, Primary, Quiet };
+    enum Motion { mainMarker, categoryMarker, recordGlyph, replayCheck, motionCount };
     enum class Glyph { None, Minimize, Close };
     struct Control {
         ControlEvent event;
         std::wstring help;
         bool checkbox = false;
         bool combo = false;
+        bool pointerMotion = false;
         ButtonTone tone = ButtonTone::Normal;
         Glyph glyph = Glyph::None;
     };
@@ -79,17 +82,30 @@ struct StudioWindow::Impl {
     void layoutRows(bool heightOnly = false);
     void scrollTo(int value, bool onPaint = false);
     void ensureVisible(HWND control);
-    void open(Page page);
+    void open(Page page, bool pointer);
     void buildPage();
     void buildPage(StudioNavigation next);
-    void syncNav();
+    void syncNav(bool pointer);
+    void updateMotionPreference();
+    void stopMotion();
+    void tickMotion();
+    void setMotion(Motion slot, float target, bool animate);
+    void invalidateMotion(Motion slot);
+    float motionValue(Motion slot) const;
+    void setHovered(HWND control);
+    RECT markerTrack(Motion slot) const;
+    RECT recordingGlyphBox(const RECT& client) const;
+    void paintTabMarker(HDC dc, Motion slot);
+    void paintRecordingGlyph(HDC dc, const RECT& box, bool disabled);
+    void paintReplayCheck(HDC dc);
+    void paintFrame(HDC dc, const RECT& dirty);
     void paintTitleBar(HDC dc, int width);
     void paintCaptionButton(const DRAWITEMSTRUCT& item, Glyph glyph);
     void paintButton(const DRAWITEMSTRUCT& item);
     void paintCheckbox(HWND control, HDC dc);
     void paintCombo(const DRAWITEMSTRUCT& item);
-    void setStatus(std::wstring value);
-    void paintFooter();
+    void setStatus(std::wstring value, bool replaySaved = false, bool pointer = false);
+    void paintFooter(bool animateCheck = false);
     bool handleShortcut(const MSG& message);
     bool editHotkey(HWND field, uint32_t modifiers, uint32_t key);
 
@@ -155,10 +171,10 @@ struct StudioWindow::Impl {
     void requestSessionStop();
     void finishClose();
     void actionLoop(std::stop_token stop);
-    bool submit(ControllerAction value, const wchar_t* status);
-    void submit(ControllerActionKind kind, const wchar_t* status);
+    bool submit(ControllerAction value, const wchar_t* status, bool pointer = false);
+    void submit(ControllerActionKind kind, const wchar_t* status, bool pointer = false);
     void completeAction();
-    void requestReplay();
+    void requestReplay(bool pointer = false);
     void configureIntegrations(const AppSettings& applied);
     void pollAutoRecord();
     bool addTray();
@@ -182,6 +198,7 @@ struct StudioWindow::Impl {
     HWND footer = nullptr;
     HWND save = nullptr;
     HWND record = nullptr;
+    HWND replayButton = nullptr;
     HWND recover = nullptr;
     size_t recoveryRow = 0;
     bool recoveryAvailable = false;
@@ -199,8 +216,13 @@ struct StudioWindow::Impl {
     std::jthread deviceWorker;
     HWND hovered = nullptr;
     HWND focused = nullptr;
+    std::optional<HWND> clickOrigin;
+    bool motionEnabled = false;
+    std::array<StudioMotion, motionCount> motions;
     HWND update = nullptr;
     std::wstring status;
+    bool replaySaved = false;
+    RECT replayCheckBox{};
     std::wstring audioWarning;
     std::array<HWND, 4> pageButtons{};
     std::array<HWND, 5> categoryButtons{};
@@ -258,6 +280,7 @@ struct StudioWindow::Impl {
     uint64_t actionRevision = 0;
     bool busy = false;
     bool applyingSettings = false;
+    bool actionFromPointer = false;
 };
 
 } // namespace backtrack

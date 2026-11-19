@@ -112,7 +112,7 @@ void StudioWindow::Impl::shutdown() {
     destroyLibrary();
 }
 
-bool StudioWindow::Impl::submit(ControllerAction value, const wchar_t* text) {
+bool StudioWindow::Impl::submit(ControllerAction value, const wchar_t* text, bool pointer) {
     if (closing || shuttingDown) return false;
     if (busy && !actionWorkerDone.load()) {
         setStatus(L"Recorder is busy. Try again when it finishes.");
@@ -138,6 +138,7 @@ bool StudioWindow::Impl::submit(ControllerAction value, const wchar_t* text) {
         return false;
     }
     busy = true;
+    actionFromPointer = pointer;
     applyingSettings = appliesSettings(kind);
     if (kind != ControllerActionKind::SaveReplay) recoveryAvailable = false;
     if (applyingSettings && (!saved.replay.enabled || !saved.gameIntegrations.leagueOfLegendsKillReminder))
@@ -148,10 +149,10 @@ bool StudioWindow::Impl::submit(ControllerAction value, const wchar_t* text) {
     return true;
 }
 
-void StudioWindow::Impl::submit(ControllerActionKind kind, const wchar_t* text) {
+void StudioWindow::Impl::submit(ControllerActionKind kind, const wchar_t* text, bool pointer) {
     ControllerAction action;
     action.kind = kind;
-    submit(std::move(action), text);
+    submit(std::move(action), text, pointer);
 }
 
 void StudioWindow::Impl::actionLoop(std::stop_token stop) {
@@ -275,6 +276,7 @@ void StudioWindow::Impl::completeAction() {
     if (recovery) recoveryAvailable = *recovery;
     if (completion) {
         auto& result = *completion;
+        const bool pointer = std::exchange(actionFromPointer, false);
         busy = false;
         applyingSettings = false;
         if (appliesSettings(result.kind)) {
@@ -283,9 +285,12 @@ void StudioWindow::Impl::completeAction() {
             autoRecord = reconcileAutoRecordOwnership(autoRecord, result.automatic, result.startedRecording,
                                                        result.stoppedRecording, !matchedApp.executablePath.empty());
         }
-        if (record) setText(record, controller.isRecording() ? L"Stop recording" : L"Start recording");
-        if (!controller.isRecording()) audioWarning.clear();
-        setStatus(result.status == L"Ready" ? std::wstring{} : std::move(result.status));
+        const bool recording = controller.isRecording();
+        if (motions[recordGlyph].to != static_cast<float>(recording))
+            setMotion(recordGlyph, static_cast<float>(recording), pointer && record);
+        if (record) setText(record, recording ? L"Stop recording" : L"Start recording");
+        if (!recording) audioWarning.clear();
+        setStatus(result.status == L"Ready" ? std::wstring{} : std::move(result.status), result.savedReplay, pointer);
         if (result.refreshLibrary && gallery) refreshLibrary();
     }
     if (completion || recovery) syncRecoveryAction();
@@ -314,12 +319,12 @@ void StudioWindow::Impl::pollAutoRecord() {
     actionCv.notify_one();
 }
 
-void StudioWindow::Impl::requestReplay() {
+void StudioWindow::Impl::requestReplay(bool pointer) {
     ControllerAction action;
     action.kind = ControllerActionKind::SaveReplay;
     const bool tag = SteadyClock::now() <= killDeadline;
     if (tag) action.replayTag = L"Kill clip";
-    if (submit(std::move(action), tag ? L"Saving kill clip\u2026" : L"Saving replay\u2026") && tag)
+    if (submit(std::move(action), tag ? L"Saving kill clip\u2026" : L"Saving replay\u2026", pointer) && tag)
         killDeadline = SteadyClock::time_point::min();
 }
 

@@ -14,6 +14,11 @@ struct MuxedInputs {
     std::filesystem::path videoPath;
     std::filesystem::path systemAudioPath;
     std::filesystem::path microphoneAudioPath;
+    // Relative immediate subfolder under the clip root (e.g. a per-game
+    // folder) when temporary files are staged in `<clip root>/.backtrack_tmp/`
+    // instead of beside the output. Empty when the output lives directly in
+    // the recovery root.
+    std::filesystem::path outputSubdir;
     struct VideoSample {
         uint64_t offset = 0;
         uint32_t size = 0;

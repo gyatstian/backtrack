@@ -161,6 +161,7 @@ target_link_libraries(BacktrackApp PUBLIC
     propsys
     user32
     gdi32
+    gdiplus
     uuid
     winmm
     winhttp

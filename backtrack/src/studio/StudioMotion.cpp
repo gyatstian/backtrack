@@ -1,6 +1,9 @@
 #include "studio/StudioWindowImpl.h"
 #include "studio/StudioTheme.h"
 
+#include <objidl.h>
+#include <gdiplus.h>
+
 #include <algorithm>
 
 namespace backtrack {
@@ -91,7 +94,8 @@ RECT StudioWindow::Impl::markerTrack(Motion slot) const {
 
 void StudioWindow::Impl::paintTabMarker(HDC dc, Motion slot) {
     const RECT track = markerTrack(slot);
-    RECT rule{0, track.bottom - 1, layoutSize.cx, track.bottom};
+    const int hairline = hairlinePx();
+    RECT rule{0, track.bottom - hairline, layoutSize.cx, track.bottom};
     theme::fill(dc, rule, theme::rule);
     if (!RectVisible(dc, &track)) return;
     const int count = static_cast<int>(slot == mainMarker ? pageButtons.size() : categoryButtons.size());
@@ -101,7 +105,7 @@ void StudioWindow::Impl::paintTabMarker(HDC dc, Motion slot) {
     const auto b = theme::tabBounds(track, second, count, px(theme::gap));
     const auto left = interpolate(a.left, b.left, at - first);
     const auto right = interpolate(a.right, b.right, at - first);
-    theme::fill(dc, {left, track.top, right, track.bottom - px(1)}, theme::muted);
+    theme::fill(dc, {left, track.top, right, track.bottom - hairline}, theme::muted);
 }
 
 RECT StudioWindow::Impl::recordingGlyphBox(const RECT& client) const {
@@ -112,14 +116,29 @@ RECT StudioWindow::Impl::recordingGlyphBox(const RECT& client) const {
 void StudioWindow::Impl::paintRecordingGlyph(HDC dc, const RECT& box, bool disabled) {
     if (!RectVisible(dc, &box)) return;
     const float p = motionValue(recordGlyph);
-    const int size = interpolate(px(14), px(20), p);
-    const int corner = std::lround(size * (1.f - p));
-    const int x = (box.left + box.right - size) / 2, y = (box.top + box.bottom - size) / 2;
-    SetDCBrushColor(dc, disabled ? theme::disabled : theme::recording);
-    SelectObject(dc, GetStockObject(DC_BRUSH));
-    SelectObject(dc, GetStockObject(NULL_PEN));
-    if (corner > 1) RoundRect(dc, x, y, x + size, y + size, corner, corner);
-    else Rectangle(dc, x, y, x + size, y + size);
+    const float size = std::lerp(static_cast<float>(px(14)), static_cast<float>(px(20)), p);
+    const float x = (box.left + box.right - size) * 0.5f;
+    const float y = (box.top + box.bottom - size) * 0.5f;
+    const COLORREF c = disabled ? theme::disabled : theme::recording;
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(c), GetGValue(c), GetBValue(c)));
+    if (p <= 0.01f) {
+        g.FillEllipse(&brush, x, y, size, size);
+    } else if (p >= 0.99f) {
+        g.FillRectangle(&brush, x, y, size, size);
+    } else {
+        const float r = size * 0.5f * (1.f - p);
+        const float d = r * 2.f;
+        Gdiplus::GraphicsPath path;
+        path.AddArc(x, y, d, d, 180.f, 90.f);
+        path.AddArc(x + size - d, y, d, d, 270.f, 90.f);
+        path.AddArc(x + size - d, y + size - d, d, d, 0.f, 90.f);
+        path.AddArc(x, y + size - d, d, d, 90.f, 90.f);
+        path.CloseFigure();
+        g.FillPath(&brush, &path);
+    }
 }
 
 void StudioWindow::Impl::paintReplayCheck(HDC dc) {
@@ -127,20 +146,24 @@ void StudioWindow::Impl::paintReplayCheck(HDC dc) {
     const float p = motionValue(replayCheck);
     if (p <= 0.f) return;
     const int x = replayCheckBox.left + px(2), y = replayCheckBox.top;
-    const POINT start{x, y + px(11)}, elbow{x + px(6), y + px(17)}, end{x + px(19), y + px(4)};
+    const Gdiplus::PointF start{static_cast<float>(x), static_cast<float>(y + px(11))};
+    const Gdiplus::PointF elbow{static_cast<float>(x + px(6)), static_cast<float>(y + px(17))};
+    const Gdiplus::PointF end{static_cast<float>(x + px(19)), static_cast<float>(y + px(4))};
     constexpr float turn = 0.32f;
     const bool first = p < turn;
     const auto from = first ? start : elbow;
     const auto to = first ? elbow : end;
     const float t = first ? p / turn : (p - turn) / (1.f - turn);
-    const POINT tip{interpolate(from.x, to.x, t), interpolate(from.y, to.y, t)};
-    const POINT stroke[]{start, first ? tip : elbow, tip};
-    if (const auto pen = CreatePen(PS_SOLID, px(2), theme::success)) {
-        const auto old = SelectObject(dc, pen);
-        Polyline(dc, stroke, first ? 2 : 3);
-        SelectObject(dc, old);
-        DeleteObject(pen);
-    }
+    const Gdiplus::PointF tip{std::lerp(from.X, to.X, t), std::lerp(from.Y, to.Y, t)};
+    const Gdiplus::PointF stroke[]{start, first ? tip : elbow, tip};
+    Gdiplus::Graphics g(dc);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(theme::success), GetGValue(theme::success), GetBValue(theme::success)),
+                     static_cast<Gdiplus::REAL>(px(2)));
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    g.DrawLines(&pen, stroke, first ? 2 : 3);
 }
 
 } // namespace backtrack

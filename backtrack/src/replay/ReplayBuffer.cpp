@@ -650,7 +650,8 @@ void ReplayBuffer::pushAudio(AudioPacket packet) {
 bool ReplayBuffer::saveTo(
     const std::filesystem::path& outputPath,
     const VideoSettings& videoSettings,
-    std::wstring* errorDetail) {
+    std::wstring* errorDetail,
+    const std::filesystem::path& clipRoot) {
     // Specific, user-presentable reason for every failure path; the UI shows
     // this instead of a generic "could not be saved" message.
     auto fail = [errorDetail](std::wstring_view reason) {
@@ -840,9 +841,10 @@ bool ReplayBuffer::saveTo(
         }
     }
 
+    const auto tempTarget = RecoveryStore::resolveTempSessionTarget(outputPath, clipRoot);
     std::error_code tempError;
     const auto tempDirectory = RecoveryStore::createUniqueDirectory(
-        outputPath.parent_path() / L".backtrack_tmp" / outputPath.stem(), tempError);
+        tempTarget.tempRoot / L".backtrack_tmp" / outputPath.stem(), tempError);
     if (tempDirectory.empty()) {
         return fail(L"could not create replay temporary folder for " + outputPath.wstring() +
                     L" (" + utf8ToWide(tempError.message()) + L")");
@@ -995,6 +997,7 @@ bool ReplayBuffer::saveTo(
     videoStream.close();
     MuxedInputs inputs;
     inputs.videoPath = videoPath;
+    inputs.outputSubdir = tempTarget.outputSubdir;
     inputs.videoSamples = std::move(videoSamples);
     inputs.codec = videoSettings.codec;
     inputs.fps = videoSettings.fps;

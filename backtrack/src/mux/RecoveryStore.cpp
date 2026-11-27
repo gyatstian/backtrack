@@ -8,6 +8,7 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cwctype>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -56,6 +57,42 @@ std::string narrowFileName(const std::filesystem::path& path) {
 
 std::filesystem::path recoveryRoot(const std::filesystem::path& clipDirectory) {
     return clipDirectory / L".backtrack_tmp";
+}
+
+std::filesystem::path normalizedDirectory(std::filesystem::path path) {
+    path = path.lexically_normal();
+    while (path.has_relative_path() && path.filename().empty()) {
+        path = path.parent_path();
+    }
+    return path;
+}
+
+bool equalPathsInsensitive(const std::filesystem::path& left, const std::filesystem::path& right) {
+    const auto& a = left.native();
+    const auto& b = right.native();
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        const wchar_t ca = a[i] == L'/' ? L'\\' : static_cast<wchar_t>(std::towlower(a[i]));
+        const wchar_t cb = b[i] == L'/' ? L'\\' : static_cast<wchar_t>(std::towlower(b[i]));
+        if (ca != cb) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool isValidOutputSubdir(const std::filesystem::path& name) {
+    const auto& text = name.native();
+    if (text.empty() || name != name.filename() || name == L"." || name == L".." ||
+        name.has_root_path() || text.find(L':') != std::wstring::npos ||
+        text.find(L'/') != std::wstring::npos || text.find(L'\\') != std::wstring::npos) {
+        return false;
+    }
+    return std::none_of(text.begin(), text.end(), [](wchar_t ch) {
+        return ch < 0x20;
+    });
 }
 
 std::filesystem::path manifestPathFor(const std::filesystem::path& tempDirectory) {
@@ -307,6 +344,16 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
                     (parts[0] == "systemAudio" ? manifest.inputs.systemAudioPath : manifest.inputs.microphoneAudioPath);
                 destination = tempDirectory / name;
             }
+        } else if (parts[0] == "outputSubdir") {
+            if (parts.size() != 2) {
+                damagedMetadata = true;
+            } else {
+                const std::filesystem::path name(utf8ToWide(parts[1]));
+                damagedMetadata = !isValidOutputSubdir(name);
+                if (!damagedMetadata) {
+                    manifest.inputs.outputSubdir = name;
+                }
+            }
         } else if (parts[0] == "samples" && parts.size() >= 2) {
             uint64_t count = 0;
             if (parseStrict(parts[1], count)) {
@@ -400,6 +447,33 @@ bool readRecoveryManifest(const std::filesystem::path& tempDirectory, RecoveryMa
 
 } // namespace
 
+TempSessionTarget resolveTempSessionTarget(
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& clipRoot) {
+    const auto outputDir = outputPath.parent_path();
+    if (clipRoot.empty() || outputDir.empty()) {
+        return {outputDir, {}};
+    }
+    const auto normRoot = normalizedDirectory(clipRoot);
+    const auto normOutput = normalizedDirectory(outputDir);
+    if (equalPathsInsensitive(normOutput, normRoot)) {
+        return {normRoot, {}};
+    }
+    // Only hoist staging into clipRoot/.backtrack_tmp when outputDir is an
+    // immediate non-reparse child of clipRoot: MoveFileExW requires staging
+    // and final output on the same volume, and recovery/library scans only
+    // cover one game-folder level below the root.
+    const auto parentOfOutput = normalizedDirectory(normOutput.parent_path());
+    const auto subdir = normOutput.filename();
+    if (equalPathsInsensitive(parentOfOutput, normRoot) &&
+        isValidOutputSubdir(subdir) &&
+        ClipStorage::isDirectoryWithoutReparsePoint(normRoot) &&
+        ClipStorage::isDirectoryWithoutReparsePoint(normOutput)) {
+        return {normRoot, subdir};
+    }
+    return {outputDir, {}};
+}
+
 std::filesystem::path createUniqueDirectory(
     const std::filesystem::path& preferredPath, std::error_code& error) {
     std::filesystem::create_directories(preferredPath.parent_path(), error);
@@ -459,6 +533,9 @@ void writeManifestHeader(std::ostream& stream, const MuxedInputs& partialInputs)
     }
     if (!partialInputs.microphoneAudioPath.empty()) {
         stream << "microphoneAudio\t" << narrowFileName(partialInputs.microphoneAudioPath) << "\n";
+    }
+    if (!partialInputs.outputSubdir.empty()) {
+        stream << "outputSubdir\t" << wideToUtf8(partialInputs.outputSubdir.wstring()) << "\n";
     }
 }
 
@@ -626,7 +703,11 @@ std::wstring preservedRecordingDetail(
     const std::filesystem::path& tempDirectory,
     const MuxedInputs& inputs,
     const std::wstring& reason) {
-    const auto outputDirectory = outputPath.parent_path().empty() ? std::filesystem::path(L".") : outputPath.parent_path();
+    const auto tempParent = tempDirectory.parent_path();
+    const auto libraryDirectory =
+        (tempParent.filename() == L".backtrack_tmp" && !tempParent.parent_path().empty())
+            ? tempParent.parent_path()
+            : (outputPath.parent_path().empty() ? std::filesystem::path(L".") : outputPath.parent_path());
     std::wstring detail;
     if (!reason.empty()) {
         detail = reason + L". ";
@@ -634,7 +715,7 @@ std::wstring preservedRecordingDetail(
     return detail +
            L"Preserved " + std::to_wstring(inputs.videoSamples.size()) +
            L" video packets and elementary streams in " + tempDirectory.wstring() +
-           L". Use Recover Failed in the clip library, or retry with " + outputDirectory.wstring() +
+           L". Use Recover Failed in the clip library, or retry with " + libraryDirectory.wstring() +
            L" as the library. The video/audio files can also be recovered manually.";
 }
 
@@ -806,6 +887,19 @@ std::vector<LocatedManifest> findManifests(const std::filesystem::path& clipDire
                     L"Ignoring unreadable recovery manifest: " + manifestPathFor(session).wstring());
                 continue;
             }
+            if (outputDirectory == clipDirectory && !located.manifest.inputs.outputSubdir.empty()) {
+                const auto candidate = outputDirectory / located.manifest.inputs.outputSubdir;
+                const DWORD attrs = GetFileAttributesW(candidate.c_str());
+                if (attrs == INVALID_FILE_ATTRIBUTES) {
+                    const DWORD attrError = GetLastError();
+                    if (attrError == ERROR_FILE_NOT_FOUND || attrError == ERROR_PATH_NOT_FOUND) {
+                        located.outputDirectory = candidate;
+                    }
+                } else if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
+                           (attrs & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+                    located.outputDirectory = candidate;
+                }
+            }
             std::error_code timeError;
             located.modified = std::filesystem::last_write_time(manifestPathFor(session), timeError);
             if (!timeError && !alreadyRecovered(located)) {
@@ -867,9 +961,19 @@ std::filesystem::path recoverManifest(const LocatedManifest& located, std::wstri
     if (!inputs.systemAudioPath.empty()) inputs.systemAudioPath = system;
     if (!inputs.microphoneAudioPath.empty()) inputs.microphoneAudioPath = microphone;
 
-    const auto output = uniqueRecoveredOutputPath(located.outputDirectory, manifest.tempDirectory.filename().wstring());
+    auto targetDirectory = located.outputDirectory;
+    const auto sessionRoot = manifest.tempDirectory.parent_path().parent_path();
+    if (!manifest.inputs.outputSubdir.empty() && targetDirectory != sessionRoot) {
+        std::error_code dirError;
+        std::filesystem::create_directories(targetDirectory, dirError);
+        if (dirError || !ClipStorage::isDirectoryWithoutReparsePoint(targetDirectory)) {
+            targetDirectory = sessionRoot;
+        }
+    }
+
+    const auto output = uniqueRecoveredOutputPath(targetDirectory, manifest.tempDirectory.filename().wstring());
     if (output.empty()) {
-        detail = L"Could not reserve a recovery output in " + located.outputDirectory.wstring();
+        detail = L"Could not reserve a recovery output in " + targetDirectory.wstring();
         return {};
     }
     std::wstring muxError;

@@ -15,7 +15,10 @@ namespace backtrack {
 
 class Mp4Muxer {
 public:
-    bool startRecording(const std::filesystem::path& outputPath, const VideoSettings& settings);
+    bool startRecording(
+        const std::filesystem::path& outputPath,
+        const VideoSettings& settings,
+        const std::filesystem::path& clipRoot = {});
     void writeVideoPacket(const EncodedPacket& packet);
     // Recording cut: once set, a packet at or below `pts100ns` is written and a
     // packet above it latches a hold, as does everything after it. finalize()
@@ -93,6 +96,7 @@ private:
     bool active_ = false;
     VideoSettings settings_;
     std::filesystem::path outputPath_;
+    std::filesystem::path outputSubdir_;
     std::filesystem::path tempDirectory_;
     std::filesystem::path videoPath_;
     std::ofstream videoStream_;

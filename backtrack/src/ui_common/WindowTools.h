@@ -177,6 +177,14 @@ bool pickFileForOpen(
     UINT filterCount,
     const wchar_t* defaultExtension,
     std::filesystem::path& out);
+bool pickFileForSave(
+    HWND owner,
+    const wchar_t* title,
+    const COMDLG_FILTERSPEC* filters,
+    UINT filterCount,
+    const wchar_t* defaultExtension,
+    const wchar_t* defaultFileName,
+    std::filesystem::path& out);
 bool pickFolder(HWND owner, const wchar_t* title, std::wstring& out);
 HICON loadExecutableIcon(const std::filesystem::path& path);
 HBITMAP loadShellThumbnail(const std::filesystem::path& path, int width, int height);

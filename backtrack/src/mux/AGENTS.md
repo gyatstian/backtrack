@@ -37,8 +37,14 @@ recovery store that keeps a killed recording recoverable.
 - Audio that arrives before the first video packet is held in `pendingAudio_`
   (at most 512 packets) and flushed when that packet anchors the timeline, so
   short recordings and pre-keyframe audio are not dropped.
-- `RecoveryStore::createUniqueDirectory` exclusively creates each recording or
-  replay session under `<output dir>/.backtrack_tmp/` and each MP4 staging
+- `RecoveryStore::resolveTempSessionTarget` hoists `.backtrack_tmp/` to
+  `<clip root>/.backtrack_tmp/` when an output sits in an immediate non-reparse
+  child of `clipRoot` (per-game folders) and records `outputSubdir` in
+  `recovery.tsv` so recovery still publishes into that game folder; callers
+  without a `clipRoot` (or outputs outside/through a reparse point) fall back
+  to `<output dir>/.backtrack_tmp/` so staged-to-final moves stay on one
+  volume. `RecoveryStore::createUniqueDirectory` exclusively creates each
+  recording or replay session under that `.backtrack_tmp/` and each MP4 staging
   attempt inside its session. never reuse an existing directory. the staged
   MP4 is flushed and moved with `MOVEFILE_WRITE_THROUGH`; the final move is
   fail-if-exists except for an empty hidden name reservation. mux retries use a
@@ -186,8 +192,9 @@ recovery store that keeps a killed recording recoverable.
 
 ## Verification
 
-- `StorageLayoutTests` (CTest) covers recovery availability, nested recovery,
-  and collision preservation: recovery muxes an owned work copy, so the
+- `StorageLayoutTests` (CTest) covers recovery availability, root-staged
+  per-game saves and `outputSubdir` recovery, legacy nested recovery, and
+  collision preservation: recovery muxes an owned work copy, so the
   original sessions and their streams are retained. a completed recovery is
   marked so the sweep does not repeat it, even after the recovered clip is
   deleted or renamed.

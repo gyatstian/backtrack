@@ -30,6 +30,31 @@ std::wstring hotkeyName(uint32_t modifiers, uint32_t virtualKey) {
     wchar_t name[64]{};
     const UINT scanCode = MapVirtualKeyW(virtualKey, MAPVK_VK_TO_VSC);
     LONG lParam = static_cast<LONG>(scanCode << 16);
+    switch (virtualKey) {
+    case VK_CANCEL:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_END:
+    case VK_HOME:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+    case VK_SNAPSHOT:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_LWIN:
+    case VK_RWIN:
+    case VK_APPS:
+    case VK_DIVIDE:
+    case VK_NUMLOCK:
+    case VK_RCONTROL:
+    case VK_RMENU:
+        lParam |= (1 << 24);
+        break;
+    default:
+        break;
+    }
     if (GetKeyNameTextW(lParam, name, static_cast<int>(_countof(name))) > 0) {
         value += name;
     } else {

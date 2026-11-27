@@ -81,6 +81,13 @@ struct StudioWindow::Impl {
         int margin = 0;
         bool checkbox = false;
         bool combo = false;
+        bool editBorder = false;
+        bool number = false;
+        bool slider = false;
+        uint32_t sliderMax = 100;
+        HWND sliderBuddy = nullptr;
+        HICON icon = nullptr;
+        bool mutedText = false;
         bool pointerMotion = false;
         ButtonTone tone = ButtonTone::Normal;
     };
@@ -90,7 +97,8 @@ struct StudioWindow::Impl {
         int height = 0;
         bool split = false;
         bool tail = false;
-        int inset = 0;
+        // Starts in the control column instead of the label column.
+        bool controlColumn = false;
         std::array<int, 4> widths{};
         int dependencyDepth = 0;
         bool hidden = false;
@@ -112,6 +120,7 @@ struct StudioWindow::Impl {
 
     int dpiPx(int dip) const { return MulDiv(dip, static_cast<int>(dpi), 96); }
     int px(int dip) const { return MulDiv(dpiPx(dip), uiScale, 100); }
+    int hairlinePx() const { return (std::max)(1, px(1)); }
     // Library content uses its own scale when the setting is on; everything
     // else, including the navigation and footer, keeps the UI scale.
     int libraryPx(int dip) const { return MulDiv(dpiPx(dip), galleryScale, 100); }
@@ -120,6 +129,7 @@ struct StudioWindow::Impl {
     void updateFont();
     void saveUiState();
     bool keyboardCuesHidden() const;
+    void setFocusCuesVisible(bool visible);
     void layout(bool newPage = false);
     void layoutFooter(const RECT& client);
     void layoutRows(bool heightOnly = false, bool repaint = true);
@@ -148,6 +158,10 @@ struct StudioWindow::Impl {
     void paintButton(const DRAWITEMSTRUCT& item);
     void paintCheckbox(HWND control, HDC dc);
     void paintCombo(const DRAWITEMSTRUCT& item);
+    void paintComboBox(HWND control, HDC dc);
+    void paintSlider(HWND control, HDC dc);
+    void paintIconCell(HWND control, HDC dc);
+    void syncFooterScroll(HWND control);
     void setStatus(std::wstring value, bool replaySaved = false, bool pointer = false);
     void paintFooter(bool animateCheck = false);
     bool handleShortcut(const MSG& message);
@@ -165,8 +179,10 @@ struct StudioWindow::Impl {
     void row(std::initializer_list<HWND> controls, bool split = false, int height = 0);
     HWND checkbox(const wchar_t* title, bool& value, const wchar_t* help);
     void check(const wchar_t* title, bool& value, const wchar_t* help = L"");
+    void atControlColumn();
     void number(const wchar_t* title, uint32_t& value, const uint32_t& fallback, const wchar_t* help = L"");
     HWND numberField(uint32_t& value, const uint32_t& fallback, const wchar_t* help);
+    HWND gainSlider(HWND field, uint32_t maxValue, const wchar_t* help);
     void path(const wchar_t* title, std::filesystem::path& value, bool folder, const wchar_t* help = L"");
     using Choices = std::vector<std::pair<std::wstring, Action>>;
     HWND choices(const wchar_t* title, const Choices& values, int selected, const wchar_t* help = L"");
@@ -182,6 +198,8 @@ struct StudioWindow::Impl {
     HWND invalidNumber() const;
     bool dirty() const;
     void changed();
+    void syncActionButtons();
+    void discardSettings();
     bool saveSettings(bool refreshPage = true);
     bool leaveSettings(bool refreshPage);
     void buildCapture();
@@ -192,14 +210,16 @@ struct StudioWindow::Impl {
     void layoutDiagnostics();
     void updateDiagnostics();
     void saveLog();
+    void copyDiagnostics();
 
     void buildLibrary();
     void closeLibrary();
     void requestLibraryStop();
     bool libraryWorkerStopped();
     void destroyLibrary();
-    void refreshLibrary();
+    void refreshLibrary(bool userInitiated = false);
     void selectClip(size_t index, bool focus = false);
+    void focusFolder(size_t index);
     void openClip();
     void beginRename();
     void endRename();
@@ -244,7 +264,9 @@ struct StudioWindow::Impl {
     HWND window = nullptr;
     HWND body = nullptr;
     HWND footer = nullptr;
+    HWND footerWarning = nullptr;
     HWND save = nullptr;
+    HWND discard = nullptr;
     HWND record = nullptr;
     HWND replayButton = nullptr;
     HWND recover = nullptr;
@@ -275,6 +297,7 @@ struct StudioWindow::Impl {
     std::wstring persistentWarning;
     bool replaySaved = false;
     RECT replayCheckBox{};
+    RECT footerWarningBar{};
     std::wstring audioWarning;
     std::array<HWND, 4> pageButtons{};
     std::array<HWND, 5> categoryButtons{};
@@ -283,6 +306,8 @@ struct StudioWindow::Impl {
     std::vector<RECT> headingRects;
     std::unordered_map<HWND, std::pair<uint32_t*, uint32_t*>> hotkeyFields;
     std::unordered_set<HWND> invalidNumbers;
+    HWND invalidSaveAttempt = nullptr;
+    ULONG_PTR gdiplusToken = 0;
     std::vector<std::pair<size_t, std::function<bool()>>> conditions;
     std::vector<std::pair<HWND, std::function<bool()>>> visibility;
     unsigned dpi = 96;
@@ -342,6 +367,7 @@ struct StudioWindow::Impl {
     std::optional<AudioSessionAppInfo> autoResult;
     uint64_t actionRevision = 0;
     bool busy = false;
+    std::optional<ControllerActionKind> activeAction;
     bool applyingSettings = false;
     bool actionFromPointer = false;
     // The encoder report only changes when an action applies settings or a

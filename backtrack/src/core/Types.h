@@ -256,6 +256,9 @@ struct AppSettings {
     // `libraryOwnScale` is set, and rides the UI zoom otherwise.
     uint32_t libraryZoomPercent = 100;
     bool libraryOwnScale = false;
+    // Show dot-prefixed folders (e.g. .backtrack_tmp, .backtrack_ring) in the
+    // library folder browser. Hidden by default.
+    bool libraryShowHiddenFolders = false;
     uint32_t monitorIndex = 0;
     bool multiMonitorSupport = false;
     // Multi-monitor on with this set follows the cursor instead of the focused window.

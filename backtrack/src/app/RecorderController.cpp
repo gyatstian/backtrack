@@ -495,8 +495,9 @@ bool RecorderController::startRecording() {
         std::scoped_lock lock(stateMutex_);
         videoSettings = activeVideoSettings_;
     }
-    if (!muxer_.startRecording(output, videoSettings)) {
-        const std::wstring detail = L"could not create the recording temporary streams in " + output.parent_path().wstring();
+    const auto clipDirectory = settings().clipDirectory;
+    if (!muxer_.startRecording(output, videoSettings, clipDirectory)) {
+        const std::wstring detail = L"could not create the recording temporary streams in " + clipDirectory.wstring();
         Logger::instance().error(L"recorder", L"Recording muxer could not start for output: " + output.wstring());
         // Release the clip name reserved by nextClipPath; nothing was written.
         removeEmptyOutputReservation(output);
@@ -750,7 +751,7 @@ std::filesystem::path RecorderController::saveReplay() {
     LogContext::breadcrumb(L"saveTo begin");
     const auto saveStart = SteadyClock::now();
     std::wstring saveDetail;
-    const bool saved = replay_.saveTo(output, videoSettings, &saveDetail);
+    const bool saved = replay_.saveTo(output, videoSettings, &saveDetail, snapshot.clipDirectory);
     if (saved) {
         reservation.dismissed = true;
     }

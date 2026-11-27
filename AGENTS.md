@@ -163,6 +163,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - `backtrack` - the executable project: build definitions, resources, and the
   test suite. Its index names the source domains; walk the chain rather than
   reading a flattened copy of it here.
+- `tools` - repository-local scripts for recurring developer tasks.
 
 Rules that reach every domain, so they are not repeated in the children:
 

@@ -26,8 +26,11 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 - use one 15-dip Bahnschrift SemiLight font (GDI weight 350). leave gaps
   between buttons in both navigation rows. animate the existing full-width
   neutral underline in each row's bottom band, not a second indicator. use
-  an inset outline for keyboard focus when cues are visible: owner-drawn
-  controls honour `ODS_NOFOCUSRECT` and the checkbox honours `UISF_HIDEFOCUS`.
+  an inset outline for keyboard focus when cues are visible: `WM_CREATE` sets
+  `UISF_HIDEFOCUS`, pointer clicks re-set it (so clicking a page or setting
+  never draws a focus box), keyboard navigation clears it, and owner-drawn and
+  custom-painted controls (tabs, buttons, checkboxes, sliders, combo boxes,
+  gallery rows/tiles) honour `ODS_NOFOCUSRECT` and `UISF_HIDEFOCUS`.
 - the window remembers its rect through `AppSettings::window*`; restore keeps the
   stored rect only when it still intersects a monitor work area, and the stored
   maximized flag is written false because the window cannot maximize.
@@ -35,9 +38,12 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   through the settings draft, so it cannot publish unsaved pages. it runs on
   shutdown and on every Ctrl+Scroll notch: a zoom that waited for exit was lost
   whenever the app closed to the tray or ended abnormally.
-- the footer carries one persistent failure line for the last recorder or
-  hotkey failure. it outlives `statusTimer` and clears only on a later
-  successful action; ordinary status text still expires.
+- the footer separates persistent recorder/hotkey and audio warnings
+  (`footerWarning`, `theme::recording` with a left accent bar) from transient
+  status and hover help (`footer`, `theme::muted`). neither footer field takes
+  `WS_TABSTOP`, and the replay checkmark reserves width only while shown.
+  persistent warnings outlive `statusTimer` and clear only on a later successful
+  action; ordinary status text still expires.
 - controls with an ambiguous effect carry hover help: consequences, defaults,
   units, and what a blank value means. never restate the label or the checkbox
   text, and add no help to a control whose name already says what it does.
@@ -55,10 +61,10 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   window factor is applied from the saved baseline (`ui.scaleWithWindow`), not
   the draft, so the checkbox takes effect on save. the zoom is live state that
   also goes into the draft and the baseline on every change, so a page save
-  keeps it instead of publishing the stale draft value. a footer with nothing
-  else to show names the gesture. `library.ownScale` gives the library page its
-  own zoom: gallery content is measured with `libraryPx`/`pageFont` (the
-  `galleryScale`) while chrome, navigation and footer keep `px`/`font`, so
+  keeps it instead of publishing the stale draft value. `library.ownScale` gives
+  the library page its own zoom: gallery content is measured with
+  `libraryPx`/`pageFont` (`galleryScale`), while chrome, navigation and footer
+  keep `px`/`font`, so
   Ctrl+Scroll on the library moves the tiles and leaves the tabs alone. a scale
   change rebuilds both fonts; the library font exists only while the two scales
   differ.
@@ -77,16 +83,24 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   replay shortcut above the save action and the buffer length; while replay is
   off the shortcut is hidden and the second line is hidden. `enabledWhen` hides
   a whole row and reflows, `visibleWhen` hides one control in place. replay sound
-  belongs in audio settings and monitor options in capture settings. the save
-  action sits at the left of the reserved footer; the window-wide update action
-  sits at the right.
+  belongs in audio settings (with a `Test` preview button) and monitor options
+  in capture settings. the `Save settings` action (116 dip across Capture and
+  all Settings categories, highlighted when dirty) sits at the left of the
+  reserved footer beside `Discard` (shown only while dirty); the window-wide
+  update action sits at the right. in-flight recorder actions disable `record`,
+  `replayButton`, `save`, and `discard` with pending labels.
 - the library toolbar is one row above the gallery: Open, Rename, Favorite from
   the left, Refresh and Delete in from the right edge. diagnostics keeps
   runtime, encoder, and recent log in separate columns with log actions above
-  the log. size fields for their values. indent dependent settings with a
-  vertical guide on the left; keep activation rules with their rows. a
-  dependent row whose rule is false is hidden and the page reflows without it,
-  so it draws no guide and takes no keyboard focus.
+  the log. size fields for their values. every form row starts on the page
+  margin or on the control column that follows the label column
+  (`studio_theme::labelColumnPercent`); there is no per-row offset, so one page
+  has one label x and one control x. a checkbox that qualifies the field above
+  it starts on that control column. indent dependent settings with a vertical
+  guide on the left, measured from the parent row rather than the page, and keep
+  the dependent control on the control column; keep activation rules with their
+  rows. a dependent row whose rule is false is hidden and the page reflows
+  without it, so it draws no guide and takes no keyboard focus.
 - apply live resize and form wheel bursts at paint time; finish the last
   resize on drag exit. height changes only reposition form rows if the usable
   width or scroll position changes. clamped scrolls do nothing. a hidden row
@@ -95,9 +109,12 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 - buffer scrolling pages with their native children. finish positioning before
   queueing repaint; don't blit old child pixels or erase owner-drawn button
   backgrounds separately.
-- page controls share one settings draft. entering audio settings requests
-  endpoint discovery off the ui thread; results refresh the existing selectors
-  without rebuilding the page or losing draft edits.
+- page controls share one settings draft, carried seamlessly between capture and
+  settings (prompting only when leaving to library/diagnostics or exiting).
+  entering audio settings requests endpoint discovery off the ui thread;
+  results refresh the existing selectors without rebuilding the page or losing
+  draft edits. audio gain sliders preview volumes lock-free via
+  `RecorderController::previewAudioVolumes` and revert on discard.
 - invalid visible numeric input blocks publication; invalid hidden fields use
   their saved values. only a successful save of changed normalized settings
   advances the baseline and queues a recorder apply. an unchanged normalized
@@ -114,8 +131,10 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
 - `WM_QUERYENDSESSION` allows shutdown; `WM_ENDSESSION(TRUE)` finalizes an
   active recording and joins every worker synchronously through `shutdown`,
   because nothing runs after that message. closing to the tray only hides the
-  window, so it neither prompts nor saves the draft; an exit from the tray
-  restores the window before the unsaved-changes prompt.
+  window, so it neither prompts nor saves the draft; exiting (or tray Exit)
+  restores the window before confirming an active recording and prompting for
+  unsaved changes. the tray menu exposes `Start/Stop recording` and `Save
+  replay` alongside `Open Backtrack` and `Exit`.
 - normal exit stops accepting new work and keeps dispatching messages until
   all workers finish, including the gallery worker. accepted recorder actions
   (including startup) and queued gallery edits drain before destruction.
@@ -126,23 +145,26 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   only when an eligible session is known and the recorder is idle.
 - the library is gallery-only and leaves the legacy view setting untouched. it
   browses one disk folder at a time through `ClipManager::listContents`: the
-  gallery shows the subfolders of the open folder and the clips directly inside
-  it. the gallery draws thin folder rows above the clip grid, one video tile wide
+  gallery shows the subfolders of the open folder (hiding dot-prefixed folders
+  unless `library.showHiddenFolders` / "Show hidden folders" in Settings -> App
+  is enabled) and the clips directly inside it. the gallery draws thin folder rows above the clip grid, one video tile wide
   and scrolled with it: a drawn folder glyph, the folder name, and the number of
   clips below it at any depth, one row per subfolder, alphabetical. rows are
   recycled owner-drawn buttons in their own pool, drawn like the clip tiles and
   clicked like them: the folder name is the button text, the count is painted,
   and the row opens through the ordinary button click. never move a folder row
   back to view-level hit testing; that path did not receive clicks.
-  the open folder is the top of `Gallery::stack`; clicking a row pushes it,
+  the open folder is the top of `Gallery::stack`; clicking a row or pressing
+  Enter on a focused folder row pushes it (and arrow keys traverse both folder
+  rows and clip tiles), a breadcrumb bar shows the open path below the toolbar,
   **Back** (left of Refresh, hidden at the root with its slot reserved) pops
-  it, `VK_BACK` does the same, and clicking the Library tab while on the library
-  returns to the root.
+  it, `VK_BACK` and `Alt+Left` do the same, ancestor breadcrumb segments are
+  clickable, and clicking the Library tab while on the library returns to the
+  root. empty-state copy appears only when both folders and clips are empty.
   building the library page also drops the stack, so the tab never resumes a
   folder. each level change clears the selection, the scroll and the thumbnail
-  window, then rescans through the worker. the viewport slides in over 200ms from
-  the side the navigation came from, through the `librarySlide` motion slot, so
-  it honours the windows animation preference. page-wide pointer input (the wheel
+  window, then rescans through the worker; `librarySlide` waits until the new
+  folder's snapshot arrives. page-wide pointer input (the wheel
   and the back side mouse button) goes through `libraryInput` and is called from
   the viewport, every control, the body and the window: the body's own handlers
   ran scroll math on every page and swallowed those messages, so only input over
@@ -156,8 +178,9 @@ the native Win32 window: chrome, pages, session worker, gallery, diagnostics.
   renaming replaces the selected tile's name line with one edit field rather
   than adding a row: the field is a child of the gallery viewport so it scrolls
   and clips with its tile, and it is raised above the recycled tiles on every
-  placement. Enter in the field commits, Escape cancels, and a selection change
-  cancels with it. the field owns its keys, so Delete and Ctrl+R are text there.
+  placement. Enter in the field commits, Escape or focus loss cancels, and a
+  selection change cancels with it. the field owns its keys, so Delete and Ctrl+R
+  are text there.
   the clips rename rules check the name on the ui thread before the edit is
   queued; a rejected or colliding name keeps the field open with its text and a
   specific status. a successful rename patches the tile in place, no rescan.

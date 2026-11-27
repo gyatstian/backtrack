@@ -96,7 +96,7 @@ build.
   - `ClipManagerTests` - `clips/ClipManager.cpp`, `core/Logger.cpp`,
     `LIBS propsys`: linked sidecars, failed tag publication, a rename race, rename
     name rules and orphan sidecars, scan sidecar flags, the supported clip
-    roots, and scan cancellation.
+    roots, dot-prefixed folder filtering in `listContents`, and scan cancellation.
   - `AudioPersistenceTests` - `audio/AudioMix.cpp`, `audio/WavReader.cpp`,
     `mux/WavWriter.cpp`, `core/Logger.cpp`: the mix source policy (read-denied
     and locked WAVs fail, absent or empty tracks stay video-only), the full-gap
@@ -117,9 +117,10 @@ build.
     with nothing published.
   - `StorageLayoutTests` - the `ReplayBufferTests` source set plus
     `clips/ClipManager.cpp`, `LIBS propsys`: reservation collisions, the shared
-    root rules, game-root and nested recovery, candidate availability, and that
-    recovery muxes an owned work copy so the original session survives; clear/disable/re-enable ring
-    lifecycle and stale-audio removal.
+    root rules, root-staged per-game saves (`outputSubdir` recovery and
+    validation), legacy game-root and nested recovery, candidate availability,
+    and that recovery muxes an owned work copy so the original session
+    survives; clear/disable/re-enable ring lifecycle and stale-audio removal.
   - `LoggerDiagnosticsTests` - `core/Logger.cpp`, `ui_common/DiagnosticsLog.cpp`:
     rate limiting, pruning, stream failure, diagnostics export, an unarchivable
     previous log left untruncated, and a `recentLines` poll reporting the pending
@@ -218,6 +219,17 @@ build.
     height, unfitted grows to the frame's shape. checks a separate library scale
     by font size: Ctrl+Scroll on the library changes the tile font and leaves the
     navigation font alone, and the library zoom is written with the placement.
+    also covers busy pending action states, non-tabstop footer, `Discard` and
+    standardized `Save settings`, clamped field name reporting, Audio `Test`
+    sound button and `SS_ENDELLIPSIS` labels, folder-only library empty state
+    and breadcrumb, and non-overlapping Library toolbar and Diagnostics columns
+    at minimum width and high zoom. also covers extended-key `keyName`, idle
+    footer paint and dynamic scrollbar, zoom status readout, Capture/Settings
+    draft continuity, compact numeric width and stepping, scroll preservation on
+    clamped save, bordered Diagnostics panes and Copy button, subfolder clip
+    edits, inline rename focus/dismissal, hidden-folder filtering with the
+    "Show hidden folders" setting, and hiding keyboard focus cues on pointer
+    clicks.
 - Stubs live inside the test source, inside `namespace backtrack` so they
   satisfy the production declaration. `ReplayBufferTests` and
   `StorageLayoutTests` define `Mp4Muxer::muxToMp4` and

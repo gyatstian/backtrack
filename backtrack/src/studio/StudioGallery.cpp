@@ -8,6 +8,8 @@
 #include "ui_common/WindowTools.h"
 
 #include <CommCtrl.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <ole2.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -61,6 +63,7 @@ int thumbnailWidth(int tileWidth) {
 struct GalleryClip {
     ClipInfo info;
     std::wstring name;
+    std::wstring duration;
     std::wstring details;
 };
 
@@ -98,7 +101,7 @@ struct StudioWindow::Impl::Gallery {
         unsigned dpi;
         bool operator==(const Viewport&) const = default;
     };
-    struct Scan { uint64_t revision; std::filesystem::path directory; };
+    struct Scan { uint64_t revision; std::filesystem::path directory; bool includeHiddenFolders = false; };
     struct Snapshot { uint64_t revision; std::vector<GalleryClip> clips; std::vector<GalleryFolder> folders; bool ok = false; };
     using PreviewKey = std::pair<uint64_t, size_t>;
     struct Request {
@@ -190,16 +193,19 @@ struct StudioWindow::Impl::Gallery {
                     try {
                         if (cancelled()) continue;
                         manager.setDirectory(nextScan->directory);
-                        auto contents = manager.listContents(cancelled);
+                        auto contents = manager.listContents(cancelled, nextScan->includeHiddenFolders);
                         if (cancelled()) continue;
                         result->clips.reserve(contents.clips.size());
                         for (auto& info : contents.clips) {
                             if (cancelled()) break;
                             auto name = info.path.filename().wstring();
-                            auto details = durationToText(info.duration100ns) + L"  \u00b7  " + bytesToText(info.bytes);
+                            auto duration = durationToText(info.duration100ns);
+                            auto details = info.duration100ns > 0
+                                ? bytesToText(info.bytes)
+                                : duration + L"  \u00b7  " + bytesToText(info.bytes);
                             if (const auto date = shortDateText(info.modifiedTime); !date.empty()) details += L"  \u00b7  " + date;
                             if (!info.tags.empty()) details += L"  \u00b7  " + tagsToText(info.tags);
-                            result->clips.push_back({std::move(info), std::move(name), std::move(details)});
+                            result->clips.push_back({std::move(info), std::move(name), std::move(duration), std::move(details)});
                         }
                         for (auto& folder : contents.folders)
                             result->folders.push_back({std::move(folder.name), std::move(folder.path), folder.clips});
@@ -230,6 +236,7 @@ struct StudioWindow::Impl::Gallery {
     }
 
     HWND view = nullptr;
+    HWND breadcrumb = nullptr;
     HWND rename = nullptr;
     bool renaming = false;
     HWND empty = nullptr;
@@ -241,6 +248,9 @@ struct StudioWindow::Impl::Gallery {
     int tileWidth = 0;
     int folderHeight = 0;
     int slide = 0;
+    std::optional<bool> pendingSlide;
+    int hoveredCrumb = -1;
+    std::vector<RECT> crumbRects;
 
     // Height of the scrolling folder band above the clip grid.
     int headerHeight() const {
@@ -265,6 +275,7 @@ struct StudioWindow::Impl::Gallery {
     POINT dragStart{};
     HWND dragTile = nullptr;
     bool scanning = false;
+    bool manualRefresh = false;
     bool editing = false;
     bool dragActive = false;
     bool noticePending = false;
@@ -291,18 +302,28 @@ void StudioWindow::Impl::buildLibrary() {
     g.actions[0] = button(L"Open", [this] { openClip(); });
     g.actions[1] = button(L"Rename", [this] { beginRename(); });
     g.actions[2] = button(L"Favorite", [this] { editClip(ClipEdit::Favorite); });
-    g.actions[3] = button(L"Refresh", [this] { refreshLibrary(); });
+    g.actions[3] = button(L"Refresh", [this] { refreshLibrary(true); });
     g.actions[4] = button(L"Delete", [this] { editClip(ClipEdit::Remove); });
     g.actions[5] = button(L"Back", [this] { backFolder(); });
+    g.breadcrumb = make(L"STATIC", L"", SS_CENTERIMAGE | SS_NOTIFY | SS_NOPREFIX | SS_ENDELLIPSIS, {}, L"", body);
+    if (g.breadcrumb) {
+        controls.at(g.breadcrumb).mutedText = true;
+        SetWindowSubclass(g.breadcrumb, galleryProc, 2, reinterpret_cast<DWORD_PTR>(this));
+    }
     g.view = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"Clip gallery",
         WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL | WS_TABSTOP, 0, 0, 0, 0, body, nullptr, nullptr, nullptr);
     if (!g.view) return;
     // The field replaces the selected tile's name line, so it belongs to the scrolling viewport.
     g.rename = make(L"EDIT", L"", WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL, {}, L"Rename the selected clip without changing its extension.", g.view);
-    if (g.rename) SetWindowSubclass(g.rename, galleryProc, 2, reinterpret_cast<DWORD_PTR>(this));
+    if (g.rename) {
+        controls.at(g.rename).editBorder = true;
+        controls.at(g.rename).margin = 5;
+        SetWindowSubclass(g.rename, galleryProc, 2, reinterpret_cast<DWORD_PTR>(this));
+    }
     SetWindowSubclass(g.view, galleryProc, 2, reinterpret_cast<DWORD_PTR>(this));
     SetWindowTheme(g.view, L"DarkMode_Explorer", nullptr);
-    g.empty = make(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE | SS_NOPREFIX, {}, L"", g.view);
+    g.empty = make(L"STATIC", L"", SS_CENTER | SS_NOPREFIX, {}, L"", g.view);
+    if (g.empty) controls.at(g.empty).mutedText = true;
     if (g.rename) {
         SendMessageW(g.rename, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(libraryPx(5), libraryPx(5)));
         SendMessageW(g.rename, EM_LIMITTEXT, 200, 0);
@@ -337,11 +358,15 @@ void StudioWindow::Impl::closeLibrary() {
     g.folderTiles.clear();
     g.viewport.reset();
     g.slide = 0;
+    g.pendingSlide.reset();
+    g.hoveredCrumb = -1;
+    g.crumbRects.clear();
     motions[librarySlide] = {0.f, 0.f};
-    g.view = g.empty = g.rename = nullptr;
+    g.view = g.breadcrumb = g.empty = g.rename = nullptr;
     g.actions.fill(nullptr);
     g.wheel = 0;
     g.scanning = false;
+    g.manualRefresh = false;
     g.renaming = false;
 }
 
@@ -359,16 +384,25 @@ void StudioWindow::Impl::destroyLibrary() {
     delete std::exchange(gallery, nullptr);
 }
 
-void StudioWindow::Impl::refreshLibrary() {
+void StudioWindow::Impl::refreshLibrary(bool userInitiated) {
     if (closing || shuttingDown || nav.page != Page::Library || !gallery || !gallery->view) return;
     auto& g = *gallery;
     g.scanning = true;
+    g.manualRefresh = userInitiated;
     {
         std::scoped_lock lock(g.mutex);
-        g.scan = Gallery::Scan{++g.revision, g.currentFolder()};
+        g.scan = Gallery::Scan{++g.revision, g.currentFolder(), saved.libraryShowHiddenFolders};
     }
     g.cv.notify_one();
-    if (g.clips.empty()) setText(g.empty, L"Loading clips\u2026");
+    if (userInitiated) {
+        if (g.actions[3]) {
+            setText(g.actions[3], L"Refreshing\u2026");
+            EnableWindow(g.actions[3], FALSE);
+            InvalidateRect(g.actions[3], nullptr, FALSE);
+        }
+        setStatus(L"Refreshing library\u2026");
+    }
+    if (g.clips.empty() && g.folders.empty()) setText(g.empty, L"Loading clips\u2026");
 }
 
 void StudioWindow::Impl::galleryChanged() {
@@ -433,6 +467,10 @@ void StudioWindow::Impl::galleryChanged() {
                         node.key() = it->info.path.native();
                         g.cache.insert(std::move(node));
                     }
+                    if (index == g.selected) {
+                        const auto focus = GetFocus();
+                        refocus = focus == g.view;
+                    }
                     layoutChanged = true;
                 }
                 break;
@@ -445,6 +483,7 @@ void StudioWindow::Impl::galleryChanged() {
     const bool scanFinished = snapshot && snapshot->revision == g.revision.load();
     if (scanFinished) {
         g.scanning = false;
+        const bool wasManual = std::exchange(g.manualRefresh, false);
         if (snapshot->ok) {
             for (auto& tile : g.tiles) {
                 const auto i = tile.index;
@@ -463,8 +502,9 @@ void StudioWindow::Impl::galleryChanged() {
                 }
             }
             layoutChanged = true;
+            if (wasManual) setStatus(L"Library refreshed.");
         } else {
-            if (g.clips.empty()) setText(g.empty, L"No clips");
+            if (g.clips.empty() && g.folders.empty()) setText(g.empty, L"Clip library could not be read.");
             setStatus(L"Clip library could not be read.");
         }
     }
@@ -492,6 +532,8 @@ void StudioWindow::Impl::galleryChanged() {
     }
     if (edit || scanFinished) selectClip(g.selected);
     if (layoutChanged) updateGallery();
+    if (scanFinished && snapshot->ok && g.pendingSlide)
+        startGallerySlide(*std::exchange(g.pendingSlide, std::nullopt));
     if (refocus) selectClip(g.selected, true);
     if (edit || snapshot) g.cv.notify_one();
 }
@@ -523,10 +565,25 @@ void StudioWindow::Impl::showLibraryFolder(std::vector<std::filesystem::path> st
     g.folders.clear();
     g.scroll = 0;
     g.viewport.reset();
+    g.hoveredCrumb = -1;
+    g.crumbRects.clear();
+    motions[librarySlide] = {0.f, 0.f};
+    g.slide = 0;
+    if (g.breadcrumb) {
+        std::wstring crumb;
+        if (!g.stack.empty()) {
+            crumb = L"Library";
+            for (const auto& folder : g.stack) {
+                crumb += L"  \u203a  ";
+                crumb += folder.filename().wstring();
+            }
+        }
+        setText(g.breadcrumb, crumb);
+        InvalidateRect(g.breadcrumb, nullptr, FALSE);
+    }
     selectClip(noClip);
+    g.pendingSlide = forward;
     refreshLibrary();
-    // The new level slides in from the side the navigation came from.
-    startGallerySlide(forward);
     updateGallery();
 }
 
@@ -579,13 +636,27 @@ void StudioWindow::Impl::layoutGallery() {
     GetClientRect(body, &r);
     const int pad = libraryPx(theme::inset), gap = libraryPx(theme::gap);
     const int width = (std::max)(0L, r.right - pad * 2);
-    const int row = libraryPx(30), y = libraryPx(9), buttonWidth = libraryPx(92);
+    const int row = libraryPx(30), y = libraryPx(9);
+    // Shrink toolbar buttons evenly when narrow or zoomed so left and right
+    // groups never overlap.
+    const int toolbarGap = (std::min)(gap, (std::max)(0, width / 12));
+    const int buttonWidth = (std::min)(libraryPx(92), (std::max)(1, (width - 5 * toolbarGap) / 6));
     std::vector<WindowMove> moves;
-    for (int i = 0; i < 3; ++i) moves.push_back({g.actions[i], pad + i * (buttonWidth + gap), y, buttonWidth, row});
-    moves.push_back({g.actions[5], pad + width - 3 * buttonWidth - 2 * gap, y, buttonWidth, row});
-    moves.push_back({g.actions[3], pad + width - 2 * buttonWidth - gap, y, buttonWidth, row});
+    for (int i = 0; i < 3; ++i) moves.push_back({g.actions[i], pad + i * (buttonWidth + toolbarGap), y, buttonWidth, row});
+    moves.push_back({g.actions[5], pad + width - 3 * buttonWidth - 2 * toolbarGap, y, buttonWidth, row});
+    moves.push_back({g.actions[3], pad + width - 2 * buttonWidth - toolbarGap, y, buttonWidth, row});
     moves.push_back({g.actions[4], pad + width - buttonWidth, y, buttonWidth, row});
-    const int top = y + row + gap * 2;
+    int top = y + row + gap * 2;
+    if (g.breadcrumb) {
+        const bool showCrumb = !g.stack.empty();
+        if (showCrumb) {
+            const int crumbHeight = libraryPx(22);
+            moves.push_back({g.breadcrumb, pad, y + row + gap, width, crumbHeight});
+            top = y + row + gap + crumbHeight + gap;
+        }
+        if (((GetWindowLongPtrW(g.breadcrumb, GWL_STYLE) & WS_VISIBLE) != 0) != showCrumb)
+            ShowWindow(g.breadcrumb, showCrumb ? SW_SHOWNA : SW_HIDE);
+    }
     const int slide = gallerySlide();
     moves.push_back({g.view, slide, top, r.right, (std::max)(0L, r.bottom - top)});
     applyWindowMoves(moves);
@@ -611,30 +682,48 @@ void StudioWindow::Impl::updateGallery() {
     auto& g = *gallery;
     RECT r{};
     GetClientRect(g.view, &r);
-    const int width = r.right, height = r.bottom;
     const int pad = libraryPx(theme::inset), gap = libraryPx(theme::gap);
-    const int fitted = std::clamp((width + GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) - pad * 2 + gap) / libraryPx(210), 1, 5);
-    // The gap arithmetic is int, so an unusable count still has to stay below it.
-    const int columns = saved.libraryColumns ? static_cast<int>((std::min)(saved.libraryColumns, 10000u)) : fitted;
-    const int tileWidth = (std::max)(1, (width - pad * 2 - (columns - 1) * gap) / columns);
-    // Fitting fills the tile: the row takes the frame's 16:9 shape, so the
-    // thumbnail has no bars and nothing is cropped away. Unfitted keeps one tile
-    // height and scales the frame into it, so a wide tile shows bars.
-    const int naturalHeight = tileWidth * 9 / 16 + libraryPx(59);
-    const int rowHeight = saved.libraryFitThumbnails
-        ? (std::min)(naturalHeight, (std::max)(height, libraryPx(250)))
-        : (std::min)(libraryPx(250), naturalHeight);
-    int64_t position = g.scroll;
-    if (g.grid.columns != columns || g.grid.rowHeight != rowHeight)
-        position = position / g.grid.rowHeight * g.grid.columns / columns * rowHeight;
-    g.grid = {columns, rowHeight};
-    g.tileWidth = tileWidth;
-    g.folderHeight = libraryPx(34);
-    const int header = g.headerHeight();
-    const auto rowCount = g.grid.rowCount(g.clips.size());
-    const int bottom = header + static_cast<int>((std::min)(rowCount, static_cast<size_t>(INT_MAX / rowHeight))) * rowHeight;
-    g.maxScroll = (std::max)(0, bottom - height);
-    g.scrollTo(position);
+    int width = r.right, height = r.bottom;
+    int columns = 1, tileWidth = 1, rowHeight = 1, header = 0, bottom = 0;
+    const auto computeLayout = [&](int viewWidth) {
+        const int fitted = std::clamp((viewWidth + GetSystemMetricsForDpi(SM_CXVSCROLL, dpi) - pad * 2 + gap) / libraryPx(210), 1, 5);
+        // The gap arithmetic is int, so an unusable count still has to stay below it.
+        columns = saved.libraryColumns ? static_cast<int>((std::min)(saved.libraryColumns, 10000u)) : fitted;
+        tileWidth = (std::max)(1, (viewWidth - pad * 2 - (columns - 1) * gap) / columns);
+        // Fitting fills the tile: the row takes the frame's 16:9 shape, so the
+        // thumbnail has no bars and nothing is cropped away. Unfitted keeps one tile
+        // height and scales the frame into it, so a wide tile shows bars.
+        const int naturalHeight = tileWidth * 9 / 16 + libraryPx(59);
+        rowHeight = saved.libraryFitThumbnails
+            ? (std::min)(naturalHeight, (std::max)(height, libraryPx(250)))
+            : (std::min)(libraryPx(250), naturalHeight);
+        int64_t position = g.scroll;
+        if (g.grid.columns != columns || g.grid.rowHeight != rowHeight)
+            position = position / g.grid.rowHeight * g.grid.columns / columns * rowHeight;
+        g.grid = {columns, rowHeight};
+        g.tileWidth = tileWidth;
+        g.folderHeight = libraryPx(34);
+        header = g.headerHeight();
+        const auto rowCount = g.grid.rowCount(g.clips.size());
+        bottom = header + static_cast<int>((std::min)(rowCount, static_cast<size_t>(INT_MAX / rowHeight))) * rowHeight;
+        g.maxScroll = (std::max)(0, bottom - height);
+        g.scrollTo(position);
+    };
+    computeLayout(width);
+    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS, 0,
+                    (std::max)(0, bottom - 1), static_cast<UINT>(r.bottom), g.scroll};
+    SetScrollInfo(g.view, SB_VERT, &info, FALSE);
+    // The scrollbar can appear or disappear, changing the usable client width.
+    GetClientRect(g.view, &r);
+    if (r.right != width) {
+        width = r.right;
+        height = r.bottom;
+        computeLayout(width);
+        info.nMax = (std::max)(0, bottom - 1);
+        info.nPage = static_cast<UINT>(r.bottom);
+        info.nPos = g.scroll;
+        SetScrollInfo(g.view, SB_VERT, &info, FALSE);
+    }
     const bool placeRename = g.renaming && g.rename && g.selected < g.clips.size();
     if (placeRename) {
         const int nameTop = rowHeight - libraryPx(4) - libraryPx(42);
@@ -649,12 +738,12 @@ void StudioWindow::Impl::updateGallery() {
         return;
     }
     g.viewport = viewport;
-    SCROLLINFO info{sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL, 0,
-                    (std::max)(0, bottom - 1), static_cast<UINT>(r.bottom), g.scroll};
-    SetScrollInfo(g.view, SB_VERT, &info, FALSE);
-    if (g.clips.empty()) {
-        setText(g.empty, g.scanning ? L"Loading clips\u2026" : L"No clips");
-        moveWindowIfChanged(g.empty, 0, (std::max)(0, header - g.scroll), r.right, libraryPx(52));
+    if (g.clips.empty() && g.folders.empty()) {
+        const std::wstring message = g.scanning ? L"Loading clips\u2026"
+            : !g.stack.empty() ? L"No clips in this folder."
+            : L"No clips yet.\r\nClips are saved to " + g.directory.wstring();
+        setText(g.empty, message);
+        moveWindowIfChanged(g.empty, pad, libraryPx(20), (std::max)(0, static_cast<int>(r.right) - pad * 2), libraryPx(64));
         ShowWindow(g.empty, SW_SHOWNA);
     } else ShowWindow(g.empty, SW_HIDE);
     const int headerShown = std::clamp(header - g.scroll, 0, height);
@@ -781,7 +870,9 @@ void StudioWindow::Impl::selectClip(size_t index, bool focus) {
     g.selected = selected ? index : noClip;
     if (g.renaming && old != g.selected) endRename();
     for (const auto i : {0, 1, 2, 4}) EnableWindow(g.actions[i], selected && !g.editing);
-    EnableWindow(g.actions[3], !g.editing);
+    const bool refreshing = g.scanning && g.manualRefresh;
+    setText(g.actions[3], refreshing ? L"Refreshing\u2026" : L"Refresh");
+    EnableWindow(g.actions[3], !g.editing && !refreshing);
     EnableWindow(g.actions[5], !g.editing);
     // Back only exists inside a folder; its slot stays reserved so the other
     // actions do not move.
@@ -809,10 +900,40 @@ void StudioWindow::Impl::selectClip(size_t index, bool focus) {
     }
 }
 
+void StudioWindow::Impl::focusFolder(size_t index) {
+    if (!gallery || !gallery->view || index >= gallery->folders.size() || index >= gallery->folderTiles.size()) return;
+    auto& g = *gallery;
+    selectClip(noClip);
+    RECT r{};
+    GetClientRect(g.view, &r);
+    const auto y = static_cast<int64_t>(index / g.grid.columns) * g.folderHeight;
+    if (r.bottom > 0) {
+        const auto position = y < g.scroll ? y : (std::max)(int64_t{g.scroll}, y + g.folderHeight - r.bottom);
+        if (g.scrollTo(position)) updateGallery();
+    }
+    SetFocus(g.folderTiles[index].hwnd);
+}
+
 void StudioWindow::Impl::beginRename() {
     if (closing || shuttingDown || !gallery || !gallery->view || !gallery->rename || gallery->editing ||
         gallery->selected >= gallery->clips.size()) return;
     auto& g = *gallery;
+    RECT r{};
+    GetClientRect(g.view, &r);
+    const int cols = (std::max)(1, g.grid.columns);
+    const int y = g.headerHeight() + static_cast<int>(g.selected / cols) * g.grid.rowHeight;
+    if (r.bottom > 0 && g.grid.rowHeight > 0) {
+        if (g.grid.rowHeight <= r.bottom) {
+            const int position = y < g.scroll ? y : (std::max)(g.scroll, y + g.grid.rowHeight - static_cast<int>(r.bottom));
+            g.scrollTo(position);
+        } else {
+            const int nameTop = g.grid.rowHeight - libraryPx(4) - libraryPx(42);
+            const int nameBottom = nameTop + libraryPx(21);
+            const int position = (y + nameTop < g.scroll) ? (y + nameTop)
+                : (std::max)(g.scroll, y + nameBottom - static_cast<int>(r.bottom));
+            g.scrollTo(position);
+        }
+    }
     g.renaming = true;
     setText(g.rename, g.clips[g.selected].info.path.stem().wstring());
     ShowWindow(g.rename, SW_SHOWNA);
@@ -822,11 +943,15 @@ void StudioWindow::Impl::beginRename() {
 }
 
 void StudioWindow::Impl::endRename() {
-    if (!gallery || !gallery->view || !gallery->rename) return;
+    if (!gallery || !gallery->view || !gallery->rename || !gallery->renaming) return;
     auto& g = *gallery;
+    const bool hadFocus = GetFocus() == g.rename;
     g.renaming = false;
     ShowWindow(g.rename, SW_HIDE);
-    if (GetFocus() == g.rename) SetFocus(g.view);
+    if (hadFocus) {
+        if (const auto tile = g.tileFor(g.selected)) SetFocus(tile);
+        else SetFocus(g.view);
+    }
 }
 
 void StudioWindow::Impl::openClip() {
@@ -870,7 +995,7 @@ void StudioWindow::Impl::editClip(ClipEdit kind) {
         assert(!g.edit);
         g.edit = std::move(change);
         // A scan that began before the edit must not publish pre-edit state.
-        if (g.scanning && !g.scan) g.scan = Gallery::Scan{++g.revision, g.directory};
+        if (g.scanning && !g.scan) g.scan = Gallery::Scan{++g.revision, g.currentFolder()};
     }
     g.cv.notify_one();
     for (const auto i : {0, 1, 2, 4}) EnableWindow(g.actions[i], FALSE);
@@ -889,26 +1014,110 @@ bool StudioWindow::Impl::galleryShortcut(const MSG& msg) {
         else return false;
         return true;
     }
-    if (msg.wParam == VK_F5 || (isControlDown() && msg.wParam == L'R')) { refreshLibrary(); return true; }
+    if (msg.wParam == VK_F5 || (isControlDown() && msg.wParam == L'R')) { refreshLibrary(true); return true; }
+    if (msg.wParam == VK_LEFT && (GetKeyState(VK_MENU) & 0x8000) != 0) {
+        if (!g.stack.empty()) backFolder();
+        return true;
+    }
     if (msg.wParam == VK_BACK && !g.stack.empty()) { backFolder(); return true; }
-    if ((isControlDown() && msg.wParam == L'O') || (inGallery && msg.wParam == VK_RETURN)) { openClip(); return true; }
+    size_t focusedFolder = noClip;
+    if (tile) {
+        for (const auto& ft : g.folderTiles) {
+            if (ft.hwnd == focus && ft.index < g.folders.size()) {
+                focusedFolder = ft.index;
+                break;
+            }
+        }
+    }
+    if (isControlDown() && msg.wParam == L'O') { openClip(); return true; }
+    if (msg.message == WM_KEYDOWN && !isControlDown() && !(GetKeyState(VK_MENU) & 0x8000) &&
+        msg.wParam == L'F' && tile && focusedFolder == noClip && g.selected < g.clips.size()) {
+        editClip(ClipEdit::Favorite);
+        return true;
+    }
+    if (inGallery && msg.wParam == VK_RETURN) {
+        if (focusedFolder != noClip) openFolder(focusedFolder);
+        else openClip();
+        return true;
+    }
     if (msg.wParam == VK_DELETE) { editClip(ClipEdit::Remove); return true; }
     if (msg.wParam == VK_F2 && g.selected < g.clips.size()) { beginRename(); return true; }
-    if (!inGallery || g.clips.empty()) return false;
+    if (!inGallery || (g.clips.empty() && g.folders.empty())) return false;
+    const auto cols = static_cast<ptrdiff_t>((std::max)(1, g.grid.columns));
+    const auto folderCount = static_cast<ptrdiff_t>(g.folders.size());
+    const auto clipCount = static_cast<ptrdiff_t>(g.clips.size());
+    if (focusedFolder != noClip) {
+        const auto fi = static_cast<ptrdiff_t>(focusedFolder);
+        switch (msg.wParam) {
+        case VK_LEFT:
+            if (fi > 0) focusFolder(static_cast<size_t>(fi - 1));
+            return true;
+        case VK_RIGHT:
+            if (fi + 1 < folderCount) focusFolder(static_cast<size_t>(fi + 1));
+            else if (clipCount > 0) selectClip(0, true);
+            return true;
+        case VK_UP:
+            if (fi >= cols) focusFolder(static_cast<size_t>(fi - cols));
+            return true;
+        case VK_DOWN:
+            if (fi + cols < folderCount) focusFolder(static_cast<size_t>(fi + cols));
+            else if (clipCount > 0) selectClip(static_cast<size_t>((std::min)(fi % cols, clipCount - 1)), true);
+            return true;
+        case VK_HOME:
+        case VK_PRIOR:
+            focusFolder(0);
+            return true;
+        case VK_END:
+            if (clipCount > 0) selectClip(static_cast<size_t>(clipCount - 1), true);
+            else focusFolder(static_cast<size_t>(folderCount - 1));
+            return true;
+        case VK_NEXT:
+            if (clipCount > 0) selectClip(0, true);
+            else focusFolder(static_cast<size_t>(folderCount - 1));
+            return true;
+        default: return false;
+        }
+    }
+    if (clipCount == 0) {
+        switch (msg.wParam) {
+        case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_HOME: case VK_PRIOR:
+            focusFolder(0);
+            return true;
+        case VK_END: case VK_NEXT:
+            focusFolder(static_cast<size_t>(folderCount - 1));
+            return true;
+        default: return false;
+        }
+    }
     const auto current = static_cast<ptrdiff_t>(g.selected == noClip ? 0 : g.selected);
-    const auto last = static_cast<ptrdiff_t>(g.clips.size() - 1);
+    const auto last = clipCount - 1;
+    if (g.selected == noClip && folderCount > 0 &&
+        (msg.wParam == VK_HOME || msg.wParam == VK_LEFT || msg.wParam == VK_UP)) {
+        focusFolder(0);
+        return true;
+    }
+    if (g.selected != noClip && folderCount > 0) {
+        if (msg.wParam == VK_HOME) { focusFolder(0); return true; }
+        if (msg.wParam == VK_LEFT && current == 0) { focusFolder(static_cast<size_t>(folderCount - 1)); return true; }
+        if (msg.wParam == VK_UP && current < cols) {
+            const ptrdiff_t lastFolderRow = (folderCount - 1) / cols;
+            const ptrdiff_t target = (std::min)(lastFolderRow * cols + (current % cols), folderCount - 1);
+            focusFolder(static_cast<size_t>(target));
+            return true;
+        }
+    }
     ptrdiff_t next = current;
     switch (msg.wParam) {
     case VK_LEFT: --next; break;
     case VK_RIGHT: ++next; break;
-    case VK_UP: next -= g.grid.columns; break;
-    case VK_DOWN: next += g.grid.columns; break;
+    case VK_UP: next -= cols; break;
+    case VK_DOWN: next += cols; break;
     case VK_HOME: next = 0; break;
     case VK_END: next = last; break;
     case VK_PRIOR: case VK_NEXT: {
         RECT r{};
         GetClientRect(g.view, &r);
-        next += (msg.wParam == VK_PRIOR ? -1 : 1) * g.grid.columns * (std::max)(1L, r.bottom / g.grid.rowHeight - 1);
+        next += (msg.wParam == VK_PRIOR ? -1 : 1) * cols * (std::max)(1L, r.bottom / g.grid.rowHeight - 1);
         break;
     }
     default: return false;
@@ -924,11 +1133,100 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
     auto& g = *self.gallery;
     // Wheel and the side mouse buttons belong to the page, not to the child that
     // happens to sit under the cursor.
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN) {
+        self.setFocusCuesVisible(false);
+    }
     if (self.libraryInput(msg, wp)) return 0;
+    if (hwnd == g.breadcrumb) {
+        switch (msg) {
+        case WM_ERASEBKGND: return TRUE;
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            auto dc = BeginPaint(hwnd, &ps);
+            RECT r{};
+            GetClientRect(hwnd, &r);
+            theme::fill(dc, r, theme::surface);
+            g.crumbRects.clear();
+            if (!g.stack.empty()) {
+                SetBkMode(dc, TRANSPARENT);
+                SelectObject(dc, self.pageFont());
+                int x = r.left;
+                const std::wstring sep = L"  \u203a  ";
+                SIZE sepSize{};
+                GetTextExtentPoint32W(dc, sep.c_str(), static_cast<int>(sep.size()), &sepSize);
+                const size_t total = g.stack.size() + 1;
+                for (size_t i = 0; i < total && x < r.right; ++i) {
+                    const std::wstring segment = i == 0 ? L"Library" : g.stack[i - 1].filename().wstring();
+                    SIZE size{};
+                    GetTextExtentPoint32W(dc, segment.c_str(), static_cast<int>(segment.size()), &size);
+                    RECT segRect{x, r.top, (std::min)(r.right, static_cast<LONG>(x + size.cx)), r.bottom};
+                    const bool clickable = i + 1 < total;
+                    const bool hot = clickable && g.hoveredCrumb == static_cast<int>(i);
+                    SetTextColor(dc, clickable ? (hot ? theme::text : theme::muted) : theme::text);
+                    DrawTextW(dc, segment.c_str(), -1, &segRect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+                    if (hot) {
+                        const int underlineY = (r.top + r.bottom + size.cy) / 2;
+                        theme::fill(dc, {segRect.left, underlineY, segRect.right, underlineY + (std::max)(1, self.libraryPx(1))}, theme::muted);
+                    }
+                    if (clickable) g.crumbRects.push_back(segRect);
+                    x = segRect.right;
+                    if (i + 1 < total && x < r.right) {
+                        RECT sepRect{x, r.top, (std::min)(r.right, static_cast<LONG>(x + sepSize.cx)), r.bottom};
+                        SetTextColor(dc, theme::disabled);
+                        DrawTextW(dc, sep.c_str(), -1, &sepRect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                        x = sepRect.right;
+                    }
+                }
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&track);
+            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            int hit = -1;
+            for (size_t i = 0; i < g.crumbRects.size(); ++i) {
+                if (PtInRect(&g.crumbRects[i], pt)) { hit = static_cast<int>(i); break; }
+            }
+            if (hit != g.hoveredCrumb) {
+                g.hoveredCrumb = hit;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            if (g.hoveredCrumb != -1) {
+                g.hoveredCrumb = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_SETCURSOR:
+            if (g.hoveredCrumb >= 0) {
+                SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                return TRUE;
+            }
+            break;
+        case WM_LBUTTONUP: {
+            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            for (size_t i = 0; i < g.crumbRects.size(); ++i) {
+                if (PtInRect(&g.crumbRects[i], pt)) {
+                    self.showLibraryFolder({g.stack.begin(), g.stack.begin() + static_cast<ptrdiff_t>(i)}, false);
+                    return 0;
+                }
+            }
+            return 0;
+        }
+        }
+        return DefSubclassProc(hwnd, msg, wp, lp);
+    }
     if (hwnd == g.view) {
         switch (msg) {
         case WM_COMMAND: case WM_DRAWITEM: case WM_CTLCOLORSTATIC:
             return self.message(msg, wp, lp);
+        case WM_LBUTTONDOWN:
+            SetFocus(g.view);
+            return 0;
         case WM_PAINT: {
             PAINTSTRUCT ps{};
             auto dc = BeginPaint(hwnd, &ps);
@@ -961,6 +1259,7 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
     } else if (hwnd == g.rename) {
         if (msg == WM_KEYDOWN && wp == VK_RETURN) { self.editClip(ClipEdit::Rename); return 0; }
         if (msg == WM_KEYDOWN && wp == VK_ESCAPE) { self.endRename(); return 0; }
+        if (msg == WM_KILLFOCUS && g.renaming) { self.endRename(); }
     } else {
         const auto slot = static_cast<size_t>(GetWindowLongPtrW(hwnd, GWLP_USERDATA) - 1);
         const bool folder = slot < g.folderTiles.size() && g.folderTiles[slot].hwnd == hwnd;
@@ -972,6 +1271,49 @@ LRESULT CALLBACK StudioWindow::Impl::galleryProc(HWND hwnd, UINT msg, WPARAM wp,
         if (msg == WM_LBUTTONDOWN && index != noClip) {
             self.selectClip(index);
             g.dragTile = GetCursorPos(&g.dragStart) ? hwnd : nullptr;
+        } else if (msg == WM_RBUTTONDOWN && index != noClip) {
+            self.selectClip(index);
+        } else if (msg == WM_CONTEXTMENU && index < g.clips.size() && !g.editing) {
+            self.selectClip(index);
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (pt.x == -1 && pt.y == -1) {
+                RECT tr{};
+                GetWindowRect(hwnd, &tr);
+                pt = {(tr.left + tr.right) / 2, (tr.top + tr.bottom) / 2};
+            }
+            if (const HMENU menu = CreatePopupMenu()) {
+                constexpr UINT cmdOpen = 1, cmdExplorer = 2, cmdRename = 3, cmdFavorite = 4, cmdDelete = 5;
+                AppendMenuW(menu, MF_STRING, cmdOpen, L"Open");
+                SetMenuDefaultItem(menu, cmdOpen, FALSE);
+                AppendMenuW(menu, MF_STRING, cmdExplorer, L"Show in Explorer");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, cmdRename, L"Rename");
+                AppendMenuW(menu, MF_STRING, cmdFavorite,
+                            g.clips[index].info.favorite ? L"Unfavorite" : L"Favorite");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, cmdDelete, L"Delete");
+                const auto cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                                                pt.x, pt.y, 0, self.window, nullptr);
+                DestroyMenu(menu);
+                if (cmd == cmdOpen) self.openClip();
+                else if (cmd == cmdExplorer && index < g.clips.size()) {
+                    const auto path = g.clips[index].info.path;
+                    PIDLIST_ABSOLUTE pidl = nullptr;
+                    bool shown = false;
+                    if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) {
+                        shown = SUCCEEDED(SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0));
+                        CoTaskMemFree(pidl);
+                    }
+                    if (!shown) {
+                        const auto args = L"/select,\"" + path.wstring() + L"\"";
+                        if (!shellExecuteSucceeded(ShellExecuteW(self.window, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL)))
+                            self.setStatus(L"Could not open folder in Explorer.");
+                    }
+                } else if (cmd == cmdRename) self.beginRename();
+                else if (cmd == cmdFavorite) self.editClip(ClipEdit::Favorite);
+                else if (cmd == cmdDelete) self.editClip(ClipEdit::Remove);
+            }
+            return 0;
         } else if (msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE || msg == WM_NCDESTROY) {
             if (g.dragTile == hwnd) g.dragTile = nullptr;
         } else if (msg == WM_LBUTTONDBLCLK && index != noClip) {
@@ -1008,13 +1350,16 @@ bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
         if (index >= g.folders.size()) return true;
         auto r = item.rcItem;
         auto dc = item.hDC;
-        theme::fill(dc, r, hovered == item.hwndItem ? theme::hover : theme::field);
-        theme::frame(dc, r, theme::rule);
+        const bool down = (item.itemState & ODS_SELECTED) != 0;
+        const bool hasFocus = (item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS && !keyboardCuesHidden();
+        theme::fill(dc, r, down ? theme::press : hovered == item.hwndItem ? theme::hover : theme::field);
+        theme::frame(dc, r, hasFocus ? theme::accent : theme::rule);
         // Folder glyph: a tab over a body, so no image asset is needed.
         const int icon = libraryPx(16), iconLeft = r.left + libraryPx(8), iconTop = (r.top + r.bottom - libraryPx(14)) / 2;
         theme::fill(dc, {iconLeft, iconTop + libraryPx(2), iconLeft + libraryPx(7), iconTop + libraryPx(6)}, theme::muted);
         theme::fill(dc, {iconLeft, iconTop + libraryPx(4), iconLeft + icon, iconTop + libraryPx(14)}, theme::muted);
-        const auto count = std::to_wstring(g.folders[index].count) + L" Items";
+        const auto clipCount = g.folders[index].count;
+        const auto count = std::to_wstring(clipCount) + (clipCount == 1 ? L" clip" : L" clips");
         SetBkMode(dc, TRANSPARENT);
         SelectObject(dc, pageFont());
         SIZE extent{};
@@ -1033,24 +1378,61 @@ bool StudioWindow::Impl::drawGallery(const DRAWITEMSTRUCT& item) {
     const auto& clip = g.clips[index];
     auto r = item.rcItem;
     auto dc = item.hDC;
-    theme::fill(dc, r, theme::surface);
+    const bool selected = index == g.selected;
+    const bool down = (item.itemState & ODS_SELECTED) != 0;
+    const bool hot = hovered == item.hwndItem;
+    const bool focusCue = (item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS && !keyboardCuesHidden();
+    theme::fill(dc, r, down ? theme::press : selected ? theme::active : hot ? theme::hover : theme::surface);
     const int line = r.bottom - libraryPx(4);
     const int title = line - libraryPx(42);
     const RECT image{r.left, r.top + libraryPx(5), r.right, title - libraryPx(4)};
     theme::fill(dc, image, theme::field);
+    bool drewThumbnail = false;
     if (auto it = g.cache.find(clip.info.path.native());
         it != g.cache.end() && it->second.bytes == clip.info.bytes && it->second.modifiedTime == clip.info.modifiedTime) {
         auto& bitmap = it->second.bitmap;
-        if (bitmap.source) drawBitmapFitCached(dc, bitmap.source, bitmap.scaled, bitmap.width, bitmap.height, image);
+        if (bitmap.source) {
+            drawBitmapFitCached(dc, bitmap.source, bitmap.scaled, bitmap.width, bitmap.height, image);
+            drewThumbnail = true;
+        }
     }
-    const auto selected = index == g.selected;
-    const bool hasFocus = (item.itemState & ODS_FOCUS) != 0;
-    if (selected || hasFocus || hovered == item.hwndItem) theme::frame(dc, image, selected || hasFocus ? theme::accent : theme::rule);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, theme::text);
+    if (!drewThumbnail && image.right - image.left >= libraryPx(24) && image.bottom - image.top >= libraryPx(24)) {
+        const float cx = (image.left + image.right) * 0.5f;
+        const float cy = (image.top + image.bottom) * 0.5f;
+        const float radius = static_cast<float>(libraryPx(10));
+        const Gdiplus::PointF triangle[]{
+            {cx - radius * 0.5f, cy - radius * 0.75f},
+            {cx + radius * 0.75f, cy},
+            {cx - radius * 0.5f, cy + radius * 0.75f},
+        };
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::SolidBrush brush(Gdiplus::Color(255, GetRValue(theme::rule), GetGValue(theme::rule), GetBValue(theme::rule)));
+        graphics.FillPolygon(&brush, triangle, 3);
+    }
     SelectObject(dc, pageFont());
+    SetBkMode(dc, TRANSPARENT);
+    if (clip.info.duration100ns > 0 && image.right - image.left >= libraryPx(48) && image.bottom - image.top >= libraryPx(26)) {
+        RECT measure{};
+        DrawTextW(dc, clip.duration.c_str(), -1, &measure, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        const int badgeW = measure.right - measure.left + libraryPx(10);
+        const int badgeH = measure.bottom - measure.top + libraryPx(4);
+        const int margin = libraryPx(5);
+        const RECT badge{image.right - margin - badgeW, image.bottom - margin - badgeH, image.right - margin, image.bottom - margin};
+        if (badge.left > image.left + margin && badge.top > image.top + margin) {
+            theme::fill(dc, badge, theme::surface);
+            theme::frame(dc, badge, theme::rule);
+            SetTextColor(dc, theme::text);
+            RECT badgeText = badge;
+            DrawTextW(dc, clip.duration.c_str(), -1, &badgeText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+    theme::frame(dc, image, selected ? theme::accent : (down || hot) ? theme::border : theme::rule);
+    if (focusCue) theme::frame(dc, r, theme::accent);
+    SetTextColor(dc, theme::text);
+    const auto displayTitle = clip.info.path.stem().wstring();
     RECT name{r.left + libraryPx(2), title, r.right - (clip.info.favorite ? libraryPx(21) : libraryPx(2)), title + libraryPx(21)};
-    DrawTextW(dc, clip.name.c_str(), -1, &name, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    DrawTextW(dc, displayTitle.c_str(), -1, &name, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     if (clip.info.favorite) {
         RECT star{name.right, name.top, r.right, name.bottom};
         SetTextColor(dc, theme::accent);

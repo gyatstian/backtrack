@@ -43,7 +43,9 @@ public:
     void setDirectory(std::filesystem::path directory);
     std::vector<ClipInfo> listClips(const std::function<bool()>& cancelled = {}) const;
     // The current directory as one library level, for folder-by-folder browsing.
-    ClipContents listContents(const std::function<bool()>& cancelled = {}) const;
+    // Dot-prefixed folders are omitted unless includeHiddenFolders is set.
+    ClipContents listContents(const std::function<bool()>& cancelled = {},
+                              bool includeHiddenFolders = false) const;
     bool removeClip(const std::filesystem::path& path) const;
     bool renameClip(const std::filesystem::path& path, const std::wstring& newStem) const;
     bool setFavorite(const std::filesystem::path& path, bool favorite) const;

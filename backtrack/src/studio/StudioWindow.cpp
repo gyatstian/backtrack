@@ -9,6 +9,8 @@
 
 #include <CommCtrl.h>
 #include <dwmapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <uxtheme.h>
 #include <windowsx.h>
@@ -61,6 +63,9 @@ StudioWindow::Impl::Impl(RecorderController& controller, SettingsStore& store, c
 StudioWindow::Impl::~Impl() {
     if (window) DestroyWindow(window);
     shutdown();
+    if (gdiplusToken) {
+        Gdiplus::GdiplusShutdown(std::exchange(gdiplusToken, 0));
+    }
     DeleteObject(font);
     if (libraryFont) DeleteObject(libraryFont);
     DeleteObject(surfaceBrush);
@@ -71,6 +76,8 @@ StudioWindow::Impl::~Impl() {
 
 bool StudioWindow::Impl::create(HINSTANCE instance, int showCommand, bool startMinimized) {
     InitCommonControls();
+    Gdiplus::GdiplusStartupInput gdiplusInput;
+    if (Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusInput, nullptr) != Gdiplus::Ok) gdiplusToken = 0;
     surfaceBrush = CreateSolidBrush(theme::surface);
     fieldBrush = CreateSolidBrush(theme::field);
     activeBrush = CreateSolidBrush(theme::active);
@@ -120,11 +127,41 @@ bool StudioWindow::Impl::create(HINSTANCE instance, int showCommand, bool startM
 int StudioWindow::Impl::run() {
     MSG msg{};
     int result;
+    const auto isKeyboardNav = [this](const MSG& m) {
+        if (m.message != WM_KEYDOWN && m.message != WM_SYSKEYDOWN) return false;
+        if (m.wParam == VK_TAB) return true;
+        const HWND focus = GetFocus();
+        if (hotkeyFields.contains(focus)) return false;
+        if (isControlDown() && !(GetKeyState(VK_MENU) & 0x8000) &&
+            m.wParam >= L'1' && m.wParam <= L'4') return true;
+        if (m.wParam == VK_LEFT || m.wParam == VK_RIGHT || m.wParam == VK_UP || m.wParam == VK_DOWN ||
+            m.wParam == VK_HOME || m.wParam == VK_END || m.wParam == VK_PRIOR || m.wParam == VK_NEXT) {
+            if (focus) {
+                wchar_t cls[8]{};
+                GetClassNameW(focus, cls, static_cast<int>(std::size(cls)));
+                if (std::wstring_view(cls) == L"Edit" &&
+                    (GetWindowLongPtrW(focus, GWL_STYLE) & ES_READONLY) == 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    };
     while ((result = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         if (closing) {
             if ((msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST) ||
                 (msg.message >= WM_MOUSEFIRST && msg.message <= WM_MOUSELAST)) continue;
-        } else if (zoomInput(msg.message, msg.wParam) || handleShortcut(msg) || IsDialogMessageW(window, &msg)) continue;
+        } else {
+            if ((msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN ||
+                 msg.message == WM_MBUTTONDOWN || msg.message == WM_XBUTTONDOWN) &&
+                msg.hwnd && (msg.hwnd == window || IsChild(window, msg.hwnd))) {
+                setFocusCuesVisible(false);
+            } else if (isKeyboardNav(msg)) {
+                setFocusCuesVisible(true);
+            }
+            if (zoomInput(msg.message, msg.wParam) || handleShortcut(msg) || IsDialogMessageW(window, &msg)) continue;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -163,6 +200,7 @@ LRESULT CALLBACK StudioWindow::Impl::bodyProc(HWND hwnd, UINT msg, WPARAM wp, LP
             self->headingRects.clear();
             self->hotkeyFields.clear();
             self->invalidNumbers.clear();
+            self->invalidSaveAttempt = nullptr;
             self->resolutionFields.fill(nullptr);
             self->deviceCombos = {};
             self->conditions.clear();
@@ -192,6 +230,10 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_MOUSEWHEEL && zoomInput(msg, wp)) return 0;
     switch (msg) {
     case WM_CREATE: {
+        // Plain CreateWindowExW windows do not receive dialog-manager UI-state
+        // initialization, so UISF_HIDEFOCUS would stay clear and pointer clicks
+        // would draw keyboard focus boxes on tabs and settings.
+        SendMessageW(window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
         updateMotionPreference();
         dpi = GetDpiForWindow(window);
         updateFont();
@@ -206,7 +248,9 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
             categoryButtons[i] = button(settingsLabels[i], [this, i, category = static_cast<Category>(i)] {
                 if (nav.page != Page::Settings || (nav.category == category && body)) return;
                 if (auto invalid = invalidNumber()) {
+                    invalidSaveAttempt = invalid;
                     SetFocus(invalid);
+                    RedrawWindow(invalid, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
                     setStatus(L"Enter a valid number before changing settings categories.");
                     return;
                 }
@@ -217,8 +261,9 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
             if (!categoryButtons[i]) return -1;
             controls.at(categoryButtons[i]).pointerMotion = true;
         }
-        footer = make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP, {}, L"", window);
-        if (!footer) return -1;
+        footer = make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, {}, L"", window);
+        footerWarning = make(L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, {}, L"", window);
+        if (!footer || !footerWarning) return -1;
         setMotion(recordGlyph, static_cast<float>(controller.isRecording()), false);
         buildPage();
         if (!body) return -1;
@@ -317,10 +362,16 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         GetClassNameW(hwnd, name, static_cast<int>(std::size(name)));
         const auto cls = std::wstring_view(name);
         const bool field = cls == L"Edit" || cls == L"ComboLBox";
-        const auto color = hwnd == footer ? theme::active : field ? theme::field : theme::surface;
-        SetTextColor(dc, hwnd == footer ? theme::muted : IsWindowEnabled(hwnd) ? theme::text : theme::disabled);
+        const bool isFooter = hwnd == footer || hwnd == footerWarning;
+        const auto controlIt = controls.find(hwnd);
+        const bool mutedControl = controlIt != controls.end() && controlIt->second.mutedText;
+        const auto color = isFooter ? theme::active : field ? theme::field : theme::surface;
+        const auto fg = hwnd == footerWarning ? theme::recording
+            : (isFooter || mutedControl) ? theme::muted
+            : IsWindowEnabled(hwnd) ? theme::text : theme::disabled;
+        SetTextColor(dc, fg);
         SetBkColor(dc, color);
-        return reinterpret_cast<LRESULT>(hwnd == footer ? activeBrush : field ? fieldBrush : surfaceBrush);
+        return reinterpret_cast<LRESULT>(isFooter ? activeBrush : field ? fieldBrush : surfaceBrush);
     }
     case WM_DRAWITEM: {
         const auto& item = *reinterpret_cast<DRAWITEMSTRUCT*>(lp);
@@ -335,6 +386,13 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         auto& item = *reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
         item.itemHeight = px(22);
         return TRUE;
+    }
+    case WM_UPDATEUISTATE: {
+        const auto res = DefWindowProcW(window, msg, wp, lp);
+        if (const auto focus = GetFocus(); focus && (focus == window || IsChild(window, focus))) {
+            InvalidateRect(focus, nullptr, FALSE);
+        }
+        return res;
     }
     case WM_COMMAND: {
         if (building || closing || shuttingDown) return 0;
@@ -366,10 +424,11 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         if (closing) finishClose();
         else if (wp && actionWorkerDone.load()) {
             busy = false;
+            activeAction.reset();
             applyingSettings = false;
             actionFromPointer = false;
             setMotion(recordGlyph, static_cast<float>(controller.isRecording()), false);
-            if (record) setText(record, motions[recordGlyph].to != 0.f ? L"Stop recording" : L"Start recording");
+            syncActionButtons();
             recoveryAvailable = false;
             syncRecoveryAction();
             setStatus(L"Recorder worker has stopped. Restart Backtrack to capture again.");
@@ -422,6 +481,15 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
         if (lp == WM_LBUTTONUP || lp == WM_LBUTTONDBLCLK) restore();
         else if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) trayMenu();
         return 0;
+    case WM_LBUTTONDOWN:
+        setFocusCuesVisible(false);
+        endRename();
+        break;
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+        setFocusCuesVisible(false);
+        break;
     case WM_CLOSE: close(false); return 0;
     case WM_DESTROY:
         stopMotion();
@@ -434,6 +502,15 @@ LRESULT StudioWindow::Impl::message(UINT msg, WPARAM wp, LPARAM lp) {
 
 LRESULT StudioWindow::Impl::bodyMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+    case WM_LBUTTONDOWN:
+        setFocusCuesVisible(false);
+        if (hwnd == body) endRename();
+        break;
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+        setFocusCuesVisible(false);
+        break;
     case WM_ERASEBKGND: return TRUE;
     case WM_PAINT: {
         if (pendingScroll) scrollTo(*pendingScroll);
@@ -441,25 +518,26 @@ LRESULT StudioWindow::Impl::bodyMessage(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         auto dc = BeginPaint(hwnd, &ps);
         theme::fill(dc, ps.rcPaint, theme::surface);
         SelectObject(dc, font);
-        SetTextColor(dc, theme::text);
+        SetTextColor(dc, theme::muted);
         SetBkMode(dc, TRANSPARENT);
+        const int hairline = hairlinePx();
         for (size_t i = 0; i < rows.size() && i < headingRects.size(); ++i) {
             RECT r = headingRects[i], invalid{};
             if (!IntersectRect(&invalid, &r, &ps.rcPaint)) continue;
             const auto& item = rows[i];
             for (int depth = 0; depth < item.dependencyDepth; ++depth) {
-                const int x = r.left + px(item.inset + depth * theme::dependencyIndent);
-                theme::fill(dc, {x, r.top, x + px(1), r.bottom}, theme::rule);
+                const int x = r.left + px(depth * theme::dependencyIndent);
+                theme::fill(dc, {x, r.top, x + hairline, r.bottom}, theme::rule);
             }
             const auto& title = item.heading;
             if (title.empty()) continue;
             SIZE size{};
             GetTextExtentPoint32W(dc, title.c_str(), static_cast<int>(title.size()), &size);
-            const int center = (r.top + r.bottom) / 2, line = center - 1;
+            const int center = (r.top + r.bottom) / 2, line = center - hairline / 2;
             const int x = r.left + px(theme::sectionInset);
-            theme::fill(dc, {r.left, line, x - px(7), line + 1}, theme::divider);
+            theme::fill(dc, {r.left, line, x - px(7), line + hairline}, theme::divider);
             ExtTextOutW(dc, x, center - size.cy / 2, ETO_CLIPPED, &r, title.c_str(), static_cast<UINT>(title.size()), nullptr);
-            theme::fill(dc, {x + size.cx + px(7), line, r.right, line + 1}, theme::divider);
+            theme::fill(dc, {x + size.cx + px(7), line, r.right, line + hairline}, theme::divider);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -533,19 +611,61 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
     const auto it = self.controls.find(hwnd);
     if (it == self.controls.end()) return DefSubclassProc(hwnd, msg, wp, lp);
     const bool check = it->second.checkbox;
+    const bool combo = it->second.combo;
+    const bool slider = it->second.slider;
+    const bool hasIcon = it->second.icon != nullptr;
+    const bool editBorder = it->second.editBorder;
+    const bool isFooter = hwnd == self.footer || hwnd == self.footerWarning;
+    const bool isHotkey = self.hotkeyFields.contains(hwnd);
     switch (msg) {
-    case WM_MOUSEMOVE:
-        if (self.hovered != hwnd) {
-            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
-            TrackMouseEvent(&track);
-            self.setHovered(hwnd);
+    case WM_SETCURSOR:
+        if (it->second.tone == ButtonTone::Quiet && IsWindowEnabled(hwnd)) {
+            SetCursor(LoadCursorW(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        if (isFooter || isHotkey) {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
         }
         break;
-    case WM_MOUSELEAVE:
-        if (self.hovered == hwnd) self.setHovered(nullptr);
+    case WM_LBUTTONDOWN:
+        self.setFocusCuesVisible(false);
+        if (isFooter) return 0;
+        if (isHotkey) {
+            if (GetFocus() != hwnd) SetFocus(hwnd);
+            return 0;
+        }
+        if (slider) {
+            SetFocus(hwnd);
+            SetCapture(hwnd);
+            RECT r{};
+            GetClientRect(hwnd, &r);
+            const int pad = self.px(5);
+            const int trackWidth = (std::max)(1, static_cast<int>(r.right - r.left) - pad * 2);
+            const int pos = std::clamp<int>(GET_X_LPARAM(lp) - static_cast<int>(r.left) - pad, 0, trackWidth);
+            const uint32_t value = static_cast<uint32_t>(MulDiv(pos, static_cast<int>(it->second.sliderMax), trackWidth));
+            if (it->second.sliderBuddy) setText(it->second.sliderBuddy, std::to_wstring(value));
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         break;
-    case BM_CLICK:
-    case WM_LBUTTONUP: {
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+        self.setFocusCuesVisible(false);
+        [[fallthrough]];
+    case WM_CONTEXTMENU:
+        if (isFooter || isHotkey) return 0;
+        break;
+    case WM_LBUTTONUP:
+        if (slider) {
+            if (GetCapture() == hwnd) ReleaseCapture();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        [[fallthrough]];
+    case BM_CLICK: {
         if (!it->second.pointerMotion || (msg == WM_LBUTTONUP && self.clickOrigin == nullptr)) break;
         // An engaged null origin suppresses mouse messages synthesized by BM_CLICK.
         const auto previous = std::exchange(self.clickOrigin, std::optional<HWND>{msg == WM_LBUTTONUP ? hwnd : nullptr});
@@ -553,18 +673,110 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
         self.clickOrigin = previous;
         return result;
     }
+    case WM_CAPTURECHANGED:
+        if (slider) InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+    case WM_MOUSEMOVE:
+        if (self.hovered != hwnd) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&track);
+            self.setHovered(hwnd);
+        }
+        if (slider && GetCapture() == hwnd) {
+            RECT r{};
+            GetClientRect(hwnd, &r);
+            const int pad = self.px(5);
+            const int trackWidth = (std::max)(1, static_cast<int>(r.right - r.left) - pad * 2);
+            const int pos = std::clamp<int>(GET_X_LPARAM(lp) - static_cast<int>(r.left) - pad, 0, trackWidth);
+            const uint32_t value = static_cast<uint32_t>(MulDiv(pos, static_cast<int>(it->second.sliderMax), trackWidth));
+            if (it->second.sliderBuddy) setText(it->second.sliderBuddy, std::to_wstring(value));
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        if (self.hovered == hwnd) self.setHovered(nullptr);
+        break;
+    case WM_KEYDOWN:
+        if (it->second.number && (wp == VK_UP || wp == VK_DOWN)) {
+            const int64_t step = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
+            const int64_t current = parseUIntControl(hwnd).value_or(0);
+            int64_t next = current + (wp == VK_UP ? step : -step);
+            if (it->second.sliderBuddy) {
+                const auto sIt = self.controls.find(it->second.sliderBuddy);
+                const int64_t maxVal = sIt != self.controls.end() ? static_cast<int64_t>(sIt->second.sliderMax) : INT64_MAX;
+                next = std::clamp<int64_t>(next, 0, maxVal);
+            } else {
+                next = (std::max)(int64_t{0}, next);
+            }
+            const auto text = std::to_wstring(static_cast<uint32_t>(next));
+            setText(hwnd, text);
+            SendMessageW(hwnd, EM_SETSEL, text.size(), text.size());
+            return 0;
+        }
+        if (slider && (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == VK_DOWN || wp == VK_HOME || wp == VK_END)) {
+            const int64_t maxVal = static_cast<int64_t>(it->second.sliderMax);
+            const int64_t step = (GetKeyState(VK_SHIFT) & 0x8000) ? 10 : 1;
+            const int64_t current = it->second.sliderBuddy ? parseUIntControl(it->second.sliderBuddy).value_or(0) : 0;
+            int64_t next = current;
+            if (wp == VK_HOME) next = 0;
+            else if (wp == VK_END) next = maxVal;
+            else if (wp == VK_LEFT || wp == VK_DOWN) next = std::clamp<int64_t>(current - step, 0, maxVal);
+            else next = std::clamp<int64_t>(current + step, 0, maxVal);
+            if (it->second.sliderBuddy) setText(it->second.sliderBuddy, std::to_wstring(static_cast<uint32_t>(next)));
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        break;
     case WM_XBUTTONUP:
         if (self.libraryInput(msg, wp)) return 0;
         break;
-    case WM_SETFOCUS:
+    case WM_SETFOCUS: {
         self.ensureVisible(hwnd);
-        [[fallthrough]];
-    case WM_KILLFOCUS:
+        if (isHotkey) setText(hwnd, L"Press shortcut\u2026");
         PostMessageW(self.window, syncHelp, 0, 0);
-        if (check) InvalidateRect(hwnd, nullptr, FALSE);
+        if (check || combo || slider) InvalidateRect(hwnd, nullptr, FALSE);
+        if (editBorder) RedrawWindow(hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+        if (isFooter || isHotkey) {
+            const auto result = DefSubclassProc(hwnd, msg, wp, lp);
+            HideCaret(hwnd);
+            return result;
+        }
+        break;
+    }
+    case WM_KILLFOCUS:
+        if (self.invalidSaveAttempt == hwnd) self.invalidSaveAttempt = nullptr;
+        if (isHotkey) {
+            const auto hk = self.hotkeyFields.find(hwnd);
+            if (hk != self.hotkeyFields.end()) setText(hwnd, hotkeyDisplay(*hk->second.first, *hk->second.second));
+        }
+        PostMessageW(self.window, syncHelp, 0, 0);
+        if (check || combo || slider) InvalidateRect(hwnd, nullptr, FALSE);
+        if (editBorder) RedrawWindow(hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+        break;
+    case WM_ENABLE:
+        if (editBorder) RedrawWindow(hwnd, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+        if (combo || slider) InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+    case WM_NCPAINT:
+        if (editBorder) {
+            const auto result = DefSubclassProc(hwnd, msg, wp, lp);
+            if (const auto dc = GetWindowDC(hwnd)) {
+                RECT r{};
+                GetWindowRect(hwnd, &r);
+                OffsetRect(&r, -r.left, -r.top);
+                const bool showInvalid = self.invalidNumbers.contains(hwnd) &&
+                    (GetFocus() != hwnd || self.invalidSaveAttempt == hwnd);
+                const COLORREF borderColor = showInvalid ? theme::recording
+                    : GetFocus() == hwnd ? theme::accent
+                    : !IsWindowEnabled(hwnd) ? theme::rule : theme::border;
+                theme::frame(dc, r, borderColor);
+                ReleaseDC(hwnd, dc);
+            }
+            return result;
+        }
         break;
     case WM_MOUSEWHEEL:
-        if (!it->second.combo || !SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0)) {
+        if (!combo || !SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0)) {
             if (self.libraryInput(msg, wp)) return 0;
             const bool library = self.nav.page == Page::Library;
             auto style = GetWindowLongPtrW(hwnd, GWL_STYLE);
@@ -574,6 +786,8 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
         }
         break;
     case WM_GETDLGCODE:
+        if (slider) return DLGC_WANTARROWS;
+        if (it->second.number) return DefSubclassProc(hwnd, msg, wp, lp) | DLGC_WANTARROWS;
         if ((GetWindowLongPtrW(hwnd, GWL_STYLE) & ES_MULTILINE) != 0) {
             wchar_t cls[8]{};
             GetClassNameW(hwnd, cls, static_cast<int>(std::size(cls)));
@@ -581,25 +795,37 @@ LRESULT CALLBACK StudioWindow::Impl::controlProc(HWND hwnd, UINT msg, WPARAM wp,
         }
         break;
     case WM_PAINT:
-        if (check) {
+        if (check || combo || slider || hasIcon) {
             PAINTSTRUCT ps{};
             const auto dc = BeginPaint(hwnd, &ps);
-            self.paintCheckbox(hwnd, dc);
+            if (check) self.paintCheckbox(hwnd, dc);
+            else if (combo) self.paintComboBox(hwnd, dc);
+            else if (slider) self.paintSlider(hwnd, dc);
+            else self.paintIconCell(hwnd, dc);
             EndPaint(hwnd, &ps);
             return 0;
         }
         break;
     case WM_PRINTCLIENT:
         if (check) { self.paintCheckbox(hwnd, reinterpret_cast<HDC>(wp)); return 0; }
+        if (combo) { self.paintComboBox(hwnd, reinterpret_cast<HDC>(wp)); return 0; }
+        if (slider) { self.paintSlider(hwnd, reinterpret_cast<HDC>(wp)); return 0; }
+        if (hasIcon) { self.paintIconCell(hwnd, reinterpret_cast<HDC>(wp)); return 0; }
         break;
     case WM_ERASEBKGND:
-        if (check || (GetWindowLongPtrW(hwnd, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW) return TRUE;
+        if (check || combo || slider || hasIcon || (GetWindowLongPtrW(hwnd, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW) return TRUE;
         break;
     case WM_NCDESTROY:
         if (self.hovered == hwnd) self.hovered = nullptr;
         if (self.focused == hwnd) self.focused = nullptr;
         if (self.lastFocus == hwnd) self.lastFocus = nullptr;
         if (self.save == hwnd) self.save = nullptr;
+        if (self.discard == hwnd) self.discard = nullptr;
+        if (self.invalidSaveAttempt == hwnd) self.invalidSaveAttempt = nullptr;
+        if (it->second.icon) {
+            DestroyIcon(it->second.icon);
+            it->second.icon = nullptr;
+        }
         self.controls.erase(it);
         RemoveWindowSubclass(hwnd, controlProc, id);
         break;
@@ -613,7 +839,20 @@ void StudioWindow::Impl::open(Page page, bool pointer) {
         if (page == Page::Library) libraryToRoot();
         return;
     }
-    if (nav.page != page && !leaveSettings(false)) return;
+    const auto isSettingsGroup = [](Page p) { return p == Page::Capture || p == Page::Settings; };
+    if (nav.page != page) {
+        if (isSettingsGroup(nav.page) && isSettingsGroup(page)) {
+            if (auto invalid = invalidNumber()) {
+                invalidSaveAttempt = invalid;
+                SetFocus(invalid);
+                RedrawWindow(invalid, nullptr, nullptr, RDW_FRAME | RDW_INVALIDATE);
+                setStatus(L"Enter a valid number before changing pages.");
+                return;
+            }
+        } else if (!leaveSettings(false)) {
+            return;
+        }
+    }
     buildPage({page, nav.category});
     syncNav(pointer);
     SetFocus(nav.page == Page::Settings ? categoryButtons[static_cast<size_t>(nav.category)] : pageButtons[static_cast<size_t>(nav.page)]);
@@ -651,7 +890,8 @@ void StudioWindow::Impl::buildPage(StudioNavigation next) {
     }
     assert(!body);
     if (save && GetParent(save) == window) DestroyWindow(save);
-    hovered = focused = save = nullptr;
+    if (discard && GetParent(discard) == window) DestroyWindow(discard);
+    hovered = focused = save = discard = nullptr;
     nav = next;
     const bool scrollable = nav.page == Page::Capture || nav.page == Page::Settings;
     // A scrolled frame is only complete once the viewport and its HWNDs have painted.
@@ -744,6 +984,12 @@ bool StudioWindow::Impl::keyboardCuesHidden() const {
     return (SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS) != 0;
 }
 
+void StudioWindow::Impl::setFocusCuesVisible(bool visible) {
+    if (!window || keyboardCuesHidden() == !visible) return;
+    SendMessageW(window, WM_CHANGEUISTATE,
+                 MAKEWPARAM(visible ? UIS_CLEAR : UIS_SET, UISF_HIDEFOCUS), 0);
+}
+
 void StudioWindow::Impl::layout(bool newPage) {
     if (!footer || shuttingDown) return;
     RECT rect{};
@@ -804,9 +1050,14 @@ void StudioWindow::Impl::layoutFooter(const RECT& client) {
     int footerLeft = inset, footerRight = client.right - inset;
     const int actionHeight = px(28), actionTop = footerTop + (footerHeight - actionHeight) / 2;
     if (save) {
-        const int saveWidth = px(nav.page == Page::Settings && nav.category == Category::Capture ? 80 : 116);
+        const int saveWidth = px(116);
         moveWindowIfChanged(save, footerLeft, actionTop, saveWidth, actionHeight);
         footerLeft += saveWidth + px(theme::gap);
+    }
+    if (discard && (GetWindowLongPtrW(discard, GWL_STYLE) & WS_VISIBLE) != 0) {
+        const int discardWidth = px(76);
+        moveWindowIfChanged(discard, footerLeft, actionTop, discardWidth, actionHeight);
+        footerLeft += discardWidth + px(theme::gap);
     }
     if (update) {
         const int updateWidth = px(132);
@@ -814,9 +1065,59 @@ void StudioWindow::Impl::layoutFooter(const RECT& client) {
         footerRight -= updateWidth + px(theme::gap);
     }
     const int textTop = footerTop + px(5), bottomGap = px(3);
-    replayCheckBox = {footerLeft, textTop, footerLeft + px(26), textTop + px(22)};
-    footerLeft = replayCheckBox.right;
-    moveWindowIfChanged(footer, footerLeft, textTop, (std::max)(0, footerRight - footerLeft), client.bottom - bottomGap - textTop);
+    const int textBottom = client.bottom - bottomGap;
+    const bool showCheck = replaySaved || motions[replayCheck].active();
+    if (showCheck) {
+        replayCheckBox = {footerLeft, textTop, footerLeft + px(26), textTop + px(22)};
+        footerLeft = replayCheckBox.right;
+    } else {
+        replayCheckBox = {footerLeft, textTop, footerLeft, textTop};
+    }
+    const int textWidth = (std::max)(0, footerRight - footerLeft);
+    const int textHeight = (std::max)(0, textBottom - textTop);
+    const bool showStatus = footer && (GetWindowLongPtrW(footer, GWL_STYLE) & WS_VISIBLE) != 0;
+    const bool showWarning = footerWarning && (GetWindowLongPtrW(footerWarning, GWL_STYLE) & WS_VISIBLE) != 0;
+    const int barWidth = px(3), barGap = px(6);
+    if (showWarning && showStatus) {
+        const int warnHeight = textHeight / 2;
+        footerWarningBar = {footerLeft, textTop + px(1), footerLeft + barWidth, textTop + warnHeight - px(2)};
+        const int warnLeft = footerLeft + barWidth + barGap;
+        moveWindowIfChanged(footerWarning, warnLeft, textTop, (std::max)(0, footerRight - warnLeft), warnHeight);
+        moveWindowIfChanged(footer, footerLeft, textTop + warnHeight, textWidth, textHeight - warnHeight);
+    } else if (showWarning) {
+        footerWarningBar = {footerLeft, textTop + px(1), footerLeft + barWidth, textBottom - px(2)};
+        const int warnLeft = footerLeft + barWidth + barGap;
+        moveWindowIfChanged(footerWarning, warnLeft, textTop, (std::max)(0, footerRight - warnLeft), textHeight);
+        moveWindowIfChanged(footer, footerLeft, textTop, textWidth, textHeight);
+    } else {
+        footerWarningBar = {};
+        moveWindowIfChanged(footer, footerLeft, textTop, textWidth, textHeight);
+        if (footerWarning) moveWindowIfChanged(footerWarning, footerLeft, textTop, textWidth, textHeight);
+    }
+    syncFooterScroll(footer);
+    if (footerWarning) syncFooterScroll(footerWarning);
+}
+
+void StudioWindow::Impl::syncFooterScroll(HWND control) {
+    if (!control) return;
+    RECT r{};
+    if (!GetClientRect(control, &r) || r.bottom <= 0) return;
+    const auto lines = static_cast<int>(SendMessageW(control, EM_GETLINECOUNT, 0, 0));
+    int lineHeight = px(18);
+    if (const auto dc = GetDC(control)) {
+        const auto old = SelectObject(dc, font);
+        TEXTMETRICW tm{};
+        if (GetTextMetricsW(dc, &tm) && tm.tmHeight > 0) lineHeight = tm.tmHeight + tm.tmExternalLeading;
+        SelectObject(dc, old);
+        ReleaseDC(control, dc);
+    }
+    const bool overflow = lines * lineHeight > r.bottom;
+    const auto style = GetWindowLongPtrW(control, GWL_STYLE);
+    const bool hasScroll = (style & WS_VSCROLL) != 0;
+    if (overflow != hasScroll) {
+        SetWindowLongPtrW(control, GWL_STYLE, overflow ? (style | WS_VSCROLL) : (style & ~WS_VSCROLL));
+        SetWindowPos(control, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
 }
 
 void StudioWindow::Impl::row(std::initializer_list<HWND> controls, bool split, int height) {
@@ -849,6 +1150,7 @@ void StudioWindow::Impl::layoutRows(bool heightOnly, bool repaint) {
     rowWidth = r.right;
     const int left = px(theme::inset), right = (std::max)(left, static_cast<int>(r.right) - left);
     const int gap = px(theme::gap);
+    const int labelColumn = MulDiv(right - left, theme::labelColumnPercent, 100);
     int y = px(3) - scroll;
     std::vector<WindowMove> moves;
     moves.reserve(controls.size());
@@ -858,16 +1160,23 @@ void StudioWindow::Impl::layoutRows(bool heightOnly, bool repaint) {
         const int height = item.hidden ? 0 : px(item.height);
         headingRects[i] = {left, y, right, y + height};
         if (!height) continue;
-        int x = left + px(item.inset + item.dependencyDepth * theme::dependencyIndent);
+        int x = item.controlColumn ? left + labelColumn + gap
+                                   : left + px(item.dependencyDepth * theme::dependencyIndent);
         for (size_t j = 0; j < item.cells.size(); ++j) {
             const auto cell = item.cells[j];
             const int remaining = static_cast<int>(item.cells.size() - j);
             int w = remaining == 1 ? right - x : (right - x - gap * (remaining - 1)) / remaining;
-            if (item.widths[0]) {
+            if (const int width = item.widths[j]) {
                 const int tail = item.tail && remaining == 2 ? px(item.widths[j + 1]) : 0;
-                w = (std::min)(px(item.widths[j]), right - x - gap * (remaining - 1) - tail);
-            } else if (item.split && j == 0 && remaining > 1) w = (right - left) * 36 / 100;
-            else if (item.tail && remaining == 2) w = right - x - gap - px(88);
+                w = (std::min)(px(width), right - x - gap * (remaining - 1) - tail);
+            } else if (item.split && j == 0 && remaining > 1) {
+                w = labelColumn - (x - left);
+            } else if (item.tail && j > 0 && remaining > 1) {
+                int trailing = 0;
+                for (size_t k = j + 1; k < item.cells.size(); ++k)
+                    trailing += px(item.widths[k] ? item.widths[k] : 88);
+                w = right - x - gap * (remaining - 1) - trailing;
+            }
             w = (std::max)(1, w);
             if (cell) {
                 const auto& control = controls.at(cell);
@@ -919,10 +1228,13 @@ void StudioWindow::Impl::paintFrame(HDC dc, const RECT& dirty) {
     paintTabMarker(dc, mainMarker);
     if (nav.page == Page::Settings) paintTabMarker(dc, categoryMarker);
     r.top = r.bottom - px(theme::footerHeight);
-    if (dirty.bottom > r.top && IsWindowVisible(footer)) {
+    if (dirty.bottom > r.top) {
+        const int hairline = hairlinePx();
         theme::fill(dc, r, theme::active);
-        theme::fill(dc, {r.left, r.top, r.right, r.top + 1}, theme::rule);
+        theme::fill(dc, {r.left, r.top, r.right, r.top + hairline}, theme::rule);
         paintReplayCheck(dc);
+        if (footerWarningBar.right > footerWarningBar.left && footerWarningBar.bottom > footerWarningBar.top)
+            theme::fill(dc, footerWarningBar, theme::recording);
     }
 }
 
@@ -944,11 +1256,11 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
     const auto tone = found == controls.end() ? ButtonTone::Normal : found->second.tone;
     const bool quiet = tone == ButtonTone::Quiet;
     const auto base = selected || tone == ButtonTone::Primary ? theme::active : navigation || quiet ? theme::surface : theme::field;
-    theme::fill(dc, r, !navigation && down ? theme::press : !navigation && hot ? theme::hover : base);
+    theme::fill(dc, r, down ? theme::press : hot ? theme::hover : base);
     // Windows reports a suppressed focus rectangle through ODS_NOFOCUSRECT
     // (pointer-driven focus, or cues hidden); the theme outline follows the same
     // rule as the native one.
-    const bool focusCue = (item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS;
+    const bool focusCue = (item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS && !keyboardCuesHidden();
     if (navigation) {
         if (focusCue) {
             RECT focus = r;
@@ -957,7 +1269,9 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
         }
         r.bottom += inset(theme::navUnderlineBand);
     } else {
-        if (!quiet) theme::frame(dc, r, disabled ? theme::rule : theme::border);
+        const COLORREF frameColor = disabled ? theme::rule
+            : (item.hwndItem == save && tone == ButtonTone::Primary) ? theme::accent : theme::border;
+        if (!quiet) theme::frame(dc, r, frameColor);
         if (focusCue) {
             RECT focus = r;
             InflateRect(&focus, -inset(3), -inset(3));
@@ -972,7 +1286,8 @@ void StudioWindow::Impl::paintButton(const DRAWITEMSTRUCT& item) {
     InflateRect(&r, -inset(6), 0);
     if (!RectVisible(dc, &r)) return;
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, disabled ? theme::disabled : quiet && !hot ? theme::muted : theme::text);
+    const bool dimmed = (quiet && !hot) || (navigation && !selected && !hot && !down);
+    SetTextColor(dc, disabled ? theme::disabled : dimmed ? theme::muted : theme::text);
     SelectObject(dc, chrome ? font : pageFont());
     const auto label = readText(item.hwndItem);
     DrawTextW(dc, label.c_str(), -1, &r, (quiet ? DT_LEFT : DT_CENTER) | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -991,12 +1306,19 @@ void StudioWindow::Impl::paintCheckbox(HWND hwnd, HDC dc) {
     theme::fill(dc, box, checked ? checkedFill : down ? theme::press : hovered == hwnd ? theme::hover : theme::field);
     theme::frame(dc, box, checked ? checkedFill : enabled ? theme::border : theme::rule);
     if (checked) {
-        const auto pen = CreatePen(PS_SOLID, px(2), theme::surface);
-        const auto old = SelectObject(dc, pen);
-        const POINT points[]{{x + px(3), y + px(8)}, {x + px(6), y + px(11)}, {x + px(12), y + px(4)}};
-        Polyline(dc, points, 3);
-        SelectObject(dc, old);
-        DeleteObject(pen);
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(theme::surface), GetGValue(theme::surface), GetBValue(theme::surface)),
+                         static_cast<Gdiplus::REAL>(px(2)));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        const Gdiplus::PointF points[]{
+            {static_cast<float>(x + px(3)), static_cast<float>(y + px(8))},
+            {static_cast<float>(x + px(6)), static_cast<float>(y + px(11))},
+            {static_cast<float>(x + px(12)), static_cast<float>(y + px(4))},
+        };
+        g.DrawLines(&pen, points, 3);
     }
     if (GetFocus() == hwnd && !keyboardCuesHidden()) theme::frame(dc, r, theme::accent);
     r.left += px(24);
@@ -1011,7 +1333,8 @@ void StudioWindow::Impl::paintCheckbox(HWND hwnd, HDC dc) {
 void StudioWindow::Impl::paintCombo(const DRAWITEMSTRUCT& item) {
     auto r = item.rcItem;
     const bool selected = (item.itemState & ODS_SELECTED) != 0;
-    theme::fill(item.hDC, r, selected ? theme::active : theme::field);
+    const bool hot = hovered == item.hwndItem && !(item.itemState & ODS_DISABLED) && (item.itemState & ODS_COMBOBOXEDIT) != 0;
+    theme::fill(item.hDC, r, selected ? theme::active : hot ? theme::hover : theme::field);
     if (item.itemID == static_cast<UINT>(-1)) return;
     const auto length = SendMessageW(item.hwndItem, CB_GETLBTEXTLEN, item.itemID, 0);
     if (length == CB_ERR) return;
@@ -1020,9 +1343,95 @@ void StudioWindow::Impl::paintCombo(const DRAWITEMSTRUCT& item) {
     SetBkMode(item.hDC, TRANSPARENT);
     SetTextColor(item.hDC, (item.itemState & ODS_DISABLED) ? theme::disabled : theme::text);
     SelectObject(item.hDC, font);
-    if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) theme::frame(item.hDC, r, theme::accent);
+    if ((item.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS && !keyboardCuesHidden()) theme::frame(item.hDC, r, theme::accent);
     InflateRect(&r, -px(6), 0);
     DrawTextW(item.hDC, label.c_str(), -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+}
+
+void StudioWindow::Impl::paintComboBox(HWND hwnd, HDC dc) {
+    RECT r{};
+    GetClientRect(hwnd, &r);
+    const bool enabled = IsWindowEnabled(hwnd) != FALSE;
+    const bool dropped = SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0;
+    const bool hot = enabled && hovered == hwnd;
+    const bool hasFocus = GetFocus() == hwnd;
+    const bool focusCue = hasFocus && !keyboardCuesHidden();
+    theme::fill(dc, r, dropped ? theme::press : hot ? theme::hover : theme::field);
+    theme::frame(dc, r, focusCue ? theme::accent : !enabled ? theme::rule : theme::border);
+    const int chevronWidth = px(22);
+    const int cx = r.right - chevronWidth / 2;
+    const int cy = (r.top + r.bottom) / 2;
+    const int arm = px(4);
+    const COLORREF chevronColor = !enabled ? theme::disabled : (hot || dropped || hasFocus) ? theme::text : theme::muted;
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(chevronColor), GetGValue(chevronColor), GetBValue(chevronColor)),
+                         static_cast<Gdiplus::REAL>((std::max)(1, px(1))));
+        pen.SetStartCap(Gdiplus::LineCapRound);
+        pen.SetEndCap(Gdiplus::LineCapRound);
+        pen.SetLineJoin(Gdiplus::LineJoinRound);
+        const Gdiplus::PointF pts[]{
+            {static_cast<float>(cx - arm), static_cast<float>(cy - arm / 2)},
+            {static_cast<float>(cx), static_cast<float>(cy + arm / 2)},
+            {static_cast<float>(cx + arm), static_cast<float>(cy - arm / 2)},
+        };
+        g.DrawLines(&pen, pts, 3);
+    }
+    const auto sel = SendMessageW(hwnd, CB_GETCURSEL, 0, 0);
+    if (sel != CB_ERR) {
+        const auto len = SendMessageW(hwnd, CB_GETLBTEXTLEN, static_cast<WPARAM>(sel), 0);
+        if (len != CB_ERR && len > 0) {
+            std::wstring label(static_cast<size_t>(len) + 1, L'\0');
+            SendMessageW(hwnd, CB_GETLBTEXT, static_cast<WPARAM>(sel), reinterpret_cast<LPARAM>(label.data()));
+            RECT textRect{r.left + px(6), r.top, (std::max)(r.left + px(6), r.right - chevronWidth), r.bottom};
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, enabled ? theme::text : theme::disabled);
+            SelectObject(dc, font);
+            DrawTextW(dc, label.c_str(), -1, &textRect, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        }
+    }
+}
+
+void StudioWindow::Impl::paintSlider(HWND hwnd, HDC dc) {
+    RECT r{};
+    GetClientRect(hwnd, &r);
+    theme::fill(dc, r, theme::surface);
+    const auto it = controls.find(hwnd);
+    if (it == controls.end()) return;
+    const bool enabled = IsWindowEnabled(hwnd) != FALSE;
+    const bool hot = enabled && (hovered == hwnd || GetCapture() == hwnd);
+    const bool hasFocus = GetFocus() == hwnd && !keyboardCuesHidden();
+    const uint32_t maxVal = (std::max)(uint32_t{1}, it->second.sliderMax);
+    const uint32_t current = it->second.sliderBuddy ? std::clamp(parseUIntControl(it->second.sliderBuddy).value_or(0), uint32_t{0}, maxVal) : 0;
+    const int pad = px(5);
+    const int left = r.left + pad;
+    const int right = (std::max)(left + 1, static_cast<int>(r.right) - pad);
+    const int trackWidth = right - left;
+    const int thumbX = left + MulDiv(static_cast<int>(current), trackWidth, static_cast<int>(maxVal));
+    const int trackHeight = (std::max)(2, px(3));
+    const int midY = (r.top + r.bottom) / 2;
+    const int trackTop = midY - trackHeight / 2;
+    theme::fill(dc, {left, trackTop, right, trackTop + trackHeight}, enabled ? theme::rule : theme::field);
+    if (thumbX > left) {
+        theme::fill(dc, {left, trackTop, thumbX, trackTop + trackHeight}, enabled ? theme::accent : theme::disabled);
+    }
+    const int thumbW = px(8), thumbH = px(14);
+    const RECT thumb{thumbX - thumbW / 2, midY - thumbH / 2, thumbX + thumbW / 2, midY + thumbH / 2};
+    theme::fill(dc, thumb, !enabled ? theme::disabled : hot ? theme::text : theme::accent);
+    if (hasFocus) theme::frame(dc, r, theme::accent);
+}
+
+void StudioWindow::Impl::paintIconCell(HWND hwnd, HDC dc) {
+    RECT r{};
+    GetClientRect(hwnd, &r);
+    theme::fill(dc, r, theme::surface);
+    const auto it = controls.find(hwnd);
+    if (it == controls.end() || !it->second.icon) return;
+    const int size = px(16);
+    const int x = r.left + ((r.right - r.left) - size) / 2;
+    const int y = r.top + ((r.bottom - r.top) - size) / 2;
+    DrawIconEx(dc, x, y, it->second.icon, size, size, 0, nullptr, DI_NORMAL);
 }
 
 void StudioWindow::Impl::setStatus(std::wstring value, bool savedReplay, bool pointer) {
@@ -1033,40 +1442,59 @@ void StudioWindow::Impl::setStatus(std::wstring value, bool savedReplay, bool po
 }
 
 void StudioWindow::Impl::paintFooter(bool animateCheck) {
-    if (!footer || building || shuttingDown || focused == footer) return;
+    if (!footer || building || shuttingDown) return;
     auto help = [this](HWND hwnd) -> std::wstring_view {
         const auto it = controls.find(hwnd);
         return it != controls.end() && IsWindowVisible(hwnd) ? it->second.help : std::wstring_view{};
     };
     auto hint = help(hovered);
-    if (hint.empty()) hint = help(focused);
-    std::wstring text = status;
-    const auto append = [&text](std::wstring_view line) {
+    std::wstring pausedHint;
+    if (hint.empty()) {
+        hint = help(focused);
+        if (!hint.empty() && nav.page == Page::Diagnostics &&
+            (focused == diagnostics[0] || focused == diagnostics[1] || focused == diagnostics[2])) {
+            pausedHint = std::wstring(hint) + L" (live updates paused while focused)";
+            hint = pausedHint;
+        }
+    }
+    const auto append = [](std::wstring& dst, std::wstring_view line) {
         if (line.empty()) return;
-        if (!text.empty()) text += L"\r\n";
-        text.append(line);
+        if (!dst.empty()) dst += L"\r\n";
+        dst.append(line);
     };
-    append(hint);
-    append(persistentWarning);
-    append(audioWarning);
-    // The zoom gesture has no control of its own, so an idle footer names it
-    // without crowding a status or a hover hint.
-    if (text.empty()) text = L"Ctrl+Scroll scales the font";
+    std::wstring statusText = status;
+    append(statusText, hint);
+    std::wstring warningText;
+    append(warningText, persistentWarning);
+    append(warningText, audioWarning);
+
+    const bool hadCheck = replayCheckBox.right > replayCheckBox.left;
     if (motions[replayCheck].to != static_cast<float>(replaySaved))
         setMotion(replayCheck, static_cast<float>(replaySaved), replaySaved && animateCheck);
-    const bool showing = (GetWindowLongPtrW(footer, GWL_STYLE) & WS_VISIBLE) != 0;
-    if (text.empty()) {
-        if (!showing) return;
-        ShowWindow(footer, SW_HIDE);
-    } else {
-        setText(footer, text);
-        if (showing) return;
-        ShowWindow(footer, SW_SHOWNA);
+    const bool wantCheck = replaySaved || motions[replayCheck].active();
+
+    const bool showingStatus = (GetWindowLongPtrW(footer, GWL_STYLE) & WS_VISIBLE) != 0;
+    const bool showingWarning = footerWarning && (GetWindowLongPtrW(footerWarning, GWL_STYLE) & WS_VISIBLE) != 0;
+    const bool wantStatus = !statusText.empty();
+    const bool wantWarning = !warningText.empty();
+    if (wantStatus) {
+        setText(footer, statusText);
+        syncFooterScroll(footer);
     }
-    RECT r{};
-    GetClientRect(window, &r);
-    r.top = r.bottom - px(theme::footerHeight);
-    InvalidateRect(window, &r, FALSE);
+    if (wantWarning && footerWarning) {
+        setText(footerWarning, warningText);
+        syncFooterScroll(footerWarning);
+    }
+    if (wantStatus != showingStatus) ShowWindow(footer, wantStatus ? SW_SHOWNA : SW_HIDE);
+    if (footerWarning && wantWarning != showingWarning) ShowWindow(footerWarning, wantWarning ? SW_SHOWNA : SW_HIDE);
+    if (wantStatus != showingStatus || wantWarning != showingWarning || wantCheck != hadCheck) {
+        RECT client{};
+        if (GetClientRect(window, &client)) {
+            layoutFooter(client);
+            client.top = client.bottom - px(theme::footerHeight);
+            InvalidateRect(window, &client, FALSE);
+        }
+    }
 }
 
 bool StudioWindow::Impl::editHotkey(HWND field, uint32_t modifiers, uint32_t key) {
@@ -1089,6 +1517,8 @@ bool StudioWindow::Impl::editHotkey(HWND field, uint32_t modifiers, uint32_t key
     *it->second.second = key;
     setText(field, hotkeyDisplay(modifiers, key));
     changed();
+    const HWND nextFocus = GetNextDlgTabItem(window, field, TRUE);
+    SetFocus(nextFocus && nextFocus != field ? nextFocus : body);
     return true;
 }
 
@@ -1112,6 +1542,7 @@ bool StudioWindow::Impl::zoomInput(UINT message, WPARAM wheel) {
         // Persist on the notch, not on exit: closing to the tray or an abnormal
         // end would otherwise drop the scale the user just set.
         saveUiState();
+        setStatus((libraryPage ? L"Library zoom " : L"Zoom ") + std::to_wstring(zoom) + L"%");
     }
     return true;
 }
@@ -1119,8 +1550,32 @@ bool StudioWindow::Impl::zoomInput(UINT message, WPARAM wheel) {
 bool StudioWindow::Impl::handleShortcut(const MSG& msg) {
     if (msg.message != WM_KEYDOWN && msg.message != WM_SYSKEYDOWN) return false;
     const HWND focus = GetFocus();
-    if (msg.wParam != VK_TAB && msg.wParam != VK_ESCAPE &&
-        editHotkey(focus, currentModifierState(), static_cast<uint32_t>(msg.wParam))) return true;
+    if (hotkeyFields.contains(focus)) {
+        if (msg.wParam == VK_ESCAPE) {
+            const HWND nextFocus = GetNextDlgTabItem(window, focus, TRUE);
+            SetFocus(nextFocus && nextFocus != focus ? nextFocus : body);
+            return true;
+        }
+        if (msg.wParam != VK_TAB && editHotkey(focus, currentModifierState(), static_cast<uint32_t>(msg.wParam))) return true;
+    }
+    const bool altDown = (GetKeyState(VK_MENU) & 0x8000) != 0;
+    const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+    if (msg.message == WM_KEYDOWN && isControlDown() && !altDown) {
+        if (!shiftDown && msg.wParam == L'S' && (nav.page == Page::Capture || nav.page == Page::Settings)) {
+            if (dirty()) saveSettings();
+            return true;
+        }
+        if (!shiftDown && msg.wParam >= L'1' && msg.wParam <= L'4') {
+            open(static_cast<Page>(msg.wParam - L'1'), false);
+            return true;
+        }
+        if (msg.wParam == VK_TAB) {
+            const int count = static_cast<int>(pageButtons.size());
+            const int step = shiftDown ? count - 1 : 1;
+            open(static_cast<Page>((static_cast<int>(nav.page) + step) % count), false);
+            return true;
+        }
+    }
     if (nav.page == Page::Library && galleryShortcut(msg)) return true;
     if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && controls.contains(focus) && IsWindowEnabled(focus)) {
         wchar_t cls[8]{};

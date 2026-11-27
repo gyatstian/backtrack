@@ -534,6 +534,33 @@ bool shellExecuteSucceeded(HINSTANCE result) {
     return reinterpret_cast<INT_PTR>(result) > 32;
 }
 
+bool isExtendedVirtualKey(uint32_t virtualKey) {
+    switch (virtualKey) {
+    case VK_CANCEL:
+    case VK_PRIOR:
+    case VK_NEXT:
+    case VK_END:
+    case VK_HOME:
+    case VK_LEFT:
+    case VK_UP:
+    case VK_RIGHT:
+    case VK_DOWN:
+    case VK_SNAPSHOT:
+    case VK_INSERT:
+    case VK_DELETE:
+    case VK_LWIN:
+    case VK_RWIN:
+    case VK_APPS:
+    case VK_DIVIDE:
+    case VK_NUMLOCK:
+    case VK_RCONTROL:
+    case VK_RMENU:
+        return true;
+    default:
+        return false;
+    }
+}
+
 std::wstring keyName(uint32_t virtualKey) {
     if (virtualKey == 0) {
         return L"None";
@@ -542,6 +569,9 @@ std::wstring keyName(uint32_t virtualKey) {
     wchar_t name[64]{};
     const UINT scanCode = MapVirtualKeyW(virtualKey, MAPVK_VK_TO_VSC);
     LONG lParam = static_cast<LONG>(scanCode << 16);
+    if (isExtendedVirtualKey(virtualKey)) {
+        lParam |= (1 << 24);
+    }
     if (GetKeyNameTextW(lParam, name, static_cast<int>(_countof(name))) > 0) {
         return name;
     }
@@ -864,6 +894,55 @@ std::wstring appNameFromPath(const std::filesystem::path& path) {
     return name.empty() ? path.filename().wstring() : name;
 }
 
+namespace {
+
+bool showFileDialog(
+    IFileDialog* dialog,
+    HWND owner,
+    const wchar_t* label,
+    const wchar_t* title,
+    const COMDLG_FILTERSPEC* filters,
+    UINT filterCount,
+    const wchar_t* defaultExtension,
+    std::filesystem::path& out) {
+    if (title) {
+        dialog->SetTitle(title);
+    }
+    if (filters && filterCount > 0) {
+        dialog->SetFileTypes(filterCount, filters);
+        dialog->SetFileTypeIndex(1);
+    }
+    if (defaultExtension) {
+        dialog->SetDefaultExtension(defaultExtension);
+    }
+    HRESULT hr = dialog->Show(owner);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        return false;
+    }
+    if (FAILED(hr)) {
+        Logger::instance().warning(L"ui", std::wstring(label) + L" failed: " + hresultToString(hr));
+        return false;
+    }
+    ComPtr<IShellItem> item;
+    hr = dialog->GetResult(&item);
+    if (FAILED(hr) || !item) {
+        Logger::instance().warning(L"ui", std::wstring(label) + L" returned no item: " + hresultToString(hr));
+        return false;
+    }
+    PWSTR rawPath = nullptr;
+    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
+    if (FAILED(hr) || !rawPath) {
+        CoTaskMemFree(rawPath);
+        Logger::instance().warning(L"ui", std::wstring(label) + L" path could not be read: " + hresultToString(hr));
+        return false;
+    }
+    out.assign(rawPath);
+    CoTaskMemFree(rawPath);
+    return true;
+}
+
+} // namespace
+
 bool pickFileForOpen(
     HWND owner,
     const wchar_t* title,
@@ -877,59 +956,47 @@ bool pickFileForOpen(
         Logger::instance().warning(L"ui", std::wstring(L"File picker could not open: ") + hresultToString(hr));
         return false;
     }
-    dialog->SetTitle(title);
-    if (filters && filterCount > 0) {
-        dialog->SetFileTypes(filterCount, filters);
-        dialog->SetFileTypeIndex(1);
-    }
-    if (defaultExtension) {
-        dialog->SetDefaultExtension(defaultExtension);
-    }
-    hr = dialog->Show(owner);
-    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+    return showFileDialog(dialog.Get(), owner, L"File picker", title, filters, filterCount, defaultExtension, out);
+}
+
+bool pickFileForSave(
+    HWND owner,
+    const wchar_t* title,
+    const COMDLG_FILTERSPEC* filters,
+    UINT filterCount,
+    const wchar_t* defaultExtension,
+    const wchar_t* defaultFileName,
+    std::filesystem::path& out) {
+    ComPtr<IFileSaveDialog> dialog;
+    HRESULT hr = CoCreateInstance(CLSID_FileSaveDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        Logger::instance().warning(L"ui", std::wstring(L"Save picker could not open: ") + hresultToString(hr));
         return false;
     }
-    if (FAILED(hr)) {
-        Logger::instance().warning(L"ui", std::wstring(L"File picker failed: ") + hresultToString(hr));
-        return false;
+    DWORD options = 0;
+    const DWORD extra = FOS_OVERWRITEPROMPT | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR | FOS_FORCEFILESYSTEM;
+    dialog->SetOptions(SUCCEEDED(dialog->GetOptions(&options)) ? (options | extra) : extra);
+    if (defaultFileName) {
+        dialog->SetFileName(defaultFileName);
     }
-    ComPtr<IShellItem> item;
-    hr = dialog->GetResult(&item);
-    if (FAILED(hr) || !item) {
-        Logger::instance().warning(L"ui", std::wstring(L"File picker returned no item: ") + hresultToString(hr));
-        return false;
-    }
-    PWSTR rawPath = nullptr;
-    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &rawPath);
-    if (FAILED(hr) || !rawPath) {
-        CoTaskMemFree(rawPath);
-        Logger::instance().warning(L"ui", std::wstring(L"File picker path could not be read: ") + hresultToString(hr));
-        return false;
-    }
-    out.assign(rawPath);
-    CoTaskMemFree(rawPath);
-    return true;
+    return showFileDialog(dialog.Get(), owner, L"Save picker", title, filters, filterCount, defaultExtension, out);
 }
 
 bool pickFolder(HWND owner, const wchar_t* title, std::wstring& out) {
-    wchar_t displayName[MAX_PATH]{};
-    BROWSEINFOW browse{};
-    browse.hwndOwner = owner;
-    browse.pszDisplayName = displayName;
-    browse.lpszTitle = title;
-    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    PIDLIST_ABSOLUTE item = SHBrowseForFolderW(&browse);
-    if (!item) {
+    ComPtr<IFileOpenDialog> dialog;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog) {
+        Logger::instance().warning(L"ui", std::wstring(L"Folder picker could not open: ") + hresultToString(hr));
         return false;
     }
-    wchar_t path[MAX_PATH]{};
-    const bool ok = SHGetPathFromIDListW(item, path) != FALSE;
-    CoTaskMemFree(item);
-    if (!ok || path[0] == L'\0') {
-        Logger::instance().warning(L"ui", L"Folder picker path could not be read");
+    DWORD options = 0;
+    const DWORD extra = FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+    dialog->SetOptions(SUCCEEDED(dialog->GetOptions(&options)) ? (options | extra) : extra);
+    std::filesystem::path selected;
+    if (!showFileDialog(dialog.Get(), owner, L"Folder picker", title, nullptr, 0, nullptr, selected)) {
         return false;
     }
-    out.assign(path);
+    out = selected.wstring();
     return true;
 }
 

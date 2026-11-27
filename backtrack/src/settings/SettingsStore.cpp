@@ -418,6 +418,7 @@ AppSettings SettingsStore::load(LoadStatus* status) const {
     settings.libraryFitThumbnails = readBool(values, L"library.fitThumbnails", settings.libraryFitThumbnails);
     settings.libraryZoomPercent = readUInt(values, L"library.zoomPercent", settings.libraryZoomPercent);
     settings.libraryOwnScale = readBool(values, L"library.ownScale", settings.libraryOwnScale);
+    settings.libraryShowHiddenFolders = readBool(values, L"library.showHiddenFolders", settings.libraryShowHiddenFolders);
     settings.hotkeys.startStopModifiers = readUInt(values, L"hotkeys.startStop.modifiers", settings.hotkeys.startStopModifiers);
     settings.hotkeys.startStopVirtualKey = readUInt(values, L"hotkeys.startStop.vk", settings.hotkeys.startStopVirtualKey);
     settings.hotkeys.saveReplayModifiers = readUInt(values, L"hotkeys.saveReplay.modifiers", settings.hotkeys.saveReplayModifiers);
@@ -551,6 +552,7 @@ bool SettingsStore::save(const AppSettings& settings) const {
     output << L"library.fitThumbnails=" << (normalized.libraryFitThumbnails ? 1 : 0) << L"\n";
     output << L"library.zoomPercent=" << normalized.libraryZoomPercent << L"\n";
     output << L"library.ownScale=" << (normalized.libraryOwnScale ? 1 : 0) << L"\n";
+    output << L"library.showHiddenFolders=" << (normalized.libraryShowHiddenFolders ? 1 : 0) << L"\n";
     output << L"hotkeys.startStop.modifiers=" << normalized.hotkeys.startStopModifiers << L"\n";
     output << L"hotkeys.startStop.vk=" << normalized.hotkeys.startStopVirtualKey << L"\n";
     output << L"hotkeys.saveReplay.modifiers=" << normalized.hotkeys.saveReplayModifiers << L"\n";

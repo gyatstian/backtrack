@@ -177,11 +177,13 @@ and `replay_audio.bin` in the same folder, with alternate names on collision).
   `paceAudioPacket` core (`mux/AudioTimeline.h`) with the replay window
   `[start, end]` as its bound, so a packet past the window end is not written
   and the clip's audio stops with the video.
-- each `saveTo` owns a freshly created session directory. a failed stream
-  write, audio-WAV finalization, or mux failure retains its files;
-  `RecoveryStore` creates a manifest for a usable
-  video prefix where possible and reports when manual recovery may be needed.
-  a same-name retry never truncates an earlier session.
+- each `saveTo` owns a freshly created session directory (under
+  `<clipRoot>/.backtrack_tmp/` when `clipRoot` is passed and `outputPath` is in
+  an immediate non-reparse game subfolder, else `<output dir>/.backtrack_tmp/`).
+  a failed stream write, audio-WAV finalization, or mux failure retains its
+  files; `RecoveryStore` creates a manifest for a usable video prefix where
+  possible and reports when manual recovery may be needed. a same-name retry
+  never truncates an earlier session.
 - `newestVideoPts100ns` exists because PTS-age trimming cannot detect a stalled
   capture or encode pipeline; heartbeats keep advancing timestamps while the
   pipeline is idle. Callers use it to detect that case.

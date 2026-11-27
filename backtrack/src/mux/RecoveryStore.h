@@ -18,6 +18,19 @@ inline constexpr wchar_t kRecoveryManifestName[] = L"recovery.tsv";
 // the Win32 reason so a sharing violation stays distinguishable from a full disk.
 bool flushFileToDisk(const std::filesystem::path& path, DWORD& win32Error);
 
+// Staging root for a clip save: places `.backtrack_tmp` under `clipRoot` when
+// `outputPath` sits inside an immediate non-reparse child of `clipRoot` (such
+// as a per-game folder) and records that subfolder in `outputSubdir` so crash
+// recovery still publishes back to it. Falls back to `outputPath.parent_path()`
+// otherwise so staged-to-final moves stay on the same volume.
+struct TempSessionTarget {
+    std::filesystem::path tempRoot;
+    std::filesystem::path outputSubdir;
+};
+TempSessionTarget resolveTempSessionTarget(
+    const std::filesystem::path& outputPath,
+    const std::filesystem::path& clipRoot = {});
+
 // creates and owns a new directory, adding a suffix when the preferred name exists.
 std::filesystem::path createUniqueDirectory(
     const std::filesystem::path& preferredPath, std::error_code& error);

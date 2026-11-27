@@ -8,7 +8,6 @@
 #include "platform/Win32Util.h"
 #include "settings/SettingsStore.h"
 
-#include <commdlg.h>
 #include <iomanip>
 #include <sstream>
 
@@ -64,20 +63,13 @@ std::wstring exportDiagnostics(HWND window, RecorderController& controller) {
         return L"Log file not found";
     }
 
-    wchar_t fileName[MAX_PATH]{};
-    wcscpy_s(fileName, L"backtrack-log.txt");
-
-    OPENFILENAMEW dialog{};
-    dialog.lStructSize = sizeof(dialog);
-    dialog.hwndOwner = window;
-    dialog.lpstrFilter = L"Log files (*.txt;*.log)\0*.txt;*.log\0All files (*.*)\0*.*\0";
-    dialog.lpstrFile = fileName;
-    dialog.nMaxFile = MAX_PATH;
-    dialog.lpstrTitle = L"Save log copy";
-    dialog.lpstrDefExt = L"txt";
-    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-
-    if (!GetSaveFileNameW(&dialog)) {
+    const COMDLG_FILTERSPEC filters[] = {
+        {L"Log files", L"*.txt;*.log"},
+        {L"All files", L"*.*"},
+    };
+    std::filesystem::path targetPath;
+    if (!pickFileForSave(window, L"Save log copy", filters, static_cast<UINT>(std::size(filters)),
+                         L"txt", L"backtrack-log.txt", targetPath)) {
         return {};
     }
 
@@ -106,10 +98,10 @@ std::wstring exportDiagnostics(HWND window, RecorderController& controller) {
     tail << L"System audio queue drops: " << tailStats.systemAudioQueueDrops
          << L", mic queue drops: " << tailStats.microphoneAudioQueueDrops << L"\n";
     tail << L"Frame queue depth: " << tailStats.encoder.queueDepth << L"\n";
-    if (const auto error = saveDiagnosticsLog(fileName, wideToUtf8(tail.str())); error) {
+    if (const auto error = saveDiagnosticsLog(targetPath, wideToUtf8(tail.str())); error) {
         return L"Could not save log: " + utf8ToWide(error.message());
     }
-    return std::wstring(L"Log saved to ") + fileName;
+    return L"Log saved to " + targetPath.wstring();
 }
 
 std::wstring encoderDiagnosticText(RecorderController& controller) {

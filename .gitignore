@@ -3,6 +3,7 @@ build-rnnoise-on/
 .vs/
 build/
 out/
+tools/
 build-new/
 build-verify/
 **/x64/
@@ -13,6 +14,7 @@ build-verify/
 *.obj
 *.iobj
 *.ipdb
+.gitignore
 *.idb
 *.exe
 *.recipe

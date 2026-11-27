@@ -9,16 +9,23 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <cstring>
 #include <string_view>
 
 namespace backtrack {
 
 void StudioWindow::Impl::buildDiagnostics() {
     const auto output = [this](const wchar_t* help) {
-        auto edit = make(L"EDIT", L"", WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
+        auto edit = make(L"EDIT", L"", WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_READONLY,
                          {}, help);
         // The margin is in pixels, so updateFont reapplies it on a DPI change.
-        if (edit) controls.at(edit).margin = 6;
+        if (edit) {
+            controls.at(edit).margin = 6;
+            controls.at(edit).editBorder = true;
+            SetWindowLongPtrW(edit, GWL_STYLE, GetWindowLongPtrW(edit, GWL_STYLE) | WS_BORDER);
+            SetWindowPos(edit, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
         SendMessageW(edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(px(6), px(6)));
         return edit;
     };
@@ -55,8 +62,10 @@ void StudioWindow::Impl::buildDiagnostics() {
             setStatus(L"Could not open log folder.");
     });
     const auto saveLogButton = button(L"Save log\u2026", [this] { saveLog(); });
+    const auto copyButton = button(L"Copy", [this] { copyDiagnostics(); },
+                                   L"Copy runtime, encoder, and recent log text to the clipboard.");
     diagnostics[2] = output(L"Recent lines from the session log.");
-    rows.back().cells = {logging, open, saveLogButton};
+    rows.back().cells = {logging, open, saveLogButton, copyButton};
 }
 
 void StudioWindow::Impl::layoutDiagnostics() {
@@ -64,23 +73,35 @@ void StudioWindow::Impl::layoutDiagnostics() {
     GetClientRect(body, &r);
     const int inset = px(studio_theme::inset), gap = px(studio_theme::gap);
     const int top = px(3), textTop = top + px(rows[0].height);
-    const int actionHeight = px(28), openWidth = px(122), saveWidth = px(88);
+    const int actionHeight = px(28), openWidth = px(122), saveWidth = px(88), copyWidth = px(60);
     const int right = (std::max)(inset, static_cast<int>(r.right) - inset);
     const int available = (std::max)(0, right - inset - gap * 2);
-    const int logWidth = (std::min)(available, (std::max)(available / 3, openWidth + gap + saveWidth));
+    // Keep Runtime and Encoder visible even at high zoom on a narrow window.
+    const int maxLogWidth = available / 2;
+    const int buttonsWidth = openWidth + gap + saveWidth + gap + copyWidth;
+    const int logWidth = (std::min)(maxLogWidth, (std::max)(available / 3, buttonsWidth));
     const int leftWidth = (available - logWidth) / 2;
     const int middle = inset + leftWidth + gap, log = right - logWidth;
     const int bottom = r.bottom - px(5);
     const int actionsTop = textTop + actionHeight + gap;
     const int logTop = actionsTop + actionHeight + gap;
+    int fittedOpen = openWidth, fittedSave = saveWidth, fittedCopy = copyWidth;
+    if (buttonsWidth > logWidth) {
+        const int usable = (std::max)(0, logWidth - gap * 2);
+        const int totalBase = openWidth + saveWidth + copyWidth;
+        fittedOpen = MulDiv(usable, openWidth, totalBase);
+        fittedSave = MulDiv(usable, saveWidth, totalBase);
+        fittedCopy = (std::max)(0, usable - fittedOpen - fittedSave);
+    }
     headingRects = {{inset, top, inset + leftWidth, textTop}, {middle, top, log - gap, textTop}, {log, top, right, textTop}};
     const auto& actions = rows.back().cells;
     const std::vector<WindowMove> moves{
         {diagnostics[0], inset, textTop, leftWidth, (std::max)(0, bottom - textTop)},
         {diagnostics[1], middle, textTop, (std::max)(0, log - gap - middle), (std::max)(0, bottom - textTop)},
         {actions[0], log, textTop, logWidth, actionHeight},
-        {actions[1], right - saveWidth - gap - openWidth, actionsTop, openWidth, actionHeight},
-        {actions[2], right - saveWidth, actionsTop, saveWidth, actionHeight},
+        {actions[1], right - fittedCopy - gap - fittedSave - gap - fittedOpen, actionsTop, fittedOpen, actionHeight},
+        {actions[2], right - fittedCopy - gap - fittedSave, actionsTop, fittedSave, actionHeight},
+        {actions[3], right - fittedCopy, actionsTop, fittedCopy, actionHeight},
         {diagnostics[2], log, logTop, logWidth, (std::max)(0, bottom - logTop)},
     };
     applyWindowMoves(moves);
@@ -88,6 +109,32 @@ void StudioWindow::Impl::layoutDiagnostics() {
 
 void StudioWindow::Impl::saveLog() {
     if (auto result = exportDiagnostics(window, controller); !result.empty()) setStatus(std::move(result));
+}
+
+void StudioWindow::Impl::copyDiagnostics() {
+    const std::wstring joined = L"=== Runtime ===\r\n" + readText(diagnostics[0]) +
+        L"\r\n\r\n=== Encoder ===\r\n" + readText(diagnostics[1]) +
+        L"\r\n\r\n=== Recent log ===\r\n" + readText(diagnostics[2]);
+    if (!OpenClipboard(window)) {
+        setStatus(L"Could not open the clipboard.");
+        return;
+    }
+    EmptyClipboard();
+    const size_t bytes = (joined.size() + 1) * sizeof(wchar_t);
+    if (const HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* dst = GlobalLock(mem)) {
+            std::memcpy(dst, joined.c_str(), bytes);
+            GlobalUnlock(mem);
+            if (SetClipboardData(CF_UNICODETEXT, mem)) {
+                CloseClipboard();
+                setStatus(L"Diagnostics copied to clipboard.");
+                return;
+            }
+        }
+        GlobalFree(mem);
+    }
+    CloseClipboard();
+    setStatus(L"Could not copy diagnostics.");
 }
 
 void StudioWindow::Impl::updateDiagnostics() {

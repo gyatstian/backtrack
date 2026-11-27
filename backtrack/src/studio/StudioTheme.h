@@ -31,6 +31,10 @@ inline constexpr int inset = 14;
 inline constexpr int sectionInset = 25;
 inline constexpr int dependencyIndent = 12;
 inline constexpr int gap = 8;
+// Form pages share one label column, measured against the content width, so
+// every control of a page sits on the same x. A dependent label narrows by its
+// indent instead of pushing its control right.
+inline constexpr int labelColumnPercent = 36;
 
 // UI scale = DPI scale * zoom * window factor. The window factor follows the
 // content width against the default window size in both directions, so the layout

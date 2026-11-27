@@ -18,7 +18,9 @@ namespace backtrack {
 namespace {
 constexpr UINT trayIconId = 1;
 constexpr UINT trayOpen = 1;
-constexpr UINT trayExit = 2;
+constexpr UINT trayRecord = 2;
+constexpr UINT trayReplay = 3;
+constexpr UINT trayExit = 4;
 
 bool appliesSettings(ControllerActionKind kind) {
     return kind == ControllerActionKind::Startup || kind == ControllerActionKind::ApplySettings;
@@ -142,11 +144,13 @@ bool StudioWindow::Impl::submit(ControllerAction value, const wchar_t* text, boo
         return false;
     }
     busy = true;
+    activeAction = kind;
     actionFromPointer = pointer;
     applyingSettings = appliesSettings(kind);
     if (kind != ControllerActionKind::SaveReplay) recoveryAvailable = false;
     if (applyingSettings && (!saved.replay.enabled || !saved.gameIntegrations.leagueOfLegendsKillReminder))
         killDeadline = SteadyClock::time_point::min();
+    syncActionButtons();
     syncRecoveryAction();
     actionCv.notify_one();
     setStatus(text);
@@ -282,6 +286,7 @@ void StudioWindow::Impl::completeAction() {
         auto& result = *completion;
         const bool pointer = std::exchange(actionFromPointer, false);
         busy = false;
+        activeAction.reset();
         applyingSettings = false;
         if (appliesSettings(result.kind)) {
             autoRecord = reconcileAutoRecordAfterSettings(autoRecord, controller.isRecording());
@@ -292,15 +297,21 @@ void StudioWindow::Impl::completeAction() {
         const bool recording = controller.isRecording();
         if (motions[recordGlyph].to != static_cast<float>(recording))
             setMotion(recordGlyph, static_cast<float>(recording), pointer && record);
-        if (record) setText(record, recording ? L"Stop recording" : L"Start recording");
+        syncActionButtons();
         if (!recording) audioWarning.clear();
         // A failure keeps its line until a later action succeeds; a status line
         // that expires after nine seconds would hide it.
         const bool failed = !result.ok || !result.hotkeysOk;
         if (failed) persistentWarning = result.status;
         else persistentWarning.clear();
-        setStatus(!failed && result.status != L"Ready" ? std::move(result.status) : std::wstring{},
-                  result.savedReplay, pointer);
+        const bool keepNotice = !failed && result.kind == ControllerActionKind::ApplySettings &&
+            !status.empty() && status != L"Settings saved. Applying capture changes\u2026";
+        if (!keepNotice) {
+            setStatus(!failed && result.status != L"Ready" ? std::move(result.status) : std::wstring{},
+                      result.savedReplay, pointer);
+        } else {
+            paintFooter(pointer);
+        }
         if (result.refreshLibrary && gallery) refreshLibrary();
     }
     if (completion || recovery) syncRecoveryAction();
@@ -388,6 +399,19 @@ void StudioWindow::Impl::trayMenu() {
     const auto menu = CreatePopupMenu();
     if (!menu) return;
     AppendMenuW(menu, MF_STRING, trayOpen, L"Open Backtrack");
+    SetMenuDefaultItem(menu, trayOpen, FALSE);
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    const bool recording = controller.isRecording();
+    const auto& keys = saved.hotkeys;
+    std::wstring recordLabel = recording ? L"Stop recording" : L"Start recording";
+    if (keys.startStopVirtualKey)
+        recordLabel += L"\t" + hotkeyDisplay(keys.startStopModifiers, keys.startStopVirtualKey);
+    AppendMenuW(menu, MF_STRING | (busy ? MF_GRAYED : 0), trayRecord, recordLabel.c_str());
+    std::wstring replayLabel = L"Save replay";
+    if (saved.replay.enabled && keys.saveReplayVirtualKey)
+        replayLabel += L"\t" + hotkeyDisplay(keys.saveReplayModifiers, keys.saveReplayVirtualKey);
+    AppendMenuW(menu, MF_STRING | (busy || !saved.replay.enabled ? MF_GRAYED : 0), trayReplay, replayLabel.c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, trayExit, L"Exit");
     POINT point{};
     GetCursorPos(&point);
@@ -396,6 +420,10 @@ void StudioWindow::Impl::trayMenu() {
     DestroyMenu(menu);
     PostMessageW(window, WM_NULL, 0, 0);
     if (command == trayOpen) restore();
+    else if (command == trayRecord) {
+        submit(ControllerActionKind::ToggleRecording,
+               controller.isRecording() ? L"Stopping recording\u2026" : L"Starting recording\u2026");
+    } else if (command == trayReplay) requestReplay();
     else if (command == trayExit) close(true);
 }
 
@@ -411,9 +439,15 @@ void StudioWindow::Impl::close(bool forceExit) {
         }
         return;
     }
-    // Exit from the tray runs while the window is hidden; show it first so the
-    // unsaved-changes prompt is visible and focused.
+    // Exit from the tray runs while the window is hidden; show it first so any
+    // confirmation prompt is visible and focused.
     if (forceExit) restore();
+    if (controller.isRecording()) {
+        if (MessageBoxW(window, L"A recording is in progress. Stop recording and exit?",
+                        L"Recording in progress", MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES)
+            return;
+        if (closing || shuttingDown) return;
+    }
     if (!leaveSettings(!forceExit)) return;
     // Arm completion polling before stopping workers so timer failure cannot force a UI-thread join.
     if (!SetTimer(window, shutdownTimer, 50, nullptr)) {

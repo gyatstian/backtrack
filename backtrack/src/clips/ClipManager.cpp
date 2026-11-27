@@ -162,9 +162,14 @@ void sortClips(std::vector<ClipInfo>& clips) {
     });
 }
 
+bool isHiddenFolderName(const std::wstring& name) {
+    return !name.empty() && name.front() == L'.';
+}
+
 // Recursive count for a folder row. Same clip rules as the level scan: regular,
 // nonempty MP4 files, no reparse points, no legacy staging names.
-size_t countClipsBelow(const std::filesystem::path& root, const std::function<bool()>& cancelled) {
+size_t countClipsBelow(const std::filesystem::path& root, const std::function<bool()>& cancelled,
+                       bool includeHiddenFolders) {
     size_t count = 0;
     std::error_code error;
     std::filesystem::recursive_directory_iterator iterator(
@@ -175,7 +180,8 @@ size_t countClipsBelow(const std::filesystem::path& root, const std::function<bo
         const auto& entry = *iterator;
         const auto path = entry.path();
         if (entry.is_directory(error)) {
-            if (error || (GetFileAttributesW(path.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            const bool hidden = !includeHiddenFolders && isHiddenFolderName(path.filename().wstring());
+            if (error || hidden || (GetFileAttributesW(path.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
                 iterator.disable_recursion_pending();
             }
             error = {};
@@ -270,7 +276,8 @@ std::vector<ClipInfo> ClipManager::listClips(const std::function<bool()>& cancel
     return clips;
 }
 
-ClipContents ClipManager::listContents(const std::function<bool()>& cancelled) const {
+ClipContents ClipManager::listContents(const std::function<bool()>& cancelled,
+                                       bool includeHiddenFolders) const {
     const LogContext::ScopedTask taskContext(L"clips-scan");
     ClipContents contents;
     std::error_code error;
@@ -288,7 +295,9 @@ ClipContents ClipManager::listContents(const std::function<bool()>& cancelled) c
     sortClips(contents.clips);
     for (auto& path : subdirectories) {
         if (cancelled && cancelled()) return {};
-        contents.folders.push_back({path, path.filename().wstring(), countClipsBelow(path, cancelled)});
+        const auto name = path.filename().wstring();
+        if (!includeHiddenFolders && isHiddenFolderName(name)) continue;
+        contents.folders.push_back({path, name, countClipsBelow(path, cancelled, includeHiddenFolders)});
     }
     std::sort(contents.folders.begin(), contents.folders.end(), [](const ClipFolder& left, const ClipFolder& right) {
         return lowercased(left.name) < lowercased(right.name);

@@ -459,6 +459,98 @@ void testClearAndDisableRingLifecycle() {
     }
 }
 
+void testGameReplayStagesInClipRootAndRecoversToGameFolder() {
+    TestRoot root;
+    const auto game = root.path / L"Game";
+    const auto unicodeGame = root.path / L"Caf\u00e9";
+    std::error_code error;
+    expect(std::filesystem::create_directory(game, error) && !error, "could not create game folder");
+    expect(std::filesystem::create_directory(unicodeGame, error) && !error, "could not create unicode game folder");
+
+    {
+        ReplayBuffer buffer;
+        ReplaySettings settings;
+        settings.enabled = true;
+        settings.seconds = 30;
+        settings.diskBackedVideo = true;
+        settings.diskBackedAudio = true;
+        buffer.configure(settings, root.path, 8ull * 1024 * 1024, 1024ull * 1024);
+        expect(buffer.storageFallbackReason().empty(), "could not open disk ring in clip root");
+
+        EncodedPacket packet;
+        packet.bytes = {0, 0, 0, 1, 0x65};
+        packet.keyFrame = true;
+        packet.duration100ns = 333333;
+        packet.codec = VideoCodec::H264;
+        buffer.pushVideo(packet);
+
+        // Successful save to a game folder must keep .backtrack_tmp and .backtrack_ring at the clip root.
+        const auto savedClip = game / L"Game_ok.mp4";
+        expect(buffer.saveTo(savedClip, VideoSettings{}, nullptr, root.path), "game replay save failed");
+        expect(std::filesystem::exists(savedClip), "game replay was not published");
+        expect(!std::filesystem::exists(game / L".backtrack_tmp"), "game folder received .backtrack_tmp");
+        expect(!std::filesystem::exists(game / L".backtrack_ring"), "game folder received .backtrack_ring");
+        expect(std::filesystem::exists(root.path / L".backtrack_tmp"), "clip root did not receive .backtrack_tmp");
+        expect(std::filesystem::exists(root.path / L".backtrack_ring"), "clip root did not receive .backtrack_ring");
+
+        // Failed save preserves under clip root/.backtrack_tmp and recovers back into the game folder.
+        failMux = true;
+        std::wstring detail;
+        const auto failedClip = game / L"Game_fail.mp4";
+        const auto unicodeClip = unicodeGame / L"Cafe_fail.mp4";
+        const bool failed1 = buffer.saveTo(failedClip, VideoSettings{}, &detail, root.path);
+        const bool failed2 = buffer.saveTo(unicodeClip, VideoSettings{}, &detail, root.path);
+        failMux = false;
+        expect(!failed1 && !failed2, "failed mux was reported as saved");
+        expect(!std::filesystem::exists(game / L".backtrack_tmp"), "failed game save created .backtrack_tmp in game folder");
+        expect(!std::filesystem::exists(unicodeGame / L".backtrack_tmp"), "failed unicode game save created .backtrack_tmp in game folder");
+        expect(std::filesystem::exists(root.path / L".backtrack_tmp" / L"Game_fail" / RecoveryStore::kRecoveryManifestName),
+               "failed game replay manifest missing from root .backtrack_tmp");
+        expect(std::filesystem::exists(root.path / L".backtrack_tmp" / L"Cafe_fail" / RecoveryStore::kRecoveryManifestName),
+               "failed unicode game replay manifest missing from root .backtrack_tmp");
+        expect(detail.find(root.path.wstring() + L" as the library") != std::wstring::npos,
+               "preserved detail did not name the clip root as the library");
+    }
+
+    // Removing the empty unicode game folder before recovery must still recreate and recover into it.
+    expect(std::filesystem::remove(unicodeGame, error) && !error, "could not remove empty unicode game folder");
+    expect(RecoveryStore::hasRecoverableRecording(root.path), "root-staged game replay not detected as recoverable");
+    expect(!std::filesystem::exists(unicodeGame), "availability check created missing game folder");
+
+    const unsigned before = muxCalls;
+    RecoveryStore::sweepOrphanedRecoveryData(root.path);
+    expect(muxCalls == before + 2, "startup sweep did not recover both root-staged game replays");
+    expect(readFile(game / L"Game_fail.mp4") == "published", "root-staged game replay did not recover into game folder");
+    expect(readFile(unicodeGame / L"Cafe_fail.mp4") == "published", "root-staged unicode game replay did not recover into game folder");
+
+    // Deleting the recovered clip must not resurrect it on the next sweep.
+    expect(std::filesystem::remove(game / L"Game_fail.mp4", error) && !error, "could not delete recovered clip");
+    RecoveryStore::sweepOrphanedRecoveryData(root.path);
+    expect(muxCalls == before + 2, "deleted root-staged game clip was recovered again");
+    expect(!std::filesystem::exists(game / L"Game_fail.mp4"), "deleted root-staged game clip came back");
+
+    // Trailing separator on clipRoot still resolves to clip root.
+    const auto withSlash = RecoveryStore::resolveTempSessionTarget(
+        game / L"trail.mp4", std::filesystem::path(root.path.wstring() + L"\\"));
+    expect(withSlash.tempRoot == root.path && withSlash.outputSubdir == L"Game",
+           "trailing separator on clipRoot prevented root staging");
+
+    // Escaping or malformed outputSubdir in a manifest must be rejected as damaged metadata.
+    for (const auto& [name, badLine] : std::vector<std::pair<std::wstring, std::string>>{
+             {L"escape_dotdot", "outputSubdir\t..\\outside"},
+             {L"escape_nested", "outputSubdir\ta\\b"},
+             {L"escape_empty", "outputSubdir"},
+             {L"escape_extra", "outputSubdir\tGame\textra"}}) {
+        const auto badSession = root.path / L".backtrack_tmp" / name;
+        writeFile(badSession / L"video.h264", "abcd");
+        writeFile(badSession / RecoveryStore::kRecoveryManifestName,
+                  "backtrack-recovery-v1\nvideo\tvideo.h264\n" + badLine + "\nsample\t0\t4\t0\t333333\t1\n");
+    }
+    const unsigned beforeBad = muxCalls;
+    RecoveryStore::sweepOrphanedRecoveryData(root.path);
+    expect(muxCalls == beforeBad, "malformed outputSubdir manifest was recovered");
+}
+
 void testRingCollisionIsPreserved() {
     TestRoot root;
     const auto ring = root.path / L".backtrack_ring";
@@ -497,6 +589,7 @@ int main() {
         testDeletedOrRenamedRecoveryIsNotRepeated();
         testManualRecoverySelectsNewestAcrossRoots();
         testEscapingManifestIsPreserved();
+        testGameReplayStagesInClipRootAndRecoversToGameFolder();
         testRingCollisionIsPreserved();
         testClearAndDisableRingLifecycle();
         std::cout << "StorageLayout tests passed\n";

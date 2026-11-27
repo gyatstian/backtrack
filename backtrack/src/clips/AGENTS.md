@@ -45,11 +45,14 @@ delete, favorite, and tag operations the UI offers.
   cancellation cannot interrupt a shell property read already in progress.
 - `listContents()` is the folder-browsing view of the same rules: the clips
   directly inside the current directory plus one `ClipFolder` per immediate
-  subdirectory, sorted by name. each folder's `clips` is a recursive count of
-  the clips below it, so a folder row can say how much it holds without
-  listing it. `scanDirectory` is the shared pass behind both; the legacy
-  `clips` child is only folded in by `listClips`, never by `listContents`, so a
-  folder row never points at a legacy child of another row.
+  subdirectory, sorted by name. dot-prefixed folders are omitted (and skipped
+  by the recursive clip count) by default unless `includeHiddenFolders` is set;
+  `listClips()` stays unchanged so legacy dot folders remain discoverable for
+  flat listing and recovery. each folder's `clips` is a recursive count of the
+  clips below it, so a folder row can say how much it holds without listing it.
+  `scanDirectory` is the shared pass behind both; the legacy `clips` child is
+  only folded in by `listClips`, never by `listContents`, so a folder row never
+  points at a legacy child of another row.
 - Durations come from the shell `System.Media.Duration` property, which opens a
   COM handler per file and parses the MP4 `moov` atom. The read is
   `GPS_BESTEFFORT` on purpose: `GPS_FASTPROPERTIESONLY` skips the MP4 handler

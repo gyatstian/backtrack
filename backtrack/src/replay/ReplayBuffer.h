@@ -39,7 +39,8 @@ public:
     bool saveTo(
         const std::filesystem::path& outputPath,
         const VideoSettings& videoSettings,
-        std::wstring* errorDetail = nullptr);
+        std::wstring* errorDetail = nullptr,
+        const std::filesystem::path& clipRoot = {});
     void clear();
     size_t videoPacketCount() const;
     size_t videoKeyFrameCount() const;

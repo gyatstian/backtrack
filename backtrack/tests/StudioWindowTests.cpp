@@ -5,6 +5,7 @@
 #include "studio/StudioMotion.h"
 #include "studio/StudioTheme.h"
 #include "studio/StudioWindow.h"
+#include "ui_common/WindowTools.h"
 
 #include <CommCtrl.h>
 
@@ -417,6 +418,12 @@ void checkStudioPages(HWND window, const SettingsStore& store, const std::filesy
            "Tab should move from the last main tab to the first settings category");
 
     expect(!find(window, L"Replay success sound"), "notification sound should not be on App");
+    const auto appLabel = bounds(find(window, L"Start minimized with Windows")).left;
+    expect(bounds(find(window, L"Close to the tray")).left == appLabel &&
+           bounds(find(window, L"Columns")).left == appLabel &&
+           bounds(find(window, L"Fit thumbnails")).left == appLabel &&
+           bounds(find(window, L"Separate library scale")).left == appLabel,
+           "every section of a settings page should start its rows on the same label column");
     click(window, L"Audio");
     const auto output = GetWindow(find(window, L"Output device"), GW_HWNDNEXT);
     expect(output && SendMessageW(output, CB_FINDSTRINGEXACT, -1, reinterpret_cast<LPARAM>(L"Default")) != CB_ERR,
@@ -444,8 +451,8 @@ void checkStudioPages(HWND window, const SettingsStore& store, const std::filesy
     const auto folderLabel = find(window, L"Buffer folder", false);
     const auto overlap = overlapLabel ? GetWindow(overlapLabel, GW_HWNDNEXT) : nullptr;
     const auto folder = folderLabel ? GetWindow(folderLabel, GW_HWNDNEXT) : nullptr;
-    const auto save = find(window, L"Save");
-    expect(overlap && folder && save, "capture preview should show clip overlap, buffer folder and Save");
+    const auto save = find(window, L"Save settings");
+    expect(overlap && folder && save, "capture preview should show clip overlap, buffer folder and Save settings");
     const auto body = GetParent(folder);
     expect(GetParent(save) == window && !IsWindowVisible(folder) && !IsWindowEnabled(save),
            "Save should be pinned and the buffer folder hidden until a disk track is chosen");
@@ -460,6 +467,21 @@ void checkStudioPages(HWND window, const SettingsStore& store, const std::filesy
     expect(overlapRect.left == clipRect.left && std::abs(folderRect.left - clipRect.left) <= 1 && overlapRect.right < clipRect.right &&
            clipRect.bottom < folderRect.top && folderRect.bottom < overlapRect.top,
            "capture storage should precede overlap, with the buffer folder between them");
+    const auto captureLabel = bounds(clipLabel).left;
+    expect(bounds(find(window, L"Capture method")).left == captureLabel &&
+           bounds(find(window, L"Store on disk")).left == captureLabel &&
+           bounds(overlapLabel).left == captureLabel,
+           "every section of a settings page should start its rows on the same label column");
+    const auto checkboxColumn = bounds(find(window, L"Follow across monitors")).left;
+    const auto organize = bounds(find(window, L"Organize clips by game"));
+    const auto cursor = bounds(find(window, L"Capture mouse cursor"));
+    expect(organize.left == checkboxColumn && cursor.left == checkboxColumn,
+           "capture checkboxes should align with the other left-aligned settings checkboxes");
+    expect(bounds(clipLabel).top < bounds(find(window, L"Capture method")).top &&
+           bounds(find(window, L"Capture method")).top < bounds(find(window, L"Store on disk")).top &&
+           bounds(find(window, L"Store on disk")).top < bounds(overlapLabel).top &&
+           bounds(overlapLabel).top < organize.top && organize.top < cursor.top,
+           "capture options should follow the intended order");
     click(body, L"Audio");
     expect(!IsWindowVisible(folder) && !IsWindowEnabled(save),
            "undoing the disk edit should restore the clean state and hide the buffer folder");
@@ -472,6 +494,9 @@ void checkStudioPages(HWND window, const SettingsStore& store, const std::filesy
     expect(IsWindowVisible(follow) && IsWindowVisible(stabilize) && GetWindowRect(follow, &followRect) &&
            GetWindowRect(stabilize, &stabilizeRect) && followRect.bottom < stabilizeRect.top,
            "multi-monitor should reveal both dependent controls below its checkbox");
+    expect(stabilizeRect.left - bounds(find(window, L"Follow across monitors")).left == MulDiv(12, dpi, 96) &&
+           bounds(find(window, L"Follow", false)).left == stabilizeRect.left && followRect.left == clipRect.left,
+           "a dependent row should indent from its parent row and keep its control on the page control column");
     click(body, L"Follow across monitors");
     expect(!IsWindowVisible(follow) && !IsWindowVisible(stabilize), "turning multi-monitor off should hide both dependent controls");
     expect(GetWindowRect(overlap, &overlapRect), "capture controls should have bounds after the layout settles");
@@ -812,6 +837,307 @@ void testWindow(const std::filesystem::path& temporary) {
         DestroyWindow(window);
     });
 }
+void testUxImprovements(const std::filesystem::path& temporary) {
+    const auto clips = temporary / L"ux-clips";
+    const auto alpha = clips / L"Alpha";
+    const auto beta = clips / L"Beta";
+    std::filesystem::create_directories(alpha);
+    std::filesystem::create_directories(beta);
+    std::ofstream(alpha / L"inner.mp4", std::ios::binary).put('\0');
+    SettingsStore store(temporary / L"ux-settings.ini");
+    withHeldStartup({.clipDirectory = clips}, store, [&](HWND window, RecorderController&, auto release) {
+        // Busy state disables record button with pending label during startup.
+        const auto starting = find(window, L"Starting\u2026");
+        expect(starting && !IsWindowEnabled(starting), "record button should be disabled with pending label while startup is busy");
+        // Footer must not trap keyboard focus via WS_TABSTOP.
+        const auto footer = FindWindowExW(window, nullptr, L"Edit", nullptr);
+        expect(footer && (GetWindowLongPtrW(footer, GWL_STYLE) & WS_TABSTOP) == 0, "footer must not have WS_TABSTOP");
+
+        release();
+        expect(waitFor([&] {
+            const auto rec = find(window, L"Start recording");
+            return rec && IsWindowEnabled(rec);
+        }), "record button should re-enable with normal label after startup");
+
+        // Discard button + standardized Save settings + clamped field name report + Test sound button.
+        click(window, L"Settings");
+        click(window, L"Audio");
+        expect(find(window, L"Test") != nullptr, "Audio should provide a Test button for replay success sound");
+        const auto volLabel = find(window, L"Volume (%)");
+        expect(volLabel && (GetWindowLongPtrW(volLabel, GWL_STYLE) & SS_ENDELLIPSIS) != 0,
+               "settings labels should use SS_ENDELLIPSIS");
+        expect(!find(window, L"Discard"), "Discard should be hidden when draft is clean");
+        const auto audioSaveWidth = bounds(find(window, L"Save settings")).right - bounds(find(window, L"Save settings")).left;
+
+        const auto appTab = find(window, L"App");
+        const auto captureCat = GetNextDlgTabItem(window, appTab, FALSE);
+        SendMessageW(captureCat, BM_CLICK, 0, 0);
+        const auto captureSave = find(window, L"Save settings");
+        expect(captureSave != nullptr, "Capture settings category should use Save settings label");
+        expect(bounds(captureSave).right - bounds(captureSave).left == audioSaveWidth,
+               "Save settings button width should stay consistent across categories");
+
+        click(window, L"Video");
+        const auto fps = GetWindow(find(window, L"Frame rate (fps)"), GW_HWNDNEXT);
+        expect(fps && SetWindowTextW(fps, L"999"), "fps field should accept out-of-range edit");
+        expect(find(window, L"Discard") != nullptr, "Discard should appear when draft is dirty");
+        click(window, L"Discard");
+        expect(!find(window, L"Discard") && !IsWindowEnabled(find(window, L"Save settings")),
+               "Discard should revert edits and hide itself");
+        const auto fpsAfterDiscard = GetWindow(find(window, L"Frame rate (fps)"), GW_HWNDNEXT);
+        expect(fpsAfterDiscard && SetWindowTextW(fpsAfterDiscard, L"999"), "fps field should accept out-of-range edit again");
+        click(window, L"Save settings");
+        expect(waitFor([&] {
+            wchar_t text[512]{};
+            GetWindowTextW(footer, text, static_cast<int>(std::size(text)));
+            return std::wstring_view(text).find(L"Frame rate") != std::wstring_view::npos;
+        }), "clamped save should report the adjusted field name");
+        expect(waitFor([&] { return store.load().video.fps == 240; }), "fps should save clamped to 240");
+
+        // Folder-only root: no "No clips", breadcrumb inside folder, empty subfolder copy.
+        click(window, L"Library");
+        expect(waitFor([&] { return find(window, L"Alpha") != nullptr && find(window, L"Beta") != nullptr; }),
+               "library should list subfolders");
+        expect(!find(window, L"No clips"), "populated folder-only library should not show No clips");
+        click(window, L"Alpha");
+        expect(waitFor([&] { return find(window, L"inner.mp4") != nullptr; }), "clicking folder should show its clips");
+        expect(find(window, L"Library  \u203a  Alpha") != nullptr, "subfolder view should show breadcrumb");
+        click(window, L"Back");
+        expect(waitFor([&] { return find(window, L"Beta") != nullptr; }), "Back should return to root");
+        expect(!find(window, L"Library  \u203a  Alpha"), "breadcrumb should hide at root");
+        click(window, L"Beta");
+        expect(waitFor([&] { return find(window, L"No clips in this folder.") != nullptr; }),
+               "empty subfolder should show contextual empty message");
+
+        // High zoom at minimum width: no Library toolbar overlap and no collapsed Diagnostics columns.
+        SetWindowPos(window, nullptr, 0, 0, 640, 420, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        for (int i = 0; i < 6; ++i)
+            SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, WHEEL_DELTA), 0);
+        const auto fav = bounds(find(window, L"Favorite"));
+        const auto back = bounds(find(window, L"Back"));
+        const auto ref = bounds(find(window, L"Refresh"));
+        const auto del = bounds(find(window, L"Delete"));
+        expect(fav.right < back.left && back.right < ref.left && ref.right < del.left,
+               "library toolbar buttons must not overlap at minimum width and high zoom");
+
+        click(window, L"Diagnostics");
+        const auto logging = find(window, L"Enable logging");
+        const auto runtime = FindWindowExW(GetParent(logging), nullptr, L"EDIT", nullptr);
+        const auto encoder = FindWindowExW(GetParent(logging), runtime, L"EDIT", nullptr);
+        const auto rtRect = bounds(runtime), encRect = bounds(encoder);
+        expect(rtRect.right - rtRect.left > 40 && encRect.right - encRect.left > 40 &&
+               rtRect.right < encRect.left && encRect.right < bounds(logging).left,
+               "diagnostics Runtime and Encoder columns must stay visible at minimum width and high zoom");
+
+        DestroyWindow(window);
+    });
+}
+
+COLORREF sampleClientPixel(HWND window, int x, int y) {
+    BITMAPINFO info{};
+    info.bmiHeader = {sizeof(BITMAPINFOHEADER), 1, 1, 1, 32, BI_RGB};
+    void* pixels = nullptr;
+    const auto bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    const auto dc = CreateCompatibleDC(nullptr);
+    const auto old = bitmap && dc ? SelectObject(dc, bitmap) : nullptr;
+    COLORREF color = CLR_INVALID;
+    if (old) {
+        SetViewportOrgEx(dc, -x, -y, nullptr);
+        SendMessageW(window, WM_PRINTCLIENT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT);
+        color = GetPixel(dc, x, y);
+        SelectObject(dc, old);
+    }
+    if (dc) DeleteDC(dc);
+    if (bitmap) DeleteObject(bitmap);
+    return color;
+}
+
+void testPolishAndFixes(const std::filesystem::path& temporary) {
+    // Extended-key names must resolve to navigation keys rather than Num keys.
+    expect(keyName(VK_LEFT).find(L"Num") == std::wstring::npos &&
+           keyName(VK_UP).find(L"Num") == std::wstring::npos &&
+           keyName(VK_HOME).find(L"Num") == std::wstring::npos,
+           "extended navigation keys must not display as numpad keys");
+
+    const auto clips = temporary / L"polish-clips";
+    const auto sub = clips / L"Sub";
+    std::filesystem::create_directories(sub);
+    std::ofstream(clips / L"root.mp4", std::ios::binary).put('\0');
+    std::ofstream(sub / L"inner.mp4", std::ios::binary).put('\0');
+    SettingsStore store(temporary / L"polish-settings.ini");
+    withHeldStartup({.clipDirectory = clips}, store, [&](HWND window, RecorderController&, auto release) {
+        release();
+        expect(waitFor([&] {
+            const auto rec = find(window, L"Start recording");
+            return rec && IsWindowEnabled(rec);
+        }), "startup should finish");
+
+        // Footer bar stays painted when idle and omits permanent scrollbars.
+        const auto footer = FindWindowExW(window, nullptr, L"Edit", nullptr);
+        expect(footer != nullptr, "expected footer control");
+        SendMessageW(window, WM_TIMER, 1, 0); // statusTimer = 1 -> clear status to idle
+        RECT client{};
+        GetClientRect(window, &client);
+        expect(!IsWindowVisible(footer), "idle footer text should hide");
+        expect(sampleClientPixel(window, client.right / 2, client.bottom - 10) == studio_theme::active,
+               "reserved footer bar should stay painted even when idle");
+        expect((GetWindowLongPtrW(footer, GWL_STYLE) & WS_VSCROLL) == 0,
+               "footer should not show a permanent scrollbar when idle or single-line");
+
+        // Zoom status feedback.
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, WHEEL_DELTA), 0);
+        expect(IsWindowVisible(footer) && readText(footer).find(L"Zoom 110%") != std::wstring::npos,
+               "ctrl+scroll should display the current zoom percentage in the footer");
+        SendMessageW(window, WM_MOUSEWHEEL, MAKEWPARAM(MK_CONTROL, -WHEEL_DELTA), 0);
+
+        // Capture <-> Settings preserves dirty draft without modal prompt.
+        click(window, L"Enable replay");
+        expect(IsWindowEnabled(find(window, L"Save settings")), "Enable replay should dirty draft");
+        click(window, L"Settings");
+        expect(find(window, L"App") != nullptr && IsWindowEnabled(find(window, L"Save settings")),
+               "switching from Capture to Settings should carry the dirty draft seamlessly");
+        click(window, L"Capture");
+        click(window, L"Enable replay");
+        expect(!IsWindowEnabled(find(window, L"Save settings")), "reverting Enable replay should clean draft");
+
+        // Compact numeric width, Up/Down stepping, and scroll preservation on clamped save.
+        click(window, L"Settings");
+        click(window, L"Video");
+        const auto fps = GetWindow(find(window, L"Frame rate (fps)"), GW_HWNDNEXT);
+        expect(fps && bounds(fps).right - bounds(fps).left < 140,
+               "numeric inputs should use compact width instead of stretching across the control column");
+        const auto prevFps = readText(fps);
+        SendMessageW(fps, WM_KEYDOWN, VK_UP, 0);
+        expect(readText(fps) == std::to_wstring(std::stoi(prevFps) + 1), "Up arrow should increment numeric field");
+        // Shorten window so Video scrolls, scroll down, and verify clamped save keeps scroll.
+        RECT wr{};
+        GetWindowRect(window, &wr);
+        SetWindowPos(window, nullptr, 0, 0, wr.right - wr.left, 400, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        const auto viewport = GetParent(fps);
+        SendMessageW(viewport, WM_VSCROLL, SB_BOTTOM, 0);
+        const int scrolled = GetScrollPos(viewport, SB_VERT);
+        expect(scrolled > 0, "Video should scroll when window is shortened");
+        expect(SetWindowTextW(fps, L"999"), "fps should accept out-of-range edit");
+        expect(saveUntil(window, [&] { return store.load().video.fps == 240; }), "fps should save clamped to 240");
+        const auto viewportAfterSave = GetParent(find(window, L"Frame rate (fps)"));
+        expect(viewportAfterSave && GetScrollPos(viewportAfterSave, SB_VERT) == scrolled,
+               "clamped save should preserve scroll position");
+
+        // Diagnostics panes have borders and Copy button.
+        click(window, L"Diagnostics");
+        const auto logging = find(window, L"Enable logging");
+        const auto runtime = FindWindowExW(GetParent(logging), nullptr, L"EDIT", nullptr);
+        RECT rw{}, rc{};
+        if (runtime) { GetWindowRect(runtime, &rw); GetClientRect(runtime, &rc); }
+        expect(runtime && (GetWindowLongPtrW(runtime, GWL_STYLE) & WS_BORDER) != 0 && (rw.bottom - rw.top) > rc.bottom,
+               "diagnostics panes should have borders");
+        expect(find(window, L"Copy") != nullptr, "diagnostics should include a Copy button");
+
+        // Library: no scrollbar on short content, inline rename killfocus dismissal + focus return, subfolder edit.
+        click(window, L"Library");
+        expect(waitFor([&] { return find(window, L"root.mp4") != nullptr; }), "library should load root");
+        const auto view = find(window, L"Clip gallery");
+        expect(view && (GetWindowLongPtrW(view, GWL_STYLE) & WS_VSCROLL) == 0,
+               "short library should not show a disabled scrollbar");
+        click(window, L"Sub");
+        expect(waitFor([&] { return find(window, L"inner.mp4") != nullptr; }), "subfolder should load inner clip");
+        const auto innerTile = find(window, L"inner.mp4");
+        click(window, L"inner.mp4");
+        click(window, L"Favorite");
+        expect(waitFor([&] { return find(window, L"Unfavorite") != nullptr; }), "favorite edit in subfolder should succeed");
+        expect(find(window, L"inner.mp4") != nullptr && !find(window, L"root.mp4"),
+               "subfolder edit should keep subfolder contents");
+
+        const auto renameEdit = FindWindowExW(view, nullptr, L"Edit", nullptr);
+        click(window, L"Rename");
+        expect(renameEdit && IsWindowVisible(renameEdit) && GetFocus() == renameEdit,
+               "Rename should show and focus inline rename edit");
+        SendMessageW(view, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(2, 2));
+        expect(!IsWindowVisible(renameEdit), "clicking gallery empty space should dismiss inline rename");
+
+        expect(find(window, L"Rename") != nullptr, "Rename should exist");
+        click(window, L"Rename");
+        expect(IsWindowVisible(renameEdit) && GetFocus() == renameEdit, "Rename should re-open");
+        SendMessageW(renameEdit, WM_KEYDOWN, VK_ESCAPE, 0);
+        expect(!IsWindowVisible(renameEdit) && GetFocus() == innerTile,
+               "Escape from inline rename should return focus to the tile");
+
+        DestroyWindow(window);
+    });
+}
+
+void testHiddenFoldersAndFocusCues(const std::filesystem::path& temporary) {
+    const auto dir = temporary / L"hidden_focus";
+    const auto clips = dir / L"clips";
+    std::error_code error;
+    std::filesystem::create_directories(clips / L"Alpha", error);
+    std::filesystem::create_directories(clips / L".backtrack_tmp", error);
+    std::filesystem::create_directories(clips / L".backtrack_ring", error);
+    std::filesystem::create_directories(clips / L".secret", error);
+    { std::ofstream(clips / L"Alpha" / L"a.mp4", std::ios::binary) << "clip"; }
+
+    SettingsStore store(dir / L"settings.ini");
+    withHeldStartup({.clipDirectory = clips}, store, [&](HWND window, RecorderController&, auto release) {
+        release();
+        expect(waitFor([&] {
+            const auto rec = find(window, L"Start recording");
+            return rec && IsWindowEnabled(rec);
+        }), "startup should finish");
+
+        // Focus cues start hidden so clicking pages or settings does not draw a blue box.
+        expect((SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS) != 0,
+               "window should start with keyboard focus cues hidden");
+
+        // Clearing UISF_HIDEFOCUS (keyboard navigation) reveals cues; a pointer click hides them again.
+        SendMessageW(window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
+        expect((SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS) == 0,
+               "keyboard navigation should clear UISF_HIDEFOCUS");
+        const auto settingsTab = find(window, L"Settings");
+        expect(settingsTab != nullptr, "Settings tab should exist");
+        SendMessageW(settingsTab, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(4, 4));
+        SendMessageW(settingsTab, WM_LBUTTONUP, 0, MAKELPARAM(4, 4));
+        expect((SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS) != 0,
+               "clicking a page tab should hide keyboard focus cues");
+
+        // Library hides dot-prefixed folders by default.
+        click(window, L"Library");
+        expect(waitFor([&] { return find(window, L"Alpha") != nullptr; }),
+               "library should show visible game folders");
+        expect(!find(window, L".backtrack_tmp") && !find(window, L".backtrack_ring") && !find(window, L".secret"),
+               "library should hide dot-prefixed folders by default");
+
+        // Enabling "Show hidden folders" in Settings -> App -> Library reveals them.
+        click(window, L"Settings");
+        const auto showHidden = find(window, L"Show hidden folders");
+        expect(showHidden != nullptr, "Settings -> App -> Library should have Show hidden folders");
+        expect(bounds(showHidden).left == bounds(find(window, L"Separate library scale")).left,
+               "Show hidden folders should align with the other library checkboxes");
+        // Clicking the checkbox must keep focus cues hidden (no blue box on cursor click),
+        // while keyboard focus cues draw the accent frame when UISF_HIDEFOCUS is clear.
+        SendMessageW(window, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
+        SetFocus(showHidden);
+        expect(sampleClientPixel(showHidden, 0, 0) == studio_theme::accent,
+               "keyboard-focused checkbox should draw the accent focus box");
+        SendMessageW(showHidden, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(4, 4));
+        SendMessageW(showHidden, WM_LBUTTONUP, 0, MAKELPARAM(4, 4));
+        expect((SendMessageW(window, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS) != 0,
+               "clicking a setting checkbox should hide keyboard focus cues");
+        expect(sampleClientPixel(showHidden, 0, 0) != studio_theme::accent,
+               "clicked checkbox must not draw the blue focus box");
+        expect(saveUntil(window, [&] { return store.load().libraryShowHiddenFolders; }),
+               "Show hidden folders should persist when saved");
+
+        click(window, L"Library");
+        expect(waitFor([&] {
+            return find(window, L"Alpha") != nullptr &&
+                   find(window, L".backtrack_tmp") != nullptr &&
+                   find(window, L".backtrack_ring") != nullptr &&
+                   find(window, L".secret") != nullptr;
+        }), "enabling Show hidden folders should reveal dot-prefixed folders in the library");
+
+        DestroyWindow(window);
+    });
+}
 } // namespace
 
 int main() {
@@ -825,6 +1151,9 @@ int main() {
         testWindow(path);
         testUiScaling(path);
         testLibraryColumns(path);
+        testUxImprovements(path);
+        testPolishAndFixes(path);
+        testHiddenFoldersAndFocusCues(path);
         std::filesystem::remove_all(path, error);
         return 0;
     } catch (const std::exception& errorText) {

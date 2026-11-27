@@ -638,9 +638,12 @@ void testWindowPlacementPersistence() {
     expect(!store.load().libraryFitThumbnails, "the thumbnail fit did not round trip");
     columns.libraryOwnScale = true;
     columns.libraryZoomPercent = 180;
+    columns.libraryShowHiddenFolders = true;
     expect(store.save(columns), "could not save the library scale");
     const auto scaled = store.load();
     expect(scaled.libraryOwnScale && scaled.libraryZoomPercent == 180, "the library scale did not round trip");
+    expect(scaled.libraryShowHiddenFolders, "library.showHiddenFolders did not round trip");
+    expect(!AppSettings{}.libraryShowHiddenFolders, "libraryShowHiddenFolders should default off");
     writeBytes(path, "library.zoomPercent=3\n");
     expect(store.load().libraryZoomPercent == 60, "an out-of-range library zoom was not clamped");
     writeBytes(path, "library.columns=4294967295\n");

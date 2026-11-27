@@ -299,6 +299,29 @@ void testCancelledScanStopsBeforeReadingClips() {
            "a scan that was not cancelled skipped the clip");
 }
 
+void testListContentsHidesDotFoldersByDefault() {
+    TestRoot root;
+    const auto library = root.path / L"library";
+    writeFile(library / L"Visible" / L"clip.mp4", "clip");
+    writeFile(library / L"Visible" / L".nested_hidden" / L"hidden_inner.mp4", "clip");
+    writeFile(library / L".backtrack_tmp" / L"session" / L"staged.mp4", "clip");
+    writeFile(library / L".hidden" / L"secret.mp4", "clip");
+    const backtrack::ClipManager manager(library);
+
+    const auto hiddenDefault = manager.listContents();
+    expect(hiddenDefault.folders.size() == 1 && hiddenDefault.folders.front().name == L"Visible",
+           "dot-prefixed folders should be hidden by default");
+    expect(hiddenDefault.folders.front().clips == 1,
+           "clips inside hidden subfolders should not be counted when hidden folders are off");
+
+    const auto shown = manager.listContents({}, /*includeHiddenFolders=*/true);
+    expect(shown.folders.size() == 3, "enabling hidden folders should include dot-prefixed folders");
+    const auto visible = std::find_if(shown.folders.begin(), shown.folders.end(),
+        [](const auto& f) { return f.name == L"Visible"; });
+    expect(visible != shown.folders.end() && visible->clips == 2,
+           "enabling hidden folders should count clips inside nested hidden folders");
+}
+
 } // namespace
 
 int main() {
@@ -309,6 +332,7 @@ int main() {
         testRenameRacePreservesMediaAndMetadata();
         testNormalRenameAndStorageRoots();
         testCancelledScanStopsBeforeReadingClips();
+        testListContentsHidesDotFoldersByDefault();
         testSidecarRenameFailuresStayNonfatal();
         testMixedCaseClipPathsAndStagingNames();
         testRenameNameRulesAndOrphanSidecars();

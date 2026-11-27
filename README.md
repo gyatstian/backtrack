@@ -5,39 +5,12 @@
 # backtrack
 lightweight clipping software that works with both nvidia (nvenc) and amd (amf).<br>
 
-## ui
-
-the window uses the normal Windows title bar, resized and moved natively. it has no maximize button, so it cannot be maximized by double-click or by dragging to the top edge. it reopens at the position and size it was closed with, unless that spot is on a display that is gone.
-
-**Ctrl+Scroll** scales the whole UI and the footer names it while idle. **Scale UI with app** under Settings → App also fits the UI to the window size, in both directions; Ctrl+Scroll keeps working in both modes.
-with **Close to the tray** on, closing the window only hides it, so unsaved
-settings stay in the window; **Exit** on the tray menu quits and asks about them.
-a recorder or hotkey failure stays in the footer until a later action succeeds.
-
-**Settings** opens a row of categories below the main tabs.
-replay notification sound is under **Settings → Audio**, and monitor options
-are under **Settings → Capture**. **Recover failed recording** appears on
-Capture only when there is a recording to recover. the library is gallery-only,
-and deleting a clip moves it to the Recycle Bin. the library browses folder by
-folder: clicking a folder opens it, **Back** returns to the folder before it, and
-the **Library** tab always returns to the top of the library. **Columns** under
-Settings → App pins the gallery grid; blank or 0 fits it to the window instead.
-**Fit thumbnails** gives the tile the frame's 16:9 shape, so the thumbnail fills
-it; off keeps one tile height and shows bars on wide tiles. The frame is never
-cropped. **Separate library scale** gives the gallery its own Ctrl+Scroll
-scale, so tiles can be bigger or smaller than the rest of the window.
-
-with Windows animation effects enabled, the underline slides between clicked
-tabs, the record icon changes shape after recording starts or stops, opening a
-folder slides the library in, and a checkmark draws after a replay saves.
-keyboard and hotkey actions stay immediate.
-
 ## amd
 i dont use amd, some features might not work. dont expect much
 
 ## features
 - voice commands
-- customization of the gpu/encoding settings
+- customization of the gpu settings
 - multi-monitor support
 - library
 - sound separation (mutes the audio of selected apps while recording; best effort, an app can slip in a moment of audio)
@@ -58,6 +31,10 @@ By using this project or its source code, for any purpose, you grant your implic
 - you jerk off to character.ai
 - you're diagnosed with nihilism
 - You're conscious of how wealthy elites, billionaires, powerful corporations, and government exploit ordinary people to preserve and expand their wealth, authority, and influence. You understand how economic systems, corporate monopolies, and the concentration of resources can be used to maintain power while limiting individual freedom, financial independence, and opportunities for the average person. You're aware of how mainstream media can influence public perception through censorship, selective reporting, propaganda and algorithmic manipulation. You actively question who benefits from the current system, how public opinion is shaped, and how economic dependence, political influence, and information control can restrict people's ability to think independently, make informed decisions, and exercise genuine autonomy.
+
+<div align="center">
+  <img src="capture.png" alt="Screenshot" width="650">
+</div>
 
 ## Repository Layout
 

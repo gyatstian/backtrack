@@ -243,6 +243,10 @@ public:
     bool initialize(AppSettings settings);
     bool updateSettings(AppSettings settings);
     void setUiPreferences(bool libraryGalleryView, bool loggingEnabled);
+    void previewAudioVolumes(uint32_t outputPercent, uint32_t inputPercent) noexcept {
+        audioOutputVolumePercent_.store((std::min)(outputPercent, uint32_t{200}), std::memory_order_relaxed);
+        audioInputVolumePercent_.store((std::min)(inputPercent, uint32_t{200}), std::memory_order_relaxed);
+    }
     bool startRecording();
     std::filesystem::path stopRecording();
     // Serialized action worker only: waits for recovery maintenance and reads disk.

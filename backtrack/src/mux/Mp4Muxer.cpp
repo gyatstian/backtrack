@@ -403,7 +403,10 @@ bool removeEmptyOutputReservation(const std::filesystem::path& path) {
     return !error;
 }
 
-bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const VideoSettings& settings) {
+bool Mp4Muxer::startRecording(
+    const std::filesystem::path& outputPath,
+    const VideoSettings& settings,
+    const std::filesystem::path& clipRoot) {
     std::scoped_lock lock(mutex_);
     if (active_) {
         return true;
@@ -417,10 +420,13 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     microphoneAudio_.nextPts100ns = 0;
     firstVideoPts100ns_.reset();
     closeManifestStreamLocked();
+    const auto tempTarget = RecoveryStore::resolveTempSessionTarget(outputPath, clipRoot);
+    outputSubdir_ = tempTarget.outputSubdir;
     std::error_code directoryError;
     tempDirectory_ = RecoveryStore::createUniqueDirectory(
-        outputPath.parent_path() / L".backtrack_tmp" / outputPath.stem(), directoryError);
+        tempTarget.tempRoot / L".backtrack_tmp" / outputPath.stem(), directoryError);
     if (tempDirectory_.empty()) {
+        outputSubdir_.clear();
         Logger::instance().error(L"mux", L"Could not create recording temporary directory for " + outputPath.wstring() +
             L" (" + utf8ToWide(directoryError.message()) + L")");
         return false;
@@ -433,6 +439,7 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
         std::error_code cleanupError;
         std::filesystem::remove_all(tempDirectory_, cleanupError);
         tempDirectory_.clear();
+        outputSubdir_.clear();
         return false;
     }
 
@@ -441,6 +448,7 @@ bool Mp4Muxer::startRecording(const std::filesystem::path& outputPath, const Vid
     // timing data behind instead of orphan elementary streams.
     MuxedInputs partialInputs;
     partialInputs.videoPath = videoPath_;
+    partialInputs.outputSubdir = outputSubdir_;
     partialInputs.codec = settings.codec;
     partialInputs.fps = settings.fps;
     partialInputs.width = settings.width;
@@ -697,6 +705,8 @@ std::filesystem::path Mp4Muxer::finalize() {
         inputs.videoPath = videoPath_;
         inputs.systemAudioPath = systemAudio_.writer.dataBytes() > 0 ? systemAudio_.writer.path() : std::filesystem::path();
         inputs.microphoneAudioPath = microphoneAudio_.writer.dataBytes() > 0 ? microphoneAudio_.writer.path() : std::filesystem::path();
+        inputs.outputSubdir = std::move(outputSubdir_);
+        outputSubdir_.clear();
         // Transfer ownership instead of copying: the sample table scales with
         // recording length and is only needed for this final mux pass. The
         // muxer is inactive from here on, so nothing else reads videoSamples_.
@@ -770,6 +780,7 @@ void Mp4Muxer::abort() {
         }
         tempDirectory = std::move(tempDirectory_);
         tempDirectory_.clear();
+        outputSubdir_.clear();
         outputPath = outputPath_;
         active_ = false;
         writeFailed_ = false;
